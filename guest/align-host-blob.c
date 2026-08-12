@@ -14,7 +14,7 @@
  * guest drm_mm hands out offsets from CREATE size, so an unaligned CREATE
  * puts the next blob at an offset the host cannot map.
  *
- * nativepipe-wayland already rounds its own blobs. This interposer does
+ * vmpipe-wayland already rounds its own blobs. This interposer does
  * the same for every other process (vulkaninfo, vkcube, GTK vulkan).
  */
 #define HOST_PAGE ((uint64_t)16384)

@@ -1,4 +1,4 @@
-// nativepipe-wayland — the guest half of the window path.
+// Shared Wayland compositor core (linked into vmpipe-wayland / remotepipe-wayland).
 //
 // This is a *translator*, not a compositor. It runs the Wayland protocol state
 // machine — surface roles, commit atomicity, buffer release timing — and
@@ -18,9 +18,14 @@
 
 #define _GNU_SOURCE
 
-#include "blob.h"
+#include "compositor.h"
+#include "blob.h" /* struct np_blob / np_align_row; VM also links blob.c */
 #include "dmabuf.h"
 #include "hostlink.h"
+#ifdef NP_REMOTE
+#include "medialink.h"
+#include "../encoder/encoder.h"
+#endif
 #include "fractional-scale-v1-server-protocol.h"
 #include "xdg-decoration-server-protocol.h"
 #include "text-input-v3-server-protocol.h"
@@ -55,6 +60,9 @@ struct np_server {
 	struct wl_display *display;
 	struct wl_list surfaces;  // np_surface.link
 	struct np_host host;
+#ifdef NP_REMOTE
+	struct np_media media;
+#endif
 	int drm_fd;
 	uint32_t next_id;
 	int output_scale;
@@ -218,8 +226,12 @@ struct np_surface {
 	/// traffic sharing it. Replacing the pending message instead bounds the
 	/// backlog by the number of surfaces rather than by time.
 	cJSON *pending_frame;
-
+#ifdef NP_REMOTE
+	struct np_encoder *encoder;
+	uint16_t last_epoch;
+#endif
 };
+
 
 static struct np_server *g_server;
 
@@ -238,6 +250,13 @@ static void flush_sync_children(struct np_surface *parent);
 static void flush_pending_frames(struct np_server *server);
 static void publish_surface_buffer(struct np_surface *surface, struct wl_resource *buffer);
 static void publish_gpu_frame(struct np_surface *surface, struct np_gpu_buffer *gpu);
+#ifdef NP_REMOTE
+static void publish_frame_remote(struct np_surface *surface, struct wl_shm_buffer *shm);
+static void encoder_emit(void *user, const uint8_t *data, size_t size, uint64_t pts_ns,
+                         uint16_t bitstream_epoch);
+static uint64_t monotonic_ns(void);
+static int media_listener_readable(int fd, uint32_t mask, void *data);
+#endif
 /// Shared by every per-client input binding, data devices included.
 static void input_resource_destroy(struct wl_resource *resource);
 // A popup takes keyboard focus when it grabs, which is well before the input
@@ -400,8 +419,108 @@ static void surface_damage_buffer(struct wl_client *client, struct wl_resource *
 static void surface_offset(struct wl_client *client, struct wl_resource *resource,
                            int32_t x, int32_t y) {}
 
+#ifdef NP_REMOTE
+static uint64_t monotonic_ns(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void encoder_emit(void *user, const uint8_t *data, size_t size, uint64_t pts_ns,
+                         uint16_t bitstream_epoch) {
+	struct np_surface *surface = user;
+	if (!surface || !surface->server) return;
+	uint16_t w = (uint16_t)(surface->last_width > 0 ? surface->last_width : 0);
+	uint16_t h = (uint16_t)(surface->last_height > 0 ? surface->last_height : 0);
+	surface->last_epoch = bitstream_epoch;
+	np_media_send(&surface->server->media, surface->id, w, h, pts_ns, bitstream_epoch,
+	              data, (uint32_t)size);
+}
+
+static void queue_encoded_committed(struct np_surface *surface, int32_t width, int32_t height,
+                                    const char *format_name) {
+	cJSON *frame = cJSON_CreateObject();
+	cJSON_AddNumberToObject(frame, "resourceID", surface->id);
+	cJSON_AddNumberToObject(frame, "width", width);
+	cJSON_AddNumberToObject(frame, "height", height);
+	cJSON_AddNumberToObject(frame, "bytesPerRow", width * 4);
+	cJSON_AddStringToObject(frame, "format", format_name);
+	cJSON_AddStringToObject(frame, "source", "encoded");
+	cJSON_AddStringToObject(frame, "codec", "h264");
+	cJSON_AddNumberToObject(frame, "bitstreamEpoch",
+	                        surface->encoder ? np_encoder_epoch(surface->encoder) : surface->last_epoch);
+	cJSON_AddNumberToObject(frame, "scale", surface->scale);
+	if (surface->geometry_set) {
+		cJSON *geometry = cJSON_CreateObject();
+		cJSON_AddNumberToObject(geometry, "x", surface->geometry_x);
+		cJSON_AddNumberToObject(geometry, "y", surface->geometry_y);
+		cJSON_AddNumberToObject(geometry, "width", surface->geometry_width);
+		cJSON_AddNumberToObject(geometry, "height", surface->geometry_height);
+		cJSON_AddItemToObject(frame, "windowGeometry", geometry);
+	}
+	cJSON_AddItemToObject(frame, "damage", cJSON_CreateArray());
+
+	surface->last_format = format_name;
+	surface->last_width = width;
+	surface->last_height = height;
+	surface->last_resource_id = surface->id;
+	surface->last_stride = (uint32_t)(width * 4);
+	surface->last_source = "encoded";
+	surface->has_published = true;
+
+	cJSON *body = cJSON_CreateObject();
+	cJSON_AddNumberToObject(body, "surface", surface->id);
+	cJSON_AddItemToObject(body, "frame", frame);
+	if (surface->pending_frame) cJSON_Delete(surface->pending_frame);
+	surface->pending_frame = body;
+}
+
+/// Remote path: encode wl_shm pixels to H.264 and ship NPEN on the media port.
+static void publish_frame_remote(struct np_surface *surface, struct wl_shm_buffer *shm) {
+	wl_shm_buffer_begin_access(shm);
+	const unsigned char *source = wl_shm_buffer_get_data(shm);
+	int32_t width = wl_shm_buffer_get_width(shm);
+	int32_t height = wl_shm_buffer_get_height(shm);
+	int32_t stride = wl_shm_buffer_get_stride(shm);
+	uint32_t format = wl_shm_buffer_get_format(shm);
+	if (!source || width < 2 || height < 2) {
+		wl_shm_buffer_end_access(shm);
+		return;
+	}
+
+	const char *format_name = format == WL_SHM_FORMAT_ARGB8888 ? "bgra8888"
+		: format == WL_SHM_FORMAT_XRGB8888 ? "bgrx8888"
+		: "rgba8888";
+
+	if (!surface->encoder) {
+		surface->encoder = np_encoder_create(width, height, encoder_emit, surface);
+		if (!surface->encoder) {
+			fprintf(stderr, "[wayland] encoder create failed surface=%u\n", surface->id);
+			wl_shm_buffer_end_access(shm);
+			return;
+		}
+	}
+
+	surface->last_width = width;
+	surface->last_height = height;
+	uint64_t pts = monotonic_ns();
+	if (!np_encoder_push_bgra(surface->encoder, source, width, height, stride, pts)) {
+		fprintf(stderr, "[wayland] encode failed surface=%u\n", surface->id);
+		wl_shm_buffer_end_access(shm);
+		return;
+	}
+	wl_shm_buffer_end_access(shm);
+	box_clear(&surface->pending);
+	queue_encoded_committed(surface, width, height, format_name);
+}
+
+#endif
+
 /// The one copy. Pixels leave the client's pool and land in host memory.
 static void publish_frame(struct np_surface *surface, struct wl_shm_buffer *shm) {
+#ifdef NP_REMOTE
+	publish_frame_remote(surface, shm);
+#else
 	struct np_server *server = surface->server;
 
 	wl_shm_buffer_begin_access(shm);
@@ -518,11 +637,21 @@ static void publish_frame(struct np_surface *surface, struct wl_shm_buffer *shm)
 	// Supersedes whatever this surface was about to report.
 	if (surface->pending_frame) cJSON_Delete(surface->pending_frame);
 	surface->pending_frame = body;
+#endif
 }
 
 /// Venus / linux-dmabuf: the resource already is the host GPU image.
 /// Name it. Do not copy.
 static void publish_gpu_frame(struct np_surface *surface, struct np_gpu_buffer *gpu) {
+#ifdef NP_REMOTE
+	(void)gpu;
+	// MVP remote path encodes wl_shm (cairo/GTK). Real dmabuf → VAAPI import
+	// is the next step; without virtio RESOURCE_INFO we cannot name a Venus id.
+	fprintf(stderr,
+	        "[wayland] remote: dropping dmabuf frame surface=%u (shm encode only in MVP)\n",
+	        surface->id);
+	return;
+#else
 	if (trace_enabled()) {
 		fprintf(stderr, "[wayland] gpu attach surface=%u res=%u %dx%d\n",
 		        surface->id, gpu->resource_id, gpu->width, gpu->height);
@@ -564,6 +693,7 @@ static void publish_gpu_frame(struct np_surface *surface, struct np_gpu_buffer *
 	cJSON_AddItemToObject(body, "frame", frame);
 	if (surface->pending_frame) cJSON_Delete(surface->pending_frame);
 	surface->pending_frame = body;
+#endif
 }
 
 /// Sends one frame message per surface that has one, at most once per loop.
@@ -695,10 +825,18 @@ static void surface_resource_destroy(struct wl_resource *resource) {
 		cJSON_Delete(surface->pending_frame);
 		surface->pending_frame = NULL;
 	}
+#ifdef NP_REMOTE
+	if (surface->encoder) {
+		np_encoder_destroy(surface->encoder);
+		surface->encoder = NULL;
+	}
+#endif
 	free(surface->title);
 	free(surface->app_id);
 	surface->title = surface->app_id = NULL;
+#ifndef NP_REMOTE
 	for (int i = 0; i < 2; i++) np_blob_destroy(surface->server->drm_fd, &surface->blobs[i]);
+#endif
 	wl_list_remove(&surface->link);
 	free(surface);
 }
@@ -3252,6 +3390,12 @@ static void republish_state(struct np_server *server) {
 		if (surface->last_source) {
 			cJSON_AddStringToObject(frame, "source", surface->last_source);
 		}
+#ifdef NP_REMOTE
+		if (surface->last_source && strcmp(surface->last_source, "encoded") == 0) {
+			cJSON_AddStringToObject(frame, "codec", "h264");
+			cJSON_AddNumberToObject(frame, "bitstreamEpoch", surface->last_epoch);
+		}
+#endif
 		cJSON_AddNumberToObject(frame, "scale", surface->scale);
 		if (surface->geometry_set) {
 			cJSON *geometry = cJSON_CreateObject();
@@ -3317,7 +3461,17 @@ static int host_listener_readable(int fd, uint32_t mask, void *data) {
 	return 0;
 }
 
-int main(int argc, char **argv) {
+#ifdef NP_REMOTE
+static int media_listener_readable(int fd, uint32_t mask, void *data) {
+	(void)fd;
+	(void)mask;
+	struct np_server *server = data;
+	np_media_accept(&server->media);
+	return 0;
+}
+#endif
+
+int np_compositor_run(int argc, char **argv) {
 	struct np_server server;
 	memset(&server, 0, sizeof(server));
 	server.next_id = 1;
@@ -3339,12 +3493,19 @@ int main(int argc, char **argv) {
 	server.keymap_fd = -1;
 	server.watched_host_fd = -1;
 	g_server = &server;
+	(void)argc;
+	(void)argv;
 
+	server.drm_fd = -1;
+#ifdef NP_REMOTE
+	fprintf(stderr, "[wayland] remote build: TCP 1025/1026, H.264 encode, no virtio blobs\n");
+#else
 	server.drm_fd = np_blob_open();
 	if (server.drm_fd < 0) {
 		fprintf(stderr, "[wayland] no virtio-gpu render node; cannot allocate host buffers\n");
 		return 1;
 	}
+#endif
 
 	server.display = wl_display_create();
 	if (!server.display) {
@@ -3376,7 +3537,9 @@ int main(int argc, char **argv) {
 	                 &server, text_input_manager_bind);
 	wl_global_create(server.display, &zxdg_decoration_manager_v1_interface, 1,
 	                 &server, decoration_manager_bind);
+#ifndef NP_REMOTE
 	np_dmabuf_advertise(server.display, server.drm_fd);
+#endif
 
 	const char *socket = wl_display_add_socket_auto(server.display);
 	if (!socket) {
@@ -3384,12 +3547,31 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 	fprintf(stderr, "[wayland] WAYLAND_DISPLAY=%s\n", socket);
+#ifdef NP_REMOTE
+	// So `remotepipe user@host` (and any later shell) can point clients at
+	// *this* compositor even when the session already owns wayland-0 under
+	// the normal XDG_RUNTIME_DIR.
+	{
+		const char *runtime = getenv("XDG_RUNTIME_DIR");
+		if (!runtime || !runtime[0]) runtime = "/tmp";
+		FILE *env = fopen("/tmp/remotepipe-wayland.env", "w");
+		if (env) {
+			fprintf(env, "WAYLAND_DISPLAY=%s\nXDG_RUNTIME_DIR=%s\n", socket, runtime);
+			fclose(env);
+		}
+	}
+#endif
 
 	if (!create_keymap(&server)) {
 		fprintf(stderr, "[wayland] no keymap; keyboard input will not work\n");
 	}
 
+#ifdef NP_REMOTE
+	if (!np_host_listen_tcp(&server.host)) return 1;
+	if (!np_media_listen(&server.media)) return 1;
+#else
 	if (!np_host_listen(&server.host)) return 1;
+#endif
 
 	// The host channel is a file descriptor like any other, so it belongs in the
 	// same event loop as the Wayland clients. Polling it after each dispatch made
@@ -3398,17 +3580,40 @@ int main(int argc, char **argv) {
 	struct wl_event_loop *loop = wl_display_get_event_loop(server.display);
 	wl_event_loop_add_fd(loop, server.host.listen_fd, WL_EVENT_READABLE,
 	                     host_listener_readable, &server);
+#ifdef NP_REMOTE
+	if (server.media.listen_fd >= 0) {
+		wl_event_loop_add_fd(loop, server.media.listen_fd, WL_EVENT_READABLE,
+		                     media_listener_readable, &server);
+	}
+#endif
 	for (;;) {
 		flush_pending_frames(&server);
 		wl_display_flush_clients(server.display);
 		wl_event_loop_dispatch(loop, -1);
 		np_host_pump(&server.host, handle_host_command, handle_host_binary, &server);
+#ifdef NP_REMOTE
+		np_media_pump(&server.media);
+		np_media_accept(&server.media);
+		if (server.media.just_attached) {
+			server.media.just_attached = false;
+			struct np_surface *surface;
+			wl_list_for_each(surface, &server.surfaces, link) {
+				if (surface->encoder) np_encoder_force_keyframe(surface->encoder);
+			}
+			fprintf(stderr, "[media] requested IDR on all encoders\n");
+		}
+#endif
 		sync_host_connection_source(&server);
 		flush_pending_frames(&server);
 	}
 
+#ifdef NP_REMOTE
+	np_media_finish(&server.media);
+#endif
 	np_host_finish(&server.host);
 	wl_display_destroy(server.display);
+#ifndef NP_REMOTE
 	np_blob_close(server.drm_fd);
+#endif
 	return 0;
 }

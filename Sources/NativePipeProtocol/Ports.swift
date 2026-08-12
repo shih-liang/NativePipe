@@ -1,22 +1,25 @@
 import Foundation
 
-/// vsock port assignments for the NativePipe control plane.
+/// vsock / TCP port assignments for the NativePipe control and media planes.
 ///
-/// The control plane deliberately does not ride on TCP/IP: DHCP failures, VPN
-/// changes or a guest bringing its own networking must never be able to take
-/// the window system down. Everything host <-> guest travels over vsock.
+/// Inside a LightHouse VM these ride vsock. For remote Linux they listen on
+/// TCP (typically loopback) and are reached through `ssh -L`.
 public enum NativePipePort {
     /// guestd's main RPC endpoint. The host connects, the guest listens.
     public static let control: UInt32 = 1024
 
-    /// Reserved: bulk surface/damage traffic for the Wayland bridge.
+    /// Window metadata: NPIP frames of `Windowing.GuestEvent` / `HostCommand`.
     public static let surface: UInt32 = 1025
 
-    /// Reserved: clipboard and drag-and-drop payload transfer.
-    public static let pasteboard: UInt32 = 1026
+    /// Encoded pixel channel (NPEN + H.264 Annex-B). Remote display only;
+    /// the local VM path does not use this port.
+    public static let media: UInt32 = 1026
 
     /// Reserved: xdg-desktop-portal backend requests.
     public static let portal: UInt32 = 1027
+
+    /// Reserved: clipboard bulk transfer (when not piggybacked on surface).
+    public static let pasteboard: UInt32 = 1028
 }
 
 /// The guest CID for a VZ virtual machine is always 3; 2 is the host.

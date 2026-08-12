@@ -1,11 +1,12 @@
-// The window channel to the host, over vsock.
+// The window channel to the host, over vsock or TCP.
 //
 // Same framing as the guestd control channel — "NPIP", version, length, JSON —
 // but a different port and no request/response wrapper: window traffic is a
 // stream of events one way and commands the other.
 //
-// This carries metadata only. Pixels never travel here; a frame message names a
-// virtio-gpu resource that is already host memory.
+// This carries metadata only. Local VM pixels never travel here — a frame
+// message names a virtio-gpu resource that is already host memory. Remote
+// display sends compressed pixels on NativePipePort.media (NPEN) instead.
 
 #ifndef NATIVEPIPE_HOSTLINK_H
 #define NATIVEPIPE_HOSTLINK_H
@@ -16,6 +17,11 @@
 /// NativePipePort.surface
 #define NP_SURFACE_PORT 1025
 
+enum np_host_transport {
+	NP_HOST_VSOCK = 0,
+	NP_HOST_TCP = 1,
+};
+
 /// Called for each command the host sends. `body` is the case's payload object.
 typedef void (*np_host_handler)(const char *name, cJSON *body, void *user_data);
 typedef void (*np_host_binary_handler)(const unsigned char *payload, size_t length,
@@ -24,6 +30,7 @@ typedef void (*np_host_binary_handler)(const unsigned char *payload, size_t leng
 struct np_host {
 	int listen_fd;
 	int conn_fd;
+	enum np_host_transport transport;
 	unsigned char *buffer;
 	size_t buffer_len;
 	size_t buffer_cap;
@@ -36,6 +43,8 @@ struct np_host {
 };
 
 bool np_host_listen(struct np_host *host);
+/// Listen on 127.0.0.1:NP_SURFACE_PORT for remote / SSH-forwarded hosts.
+bool np_host_listen_tcp(struct np_host *host);
 void np_host_finish(struct np_host *host);
 
 /// Accepts a waiting host connection, if any. Non-blocking.

@@ -67,7 +67,7 @@ void np_venus_context_destroy(np_venus *venus, uint32_t ctx_id);
 
 /// Registers a HOST3D blob with virglrenderer.
 ///
-/// Compositor (guest nativepipe-wayland): `iosurface` is the window buffer
+/// Compositor (guest vmpipe-wayland): `iosurface` is the window buffer
 /// already allocated on the host; vkr has no VkDeviceMemory for this
 /// `blob_id` and create_blob is allowed to fail.
 ///

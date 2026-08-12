@@ -2,9 +2,11 @@
 
 #include "hostlink.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/vm_sockets.h>
+#include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +28,7 @@ bool np_host_listen(struct np_host *host) {
 	memset(host, 0, sizeof(*host));
 	host->listen_fd = -1;
 	host->conn_fd = -1;
+	host->transport = NP_HOST_VSOCK;
 
 	int fd = socket(AF_VSOCK, SOCK_STREAM, 0);
 	if (fd < 0) {
@@ -52,6 +55,42 @@ bool np_host_listen(struct np_host *host) {
 	set_nonblocking(fd);
 	host->listen_fd = fd;
 	fprintf(stderr, "[wayland] window channel listening on vsock port %d\n", NP_SURFACE_PORT);
+	return true;
+}
+
+bool np_host_listen_tcp(struct np_host *host) {
+	memset(host, 0, sizeof(*host));
+	host->listen_fd = -1;
+	host->conn_fd = -1;
+	host->transport = NP_HOST_TCP;
+
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) {
+		fprintf(stderr, "[wayland] tcp socket: %s\n", strerror(errno));
+		return false;
+	}
+	int yes = 1;
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+	struct sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	addr.sin_port = htons(NP_SURFACE_PORT);
+	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		fprintf(stderr, "[wayland] tcp bind %d: %s\n", NP_SURFACE_PORT, strerror(errno));
+		close(fd);
+		return false;
+	}
+	if (listen(fd, 1) < 0) {
+		fprintf(stderr, "[wayland] tcp listen: %s\n", strerror(errno));
+		close(fd);
+		return false;
+	}
+
+	set_nonblocking(fd);
+	host->listen_fd = fd;
+	fprintf(stderr, "[wayland] window channel listening on 127.0.0.1:%d\n", NP_SURFACE_PORT);
 	return true;
 }
 

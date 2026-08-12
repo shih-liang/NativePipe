@@ -9,7 +9,7 @@ import os
 /// Two kinds of HOST3D blob, both mapped into the guest through the same
 /// aperture:
 ///
-///   * Compositor (guest `nativepipe-wayland`): the host allocated an
+///   * Compositor (guest `vmpipe-wayland`): the host allocated an
 ///     IOSurface. That object is the window — `CALayer.contents` and the
 ///     guest mmap see the same pages.
 ///   * Mesa Venus (guest Mesa, not us): vkr already allocated the memory

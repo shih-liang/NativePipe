@@ -924,10 +924,30 @@ private final class MetalPresenter {
     }
 
     func texture(from surface: IOSurfaceRef, frame: Windowing.Frame) -> MTLTexture? {
-        let width = max(frame.width, 1)
-        let height = max(frame.height, 1)
+        // VideoToolbox (and some GPU paths) hand back an IOSurface whose
+        // width/height/bytesPerRow are padded for the codec. The protocol
+        // frame is the logical size; Metal validates against the IOSurface
+        // itself and aborts on mismatch — so the descriptor must match the
+        // surface, and any crop happens later in `present`.
+        let width = IOSurfaceGetWidth(surface)
+        let height = IOSurfaceGetHeight(surface)
+        let bytesPerRow = IOSurfaceGetBytesPerRow(surface)
+        guard width > 0, height > 0, bytesPerRow > 0 else { return nil }
+
+        let pixelFormat: MTLPixelFormat
+        switch IOSurfaceGetPixelFormat(surface) {
+        case 0x42475241: // 'BGRA'
+            pixelFormat = .bgra8Unorm
+        case 0x52474241: // 'RGBA'
+            pixelFormat = .rgba8Unorm
+        default:
+            pixelFormat = frame.format == .rgba8888 ? .rgba8Unorm : .bgra8Unorm
+        }
+        // 32-bit formats need at least width*4 bytes per row.
+        guard bytesPerRow >= width * 4 else { return nil }
+
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: frame.format == .rgba8888 ? .rgba8Unorm : .bgra8Unorm,
+            pixelFormat: pixelFormat,
             width: width, height: height, mipmapped: false)
         descriptor.storageMode = .shared
         descriptor.usage = [.shaderRead]

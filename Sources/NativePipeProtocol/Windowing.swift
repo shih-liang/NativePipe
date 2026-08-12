@@ -133,12 +133,19 @@ extension Windowing {
         /// How this frame was produced. CPU is a guest memcpy into an
         /// IOSurface. GPU is a Venus image that already lives in MoltenVK
         /// on the host — the resource id is only a name, not a copy.
+        /// Encoded means a remote H.264 (etc.) stream keyed by resourceID.
         public var source: FrameSourceKind
+        /// Codec id for `.encoded` frames (`h264`, …). Nil for cpu/gpu.
+        public var codec: String?
+        /// Bumped when the remote encoder is reset so the host rebuilds its
+        /// decompression session.
+        public var bitstreamEpoch: UInt16
 
         public init(
             resourceID: UInt32, width: Int, height: Int, bytesPerRow: Int,
             format: PixelFormat, scale: Int = 1, windowGeometry: Rect? = nil,
-            damage: [Rect] = [], source: FrameSourceKind = .cpu
+            damage: [Rect] = [], source: FrameSourceKind = .cpu,
+            codec: String? = nil, bitstreamEpoch: UInt16 = 0
         ) {
             self.resourceID = resourceID
             self.width = width
@@ -149,11 +156,13 @@ extension Windowing {
             self.windowGeometry = windowGeometry
             self.damage = damage
             self.source = source
+            self.codec = codec
+            self.bitstreamEpoch = bitstreamEpoch
         }
 
         enum CodingKeys: String, CodingKey {
             case resourceID, width, height, bytesPerRow, format, scale
-            case windowGeometry, damage, source
+            case windowGeometry, damage, source, codec, bitstreamEpoch
         }
 
         public init(from decoder: Decoder) throws {
@@ -167,6 +176,8 @@ extension Windowing {
             windowGeometry = try c.decodeIfPresent(Rect.self, forKey: .windowGeometry)
             damage = try c.decodeIfPresent([Rect].self, forKey: .damage) ?? []
             source = try c.decodeIfPresent(FrameSourceKind.self, forKey: .source) ?? .cpu
+            codec = try c.decodeIfPresent(String.self, forKey: .codec)
+            bitstreamEpoch = try c.decodeIfPresent(UInt16.self, forKey: .bitstreamEpoch) ?? 0
         }
 
         public func encode(to encoder: Encoder) throws {
@@ -180,6 +191,8 @@ extension Windowing {
             try c.encodeIfPresent(windowGeometry, forKey: .windowGeometry)
             try c.encode(damage, forKey: .damage)
             if source != .cpu { try c.encode(source, forKey: .source) }
+            try c.encodeIfPresent(codec, forKey: .codec)
+            if bitstreamEpoch != 0 { try c.encode(bitstreamEpoch, forKey: .bitstreamEpoch) }
         }
     }
 
@@ -190,6 +203,9 @@ extension Windowing {
         /// Venus / linux-dmabuf: the virtio-gpu resource *is* the host
         /// MoltenVK image. No second allocation.
         case gpu
+        /// Remote display: pixels arrive as a compressed bitstream on the
+        /// media port; `resourceID` names the stream (usually the surface id).
+        case encoded
     }
 
     public enum PixelFormat: String, Codable, Sendable {

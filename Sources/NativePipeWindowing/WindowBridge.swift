@@ -473,6 +473,18 @@ public final class WindowBridge {
                 scheduleGPURetry()
                 return
             }
+        } else if frame.source == .encoded {
+            // Decode can lag a few milliseconds behind the committed event when
+            // both arrive over separate TCP sockets; retry like the GPU path.
+            guard let ioSurface = frameSource?.surface(forResource: frame.resourceID) else {
+                pendingGPUFrames[surface] = (frame, windowID)
+                Self.note("commit deferred: no decoded surface for resource \(frame.resourceID)")
+                scheduleGPURetry()
+                return
+            }
+            pendingGPUFrames.removeValue(forKey: surface)
+            native.present(frame: frame, surface: ioSurface)
+            dumpFirstFrame(frame, surface: ioSurface)
         } else {
             guard let ioSurface = frameSource?.surface(forResource: frame.resourceID) else {
                 Self.note("commit dropped: no host surface for resource \(frame.resourceID)")
