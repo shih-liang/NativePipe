@@ -1,0 +1,4 @@
+module NativePipeVenus {
+    header "np_venus.h"
+    export *
+}
