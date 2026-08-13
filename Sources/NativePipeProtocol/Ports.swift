@@ -20,6 +20,10 @@ public enum NativePipePort {
 
     /// Reserved: clipboard bulk transfer (when not piggybacked on surface).
     public static let pasteboard: UInt32 = 1028
+
+    /// Agent file pull. The **host listens**; the guest dials
+    /// `VMADDR_CID_HOST` and requests a named file (guestd, then unit files).
+    public static let agent: UInt32 = 1029
 }
 
 /// The guest CID for a VZ virtual machine is always 3; 2 is the host.

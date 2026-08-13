@@ -9,9 +9,8 @@ import Foundation
 ///     | NPIP | ver=1 | rsvd   | length(LE) |  payload   |
 ///     +------+-------+--------+------------+============+
 ///
-/// The payload is JSON. JSON is not the end state for the surface channel —
-/// that one will carry dmabuf handles and damage rectangles — but for the
-/// control channel it keeps guestd debuggable with `socat` and a text editor.
+/// The payload is opaque bytes. On the control channel it is `ControlWire`
+/// binary; on the window channel it may still be JSON or `WindowWire` binary.
 public enum WireFormat {
     public static let magic: [UInt8] = Array("NPIP".utf8)
     public static let version: UInt8 = 1
