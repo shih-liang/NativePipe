@@ -72,5 +72,11 @@ let package = Package(
             dependencies: ["NativePipeProtocol"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
+        .testTarget(
+            name: "NativePipeGPUTests",
+            dependencies: ["NativePipeGPU"],
+            path: "Tests/NativePipeGPUTests",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
     ]
 )

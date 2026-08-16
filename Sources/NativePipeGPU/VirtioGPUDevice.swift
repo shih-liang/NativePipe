@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import IOSurface
 import NativePipeVenus
@@ -5,7 +6,8 @@ import Virtualization
 import os
 
 /// Host virtio-gpu. Guest: stock `virtio_gpu.ko` + Mesa Venus + the
-/// NativePipe compositor. This type is only the host device.
+/// NativePipe compositor. One instance can expose both a Venus render node and
+/// an optional KMS scanout; no Apple graphics device is required in that mode.
 ///
 ///   * CREATE_BLOB from the compositor → IOSurface, mapped into the guest,
 ///     shown by `CALayer.contents` (CPU windows).
@@ -69,12 +71,61 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
     private var retiredPublished: [UInt32: PublishedBuffer] = [:]
     private var retiredPublishedOrder: [UInt32] = []
     private static let retiredPublishedLimit = 16
+    private var latestScanout: ScanoutFrame?
+    private var scanoutObservers: [UUID: (ScanoutFrame?) -> Void] = [:]
+    private var scanoutDeliveryScheduled = false
+
+    public struct ScanoutConfiguration: Equatable, Sendable {
+        public let width: UInt32
+        public let height: UInt32
+
+        public init(width: UInt32, height: UInt32) {
+            self.width = width
+            self.height = height
+        }
+    }
+
+    /// Immutable description of the resource currently bound to scanout 0.
+    /// Consumers resolve `resourceID` through `surface`, `gpuMemory`, or
+    /// `gpuMetalTexture`; the frame itself never carries an unsafe pointer.
+    public struct ScanoutFrame: Equatable, Sendable {
+        public let resourceID: UInt32
+        public let rectangle: VirtioGPU.Rect
+        public let resourceWidth: Int
+        public let resourceHeight: Int
+        public let bytesPerRow: Int
+        public let format: UInt32
+        public let planeOffset: Int
+        public let serial: UInt64
+    }
 
     /// Host view of one virtio-gpu resource, for the window to present.
     public struct PublishedBuffer {
         public var surface: IOSurfaceRef?
         public var pointer: UnsafeMutableRawPointer?
         public var byteCount: Int
+    }
+
+    /// Additive observer used by the inline preview and the detached display
+    /// window. Callbacks are always delivered on the main queue and immediately
+    /// replay the current frame (including nil before the first scanout).
+    /// FLUSH bursts are latest-wins: at most one delivery is queued on main.
+    @discardableResult
+    public func observeScanout(_ observer: @escaping (ScanoutFrame?) -> Void) -> UUID {
+        let token = UUID()
+        publishedLock.lock()
+        scanoutObservers[token] = observer
+        let shouldSchedule = !scanoutDeliveryScheduled
+        if shouldSchedule { scanoutDeliveryScheduled = true }
+        publishedLock.unlock()
+        if shouldSchedule { scheduleScanoutDelivery() }
+        return token
+    }
+
+    public func removeScanoutObserver(_ token: UUID) {
+        publishedLock.lock()
+        scanoutObservers[token] = nil
+        publishedLock.unlock()
     }
 
     /// The IOSurface behind a CPU/compositor resource, or nil.
@@ -180,14 +231,62 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
         var resources: Set<UInt32> = []
     }
 
+    private struct GuestBackingSegment {
+        let logicalOffset: UInt64
+        let mapping: VZGuestMemoryMapping
+    }
+
+    private struct GuestBacking {
+        let segments: [GuestBackingSegment]
+        let byteCount: UInt64
+    }
+
+    private struct ScanoutBinding {
+        let resourceID: UInt32
+        let rectangle: VirtioGPU.Rect
+        let resourceWidth: Int
+        let resourceHeight: Int
+        let bytesPerRow: Int
+        let format: UInt32
+        let planeOffset: Int
+    }
+
+    private enum ScanoutFailure: LocalizedError {
+        case missingDevice
+        case emptyBacking
+        case invalidBackingRange
+        case guestMappingFailed(address: UInt64, length: UInt32)
+        case invalidTransfer
+
+        var errorDescription: String? {
+            switch self {
+            case .missingDevice: return "custom virtio device is not ready"
+            case .emptyBacking: return "resource backing is empty"
+            case .invalidBackingRange: return "resource backing range overflow"
+            case .guestMappingFailed(let address, let length):
+                return "could not map guest range 0x\(String(address, radix: 16))+\(length)"
+            case .invalidTransfer: return "2D transfer is outside the resource or backing"
+            }
+        }
+    }
+
+    private var guestBackings: [UInt32: GuestBacking] = [:]
+    private var scanoutBinding: ScanoutBinding?
+    private var scanoutSerial: UInt64 = 0
+
     /// Address space only, so the default is generous rather than frugal.
     public static let defaultApertureSize: UInt64 = 4 << 30
 
     /// Size of the host-visible aperture this device advertises.
     public let apertureSize: UInt64
+    public let scanoutConfiguration: ScanoutConfiguration?
 
-    public init(hostVisibleApertureSize: UInt64 = VirtioGPUDevice.defaultApertureSize) {
+    public init(
+        hostVisibleApertureSize: UInt64 = VirtioGPUDevice.defaultApertureSize,
+        scanout: ScanoutConfiguration? = nil
+    ) {
         apertureSize = hostVisibleApertureSize
+        scanoutConfiguration = scanout
         deviceQueue = DispatchQueue(label: "com.nativepipe.gpu.device", qos: .userInteractive)
 
         let configuration = VZCustomVirtioDeviceConfiguration()
@@ -208,11 +307,11 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
             VirtioGPU.Feature.contextInit,
         ])
 
-        // numScanouts = 0 is how the guest is denied a display: Linux clears
-        // DRIVER_MODESET and DRIVER_ATOMIC on seeing zero scanouts, leaving a
-        // render node and no card0. The rule is enforced by the guest's own
-        // driver rather than by anything we have to police.
-        let deviceConfig = VirtioGPU.DeviceConfig(numScanouts: 0, numCapsets: 1)
+        // Render-only VMs keep zero scanouts. Framebuffer-enabled VMs expose a
+        // single KMS head from this same device rather than attaching Apple's
+        // second, unrelated virtio-gpu device.
+        let deviceConfig = VirtioGPU.DeviceConfig(
+            numScanouts: scanout == nil ? 0 : 1, numCapsets: 1)
         configuration.deviceSpecificConfiguration =
             VZVirtioDeviceSpecificConfiguration(configurationData: deviceConfig.encoded())
 
@@ -293,6 +392,126 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
         queueIndex: UInt16
     ) throws {
         switch command {
+
+        case .getDisplayInfo:
+            let display = scanoutConfiguration
+            let info = VirtioGPU.DisplayInfoResponse(
+                width: display?.width ?? 0,
+                height: display?.height ?? 0,
+                enabled: display != nil)
+            respond(element, header.reply(.okDisplayInfo), body: info.encoded())
+
+        case .resourceCreate2D:
+            let request = try VirtioGPU.ResourceCreate2D(parsing: &reader)
+            do {
+                let resource = try resources.create2D(
+                    id: request.resourceID, format: request.format,
+                    width: request.width, height: request.height)
+                publish(resource)
+                Self.log.info(
+                    "2D resource \(request.resourceID) created: \(request.width)x\(request.height), format \(request.format)")
+                Self.note(
+                    "create2d res=\(request.resourceID) \(request.width)x\(request.height) fmt=\(request.format)")
+                respond(element, header.reply(.okNoData))
+            } catch ResourceAllocationError.allocationFailed,
+                    ResourceAllocationError.tooSmall {
+                respond(element, header.reply(.errOutOfMemory))
+            }
+
+        case .resourceAttachBacking:
+            let request = try VirtioGPU.ResourceAttachBacking(parsing: &reader)
+            _ = try resources.require(request.resourceID)
+            try attachGuestBacking(request.entries, to: request.resourceID)
+            respond(element, header.reply(.okNoData))
+
+        case .resourceDetachBacking:
+            let request = try VirtioGPU.ResourceDetachBacking(parsing: &reader)
+            _ = try resources.require(request.resourceID)
+            guestBackings.removeValue(forKey: request.resourceID)
+            respond(element, header.reply(.okNoData))
+
+        case .transferToHost2D:
+            let request = try VirtioGPU.TransferToHost2D(parsing: &reader)
+            try transferToHost2D(request)
+            respond(element, header.reply(.okNoData))
+
+        case .setScanout:
+            let request = try VirtioGPU.SetScanout(parsing: &reader)
+            guard scanoutConfiguration != nil, request.scanoutID == 0 else {
+                respond(element, header.reply(.errInvalidScanoutID))
+                return
+            }
+            if request.resourceID == 0 {
+                setScanout(nil)
+            } else {
+                let resource = try resources.require(request.resourceID)
+                guard let metadata = resource.twoDimensional,
+                      request.rectangle.fits(
+                        width: UInt32(metadata.width), height: UInt32(metadata.height))
+                else {
+                    respond(element, header.reply(.errInvalidParameter))
+                    return
+                }
+                setScanout(ScanoutBinding(
+                    resourceID: request.resourceID,
+                    rectangle: request.rectangle,
+                    resourceWidth: metadata.width,
+                    resourceHeight: metadata.height,
+                    bytesPerRow: resource.geometry?.bytesPerRow
+                        ?? metadata.sourceBytesPerRow,
+                    format: metadata.format,
+                    planeOffset: 0))
+            }
+            respond(element, header.reply(.okNoData))
+
+        case .setScanoutBlob:
+            let request = try VirtioGPU.SetScanoutBlob(parsing: &reader)
+            guard scanoutConfiguration != nil, request.scanoutID == 0 else {
+                respond(element, header.reply(.errInvalidScanoutID))
+                return
+            }
+            if request.resourceID == 0 {
+                setScanout(nil)
+                respond(element, header.reply(.okNoData))
+                return
+            }
+            let resource = try resources.require(request.resourceID)
+            let (minimumStride, strideOverflow) = request.width.multipliedReportingOverflow(by: 4)
+            // Set-scanout-blob describes one linear 32-bit plane here. Reject
+            // geometry that would read beyond the resource before publishing it
+            // to AppKit; the view should never be the protocol validator.
+            let imageBytes = UInt64(request.strides[0]) * UInt64(request.height)
+            let requiredBytes = UInt64(request.offsets[0]) + imageBytes
+            guard !strideOverflow,
+                  let format = VirtioGPU.Format(rawValue: request.format),
+                  format.isSupportedScanout32Bit,
+                  request.width > 0, request.height > 0,
+                  request.rectangle.fits(width: request.width, height: request.height),
+                  let stride = request.strides.first, stride >= minimumStride,
+                  let offset = request.offsets.first,
+                  Int(exactly: stride) != nil, Int(exactly: offset) != nil,
+                  requiredBytes <= UInt64(resource.byteCount)
+            else {
+                respond(element, header.reply(.errInvalidParameter))
+                return
+            }
+            setScanout(ScanoutBinding(
+                resourceID: request.resourceID,
+                rectangle: request.rectangle,
+                resourceWidth: Int(request.width),
+                resourceHeight: Int(request.height),
+                bytesPerRow: Int(stride),
+                format: request.format,
+                planeOffset: Int(offset)))
+            respond(element, header.reply(.okNoData))
+
+        case .resourceFlush:
+            let request = try VirtioGPU.ResourceFlush(parsing: &reader)
+            _ = try resources.require(request.resourceID)
+            if scanoutBinding?.resourceID == request.resourceID {
+                publishCurrentScanout()
+            }
+            respond(element, header.reply(.okNoData))
 
         case .getCapsetInfo:
             let request = try VirtioGPU.GetCapsetInfo(parsing: &reader)
@@ -407,7 +626,14 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
                 Self.note("unref   res=\(resource.resourceID) final \(Self.peek(resource))")
             }
             unpublish(request.resourceID)
+            guestBackings.removeValue(forKey: request.resourceID)
+            if scanoutBinding?.resourceID == request.resourceID { setScanout(nil) }
             guard let resource = resources[request.resourceID] else {
+                respond(element, header.reply(.okNoData))
+                return
+            }
+            if resource.twoDimensional != nil {
+                _ = resources.remove(request.resourceID)
                 respond(element, header.reply(.okNoData))
                 return
             }
@@ -426,21 +652,227 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
             let payload = try reader.readBytes(Int(request.payloadByteCount))
             submitVenus(payload, header: header, element: element)
 
-        case .getDisplayInfo, .setScanout, .setScanoutBlob, .resourceFlush, .getEDID:
-            // There is no display. A guest asking for one has misunderstood the
-            // device, and saying so is better than inventing a fake monitor.
-            Self.log.error("rejecting display command \(String(describing: command), privacy: .public)")
-            respond(element, header.reply(.errInvalidScanoutID))
+        case .getEDID:
+            // VIRTIO_GPU_F_EDID is intentionally not offered. A guest issuing
+            // the command anyway gets a protocol error rather than invented data.
+            respond(element, header.reply(.errUnspecified))
 
         case .updateCursor, .moveCursor:
             // Cursor lives on the macOS side; nothing to draw here.
             respond(element, header.reply(.okNoData))
 
-        case .resourceCreate2D, .transferToHost2D, .resourceAttachBacking,
-             .resourceDetachBacking, .resourceCreate3D, .transferToHost3D,
-             .transferFromHost3D, .resourceAssignUUID:
+        case .resourceCreate3D, .transferToHost3D, .transferFromHost3D,
+             .resourceAssignUUID:
             Self.log.error("unimplemented command \(String(describing: command), privacy: .public)")
             respond(element, header.reply(.errUnspecified))
+        }
+    }
+
+    // MARK: - 2D scanout
+
+    private func attachGuestBacking(
+        _ entries: [VirtioGPU.MemoryEntry], to resourceID: UInt32
+    ) throws {
+        guard let device else { throw ScanoutFailure.missingDevice }
+        guard !entries.isEmpty else { throw ScanoutFailure.emptyBacking }
+
+        var logicalOffset: UInt64 = 0
+        var segments: [GuestBackingSegment] = []
+        segments.reserveCapacity(entries.count)
+        for entry in entries {
+            guard entry.length > 0 else { throw ScanoutFailure.emptyBacking }
+            let (end, overflow) = entry.address.addingReportingOverflow(UInt64(entry.length))
+            guard !overflow, end >= entry.address,
+                  let mapping = device.guestMemoryMapping(
+                    atPhysicalAddress: entry.address, length: Int(entry.length))
+            else {
+                throw ScanoutFailure.guestMappingFailed(
+                    address: entry.address, length: entry.length)
+            }
+            segments.append(GuestBackingSegment(
+                logicalOffset: logicalOffset, mapping: mapping))
+            let (next, countOverflow) = logicalOffset.addingReportingOverflow(UInt64(entry.length))
+            guard !countOverflow else { throw ScanoutFailure.invalidBackingRange }
+            logicalOffset = next
+        }
+        guestBackings[resourceID] = GuestBacking(
+            segments: segments, byteCount: logicalOffset)
+        Self.note("backing res=\(resourceID) entries=\(entries.count) bytes=\(logicalOffset)")
+    }
+
+    private func transferToHost2D(_ request: VirtioGPU.TransferToHost2D) throws {
+        let resource = try resources.require(request.resourceID)
+        guard let metadata = resource.twoDimensional,
+              let surface = resource.surface,
+              let backing = guestBackings[request.resourceID],
+              request.rectangle.fits(
+                width: UInt32(metadata.width), height: UInt32(metadata.height))
+        else { throw ScanoutFailure.invalidTransfer }
+
+        let x = Int(request.rectangle.x)
+        let y = Int(request.rectangle.y)
+        let width = Int(request.rectangle.width)
+        let height = Int(request.rectangle.height)
+        let rowBytes = width * 4
+        let destinationStride = IOSurfaceGetBytesPerRow(surface)
+        guard destinationStride >= metadata.width * 4,
+              let destination = resource.baseAddress
+        else { throw ScanoutFailure.invalidTransfer }
+
+        IOSurfaceLock(surface, [], nil)
+        defer { IOSurfaceUnlock(surface, [], nil) }
+
+        if x == 0, width == metadata.width,
+           destinationStride == metadata.sourceBytesPerRow {
+            let (copyBytes, copyOverflow) = rowBytes.multipliedReportingOverflow(by: height)
+            let (destinationOffset, offsetOverflow) = y.multipliedReportingOverflow(
+                by: destinationStride)
+            let (destinationEnd, endOverflow) = destinationOffset.addingReportingOverflow(
+                copyBytes)
+            guard !copyOverflow, !offsetOverflow, !endOverflow,
+                  destinationEnd <= resource.byteCount
+            else { throw ScanoutFailure.invalidTransfer }
+            try copyGuestBytes(
+                from: backing, offset: request.offset,
+                to: destination.advanced(by: destinationOffset), count: copyBytes)
+            return
+        }
+
+        for row in 0..<height {
+            let (rowDelta, rowOverflow) = UInt64(row).multipliedReportingOverflow(
+                by: UInt64(metadata.sourceBytesPerRow))
+            let (sourceOffset, offsetOverflow) = request.offset.addingReportingOverflow(rowDelta)
+            let (destinationRow, rowIndexOverflow) = y.addingReportingOverflow(row)
+            let (destinationRowOffset, destinationRowOverflow) =
+                destinationRow.multipliedReportingOverflow(by: destinationStride)
+            let (destinationColumnOffset, destinationColumnOverflow) =
+                x.multipliedReportingOverflow(by: 4)
+            let (destinationOffset, destinationOffsetOverflow) =
+                destinationRowOffset.addingReportingOverflow(destinationColumnOffset)
+            let (destinationEnd, destinationEndOverflow) =
+                destinationOffset.addingReportingOverflow(rowBytes)
+            guard !rowOverflow, !offsetOverflow,
+                  !rowIndexOverflow, !destinationRowOverflow,
+                  !destinationColumnOverflow, !destinationOffsetOverflow,
+                  !destinationEndOverflow, destinationOffset >= 0,
+                  destinationEnd <= resource.byteCount
+            else { throw ScanoutFailure.invalidTransfer }
+            try copyGuestBytes(
+                from: backing, offset: sourceOffset,
+                to: destination.advanced(by: destinationOffset), count: rowBytes)
+        }
+        Self.note(
+            "transfer2d res=\(request.resourceID) rect=\(x),\(y) \(width)x\(height) offset=\(request.offset)")
+    }
+
+    private func copyGuestBytes(
+        from backing: GuestBacking, offset: UInt64,
+        to destination: UnsafeMutableRawPointer, count: Int
+    ) throws {
+        guard count >= 0 else { throw ScanoutFailure.invalidTransfer }
+        let (end, overflow) = offset.addingReportingOverflow(UInt64(count))
+        guard !overflow, end <= backing.byteCount else {
+            throw ScanoutFailure.invalidTransfer
+        }
+
+        var cursor = offset
+        var copied = 0
+        guard var segmentIndex = segmentIndex(containing: cursor, in: backing.segments)
+        else { throw ScanoutFailure.invalidTransfer }
+        while copied < count {
+            guard segmentIndex < backing.segments.count else {
+                throw ScanoutFailure.invalidTransfer
+            }
+            let segment = backing.segments[segmentIndex]
+            let within = cursor - segment.logicalOffset
+            guard within < UInt64(segment.mapping.length) else {
+                throw ScanoutFailure.invalidTransfer
+            }
+            let available = UInt64(segment.mapping.length) - within
+            let chunk = min(count - copied, Int(available))
+            guard chunk > 0 else { throw ScanoutFailure.invalidTransfer }
+            memcpy(
+                destination.advanced(by: copied),
+                segment.mapping.mutableBytes.advanced(by: Int(within)),
+                chunk)
+            copied += chunk
+            cursor += UInt64(chunk)
+            if copied < count { segmentIndex += 1 }
+        }
+    }
+
+    /// Guest backing lists regularly contain hundreds of pages. Damage copies
+    /// call this once per row, so a linear search here turns pointer motion and
+    /// console scrolling into O(rows * pages). Locate the first page in O(log n)
+    /// and then advance sequentially across page boundaries.
+    private func segmentIndex(
+        containing offset: UInt64, in segments: [GuestBackingSegment]
+    ) -> Int? {
+        var lower = 0
+        var upper = segments.count
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2
+            if segments[middle].logicalOffset <= offset {
+                lower = middle + 1
+            } else {
+                upper = middle
+            }
+        }
+        guard lower > 0 else { return nil }
+        let index = lower - 1
+        let segment = segments[index]
+        let within = offset - segment.logicalOffset
+        return within < UInt64(segment.mapping.length) ? index : nil
+    }
+
+    private func setScanout(_ binding: ScanoutBinding?) {
+        let previous = scanoutBinding
+        scanoutBinding = binding
+        if let binding,
+           previous?.resourceID != binding.resourceID
+            || previous?.rectangle != binding.rectangle {
+            Self.log.info(
+                "scanout 0 bound to resource \(binding.resourceID), rect \(binding.rectangle.x),\(binding.rectangle.y) \(binding.rectangle.width)x\(binding.rectangle.height)")
+        } else if binding == nil, previous != nil {
+            Self.log.info("scanout 0 disabled")
+        }
+        publishCurrentScanout()
+    }
+
+    private func publishCurrentScanout() {
+        let frame: ScanoutFrame?
+        if let binding = scanoutBinding {
+            scanoutSerial &+= 1
+            frame = ScanoutFrame(
+                resourceID: binding.resourceID,
+                rectangle: binding.rectangle,
+                resourceWidth: binding.resourceWidth,
+                resourceHeight: binding.resourceHeight,
+                bytesPerRow: binding.bytesPerRow,
+                format: binding.format,
+                planeOffset: binding.planeOffset,
+                serial: scanoutSerial)
+        } else {
+            frame = nil
+        }
+
+        publishedLock.lock()
+        latestScanout = frame
+        let shouldSchedule = !scanoutObservers.isEmpty && !scanoutDeliveryScheduled
+        if shouldSchedule { scanoutDeliveryScheduled = true }
+        publishedLock.unlock()
+        if shouldSchedule { scheduleScanoutDelivery() }
+    }
+
+    private func scheduleScanoutDelivery() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.publishedLock.lock()
+            let frame = self.latestScanout
+            let observers = Array(self.scanoutObservers.values)
+            self.scanoutDeliveryScheduled = false
+            self.publishedLock.unlock()
+            for observer in observers { observer(frame) }
         }
     }
 
@@ -837,6 +1269,8 @@ extension VirtioGPUDevice: VZCustomVirtioDeviceDelegate {
 
     /// Drop mappings and Venus contexts; leave the host renderer running.
     private func clearGuestRendererState(completion: @escaping () -> Void = {}) {
+        setScanout(nil)
+        guestBackings.removeAll(keepingCapacity: true)
         let resourceIDs = resources.identifiers
         let contextIDs = Array(contexts.keys)
         for resource in resources.mapped {
@@ -864,6 +1298,8 @@ extension VirtioGPUDevice: VZCustomVirtioDeviceDelegate {
         guard !rendererTornDown else { return }
         Self.note("tearing down Venus / virglrenderer")
         rendererTornDown = true
+        setScanout(nil)
+        guestBackings.removeAll(keepingCapacity: false)
 
         // `willStop` is the ownership boundary for the whole custom device.
         // Waiting for individual VZ shared-region unmaps here can deadlock:

@@ -22,6 +22,10 @@ public final class GPUResource {
     public let surface: IOSurfaceRef?
     public let byteCount: Int
     public let geometry: VirtioGPU.BlobGeometry?
+    /// Present only for RESOURCE_CREATE_2D resources. `sourceBytesPerRow` is
+    /// the guest-visible tight stride; `geometry.bytesPerRow` is the IOSurface
+    /// stride and may be larger because Apple aligns scanout rows.
+    public let twoDimensional: Resource2DMetadata?
     /// Mesa's Venus object id, or the packed geometry word for a window.
     public let blobID: UInt64
 
@@ -46,6 +50,7 @@ public final class GPUResource {
         surface: IOSurfaceRef?,
         byteCount: Int,
         geometry: VirtioGPU.BlobGeometry?,
+        twoDimensional: Resource2DMetadata? = nil,
         blobID: UInt64
     ) {
         self.resourceID = resourceID
@@ -53,6 +58,7 @@ public final class GPUResource {
         self.surface = surface
         self.byteCount = byteCount
         self.geometry = geometry
+        self.twoDimensional = twoDimensional
         self.blobID = blobID
     }
 
@@ -80,6 +86,20 @@ public final class GPUResource {
     }
 }
 
+public struct Resource2DMetadata: Equatable, Sendable {
+    public let format: UInt32
+    public let width: Int
+    public let height: Int
+    public let sourceBytesPerRow: Int
+
+    public init(format: UInt32, width: Int, height: Int, sourceBytesPerRow: Int) {
+        self.format = format
+        self.width = width
+        self.height = height
+        self.sourceBytesPerRow = sourceBytesPerRow
+    }
+}
+
 public enum ResourceAllocationError: LocalizedError {
     case duplicateID(UInt32)
     case unknownID(UInt32)
@@ -87,6 +107,8 @@ public enum ResourceAllocationError: LocalizedError {
     case emptyBlob
     case tooSmall(allocated: Int, requested: Int)
     case unalignedPointer
+    case invalidDimensions(width: UInt32, height: UInt32)
+    case unsupportedFormat(UInt32)
 
     public var errorDescription: String? {
         switch self {
@@ -97,6 +119,10 @@ public enum ResourceAllocationError: LocalizedError {
         case .tooSmall(let allocated, let requested):
             return "allocated \(allocated) bytes for a blob the guest will map \(requested) of"
         case .unalignedPointer: return "host mapping is not a multiple of the host page"
+        case .invalidDimensions(let width, let height):
+            return "invalid 2D resource dimensions \(width)x\(height)"
+        case .unsupportedFormat(let format):
+            return "unsupported 2D resource format \(format)"
         }
     }
 }
@@ -116,6 +142,66 @@ public final class ResourceTable {
     public var identifiers: [UInt32] { Array(resources.keys) }
 
     public subscript(id: UInt32) -> GPUResource? { resources[id] }
+
+    /// Linux KMS dumb framebuffer. Guest pages remain the authoritative
+    /// backing; TRANSFER_TO_HOST_2D copies only the requested rectangle into
+    /// this IOSurface, which is then presented without another CPU copy.
+    @discardableResult
+    public func create2D(
+        id: UInt32, format: UInt32, width: UInt32, height: UInt32
+    ) throws -> GPUResource {
+        guard resources[id] == nil else { throw ResourceAllocationError.duplicateID(id) }
+        guard id != 0, width > 0, height > 0 else {
+            throw ResourceAllocationError.invalidDimensions(width: width, height: height)
+        }
+        guard let wireFormat = VirtioGPU.Format(rawValue: format),
+              wireFormat.isSupportedScanout32Bit
+        else { throw ResourceAllocationError.unsupportedFormat(format) }
+
+        let widthInt = Int(width)
+        let heightInt = Int(height)
+        let (tightStride, strideOverflow) = widthInt.multipliedReportingOverflow(by: 4)
+        guard !strideOverflow else {
+            throw ResourceAllocationError.invalidDimensions(width: width, height: height)
+        }
+        let hostStride = IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, tightStride)
+        let (minimumBytes, sizeOverflow) = hostStride.multipliedReportingOverflow(by: heightInt)
+        guard !sizeOverflow, minimumBytes > 0 else {
+            throw ResourceAllocationError.invalidDimensions(width: width, height: height)
+        }
+
+        guard let surface = IOSurface(properties: [
+            .width: widthInt,
+            .height: heightInt,
+            .bytesPerElement: 4,
+            .bytesPerRow: hostStride,
+            .allocSize: minimumBytes,
+            .pixelFormat: kCVPixelFormatType_32BGRA,
+        ]) else {
+            throw ResourceAllocationError.allocationFailed(bytes: minimumBytes)
+        }
+        let ref = surface as IOSurfaceRef
+        let byteCount = IOSurfaceGetAllocSize(ref)
+        guard byteCount >= minimumBytes else {
+            throw ResourceAllocationError.tooSmall(
+                allocated: byteCount, requested: minimumBytes)
+        }
+        let geometry = VirtioGPU.BlobGeometry(
+            width: widthInt, height: heightInt, bytesPerRow: hostStride)
+        let metadata = Resource2DMetadata(
+            format: format, width: widthInt, height: heightInt,
+            sourceBytesPerRow: tightStride)
+        let resource = GPUResource(
+            resourceID: id,
+            pointer: IOSurfaceGetBaseAddress(ref),
+            surface: ref,
+            byteCount: byteCount,
+            geometry: geometry,
+            twoDimensional: metadata,
+            blobID: 0)
+        resources[id] = resource
+        return resource
+    }
 
     /// Window / compositor blob: the host allocates an IOSurface.
     @discardableResult

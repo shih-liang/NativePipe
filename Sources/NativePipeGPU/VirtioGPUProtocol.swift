@@ -2,11 +2,10 @@ import Foundation
 
 /// The virtio-gpu wire protocol, as much of it as NativePipe speaks.
 ///
-/// NativePipe is not a display device: it never scans out, so the 2D command
-/// set, EDID and the scanout commands are absent by design. What is here is the
-/// part that concerns *memory and identity* — creating resources, mapping them
-/// into the host-visible region, and naming contexts — plus the envelope around
-/// `SUBMIT_3D`, whose payload belongs to venus and is forwarded untouched.
+/// NativePipe implements one optional scanout as well as the Venus render node.
+/// The 2D path is deliberately small but complete: Linux can allocate a dumb
+/// framebuffer in guest RAM, transfer damaged rectangles into an IOSurface and
+/// flush that surface to the host. `SUBMIT_3D` remains an opaque Venus payload.
 public enum VirtioGPU {
 
     // MARK: - Device identity
@@ -23,6 +22,7 @@ public enum VirtioGPU {
     public static let controlQueueIndex: UInt16 = 0
     public static let cursorQueueIndex: UInt16 = 1
     public static let queueCount: UInt16 = 2
+    public static let maximumScanouts = 16
 
     // MARK: - Feature bits
 
@@ -71,7 +71,7 @@ public enum VirtioGPU {
     // MARK: - Commands
 
     public enum CommandType: UInt32 {
-        // 2D — NativePipe rejects all of these; there is no scanout.
+        // 2D / scanout
         case getDisplayInfo = 0x0100
         case resourceCreate2D = 0x0101
         case resourceUnref = 0x0102
@@ -152,6 +152,23 @@ public enum VirtioGPU {
         case uncached = 0x02
         case writeCombine = 0x03
     }
+
+    /// `enum virtio_gpu_formats`. Linux's dumb framebuffer path normally uses
+    /// one of the first two entries (ARGB/XRGB in little-endian BGRA memory).
+    public enum Format: UInt32 {
+        case b8g8r8a8Unorm = 1
+        case b8g8r8x8Unorm = 2
+        case a8r8g8b8Unorm = 3
+        case x8r8g8b8Unorm = 4
+        case r8g8b8a8Unorm = 67
+        case x8b8g8r8Unorm = 68
+        case a8b8g8r8Unorm = 121
+        case r8g8b8x8Unorm = 134
+
+        public var isSupportedScanout32Bit: Bool {
+            self == .b8g8r8a8Unorm || self == .b8g8r8x8Unorm
+        }
+    }
 }
 
 // MARK: - Header
@@ -220,11 +237,8 @@ extension VirtioGPU {
 
 extension VirtioGPU {
     /// `struct virtio_gpu_config`, the device's 16-byte configuration space.
-    ///
-    /// `numScanouts = 0` is load-bearing: Linux's virtio-gpu driver clears
-    /// `DRIVER_MODESET | DRIVER_ATOMIC` when it sees zero scanouts, leaving a
-    /// render-only node. That is precisely the "GPU for rendering, never for
-    /// display" rule, enforced by the guest's own driver rather than by us.
+    /// A render-only instance reports zero scanouts; the framebuffer-enabled
+    /// instance reports one.
     public struct DeviceConfig {
         public var eventsRead: UInt32 = 0
         public var eventsClear: UInt32 = 0
@@ -250,6 +264,180 @@ extension VirtioGPU {
 // MARK: - Command bodies
 
 extension VirtioGPU {
+    public struct Rect: Equatable, Sendable {
+        public var x: UInt32
+        public var y: UInt32
+        public var width: UInt32
+        public var height: UInt32
+
+        public init(x: UInt32, y: UInt32, width: UInt32, height: UInt32) {
+            self.x = x
+            self.y = y
+            self.width = width
+            self.height = height
+        }
+
+        public init(parsing reader: inout LittleEndianReader) throws {
+            x = try reader.readUInt32()
+            y = try reader.readUInt32()
+            width = try reader.readUInt32()
+            height = try reader.readUInt32()
+        }
+
+        public func encoded(into writer: inout LittleEndianWriter) {
+            writer.write(x)
+            writer.write(y)
+            writer.write(width)
+            writer.write(height)
+        }
+
+        public func fits(width resourceWidth: UInt32, height resourceHeight: UInt32) -> Bool {
+            guard width > 0, height > 0, x <= resourceWidth, y <= resourceHeight else {
+                return false
+            }
+            let (right, xOverflow) = x.addingReportingOverflow(width)
+            let (bottom, yOverflow) = y.addingReportingOverflow(height)
+            return !xOverflow && !yOverflow && right <= resourceWidth && bottom <= resourceHeight
+        }
+    }
+
+    public struct DisplayMode: Equatable, Sendable {
+        public var rectangle: Rect
+        public var enabled: UInt32
+        public var flags: UInt32
+
+        public init(rectangle: Rect = Rect(x: 0, y: 0, width: 0, height: 0),
+                    enabled: Bool = false, flags: UInt32 = 0) {
+            self.rectangle = rectangle
+            self.enabled = enabled ? 1 : 0
+            self.flags = flags
+        }
+
+        fileprivate func encoded(into writer: inout LittleEndianWriter) {
+            rectangle.encoded(into: &writer)
+            writer.write(enabled)
+            writer.write(flags)
+        }
+    }
+
+    public struct DisplayInfoResponse {
+        public var modes: [DisplayMode]
+
+        public init(width: UInt32, height: UInt32, enabled: Bool) {
+            let primary = DisplayMode(
+                rectangle: Rect(x: 0, y: 0, width: width, height: height),
+                enabled: enabled)
+            modes = [primary]
+            modes.append(contentsOf: repeatElement(DisplayMode(), count: maximumScanouts - 1))
+        }
+
+        public func encoded() -> Data {
+            var writer = LittleEndianWriter()
+            for mode in modes.prefix(maximumScanouts) { mode.encoded(into: &writer) }
+            if modes.count < maximumScanouts {
+                for _ in modes.count..<maximumScanouts { DisplayMode().encoded(into: &writer) }
+            }
+            return writer.data
+        }
+    }
+
+    public struct ResourceCreate2D {
+        public var resourceID: UInt32
+        public var format: UInt32
+        public var width: UInt32
+        public var height: UInt32
+
+        public init(parsing reader: inout LittleEndianReader) throws {
+            resourceID = try reader.readUInt32()
+            format = try reader.readUInt32()
+            width = try reader.readUInt32()
+            height = try reader.readUInt32()
+        }
+    }
+
+    public struct SetScanout {
+        public var rectangle: Rect
+        public var scanoutID: UInt32
+        public var resourceID: UInt32
+
+        public init(parsing reader: inout LittleEndianReader) throws {
+            rectangle = try Rect(parsing: &reader)
+            scanoutID = try reader.readUInt32()
+            resourceID = try reader.readUInt32()
+        }
+    }
+
+    public struct ResourceFlush {
+        public var rectangle: Rect
+        public var resourceID: UInt32
+
+        public init(parsing reader: inout LittleEndianReader) throws {
+            rectangle = try Rect(parsing: &reader)
+            resourceID = try reader.readUInt32()
+            try reader.skip(4)
+        }
+    }
+
+    public struct TransferToHost2D {
+        public var rectangle: Rect
+        public var offset: UInt64
+        public var resourceID: UInt32
+
+        public init(parsing reader: inout LittleEndianReader) throws {
+            rectangle = try Rect(parsing: &reader)
+            offset = try reader.readUInt64()
+            resourceID = try reader.readUInt32()
+            try reader.skip(4)
+        }
+    }
+
+    public struct ResourceAttachBacking {
+        public var resourceID: UInt32
+        public var entries: [MemoryEntry]
+
+        public init(parsing reader: inout LittleEndianReader) throws {
+            resourceID = try reader.readUInt32()
+            let count = try reader.readUInt32()
+            guard count <= UInt32(reader.remaining / 16) else {
+                throw LittleEndianReader.Failure.truncated(
+                    needed: Int(count) * 16, available: reader.remaining)
+            }
+            entries = try (0..<count).map { _ in try MemoryEntry(parsing: &reader) }
+        }
+    }
+
+    public struct ResourceDetachBacking {
+        public var resourceID: UInt32
+
+        public init(parsing reader: inout LittleEndianReader) throws {
+            resourceID = try reader.readUInt32()
+            try reader.skip(4)
+        }
+    }
+
+    public struct SetScanoutBlob {
+        public var rectangle: Rect
+        public var scanoutID: UInt32
+        public var resourceID: UInt32
+        public var width: UInt32
+        public var height: UInt32
+        public var format: UInt32
+        public var strides: [UInt32]
+        public var offsets: [UInt32]
+
+        public init(parsing reader: inout LittleEndianReader) throws {
+            rectangle = try Rect(parsing: &reader)
+            scanoutID = try reader.readUInt32()
+            resourceID = try reader.readUInt32()
+            width = try reader.readUInt32()
+            height = try reader.readUInt32()
+            format = try reader.readUInt32()
+            try reader.skip(4)
+            strides = try (0..<4).map { _ in try reader.readUInt32() }
+            offsets = try (0..<4).map { _ in try reader.readUInt32() }
+        }
+    }
+
     public struct GetCapsetInfo {
         public var capsetIndex: UInt32
 
@@ -352,6 +540,12 @@ extension VirtioGPU {
         public var width: Int
         public var height: Int
         public var bytesPerRow: Int
+
+        public init(width: Int, height: Int, bytesPerRow: Int) {
+            self.width = width
+            self.height = height
+            self.bytesPerRow = bytesPerRow
+        }
 
         public init?(blobID: UInt64) {
             let width = Int((blobID >> 48) & 0xFFFF)
