@@ -11,6 +11,11 @@ export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
 
 if [ ! -f /usr/share/vulkan/icd.d/virtio_icd.json ] && \
    [ ! -f /usr/share/vulkan/icd.d/virtio_icd.aarch64.json ]; then
+	if [ "${NATIVEPIPE_SETUP_VENUS:-0}" != 1 ]; then
+		echo "Venus packages are missing; run 'make setup-3d-test' once" \
+			> "$LOG_DIR/vulkaninfo.log"
+		exit 1
+	fi
 	if ! grep -q '/community' /etc/apk/repositories; then
 		sed -i -e 's|^#\(.*/community\)|\1|' /etc/apk/repositories || true
 		if ! grep -q '/community' /etc/apk/repositories; then
@@ -75,8 +80,14 @@ HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/compositor
 
 if [ "$CLIENT" = vkpresent ]; then
 	if ! pkg-config --exists vulkan 2>/dev/null; then
-		apk add --no-progress vulkan-headers vulkan-loader-dev \
-			>> "$LOG_DIR/apk-vkpresent.log" 2>&1 || true
+		if [ "${NATIVEPIPE_SETUP_VENUS:-0}" = 1 ]; then
+			apk add --no-progress vulkan-headers vulkan-loader-dev \
+				>> "$LOG_DIR/apk-vkpresent.log" 2>&1 || true
+		else
+			echo "Vulkan headers are missing; run 'make setup-3d-test' once" \
+				>> "$LOG_DIR/vkcube.log"
+			exit 1
+		fi
 	fi
 	if ! make -C "$HERE" vkpresent >> "$LOG_DIR/vkpresent-build.log" 2>&1; then
 		echo "vkpresent build failed" >> "$LOG_DIR/vkcube.log"
@@ -87,12 +98,14 @@ if [ "$CLIENT" = vkpresent ]; then
 	echo "vkpresent pid $!" >> "$LOG_DIR/vulkaninfo.log"
 else
 	if ! command -v vkcube >/dev/null 2>&1; then
-		apk add --no-progress vulkan-tools >> "$LOG_DIR/apk-vkcube.log" 2>&1 || true
+		if [ "${NATIVEPIPE_SETUP_VENUS:-0}" = 1 ]; then
+			apk add --no-progress vulkan-tools >> "$LOG_DIR/apk-vkcube.log" 2>&1 || true
+		fi
 	fi
 	if ! command -v vkcube >/dev/null 2>&1; then
 		echo "vkcube not found" >> "$LOG_DIR/vkcube.log"
 		exit 1
 	fi
-	nohup env VK_WSI_MODE=wayland vkcube > "$LOG_DIR/vkcube.log" 2>&1 &
+	nohup vkcube --wsi wayland > "$LOG_DIR/vkcube.log" 2>&1 &
 	echo "vkcube pid $!" >> "$LOG_DIR/vulkaninfo.log"
 fi

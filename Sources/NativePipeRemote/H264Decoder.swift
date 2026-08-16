@@ -13,18 +13,17 @@ final class H264Decoder {
     private var height: Int = 0
     private var epoch: UInt16 = 0
 
-    /// Latest decoded frame, if any.
-    private(set) var latestPixelBuffer: CVPixelBuffer?
+    var onFrame: ((CVPixelBuffer) -> Void)?
 
     func reset() {
         if let session {
+            VTDecompressionSessionWaitForAsynchronousFrames(session)
             VTDecompressionSessionInvalidate(session)
         }
         session = nil
         formatDescription = nil
         sps = nil
         pps = nil
-        latestPixelBuffer = nil
         epoch = 0
     }
 
@@ -46,21 +45,23 @@ final class H264Decoder {
         }
 
         var vcl: [Data] = []
+        var formatChanged = false
         for nal in nals {
             let type = nal[nal.startIndex] & 0x1f
             switch type {
             case 7:
-                sps = Data(nal)
-                rebuildFormatIfPossible()
+                let value = Data(nal)
+                if value != sps { sps = value; formatChanged = true }
             case 8:
-                pps = Data(nal)
-                rebuildFormatIfPossible()
+                let value = Data(nal)
+                if value != pps { pps = value; formatChanged = true }
             case 1, 5:
                 vcl.append(Data(nal))
             default:
                 break
             }
         }
+        if formatChanged { rebuildFormatIfPossible() }
         guard !vcl.isEmpty else { return }
         guard session != nil else {
             fputs("nativepipe-remote: H264: VCL without VT session\n", stderr)
@@ -113,7 +114,7 @@ final class H264Decoder {
                 guard let refcon else { return }
                 let decoder = Unmanaged<H264Decoder>.fromOpaque(refcon).takeUnretainedValue()
                 if status == noErr, let imageBuffer {
-                    decoder.latestPixelBuffer = imageBuffer
+                    decoder.onFrame?(imageBuffer)
                 } else if status != noErr {
                     fputs("nativepipe-remote: VT callback status=\(status)\n", stderr)
                 }
@@ -153,47 +154,52 @@ final class H264Decoder {
         }
         let packetCount = packet.count
 
-        packet.withUnsafeMutableBytes { raw in
-            guard let base = raw.baseAddress else { return }
-            var blockBuffer: CMBlockBuffer?
-            let createStatus = CMBlockBufferCreateWithMemoryBlock(
-                allocator: kCFAllocatorDefault,
-                memoryBlock: base,
-                blockLength: packetCount,
-                blockAllocator: kCFAllocatorNull,
-                customBlockSource: nil,
-                offsetToData: 0,
-                dataLength: packetCount,
-                flags: 0,
-                blockBufferOut: &blockBuffer)
-            guard createStatus == noErr, let blockBuffer else { return }
+        var blockBuffer: CMBlockBuffer?
+        let createStatus = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault,
+            memoryBlock: nil,
+            blockLength: packetCount,
+            blockAllocator: kCFAllocatorDefault,
+            customBlockSource: nil,
+            offsetToData: 0,
+            dataLength: packetCount,
+            flags: 0,
+            blockBufferOut: &blockBuffer)
+        guard createStatus == noErr, let blockBuffer else { return }
+        let copyStatus = packet.withUnsafeBytes { raw -> OSStatus in
+            guard let base = raw.baseAddress else { return -1 }
+            return CMBlockBufferReplaceDataBytes(
+                with: base, blockBuffer: blockBuffer, offsetIntoDestination: 0,
+                dataLength: packetCount)
+        }
+        guard copyStatus == noErr else { return }
 
-            var sampleSize = packetCount
-            var sampleBuffer: CMSampleBuffer?
-            var timing = CMSampleTimingInfo(
-                duration: .invalid,
-                presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()),
-                decodeTimeStamp: .invalid)
-            let sampleStatus = CMSampleBufferCreateReady(
-                allocator: kCFAllocatorDefault,
-                dataBuffer: blockBuffer,
-                formatDescription: formatDescription,
-                sampleCount: 1,
-                sampleTimingEntryCount: 1,
-                sampleTimingArray: &timing,
-                sampleSizeEntryCount: 1,
-                sampleSizeArray: &sampleSize,
-                sampleBufferOut: &sampleBuffer)
-            guard sampleStatus == noErr, let sampleBuffer else { return }
+        var sampleSize = packetCount
+        var sampleBuffer: CMSampleBuffer?
+        var timing = CMSampleTimingInfo(
+            duration: .invalid,
+            presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()),
+            decodeTimeStamp: .invalid)
+        let sampleStatus = CMSampleBufferCreateReady(
+            allocator: kCFAllocatorDefault,
+            dataBuffer: blockBuffer,
+            formatDescription: formatDescription,
+            sampleCount: 1,
+            sampleTimingEntryCount: 1,
+            sampleTimingArray: &timing,
+            sampleSizeEntryCount: 1,
+            sampleSizeArray: &sampleSize,
+            sampleBufferOut: &sampleBuffer)
+        guard sampleStatus == noErr, let sampleBuffer else { return }
 
-            var flagsOut: VTDecodeInfoFlags = []
-            let decodeStatus = VTDecompressionSessionDecodeFrame(
-                session, sampleBuffer: sampleBuffer, flags: [],
-                frameRefcon: nil, infoFlagsOut: &flagsOut)
-            if decodeStatus != noErr {
-                fputs("nativepipe-remote: VTDecode status=\(decodeStatus)\n", stderr)
-                fflush(stderr)
-            }
+        var flagsOut: VTDecodeInfoFlags = []
+        let asynchronous = VTDecodeFrameFlags(rawValue: 1 << 0)
+        let decodeStatus = VTDecompressionSessionDecodeFrame(
+            session, sampleBuffer: sampleBuffer, flags: asynchronous,
+            frameRefcon: nil, infoFlagsOut: &flagsOut)
+        if decodeStatus != noErr {
+            fputs("nativepipe-remote: VTDecode status=\(decodeStatus)\n", stderr)
+            fflush(stderr)
         }
     }
 

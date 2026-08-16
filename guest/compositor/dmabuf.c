@@ -44,6 +44,30 @@ struct np_gpu_buffer_object {
 	int drm_fd;
 };
 
+/// Open the same DRM render node as a new file description, deliberately
+/// without CONTEXT_INIT.  PRIME_FD_TO_HANDLE only needs GEM lookup.  Reusing
+/// the compositor's Venus context fd makes the kernel emit CTX_ATTACH_RESOURCE
+/// for every client's swapchain image; the compositor never submits GPU work,
+/// and virglrenderer's proxy cannot import an MTLHeap into that second context.
+static int open_prime_lookup_fd(int context_fd) {
+	struct stat target;
+	if (fstat(context_fd, &target) < 0) return -1;
+	for (int minor = 128; minor <= 191; minor++) {
+		char path[64];
+		snprintf(path, sizeof(path), "/dev/dri/renderD%d", minor);
+		int fd = open(path, O_RDWR | O_CLOEXEC);
+		if (fd < 0) continue;
+		struct stat candidate;
+		if (fstat(fd, &candidate) == 0 && candidate.st_rdev == target.st_rdev) {
+			fprintf(stderr, "[wayland] dmabuf lookup fd %s (no GPU context)\n", path);
+			return fd;
+		}
+		close(fd);
+	}
+	errno = ENODEV;
+	return -1;
+}
+
 static uint32_t resource_from_prime(int drm_fd, int prime_fd, uint32_t *bo_out) {
 	struct drm_prime_handle prime;
 	memset(&prime, 0, sizeof(prime));
@@ -377,7 +401,13 @@ static void dmabuf_bind(struct wl_client *client, void *data,
 void np_dmabuf_advertise(struct wl_display *display, int drm_fd) {
 	struct np_dmabuf *dmabuf = calloc(1, sizeof(*dmabuf));
 	if (!dmabuf) return;
-	dmabuf->drm_fd = drm_fd;
+	dmabuf->drm_fd = open_prime_lookup_fd(drm_fd);
+	if (dmabuf->drm_fd < 0) {
+		fprintf(stderr, "[wayland] could not open context-free dmabuf lookup fd: %s\n",
+		        strerror(errno));
+		free(dmabuf);
+		return;
+	}
 	// Version 3 only. v4 feedback made Mesa Venus roundtrip the Wayland
 	// display re-entrantly from CreateSwapchain; Alpine vkcube then
 	// SIGSEGV'd in libwayland free(). Modifier events are enough for WSI.

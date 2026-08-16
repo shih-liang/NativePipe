@@ -27,6 +27,10 @@ public struct Request: Sendable {
         /// Run a command to completion and return status + captured output.
         case run(spec: LaunchSpec)
 
+        /// Interactive PTY exec. Guest allocates a PTY, starts the process, and
+        /// accepts one vsock connection on `NativePipePort.exec` for the session.
+        case exec(spec: LaunchSpec, cols: Int, rows: Int)
+
         /// Read a guest file (raw bytes) or list one directory level.
         case readPath(path: String)
 
@@ -39,12 +43,46 @@ public struct Request: Sendable {
         /// Round-trip liveness probe.
         case ping
 
+        /// Ask guestd for the version stamped into its own ELF (`NPGV:`).
+        case getVersion
+
+        /// Pull and apply the host-published, signed environment catalog.
+        /// The catalog selects only guestd adapters; it carries no commands.
+        case refreshEnvironment
+
+        /// Reconcile all host-published guest resources to one desired state.
+        /// Current guests use this instead of separate guestd/environment
+        /// update commands. The host selects the environment profile; guestd
+        /// validates it against the live system before applying it.
+        case reconcileResources(GuestResourceState)
+
         /// Create `username` if missing. If `oldUsername` is set, rename that
         /// account to `username` instead (usermod). Does not set a password.
         case setUser(username: String, oldUsername: String?)
 
         /// Set the password for an existing guest account (`chpasswd`).
         case setPassword(username: String, password: String)
+    }
+}
+
+/// Host-selected desired state for resources installed inside one guest.
+///
+/// The message contains only versions and a catalog profile identifier. Large
+/// payloads remain guest-initiated pulls from the host's agent listener, so a
+/// control notification never blocks behind an ELF or future resource bundle.
+public struct GuestResourceState: Sendable, Equatable {
+    public var guestdVersion: String
+    public var environmentRevision: UInt64
+    public var environmentProfile: String
+
+    public init(
+        guestdVersion: String,
+        environmentRevision: UInt64,
+        environmentProfile: String
+    ) {
+        self.guestdVersion = guestdVersion
+        self.environmentRevision = environmentRevision
+        self.environmentProfile = environmentProfile
     }
 }
 
@@ -55,19 +93,25 @@ public struct LaunchSpec: Sendable {
     public var workingDirectory: String?
     /// Bytes written to the child's stdin, then EOF. Used by `run` (ignored by `launch`).
     public var stdin: String?
+    /// Optional account used for desktop launches. guestd establishes HOME,
+    /// XDG_RUNTIME_DIR and the NativePipe Wayland session before dropping uid.
+    /// Nil preserves root execution for administrative run/exec calls.
+    public var username: String?
 
     public init(
         executable: String,
         arguments: [String] = [],
         environment: [String: String] = [:],
         workingDirectory: String? = nil,
-        stdin: String? = nil
+        stdin: String? = nil,
+        username: String? = nil
     ) {
         self.executable = executable
         self.arguments = arguments
         self.environment = environment
         self.workingDirectory = workingDirectory
         self.stdin = stdin
+        self.username = username
     }
 }
 
@@ -169,8 +213,11 @@ public struct Response: Sendable {
     public enum Result: Sendable {
         case hello(info: GuestInfo)
         case ok
+        case version(String)
         case launched(pid: Int32)
         case ran(status: Int32, stdout: String, stderr: String)
+        /// Interactive exec is ready: connect to guest vsock `port` for the PTY.
+        case execSession(pid: Int32, port: UInt32)
         case pathContents(PathContents)
         case pathStat(PathStat)
         case failure(code: Int32, message: String)
@@ -187,6 +234,15 @@ public struct GuestInfo: Sendable {
     public var distroVersion: String
     public var initSystem: String
     public var capabilities: [String]
+    /// Optional 0.2.9 tail; nil when talking to an older guestd.
+    public var environmentProfile: String?
+    public var environmentRevision: UInt64?
+    /// Optional runtime facts used by the host-side profile matcher. Install
+    /// metadata is only a hint; these values describe the system that actually
+    /// booted and therefore remain correct after imports or distro upgrades.
+    public var environmentID: String?
+    public var environmentIDLike: [String]
+    public var architecture: String?
 
     public init(
         agentVersion: String,
@@ -194,7 +250,12 @@ public struct GuestInfo: Sendable {
         distroName: String,
         distroVersion: String,
         initSystem: String,
-        capabilities: [String]
+        capabilities: [String],
+        environmentProfile: String? = nil,
+        environmentRevision: UInt64? = nil,
+        environmentID: String? = nil,
+        environmentIDLike: [String] = [],
+        architecture: String? = nil
     ) {
         self.agentVersion = agentVersion
         self.kernelRelease = kernelRelease
@@ -202,6 +263,11 @@ public struct GuestInfo: Sendable {
         self.distroVersion = distroVersion
         self.initSystem = initSystem
         self.capabilities = capabilities
+        self.environmentProfile = environmentProfile
+        self.environmentRevision = environmentRevision
+        self.environmentID = environmentID
+        self.environmentIDLike = environmentIDLike
+        self.architecture = architecture
     }
 }
 
@@ -224,6 +290,10 @@ public enum GuestCapability {
     public static let portal = "integration.portal"
     public static let credentials = "account.credentials"
     public static let run = "process.run"
+    public static let exec = "process.exec"
     public static let readPath = "fs.read"
     public static let statPath = "fs.stat"
+    public static let getVersion = "agent.version"
+    public static let environmentCatalog = "environment.catalog"
+    public static let resourceSync = "resource.sync.v1"
 }

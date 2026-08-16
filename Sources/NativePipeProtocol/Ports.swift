@@ -24,6 +24,10 @@ public enum NativePipePort {
     /// Agent file pull. The **host listens**; the guest dials
     /// `VMADDR_CID_HOST` and requests a named file (guestd, then unit files).
     public static let agent: UInt32 = 1029
+
+    /// Interactive PTY exec. After control `exec` succeeds, the host dials
+    /// the guest on this port and the guest accepts once per session.
+    public static let exec: UInt32 = 1030
 }
 
 /// The guest CID for a VZ virtual machine is always 3; 2 is the host.

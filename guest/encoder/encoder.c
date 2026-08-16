@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
@@ -33,6 +34,20 @@ struct np_encoder {
 	AVPacket *packet;
 	struct SwsContext *sws;
 	bool force_keyframe;
+
+	/* Wayland submits only the newest frame; encoding runs off its event loop. */
+	pthread_t worker;
+	pthread_mutex_t lock;
+	pthread_cond_t ready;
+	bool worker_started;
+	bool stopping;
+	uint8_t *pending_bgra;
+	int pending_width, pending_height, pending_stride;
+	uint64_t pending_pts;
+	uint16_t pending_epoch;
+	bool pending_force;
+	int requested_width, requested_height;
+	uint16_t advertised_epoch;
 };
 
 static bool setup_libx264(struct np_encoder *enc) {
@@ -156,6 +171,36 @@ static bool setup(struct np_encoder *enc) {
 	return false;
 }
 
+static bool encode_bgra_now(struct np_encoder *enc, const uint8_t *bgra, int width, int height,
+                            int stride, uint64_t pts_ns, uint16_t epoch, bool force);
+
+static void *encoder_worker(void *arg) {
+	struct np_encoder *enc = arg;
+	for (;;) {
+		pthread_mutex_lock(&enc->lock);
+		while (!enc->stopping && !enc->pending_bgra)
+			pthread_cond_wait(&enc->ready, &enc->lock);
+		if (enc->stopping && !enc->pending_bgra) {
+			pthread_mutex_unlock(&enc->lock);
+			break;
+		}
+		uint8_t *pixels = enc->pending_bgra;
+		int width = enc->pending_width, height = enc->pending_height;
+		int stride = enc->pending_stride;
+		uint64_t pts = enc->pending_pts;
+		uint16_t epoch = enc->pending_epoch;
+		bool force = enc->pending_force;
+		enc->pending_force = false;
+		enc->pending_bgra = NULL;
+		pthread_mutex_unlock(&enc->lock);
+
+		if (!encode_bgra_now(enc, pixels, width, height, stride, pts, epoch, force))
+			fprintf(stderr, "[encoder] frame encode failed\n");
+		free(pixels);
+	}
+	return NULL;
+}
+
 struct np_encoder *np_encoder_create(int width, int height, np_encoder_output_fn out, void *user) {
 	if (width < 2 || height < 2 || !out) return NULL;
 	struct np_encoder *enc = calloc(1, sizeof(*enc));
@@ -165,17 +210,35 @@ struct np_encoder *np_encoder_create(int width, int height, np_encoder_output_fn
 	enc->out = out;
 	enc->user = user;
 	enc->epoch = 1;
+	enc->advertised_epoch = 1;
+	enc->requested_width = enc->width;
+	enc->requested_height = enc->height;
 	enc->force_keyframe = true;
+	pthread_mutex_init(&enc->lock, NULL);
+	pthread_cond_init(&enc->ready, NULL);
 	if (!setup(enc)) {
 		np_encoder_destroy(enc);
 		return NULL;
 	}
+	if (pthread_create(&enc->worker, NULL, encoder_worker, enc) != 0) {
+		np_encoder_destroy(enc);
+		return NULL;
+	}
+	enc->worker_started = true;
 	return enc;
 }
 
 void np_encoder_destroy(struct np_encoder *enc) {
 	if (!enc) return;
+	pthread_mutex_lock(&enc->lock);
+	enc->stopping = true;
+	pthread_cond_signal(&enc->ready);
+	pthread_mutex_unlock(&enc->lock);
+	if (enc->worker_started) pthread_join(enc->worker, NULL);
+	free(enc->pending_bgra);
 	teardown_codec(enc);
+	pthread_cond_destroy(&enc->ready);
+	pthread_mutex_destroy(&enc->lock);
 	free(enc);
 }
 
@@ -195,11 +258,19 @@ bool np_encoder_resize(struct np_encoder *enc, int width, int height) {
 }
 
 uint16_t np_encoder_epoch(const struct np_encoder *enc) {
-	return enc ? enc->epoch : 0;
+	if (!enc) return 0;
+	struct np_encoder *mutable = (struct np_encoder *)enc;
+	pthread_mutex_lock(&mutable->lock);
+	uint16_t epoch = mutable->advertised_epoch;
+	pthread_mutex_unlock(&mutable->lock);
+	return epoch;
 }
 
 void np_encoder_force_keyframe(struct np_encoder *enc) {
-	if (enc) enc->force_keyframe = true;
+	if (!enc) return;
+	pthread_mutex_lock(&enc->lock);
+	enc->pending_force = true;
+	pthread_mutex_unlock(&enc->lock);
 }
 
 static bool drain_packets(struct np_encoder *enc, uint64_t pts_ns) {
@@ -207,24 +278,26 @@ static bool drain_packets(struct np_encoder *enc, uint64_t pts_ns) {
 		int ret = avcodec_receive_packet(enc->ctx, enc->packet);
 		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) return true;
 		if (ret < 0) return false;
-		enc->out(enc->user, enc->packet->data, (size_t)enc->packet->size, pts_ns, enc->epoch);
+		enc->out(enc->user, enc->packet->data, (size_t)enc->packet->size, pts_ns, enc->epoch,
+		         (uint16_t)enc->width, (uint16_t)enc->height);
 		av_packet_unref(enc->packet);
 	}
 }
 
-bool np_encoder_push_bgra(struct np_encoder *enc, const uint8_t *bgra, int width, int height,
-                          int stride, uint64_t pts_ns) {
+static bool encode_bgra_now(struct np_encoder *enc, const uint8_t *bgra, int width, int height,
+                            int stride, uint64_t pts_ns, uint16_t epoch, bool force) {
 	if (!enc || !bgra) return false;
 	if ((width & ~1) != enc->width || (height & ~1) != enc->height) {
 		if (!np_encoder_resize(enc, width, height)) return false;
 	}
+	enc->epoch = epoch;
 	if (av_frame_make_writable(enc->sw_frame) < 0) return false;
 	const uint8_t *src_slices[4] = {bgra, NULL, NULL, NULL};
 	int src_stride[4] = {stride, 0, 0, 0};
 	sws_scale(enc->sws, src_slices, src_stride, 0, enc->height,
 	          enc->sw_frame->data, enc->sw_frame->linesize);
 	enc->sw_frame->pts++;
-	if (enc->force_keyframe) {
+	if (force || enc->force_keyframe) {
 		enc->sw_frame->pict_type = AV_PICTURE_TYPE_I;
 		enc->force_keyframe = false;
 	} else {
@@ -241,4 +314,36 @@ bool np_encoder_push_bgra(struct np_encoder *enc, const uint8_t *bgra, int width
 
 	if (avcodec_send_frame(enc->ctx, to_send) < 0) return false;
 	return drain_packets(enc, pts_ns);
+}
+
+bool np_encoder_push_bgra(struct np_encoder *enc, const uint8_t *bgra, int width, int height,
+                          int stride, uint64_t pts_ns) {
+	if (!enc || !bgra || width < 2 || height < 2 || stride < width * 4) return false;
+	int even_width = width & ~1;
+	int even_height = height & ~1;
+	size_t packed_stride = (size_t)even_width * 4;
+	if ((size_t)even_height > SIZE_MAX / packed_stride) return false;
+	uint8_t *copy = malloc(packed_stride * (size_t)even_height);
+	if (!copy) return false;
+	for (int row = 0; row < even_height; row++)
+		memcpy(copy + (size_t)row * packed_stride,
+		       bgra + (size_t)row * (size_t)stride, packed_stride);
+
+	pthread_mutex_lock(&enc->lock);
+	if (even_width != enc->requested_width || even_height != enc->requested_height) {
+		enc->requested_width = even_width;
+		enc->requested_height = even_height;
+		enc->advertised_epoch++;
+		enc->pending_force = true;
+	}
+	free(enc->pending_bgra); /* latest frame wins under encoder backpressure */
+	enc->pending_bgra = copy;
+	enc->pending_width = even_width;
+	enc->pending_height = even_height;
+	enc->pending_stride = (int)packed_stride;
+	enc->pending_pts = pts_ns;
+	enc->pending_epoch = enc->advertised_epoch;
+	pthread_cond_signal(&enc->ready);
+	pthread_mutex_unlock(&enc->lock);
+	return true;
 }

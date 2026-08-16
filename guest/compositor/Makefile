@@ -61,7 +61,7 @@ CLIENT        := shmclient
 VKPRESENT     := vkpresent
 ALIGN_BLOB    := ../align-host-blob.so
 
-.PHONY: all remote clean install install-remote align-blob
+.PHONY: all remote clean install install-remote align-blob static static-clean
 
 all: $(BINARY) $(CLIENT)
 
@@ -141,3 +141,12 @@ install-remote: $(REMOTE_BINARY)
 clean:
 	rm -f $(BINARY) $(REMOTE_BINARY) $(CLIENT) $(VKPRESENT) $(ALIGN_BLOB) $(GENERATED)
 	rm -f nativepipe-wayland nativepipe-wayland-remote
+
+## Host-side static musl builds (zig). Output: dist/vmpipe-wayland-{aarch64,x86_64}
+static:
+	chmod +x build-static.sh
+	./build-static.sh aarch64-linux-musl
+	./build-static.sh x86_64-linux-musl
+
+static-clean:
+	rm -rf dist .deps

@@ -12,7 +12,8 @@ extern "C" {
 struct np_encoder;
 
 typedef void (*np_encoder_output_fn)(void *user, const uint8_t *data, size_t size,
-                                     uint64_t pts_ns, uint16_t bitstream_epoch);
+                                     uint64_t pts_ns, uint16_t bitstream_epoch,
+                                     uint16_t width, uint16_t height);
 
 struct np_encoder *np_encoder_create(int width, int height, np_encoder_output_fn out, void *user);
 void np_encoder_destroy(struct np_encoder *enc);

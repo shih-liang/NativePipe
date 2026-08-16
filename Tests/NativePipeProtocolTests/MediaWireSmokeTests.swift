@@ -29,4 +29,37 @@ final class MediaWireSmokeTests: XCTestCase {
         XCTAssertEqual(decoded.codec, "h264")
         XCTAssertEqual(decoded.bitstreamEpoch, 3)
     }
+
+    func testExecWireSurvivesFragmentationAndMagicInPTYData() throws {
+        let bytes = Data("before-NPXT-after".utf8)
+        let dataFrame = try ExecWire.data(bytes)
+        let resizeFrame = try ExecWire.resize(cols: 132, rows: 44)
+        let stream = dataFrame + resizeFrame
+        var decoder = ExecWire.Decoder()
+        for byte in stream {
+            decoder.append(Data([byte]))
+        }
+        let first = try XCTUnwrap(decoder.next())
+        XCTAssertEqual(first.kind, .data)
+        XCTAssertEqual(first.payload, bytes)
+        let second = try XCTUnwrap(decoder.next())
+        XCTAssertEqual(second.kind, .resize)
+        XCTAssertEqual(second.payload.count, 8)
+        XCTAssertNil(try decoder.next())
+    }
+
+    func testMediaDemuxerRejectsOversizedFrameAndResynchronizes() {
+        var invalid = MediaWire.Header(
+            surfaceID: 1, width: 1, height: 1, ptsNanos: 0,
+            payloadLength: UInt32(MediaWire.maximumPayloadSize + 1)).encoded()
+        let validHeader = MediaWire.Header(
+            surfaceID: 99, width: 2, height: 3, ptsNanos: 4,
+            payloadLength: 1).encoded()
+        invalid.append(validHeader)
+        invalid.append(0x7f)
+        let output = MediaWire.Demuxer().push(invalid)
+        XCTAssertEqual(output.count, 1)
+        XCTAssertEqual(output[0].0.surfaceID, 99)
+        XCTAssertEqual(output[0].1, Data([0x7f]))
+    }
 }

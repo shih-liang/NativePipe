@@ -455,8 +455,8 @@ public final class WindowBridge {
             return
         }
         if frame.source == .gpu {
-            // VIRGL_FORMAT_B8G8R8A8_UNORM == 1; rgba maps the same packing for WSI.
-            let virglFormat: UInt32 = frame.format == .rgba8888 ? 1 : 1
+            // virgl_hw.h: BGRA8_UNORM=1, RGBA8_UNORM=67.
+            let virglFormat: UInt32 = frame.format == .rgba8888 ? 67 : 1
             if let metal = frameSource?.gpuMetalTexture(
                 forResource: frame.resourceID,
                 width: frame.width, height: frame.height,

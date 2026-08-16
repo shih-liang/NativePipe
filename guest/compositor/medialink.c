@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -22,9 +23,15 @@ bool np_media_listen(struct np_media *media) {
 	memset(media, 0, sizeof(*media));
 	media->listen_fd = -1;
 	media->conn_fd = -1;
+	if (pthread_mutex_init(&media->lock, NULL) != 0) return false;
+	media->lock_initialized = true;
 
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
-	if (fd < 0) return false;
+	if (fd < 0) {
+		pthread_mutex_destroy(&media->lock);
+		media->lock_initialized = false;
+		return false;
+	}
 	int yes = 1;
 	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
@@ -36,6 +43,8 @@ bool np_media_listen(struct np_media *media) {
 	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(fd, 1) < 0) {
 		fprintf(stderr, "[media] bind/listen %d: %s\n", NP_MEDIA_PORT, strerror(errno));
 		close(fd);
+		pthread_mutex_destroy(&media->lock);
+		media->lock_initialized = false;
 		return false;
 	}
 	set_nonblocking(fd);
@@ -45,25 +54,43 @@ bool np_media_listen(struct np_media *media) {
 }
 
 void np_media_finish(struct np_media *media) {
+	if (!media || !media->lock_initialized) return;
+	pthread_mutex_lock(&media->lock);
 	if (media->conn_fd >= 0) close(media->conn_fd);
 	if (media->listen_fd >= 0) close(media->listen_fd);
-	memset(media, 0, sizeof(*media));
 	media->listen_fd = -1;
 	media->conn_fd = -1;
+	pthread_mutex_unlock(&media->lock);
+	pthread_mutex_destroy(&media->lock);
+	media->lock_initialized = false;
 }
 
 void np_media_accept(struct np_media *media) {
-	if (media->listen_fd < 0 || media->conn_fd >= 0) return;
+	if (!media || !media->lock_initialized) return;
+	pthread_mutex_lock(&media->lock);
+	if (media->listen_fd < 0 || media->conn_fd >= 0) {
+		pthread_mutex_unlock(&media->lock);
+		return;
+	}
 	int fd = accept(media->listen_fd, NULL, NULL);
-	if (fd < 0) return;
+	if (fd < 0) {
+		pthread_mutex_unlock(&media->lock);
+		return;
+	}
 	set_nonblocking(fd);
 	media->conn_fd = fd;
 	media->just_attached = true;
 	fprintf(stderr, "[media] client attached\n");
+	pthread_mutex_unlock(&media->lock);
 }
 
 void np_media_pump(struct np_media *media) {
-	if (!media || media->conn_fd < 0) return;
+	if (!media || !media->lock_initialized) return;
+	pthread_mutex_lock(&media->lock);
+	if (media->conn_fd < 0) {
+		pthread_mutex_unlock(&media->lock);
+		return;
+	}
 	// Media is write-only from this side. A readable condition means the peer
 	// closed (FIN) or sent unexpected bytes — either way drop and re-accept.
 	uint8_t scratch[64];
@@ -74,18 +101,27 @@ void np_media_pump(struct np_media *media) {
 			close(media->conn_fd);
 			media->conn_fd = -1;
 			fprintf(stderr, "[media] client detached\n");
+			pthread_mutex_unlock(&media->lock);
 			return;
 		}
-		if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			pthread_mutex_unlock(&media->lock);
+			return;
+		}
 		close(media->conn_fd);
 		media->conn_fd = -1;
 		fprintf(stderr, "[media] client detached: %s\n", strerror(errno));
+		pthread_mutex_unlock(&media->lock);
 		return;
 	}
 }
 
-bool np_media_connected(const struct np_media *media) {
-	return media && media->conn_fd >= 0;
+bool np_media_connected(struct np_media *media) {
+	if (!media || !media->lock_initialized) return false;
+	pthread_mutex_lock(&media->lock);
+	bool connected = media->conn_fd >= 0;
+	pthread_mutex_unlock(&media->lock);
+	return connected;
 }
 
 static bool write_all(int fd, const void *buf, size_t len) {
@@ -98,7 +134,11 @@ static bool write_all(int fd, const void *buf, size_t len) {
 			continue;
 		}
 		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-			usleep(1000);
+			struct pollfd out = { .fd = fd, .events = POLLOUT };
+			int ready;
+			do ready = poll(&out, 1, 20); while (ready < 0 && errno == EINTR);
+			if (ready <= 0 || (out.revents & (POLLERR | POLLHUP | POLLNVAL)))
+				return false;
 			continue;
 		}
 		return false;
@@ -109,7 +149,7 @@ static bool write_all(int fd, const void *buf, size_t len) {
 bool np_media_send(struct np_media *media, uint32_t surface_id,
                    uint16_t width, uint16_t height, uint64_t pts_ns,
                    uint16_t epoch, const uint8_t *payload, uint32_t length) {
-	if (!np_media_connected(media) || !payload || !length) return false;
+	if (!media || !media->lock_initialized || !payload || !length) return false;
 
 	uint8_t hdr[NP_MEDIA_HEADER_SIZE];
 	memset(hdr, 0, sizeof(hdr));
@@ -125,12 +165,19 @@ bool np_media_send(struct np_media *media, uint32_t surface_id,
 	memcpy(hdr + 24, &length, 4);
 	memcpy(hdr + 28, &epoch, 2);
 
+	pthread_mutex_lock(&media->lock);
+	if (media->conn_fd < 0) {
+		pthread_mutex_unlock(&media->lock);
+		return false;
+	}
 	if (!write_all(media->conn_fd, hdr, sizeof(hdr)) ||
 	    !write_all(media->conn_fd, payload, length)) {
 		close(media->conn_fd);
 		media->conn_fd = -1;
 		fprintf(stderr, "[media] client detached\n");
+		pthread_mutex_unlock(&media->lock);
 		return false;
 	}
+	pthread_mutex_unlock(&media->lock);
 	return true;
 }

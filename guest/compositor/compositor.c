@@ -129,6 +129,7 @@ struct np_output {
 };
 
 struct np_frame_callback {
+	struct wl_list link;
 	struct wl_resource *resource;
 	struct wl_event_source *timer;
 };
@@ -138,6 +139,9 @@ struct np_surface {
 	struct np_server *server;
 	struct wl_resource *resource;
 	uint32_t id;
+	/// wl_surface.frame requests are double buffered like the rest of surface
+	/// state. They become eligible only when the request's commit arrives.
+	struct wl_list pending_frame_callbacks;
 
 	// Wayland state is double buffered: nothing takes effect until commit.
 	struct wl_resource *pending_buffer;
@@ -253,7 +257,7 @@ static void publish_gpu_frame(struct np_surface *surface, struct np_gpu_buffer *
 #ifdef NP_REMOTE
 static void publish_frame_remote(struct np_surface *surface, struct wl_shm_buffer *shm);
 static void encoder_emit(void *user, const uint8_t *data, size_t size, uint64_t pts_ns,
-                         uint16_t bitstream_epoch);
+                         uint16_t bitstream_epoch, uint16_t width, uint16_t height);
 static uint64_t monotonic_ns(void);
 static int media_listener_readable(int fd, uint32_t mask, void *data);
 #endif
@@ -353,6 +357,7 @@ static void surface_damage(struct wl_client *client, struct wl_resource *resourc
 static void frame_callback_destroy(struct wl_resource *resource) {
 	struct np_frame_callback *callback = wl_resource_get_user_data(resource);
 	if (!callback) return;
+	if (!wl_list_empty(&callback->link)) wl_list_remove(&callback->link);
 	if (callback->timer) wl_event_source_remove(callback->timer);
 	free(callback);
 }
@@ -380,18 +385,27 @@ static void surface_frame(struct wl_client *client, struct wl_resource *resource
 		wl_client_post_no_memory(client);
 		return;
 	}
+	wl_list_init(&callback->link);
 	wl_resource_set_implementation(
 		callback->resource, NULL, callback, frame_callback_destroy);
-	callback->timer = wl_event_loop_add_timer(
-		wl_display_get_event_loop(surface->server->display), frame_callback_fire, callback);
-	if (!callback->timer) {
-		wl_resource_destroy(callback->resource);
-		wl_client_post_no_memory(client);
-		return;
+	wl_list_insert(surface->pending_frame_callbacks.prev, &callback->link);
+}
+
+static void schedule_frame_callbacks(struct np_surface *surface) {
+	struct np_frame_callback *callback, *tmp;
+	wl_list_for_each_safe(callback, tmp, &surface->pending_frame_callbacks, link) {
+		wl_list_remove(&callback->link);
+		wl_list_init(&callback->link);
+		callback->timer = wl_event_loop_add_timer(
+			wl_display_get_event_loop(surface->server->display), frame_callback_fire, callback);
+		if (!callback->timer) {
+			wl_resource_destroy(callback->resource);
+			continue;
+		}
+		// Fallback until host presentation feedback is carried on the control
+		// channel. Crucially this starts after commit, never at frame request time.
+		wl_event_source_timer_update(callback->timer, 16);
 	}
-	// Until the host reports CoreAnimation presentation feedback, use a bounded
-	// 60 Hz fallback instead of completing immediately and letting clients spin.
-	wl_event_source_timer_update(callback->timer, 16);
 }
 
 static void surface_set_opaque_region(struct wl_client *client, struct wl_resource *resource,
@@ -427,18 +441,17 @@ static uint64_t monotonic_ns(void) {
 }
 
 static void encoder_emit(void *user, const uint8_t *data, size_t size, uint64_t pts_ns,
-                         uint16_t bitstream_epoch) {
+                         uint16_t bitstream_epoch, uint16_t width, uint16_t height) {
 	struct np_surface *surface = user;
 	if (!surface || !surface->server) return;
-	uint16_t w = (uint16_t)(surface->last_width > 0 ? surface->last_width : 0);
-	uint16_t h = (uint16_t)(surface->last_height > 0 ? surface->last_height : 0);
-	surface->last_epoch = bitstream_epoch;
-	np_media_send(&surface->server->media, surface->id, w, h, pts_ns, bitstream_epoch,
+	np_media_send(&surface->server->media, surface->id, width, height, pts_ns, bitstream_epoch,
 	              data, (uint32_t)size);
 }
 
 static void queue_encoded_committed(struct np_surface *surface, int32_t width, int32_t height,
                                     const char *format_name) {
+	uint16_t epoch = surface->encoder ? np_encoder_epoch(surface->encoder) : surface->last_epoch;
+	surface->last_epoch = epoch;
 	cJSON *frame = cJSON_CreateObject();
 	cJSON_AddNumberToObject(frame, "resourceID", surface->id);
 	cJSON_AddNumberToObject(frame, "width", width);
@@ -447,8 +460,7 @@ static void queue_encoded_committed(struct np_surface *surface, int32_t width, i
 	cJSON_AddStringToObject(frame, "format", format_name);
 	cJSON_AddStringToObject(frame, "source", "encoded");
 	cJSON_AddStringToObject(frame, "codec", "h264");
-	cJSON_AddNumberToObject(frame, "bitstreamEpoch",
-	                        surface->encoder ? np_encoder_epoch(surface->encoder) : surface->last_epoch);
+	cJSON_AddNumberToObject(frame, "bitstreamEpoch", epoch);
 	cJSON_AddNumberToObject(frame, "scale", surface->scale);
 	if (surface->geometry_set) {
 		cJSON *geometry = cJSON_CreateObject();
@@ -658,8 +670,8 @@ static void publish_gpu_frame(struct np_surface *surface, struct np_gpu_buffer *
 	}
 	const char *format_name = gpu->format == 0x34325241 /* AR24 */ ? "bgra8888"
 		: gpu->format == 0x34325258 /* XR24 */ ? "bgrx8888"
-		: gpu->format == 0x34324241 /* AB24 */ ? "bgra8888"
-		: gpu->format == 0x34324258 /* XB24 */ ? "bgrx8888"
+		: gpu->format == 0x34324241 /* AB24 */ ? "rgba8888"
+		: gpu->format == 0x34324258 /* XB24 */ ? "rgba8888"
 		: "rgba8888";
 
 	cJSON *frame = cJSON_CreateObject();
@@ -718,6 +730,7 @@ static void surface_commit(struct wl_client *client, struct wl_resource *resourc
 		surface->geometry_height = surface->pending_geometry_height;
 		surface->pending_geometry_set = false;
 	}
+	schedule_frame_callbacks(surface);
 
 	if (!surface->pending_buffer_set) {
 		if (trace_enabled()) {
@@ -824,6 +837,10 @@ static void surface_resource_destroy(struct wl_resource *resource) {
 	if (surface->pending_frame) {
 		cJSON_Delete(surface->pending_frame);
 		surface->pending_frame = NULL;
+	}
+	struct np_frame_callback *callback, *callback_tmp;
+	wl_list_for_each_safe(callback, callback_tmp, &surface->pending_frame_callbacks, link) {
+		wl_resource_destroy(callback->resource);
 	}
 #ifdef NP_REMOTE
 	if (surface->encoder) {
@@ -1682,6 +1699,7 @@ static void compositor_create_surface(struct wl_client *client, struct wl_resour
 	surface->id = server->next_id++;
 	surface->scale = 1;
 	surface->pending_scale = 1;
+	wl_list_init(&surface->pending_frame_callbacks);
 	surface->resource = wl_resource_create(
 		client, &wl_surface_interface, wl_resource_get_version(resource), id);
 	if (!surface->resource) {
@@ -2513,8 +2531,8 @@ static const struct wp_fractional_scale_manager_v1_interface fractional_manager_
 	.get_fractional_scale = fractional_manager_get_scale,
 };
 
-static void fractional_manager_bind(struct wl_client *client, void *data,
-                                    uint32_t version, uint32_t id) {
+static void __attribute__((unused)) fractional_manager_bind(
+    struct wl_client *client, void *data, uint32_t version, uint32_t id) {
 	struct wl_resource *resource = wl_resource_create(
 		client, &wp_fractional_scale_manager_v1_interface, (int)version, id);
 	if (!resource) {
@@ -3547,6 +3565,26 @@ int np_compositor_run(int argc, char **argv) {
 		return 1;
 	}
 	fprintf(stderr, "[wayland] WAYLAND_DISPLAY=%s\n", socket);
+	#ifndef NP_REMOTE
+	// Desktop programs are launched later by root guestd after it drops to the
+	// configured session user. Publish the compositor-selected socket and the
+	// optional D-Bus address rather than assuming wayland-0 forever.
+	{
+		const char *runtime = getenv("XDG_RUNTIME_DIR");
+		if (runtime && runtime[0]) {
+			char path[1024];
+			snprintf(path, sizeof(path), "%s/nativepipe-wayland.env", runtime);
+			FILE *env = fopen(path, "w");
+			if (env) {
+				fprintf(env, "WAYLAND_DISPLAY=%s\n", socket);
+				const char *bus = getenv("DBUS_SESSION_BUS_ADDRESS");
+				if (bus && bus[0])
+					fprintf(env, "DBUS_SESSION_BUS_ADDRESS=%s\n", bus);
+				fclose(env);
+			}
+		}
+	}
+	#endif
 #ifdef NP_REMOTE
 	// So `remotepipe user@host` (and any later shell) can point clients at
 	// *this* compositor even when the session already owns wayland-0 under

@@ -13,8 +13,9 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#define RENDER_NODE "/dev/dri/renderD128"
 #define CAPSET_VENUS 4
+#define FIRST_RENDER_NODE 128
+#define LAST_RENDER_NODE 191
 
 static size_t aperture_align(size_t size) {
 	size_t page = (size_t)sysconf(_SC_PAGESIZE);
@@ -23,29 +24,47 @@ static size_t aperture_align(size_t size) {
 }
 
 int np_blob_open(void) {
-	int fd = open(RENDER_NODE, O_RDWR | O_CLOEXEC);
-	if (fd < 0) {
-		fprintf(stderr, "[wayland] open %s: %s\n", RENDER_NODE, strerror(errno));
-		return -1;
+	int nodes_seen = 0;
+	int last_error = ENOENT;
+
+	// Device numbering is not an ABI.  When VZ's scanout GPU and NativePipe's
+	// render-only custom GPU are both enabled, the former is normally renderD128
+	// and the Venus device becomes renderD129.  Probe by capability instead of
+	// silently binding the compositor to whichever driver registered first.
+	for (int minor = FIRST_RENDER_NODE; minor <= LAST_RENDER_NODE; minor++) {
+		char path[64];
+		snprintf(path, sizeof(path), "/dev/dri/renderD%d", minor);
+		int fd = open(path, O_RDWR | O_CLOEXEC);
+		if (fd < 0) {
+			if (errno != ENOENT) last_error = errno;
+			continue;
+		}
+		nodes_seen++;
+
+		// Host-memory blobs live in a context, and capset 4 selects Venus.
+		struct drm_virtgpu_context_set_param params[1];
+		struct drm_virtgpu_context_init init;
+		memset(params, 0, sizeof(params));
+		memset(&init, 0, sizeof(init));
+		params[0].param = VIRTGPU_CONTEXT_PARAM_CAPSET_ID;
+		params[0].value = CAPSET_VENUS;
+		init.num_params = 1;
+		init.ctx_set_params = (uint64_t)(uintptr_t)params;
+		if (ioctl(fd, DRM_IOCTL_VIRTGPU_CONTEXT_INIT, &init) == 0) {
+			fprintf(stderr, "[wayland] Venus render node %s\n", path);
+			return fd;
+		}
+		last_error = errno;
+		close(fd);
 	}
 
-	// Host-memory blobs live in a context, and the capset is how the guest asks
-	// for venus rather than virgl. The context is needed even though this
-	// process never submits rendering commands.
-	struct drm_virtgpu_context_set_param params[1];
-	struct drm_virtgpu_context_init init;
-	memset(params, 0, sizeof(params));
-	memset(&init, 0, sizeof(init));
-	params[0].param = VIRTGPU_CONTEXT_PARAM_CAPSET_ID;
-	params[0].value = CAPSET_VENUS;
-	init.num_params = 1;
-	init.ctx_set_params = (uint64_t)(uintptr_t)params;
-	if (ioctl(fd, DRM_IOCTL_VIRTGPU_CONTEXT_INIT, &init) < 0) {
-		fprintf(stderr, "[wayland] CONTEXT_INIT: %s\n", strerror(errno));
-		close(fd);
-		return -1;
-	}
-	return fd;
+	errno = last_error;
+	if (nodes_seen == 0)
+		fprintf(stderr, "[wayland] no DRM render nodes: %s\n", strerror(errno));
+	else
+		fprintf(stderr, "[wayland] no render node accepts Venus capset 4: %s\n",
+		        strerror(errno));
+	return -1;
 }
 
 void np_blob_close(int fd) {

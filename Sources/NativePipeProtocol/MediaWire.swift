@@ -6,6 +6,7 @@ import Foundation
 /// of codec bitstream (H.264 Annex-B for codec == h264).
 public enum MediaWire {
     public static let headerSize = 32
+    public static let maximumPayloadSize = 32 * 1024 * 1024
     public static let magic = Data("NPEN".utf8)
 
     public enum Codec: UInt8, Sendable {
@@ -91,17 +92,26 @@ public enum MediaWire {
         public func push(_ chunk: Data) -> [(Header, Data)] {
             buffer.append(chunk)
             var out: [(Header, Data)] = []
-            while buffer.count >= MediaWire.headerSize {
-                guard let header = Header.parse(from: buffer) else {
-                    // Resync: drop one byte and retry.
-                    buffer.removeFirst()
+            var offset = 0
+            while buffer.count - offset >= MediaWire.headerSize {
+                let headerBytes = buffer.subdata(in: offset..<(offset + MediaWire.headerSize))
+                guard let header = Header.parse(from: headerBytes),
+                      header.payloadLength <= UInt32(MediaWire.maximumPayloadSize) else {
+                    // Resync without repeatedly moving the complete receive buffer.
+                    offset += 1
                     continue
                 }
                 let total = MediaWire.headerSize + Int(header.payloadLength)
-                guard buffer.count >= total else { break }
-                let payload = buffer.subdata(in: MediaWire.headerSize..<total)
-                buffer.removeSubrange(0..<total)
+                guard buffer.count - offset >= total else { break }
+                let payloadStart = offset + MediaWire.headerSize
+                let payload = buffer.subdata(in: payloadStart..<(offset + total))
+                offset += total
                 out.append((header, payload))
+            }
+            if offset > 0 { buffer.removeSubrange(0..<offset) }
+            // A corrupt stream without a complete header must not grow forever.
+            if buffer.count > MediaWire.maximumPayloadSize + MediaWire.headerSize {
+                buffer.removeAll(keepingCapacity: true)
             }
             return out
         }

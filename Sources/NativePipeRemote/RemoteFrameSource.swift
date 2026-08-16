@@ -4,76 +4,115 @@ import IOSurface
 import NativePipeProtocol
 import NativePipeWindowing
 
-/// `FrameSource` backed by VideoToolbox decode of NPEN H.264 frames.
-///
-/// `resourceID` on committed encoded frames is the remote surface id (stream
-/// key), not a virtio-gpu resource.
-@MainActor
-public final class RemoteFrameSource: FrameSource {
+/// Thread-safe remote frame store. H.264 parsing and VideoToolbox submission
+/// stay on `decodeQueue`; only the finished IOSurface is observed by AppKit.
+public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
     private final class Stream {
         let decoder = H264Decoder()
         var surface: IOSurfaceRef?
         var epoch: UInt16 = 0
     }
 
-    private var streams: [UInt32: Stream] = [:]
+    private let lock = NSLock()
+    private let decodeQueue = DispatchQueue(
+        label: "com.nativepipe.remote.decode", qos: .userInteractive)
+    nonisolated(unsafe) private var streams: [UInt32: Stream] = [:]
+    nonisolated(unsafe) private var frameAvailable: (@MainActor (UInt32) -> Void)?
 
     public init() {}
 
-    public func surface(forResource resourceID: UInt32) -> IOSurfaceRef? {
-        streams[resourceID]?.surface
+    @MainActor
+    public func setFrameAvailableHandler(_ handler: @escaping @MainActor (UInt32) -> Void) {
+        lock.lock()
+        frameAvailable = handler
+        lock.unlock()
     }
 
-    public func ingest(header: MediaWire.Header, payload: Data) {
-        let id = header.surfaceID
-        let stream = streams[id] ?? {
-            let created = Stream()
-            streams[id] = created
-            return created
-        }()
+    @MainActor
+    public func surface(forResource resourceID: UInt32) -> IOSurfaceRef? {
+        lock.lock(); defer { lock.unlock() }
+        return streams[resourceID]?.surface
+    }
 
-        if header.bitstreamEpoch != 0, header.bitstreamEpoch != stream.epoch {
-            stream.decoder.reset()
-            stream.surface = nil
-            stream.epoch = header.bitstreamEpoch
+    /// Returns immediately. Under load, media/network work cannot starve the
+    /// AppKit event loop or native live-resize callbacks.
+    nonisolated public func ingest(header: MediaWire.Header, payload: Data) {
+        decodeQueue.async { [weak self] in
+            guard let self else { return }
+            let id = header.surfaceID
+            self.lock.lock()
+            let stream: Stream
+            if let existing = self.streams[id] {
+                stream = existing
+            } else {
+                stream = Stream()
+                self.streams[id] = stream
+                stream.decoder.onFrame = { [weak self, weak stream] pixelBuffer in
+                    guard let self, let stream else { return }
+                    self.publish(pixelBuffer, stream: stream, id: id)
+                }
+            }
+            if header.bitstreamEpoch != 0, header.bitstreamEpoch != stream.epoch {
+                stream.surface = nil
+                stream.epoch = header.bitstreamEpoch
+                self.lock.unlock()
+                stream.decoder.reset()
+            } else {
+                self.lock.unlock()
+            }
+
+            stream.decoder.decode(
+                annexB: payload,
+                width: Int(header.width),
+                height: Int(header.height),
+                bitstreamEpoch: header.bitstreamEpoch)
         }
+    }
 
-        stream.decoder.decode(
-            annexB: payload,
-            width: Int(header.width),
-            height: Int(header.height),
-            bitstreamEpoch: header.bitstreamEpoch)
-
-        if stream.surface == nil {
-            fputs(
-                "nativepipe-remote: decode miss surface=\(id) bytes=\(payload.count) "
-                    + "prefix=\(payload.prefix(16).map { String(format: "%02x", $0) }.joined(separator: " ")) "
-                    + "epoch=\(header.bitstreamEpoch)\n",
-                stderr)
-            fflush(stderr)
+    nonisolated public func removeSurface(_ surfaceID: UInt32) {
+        decodeQueue.async { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let stream = self.streams.removeValue(forKey: surfaceID)
+            self.lock.unlock()
+            stream?.decoder.reset()
         }
+    }
 
-        guard let pixelBuffer = stream.decoder.latestPixelBuffer else { return }
-        if let ioSurface = CVPixelBufferGetIOSurface(pixelBuffer)?.takeUnretainedValue() {
-            stream.surface = ioSurface
+    nonisolated public func removeAll() {
+        decodeQueue.async { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let removed = Array(self.streams.values)
+            self.streams.removeAll()
+            self.lock.unlock()
+            for stream in removed { stream.decoder.reset() }
+        }
+    }
+
+    nonisolated private func publish(_ pixelBuffer: CVPixelBuffer, stream: Stream, id: UInt32) {
+        let ioSurface: IOSurfaceRef?
+        if let decoded = CVPixelBufferGetIOSurface(pixelBuffer)?.takeUnretainedValue() {
+            ioSurface = decoded
+        } else {
+            ioSurface = Self.copyToIOSurface(pixelBuffer)
+        }
+        guard let ioSurface else { return }
+
+        lock.lock()
+        guard streams[id] === stream else {
+            lock.unlock()
             return
         }
-        // Fallback: copy into a dedicated IOSurface if VT did not back the
-        // buffer with one (unusual with our imageBufferAttributes).
-        stream.surface = Self.copyToIOSurface(pixelBuffer)
+        stream.surface = ioSurface
+        let callback = frameAvailable
+        lock.unlock()
+        if let callback {
+            Task { @MainActor in callback(id) }
+        }
     }
 
-    public func removeSurface(_ surfaceID: UInt32) {
-        streams[surfaceID]?.decoder.reset()
-        streams.removeValue(forKey: surfaceID)
-    }
-
-    public func removeAll() {
-        for stream in streams.values { stream.decoder.reset() }
-        streams.removeAll()
-    }
-
-    private static func copyToIOSurface(_ pixelBuffer: CVPixelBuffer) -> IOSurfaceRef? {
+    nonisolated private static func copyToIOSurface(_ pixelBuffer: CVPixelBuffer) -> IOSurfaceRef? {
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
         let bytesPerRow = IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, width * 4)
@@ -92,9 +131,8 @@ public final class RemoteFrameSource: FrameSource {
         IOSurfaceLock(ref, [], nil)
         defer { IOSurfaceUnlock(ref, [], nil) }
         let dst = IOSurfaceGetBaseAddress(ref)
-        let rows = height
         let copyWidth = min(srcRow, bytesPerRow)
-        for row in 0..<rows {
+        for row in 0..<height {
             memcpy(dst.advanced(by: row * bytesPerRow), src.advanced(by: row * srcRow), copyWidth)
         }
         return ref

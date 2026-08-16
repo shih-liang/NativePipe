@@ -47,6 +47,9 @@ typedef struct np_venus_blob {
 /// Venus capset, so Mesa will not try to start one.
 np_venus *np_venus_create(void);
 
+/// Releases this VM's exclusive renderer lease. The successful renderer is a
+/// process singleton: it is reset between sequential VMs instead of unloaded,
+/// because the macOS vkr/MoltenVK stack does not survive full reinitialization.
 void np_venus_destroy(np_venus *venus);
 
 /// True when virglrenderer initialised and reported a Venus capset. That is

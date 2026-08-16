@@ -25,7 +25,8 @@ public final class RemoteSession: @unchecked Sendable {
     private var mediaSource: DispatchSourceRead?
     private var surfaceDecoder = FrameDecoder()
     private let mediaDemuxer = MediaWire.Demuxer()
-    private let ioQueue = DispatchQueue(label: "com.nativepipe.remote.io", qos: .userInteractive)
+    private let readQueue = DispatchQueue(label: "com.nativepipe.remote.read", qos: .userInteractive)
+    private let writeQueue = DispatchQueue(label: "com.nativepipe.remote.write", qos: .userInteractive)
     private var pendingWrites: [Windowing.HostCommand] = []
     private var writerScheduled = false
 
@@ -118,7 +119,7 @@ public final class RemoteSession: @unchecked Sendable {
         writerScheduled = true
         lock.unlock()
         if shouldSchedule {
-            ioQueue.async { self.drainWrites() }
+            writeQueue.async { self.drainWrites() }
         }
     }
 
@@ -151,7 +152,7 @@ public final class RemoteSession: @unchecked Sendable {
     }
 
     private func armSurfaceReader(_ fd: Int32) {
-        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: ioQueue)
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: readQueue)
         source.setEventHandler { [weak self] in
             self?.drainSurface()
         }
@@ -160,11 +161,11 @@ public final class RemoteSession: @unchecked Sendable {
         surfaceSource = source
         lock.unlock()
         source.resume()
-        ioQueue.async { [weak self] in self?.drainSurface() }
+        readQueue.async { [weak self] in self?.drainSurface() }
     }
 
     private func armMediaReader(_ fd: Int32) {
-        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: ioQueue)
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: readQueue)
         source.setEventHandler { [weak self] in
             self?.drainMedia()
         }
@@ -173,7 +174,7 @@ public final class RemoteSession: @unchecked Sendable {
         mediaSource = source
         lock.unlock()
         source.resume()
-        ioQueue.async { [weak self] in self?.drainMedia() }
+        readQueue.async { [weak self] in self?.drainMedia() }
     }
 
     private func drainSurface() {
@@ -198,9 +199,6 @@ public final class RemoteSession: @unchecked Sendable {
             return
         }
         let data = Data(buffer.prefix(n))
-        fputs("nativepipe-remote: surface +\(n) bytes\n", stderr)
-        fflush(stderr)
-
         lock.lock()
         surfaceDecoder.append(data)
         var events: [Windowing.GuestEvent] = []
@@ -224,8 +222,6 @@ public final class RemoteSession: @unchecked Sendable {
         }
         lock.unlock()
         guard !events.isEmpty else { return }
-        fputs("nativepipe-remote: \(events.count) event(s)\n", stderr)
-        fflush(stderr)
         Task { @MainActor in
             for event in events { self.onEvent?(event) }
         }
@@ -254,12 +250,8 @@ public final class RemoteSession: @unchecked Sendable {
         }
         let frames = mediaDemuxer.push(Data(buffer.prefix(n)))
         guard !frames.isEmpty else { return }
-        fputs("nativepipe-remote: \(frames.count) media frame(s)\n", stderr)
-        fflush(stderr)
-        Task { @MainActor in
-            for (header, payload) in frames {
-                self.onMediaFrame?(header, payload)
-            }
+        for (header, payload) in frames {
+            onMediaFrame?(header, payload)
         }
     }
 
@@ -300,14 +292,20 @@ public final class RemoteSession: @unchecked Sendable {
             let total = raw.count
             guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
             while sent < total {
-                let n = Darwin.send(fd, base.advanced(by: sent), total - sent, 0)
+                let n = Darwin.send(fd, base.advanced(by: sent), total - sent, MSG_NOSIGNAL)
                 if n > 0 {
                     sent += n
                     continue
                 }
                 if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    usleep(1000)
-                    continue
+                    var descriptor = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+                    let ready = Darwin.poll(&descriptor, 1, 250)
+                    if ready > 0,
+                       descriptor.revents & Int16(POLLERR | POLLHUP | POLLNVAL) == 0 {
+                        continue
+                    }
+                    if ready < 0 && errno == EINTR { continue }
+                    throw POSIXError(ready == 0 ? .ETIMEDOUT : .EIO)
                 }
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }

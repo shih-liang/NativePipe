@@ -210,6 +210,10 @@ public final class ResourceTable {
         resources.removeValue(forKey: id)
     }
 
+    public func removeAll() {
+        resources.removeAll(keepingCapacity: true)
+    }
+
     public var mapped: [GPUResource] {
         resources.values.filter { $0.mappedOffset != nil }
     }

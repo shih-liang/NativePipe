@@ -21,16 +21,16 @@ public final class RemoteDisplayController {
         bridge.output = { [weak self] command in
             self?.session.send(command)
         }
+        frames.setFrameAvailableHandler { [weak self] _ in
+            self?.bridge.retryPendingGPUFrames()
+        }
         session.onEvent = { [weak self] event in
             Task { @MainActor in
                 self?.handle(event)
             }
         }
         session.onMediaFrame = { [weak self] header, payload in
-            Task { @MainActor in
-                self?.frames.ingest(header: header, payload: payload)
-                self?.bridge.retryPendingGPUFrames()
-            }
+            self?.frames.ingest(header: header, payload: payload)
         }
         session.onStateChange = { [weak self] state in
             Task { @MainActor in

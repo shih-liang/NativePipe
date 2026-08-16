@@ -12,8 +12,9 @@ import Foundation
 ///          | ver_len(u16 LE) | ver bytes
 ///          | if status==0 or 3: payload_len(u64 LE) + file bytes
 ///
-/// `force` is a host-initiated instruction on an already-open agent vsock:
-/// the guest installs the payload without comparing versions.
+/// `force` is retained only for migrating guests predating `NPSY`. Current
+/// guests receive desired-state notifications on control and use NPAG solely
+/// for bounded, guest-initiated artifact pulls.
 public enum AgentWire {
     public static let magic = Data("NPAG".utf8)
     public static let version: UInt8 = 1

@@ -9,9 +9,13 @@ import Foundation
 /// Host → guest:
 ///     NPHI  hello         id(u64) ver_len(u16) ver
 ///     NPPG  ping          id(u64)
+///     NPVQ  getVersion    id(u64)
+///     NPEU  refresh env   id(u64)
+///     NPSY  sync resources id(u64) guestd_ver(str) env_revision(u64) profile(str)
 ///     NPRZ  resize        id(u64) cols(u32) rows(u32)
 ///     NPLN  launch        id(u64) LaunchSpec
 ///     NPRU  run           id(u64) LaunchSpec
+///     NPXC  exec          id(u64) cols(u32) rows(u32) LaunchSpec
 ///     NPRE  read path     id(u64) path_len(u16) path
 ///     NPCT  list continue id(u64)
 ///     NPCL  list cancel   id(u64)
@@ -22,9 +26,11 @@ import Foundation
 ///
 /// Guest → host:
 ///     NPOK  ok            id(u64)
+///     NPVV  version       id(u64) ver_len(u16) ver
 ///     NPIF  hello info    id(u64) GuestInfo
 ///     NPLP  launched      id(u64) pid(i32)
 ///     NPRX  ran           id(u64) status(i32) out_len(u32) out err_len(u32) err
+///     NPXS  exec session  id(u64) pid(i32) port(u32)
 ///     NPFL  file bytes    id(u64) path_len(u16) path size(u64) bytes
 ///     NPLS  dir listing   id(u64) path_len(u16) path flags(u32) count(u32) entries
 ///     NPFS  path stat     id(u64) path_len(u16) path mode(u32) uid(u32) gid(u32) size(u64) mtime(i64)
@@ -43,7 +49,9 @@ import Foundation
 ///
 /// GuestInfo:
 ///     five length-prefixed strings (agentVersion, kernelRelease, distroName,
-///     distroVersion, initSystem), then cap_count(u16) and that many strings.
+///     distroVersion, initSystem), then cap_count(u16) and that many strings,
+///     optionally environmentProfile and environmentRevision strings.
+///     New guests append os-release ID, ID_LIKE and architecture strings.
 ///
 /// NPLS `flags`: bit0 = more remains, bit1 = last name truncated (split inside
 /// a name). Entry: dtype(u8) eflags(u8) name_len(u16) name.
@@ -51,9 +59,13 @@ public enum ControlWire {
     // Host → guest
     public static let helloMagic: [UInt8] = Array("NPHI".utf8)
     public static let pingMagic: [UInt8] = Array("NPPG".utf8)
+    public static let getVersionMagic: [UInt8] = Array("NPVQ".utf8)
+    public static let refreshEnvironmentMagic: [UInt8] = Array("NPEU".utf8)
+    public static let reconcileResourcesMagic: [UInt8] = Array("NPSY".utf8)
     public static let resizeMagic: [UInt8] = Array("NPRZ".utf8)
     public static let launchMagic: [UInt8] = Array("NPLN".utf8)
     public static let runMagic: [UInt8] = Array("NPRU".utf8)
+    public static let execMagic: [UInt8] = Array("NPXC".utf8)
     public static let readMagic: [UInt8] = Array("NPRE".utf8)
     public static let continueMagic: [UInt8] = Array("NPCT".utf8)
     public static let cancelMagic: [UInt8] = Array("NPCL".utf8)
@@ -64,9 +76,11 @@ public enum ControlWire {
 
     // Guest → host
     public static let okMagic: [UInt8] = Array("NPOK".utf8)
+    public static let versionMagic: [UInt8] = Array("NPVV".utf8)
     public static let infoMagic: [UInt8] = Array("NPIF".utf8)
     public static let launchedMagic: [UInt8] = Array("NPLP".utf8)
     public static let ranMagic: [UInt8] = Array("NPRX".utf8)
+    public static let execSessionMagic: [UInt8] = Array("NPXS".utf8)
     public static let fileMagic: [UInt8] = Array("NPFL".utf8)
     public static let listMagic: [UInt8] = Array("NPLS".utf8)
     public static let pathStatMagic: [UInt8] = Array("NPFS".utf8)
@@ -101,11 +115,12 @@ public enum ControlWire {
     }
 
     private static let knownMagics: Set<[UInt8]> = [
-        helloMagic, pingMagic, resizeMagic, launchMagic, runMagic, readMagic,
-        continueMagic, cancelMagic, statMagic, shutdownMagic, setUserMagic,
-        setPasswordMagic, okMagic, infoMagic, launchedMagic, ranMagic, fileMagic,
-        listMagic, pathStatMagic, errorMagic, runtimeReadyMagic, processExitedMagic,
-        logMagic,
+        helloMagic, pingMagic, getVersionMagic, refreshEnvironmentMagic, reconcileResourcesMagic,
+        resizeMagic, launchMagic, runMagic,
+        execMagic, readMagic, continueMagic, cancelMagic, statMagic, shutdownMagic, setUserMagic,
+        setPasswordMagic, okMagic, versionMagic, infoMagic, launchedMagic, ranMagic,
+        execSessionMagic, fileMagic, listMagic, pathStatMagic, errorMagic, runtimeReadyMagic,
+        processExitedMagic, logMagic,
     ]
 
     // MARK: - Encode requests
@@ -121,6 +136,21 @@ public enum ControlWire {
             var payload = Data(pingMagic)
             append(id, to: &payload)
             return payload
+        case .getVersion:
+            var payload = Data(getVersionMagic)
+            append(id, to: &payload)
+            return payload
+        case .refreshEnvironment:
+            var payload = Data(refreshEnvironmentMagic)
+            append(id, to: &payload)
+            return payload
+        case .reconcileResources(let desired):
+            var payload = Data(reconcileResourcesMagic)
+            append(id, to: &payload)
+            appendString(desired.guestdVersion, to: &payload)
+            append(desired.environmentRevision, to: &payload)
+            appendString(desired.environmentProfile, to: &payload)
+            return payload
         case .resizeConsole(let cols, let rows):
             var payload = Data(resizeMagic)
             append(id, to: &payload)
@@ -135,6 +165,13 @@ public enum ControlWire {
         case .run(let spec):
             var payload = Data(runMagic)
             append(id, to: &payload)
+            appendLaunchSpec(spec, to: &payload)
+            return payload
+        case .exec(let spec, let cols, let rows):
+            var payload = Data(execMagic)
+            append(id, to: &payload)
+            append(UInt32(clamping: cols), to: &payload)
+            append(UInt32(clamping: rows), to: &payload)
             appendLaunchSpec(spec, to: &payload)
             return payload
         case .readPath(let path):
@@ -213,6 +250,10 @@ public enum ControlWire {
         if magic == okMagic {
             return .response(id: id, result: .ok)
         }
+        if magic == versionMagic {
+            guard let ver = takeString(&offset, from: payload) else { return nil }
+            return .response(id: id, result: .version(ver))
+        }
         if magic == infoMagic {
             guard let info = takeGuestInfo(&offset, from: payload) else { return nil }
             return .response(id: id, result: .hello(info: info))
@@ -236,6 +277,11 @@ public enum ControlWire {
                     status: status,
                     stdout: String(decoding: outData, as: UTF8.self),
                     stderr: String(decoding: errData, as: UTF8.self)))
+        }
+        if magic == execSessionMagic {
+            guard let pid: Int32 = take(&offset, from: payload),
+                  let port: UInt32 = take(&offset, from: payload) else { return nil }
+            return .response(id: id, result: .execSession(pid: pid, port: port))
         }
         if magic == fileMagic {
             guard let path = takeString(&offset, from: payload),
@@ -303,6 +349,11 @@ public enum ControlWire {
         let stdin = Data((spec.stdin ?? "").utf8)
         append(UInt32(clamping: stdin.count), to: &data)
         data.append(stdin)
+        // Optional tail keeps nil-user calls byte-for-byte compatible with
+        // guestd 0.2.5. Only desktop launches require the 0.2.6 extension.
+        if let username = spec.username {
+            appendString(username, to: &data)
+        }
     }
 
     private static func takeGuestInfo(_ offset: inout Int, from data: Data) -> GuestInfo? {
@@ -318,13 +369,44 @@ public enum ControlWire {
             guard let cap = takeString(&offset, from: data) else { return nil }
             capabilities.append(cap)
         }
+        var environmentProfile: String?
+        var environmentRevision: UInt64?
+        var environmentID: String?
+        var environmentIDLike: [String] = []
+        var architecture: String?
+        if offset < data.count {
+            guard let profile = takeString(&offset, from: data) else { return nil }
+            environmentProfile = profile.isEmpty ? nil : profile
+        }
+        if offset < data.count {
+            guard let revision = takeString(&offset, from: data) else { return nil }
+            environmentRevision = UInt64(revision)
+        }
+        if offset < data.count {
+            guard let id = takeString(&offset, from: data) else { return nil }
+            environmentID = id.isEmpty ? nil : id
+        }
+        if offset < data.count {
+            guard let idLike = takeString(&offset, from: data) else { return nil }
+            environmentIDLike = idLike.split(whereSeparator: { $0 == " " || $0 == "\t" })
+                .map(String.init)
+        }
+        if offset < data.count {
+            guard let arch = takeString(&offset, from: data) else { return nil }
+            architecture = arch.isEmpty ? nil : arch
+        }
         return GuestInfo(
             agentVersion: agentVersion,
             kernelRelease: kernelRelease,
             distroName: distroName,
             distroVersion: distroVersion,
             initSystem: initSystem,
-            capabilities: capabilities)
+            capabilities: capabilities,
+            environmentProfile: environmentProfile,
+            environmentRevision: environmentRevision,
+            environmentID: environmentID,
+            environmentIDLike: environmentIDLike,
+            architecture: architecture)
     }
 
     private static func takeEntry(_ offset: inout Int, from data: Data) -> DirEntry? {

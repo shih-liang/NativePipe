@@ -16,8 +16,9 @@ import os
 /// All delegate callbacks arrive on `deviceQueue`, so the state below is queue
 /// confined and deliberately unsynchronised.
 @available(macOS 27.0, *)
-public final class VirtioGPUDevice: NSObject {
+public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
     private static let log = Logger(subsystem: "com.nativepipe.gpu", category: "virtio-gpu")
+    private static let deviceQueueKey = DispatchSpecificKey<Void>()
 
     /// Resource lifecycle tracing, off unless NATIVEPIPE_GPU_TRACE is set.
     /// Writes to stderr so it interleaves with `nativepipe smoke` output.
@@ -55,6 +56,7 @@ public final class VirtioGPUDevice: NSObject {
     /// Set once Venus/virglrenderer has been cleaned up. Further virtio
     /// commands are dropped; `deinit` must not call cleanup again.
     private var rendererTornDown = false
+    private var rendererDestroyed = false
 
     /// Resource lookup for consumers outside the device queue — the window
     /// bridge resolves a committed frame's `resourceID` on the main actor.
@@ -95,11 +97,16 @@ public final class VirtioGPUDevice: NSObject {
         forResource resourceID: UInt32,
         width: Int, height: Int, bytesPerRow: Int, format: UInt32
     ) -> AnyObject? {
-        guard let raw = np_venus_metal_texture(
-            venus, resourceID, UInt32(width), UInt32(height),
-            UInt32(bytesPerRow), format)
-        else { return nil }
-        return Unmanaged<AnyObject>.fromOpaque(raw).takeUnretainedValue()
+        let lookup: () -> AnyObject? = { [self] in
+            guard !rendererTornDown,
+                  let raw = np_venus_metal_texture(
+                    venus, resourceID, UInt32(width), UInt32(height),
+                    UInt32(bytesPerRow), format)
+            else { return nil }
+            return Unmanaged<AnyObject>.fromOpaque(raw).takeUnretainedValue()
+        }
+        if DispatchQueue.getSpecific(key: Self.deviceQueueKey) != nil { return lookup() }
+        return deviceQueue.sync(execute: lookup)
     }
 
     private func buffer(forResource resourceID: UInt32) -> PublishedBuffer? {
@@ -122,7 +129,7 @@ public final class VirtioGPUDevice: NSObject {
 
     private func unpublish(_ resourceID: UInt32) {
         publishedLock.lock()
-        if let entry = published.removeValue(forKey: resourceID) {
+        if let entry = published.removeValue(forKey: resourceID), entry.surface != nil {
             retiredPublished[resourceID] = entry
             retiredPublishedOrder.removeAll { $0 == resourceID }
             retiredPublishedOrder.append(resourceID)
@@ -220,6 +227,7 @@ public final class VirtioGPUDevice: NSObject {
         }
         self.venus = created
         super.init()
+        deviceQueue.setSpecific(key: Self.deviceQueueKey, value: ())
         Self.log.info("venus host live=\(np_venus_is_live(created))")
 
         configuration.provider = VZCustomVirtioDeviceDelegateProvider(
@@ -231,8 +239,18 @@ public final class VirtioGPUDevice: NSObject {
         // tears Venus down before AppKit's main actor releases this object.
         // Falling through to cleanup here used to `thrd_join` the in-process
         // render thread on the main thread and beachball the app.
-        if !rendererTornDown {
+        if !rendererDestroyed {
             np_venus_destroy(venus)
+        }
+    }
+
+    /// Schedule cleanup for an unexpected stop path that did not receive the
+    /// custom-device `willStop` callback. Normal stop/restart cleans up there.
+    public func requestRendererShutdown() {
+        if DispatchQueue.getSpecific(key: Self.deviceQueueKey) != nil {
+            shutdownRenderer()
+        } else {
+            deviceQueue.async { [self] in shutdownRenderer() }
         }
     }
 
@@ -246,6 +264,7 @@ public final class VirtioGPUDevice: NSObject {
 
         guard let header = try? VirtioGPU.ControlHeader(parsing: &reader) else {
             Self.log.error("dropped a command shorter than its header")
+            element.returnToQueue()
             return
         }
 
@@ -359,33 +378,18 @@ public final class VirtioGPUDevice: NSObject {
             if let stale = resources[request.resourceID] {
                 Self.note("replace res=\(request.resourceID) (create arrived before unref)")
                 unpublish(request.resourceID)
-                np_venus_unimport_blob(venus, request.resourceID)
-                if stale.mappedOffset != nil {
-                    unmapFromGuest(stale, element: nil, header: nil)
+                unmapFromGuest(stale, element: nil, header: nil) { [weak self] in
+                    guard let self, !self.rendererTornDown else {
+                        element.returnToQueue()
+                        return
+                    }
+                    np_venus_unimport_blob(self.venus, request.resourceID)
+                    _ = self.resources.remove(request.resourceID)
+                    self.createBlobResource(request, header: header, element: element)
                 }
-                resources.remove(request.resourceID)
+                return
             }
-            let geometry = VirtioGPU.BlobGeometry(blobID: request.blobID)
-            if geometry != nil {
-                // Guest compositor: this blob *is* the window. Allocate the
-                // IOSurface here; vkr has nothing under this blob_id.
-                let resource = try resources.createBlob(
-                    id: request.resourceID, size: request.size, geometry: geometry,
-                    blobID: request.blobID)
-                importIntoVenus(resource, contextID: header.contextID)
-                finishCreateBlob(resource, geometry: geometry, header: header, element: element)
-            } else if np_venus_is_live(venus) {
-                // Guest Mesa: vkr shm (blob_id 0) or a VkDeviceMemory mapping.
-                // Completes asynchronously: the vkAllocateMemory backing this
-                // blob rides the Venus ring, and the ring's doorbell EXECBUFFER
-                // may be queued in the virtqueue *behind* this very command.
-                // Blocking here would deadlock; retry off-queue instead.
-                adoptVenusBlob(request, header: header, element: element, attempt: 0)
-            } else {
-                Self.note(
-                    "reject  create res=\(request.resourceID) blob_id=\(request.blobID) — no vkr mapping")
-                respond(element, header.reply(.errOutOfMemory))
-            }
+            createBlobResource(request, header: header, element: element)
 
         case .resourceMapBlob:
             let request = try VirtioGPU.ResourceMapBlob(parsing: &reader)
@@ -403,11 +407,19 @@ public final class VirtioGPUDevice: NSObject {
                 Self.note("unref   res=\(resource.resourceID) final \(Self.peek(resource))")
             }
             unpublish(request.resourceID)
-            np_venus_unimport_blob(venus, request.resourceID)
-            if let resource = resources.remove(request.resourceID), resource.mappedOffset != nil {
-                unmapFromGuest(resource, element: nil, header: nil)
+            guard let resource = resources[request.resourceID] else {
+                respond(element, header.reply(.okNoData))
+                return
             }
-            respond(element, header.reply(.okNoData))
+            unmapFromGuest(resource, element: nil, header: nil) { [weak self] in
+                guard let self, !self.rendererTornDown else {
+                    element.returnToQueue()
+                    return
+                }
+                np_venus_unimport_blob(self.venus, request.resourceID)
+                _ = self.resources.remove(request.resourceID)
+                self.respond(element, header.reply(.okNoData))
+            }
 
         case .submit3D:
             let request = try VirtioGPU.Submit3D(parsing: &reader)
@@ -433,6 +445,32 @@ public final class VirtioGPUDevice: NSObject {
     }
 
     // MARK: - Shared memory
+
+    private func createBlobResource(
+        _ request: VirtioGPU.ResourceCreateBlob,
+        header: VirtioGPU.ControlHeader,
+        element: VZVirtioQueueElement
+    ) {
+        let geometry = VirtioGPU.BlobGeometry(blobID: request.blobID)
+        if geometry != nil {
+            do {
+                let resource = try resources.createBlob(
+                    id: request.resourceID, size: request.size, geometry: geometry,
+                    blobID: request.blobID)
+                importIntoVenus(resource, contextID: header.contextID)
+                finishCreateBlob(resource, geometry: geometry, header: header, element: element)
+            } catch {
+                Self.log.error("could not create compositor blob: \(error.localizedDescription, privacy: .public)")
+                respond(element, header.reply(.errOutOfMemory))
+            }
+        } else if np_venus_is_live(venus) {
+            adoptVenusBlob(request, header: header, element: element, attempt: 0)
+        } else {
+            Self.note(
+                "reject  create res=\(request.resourceID) blob_id=\(request.blobID) — no vkr mapping")
+            respond(element, header.reply(.errOutOfMemory))
+        }
+    }
 
     private func mapIntoGuest(
         _ resource: GPUResource,
@@ -464,12 +502,21 @@ public final class VirtioGPUDevice: NSObject {
         }
 
         enqueueRegionOperation { [weak self] done in
-            guard let self, let address = resource.baseAddress else { done(); return }
+            guard let self, !rendererTornDown, let address = resource.baseAddress else {
+                element.returnToQueue()
+                done()
+                return
+            }
             region.mapMemory(
                 address,
                 atOffset: offset,
                 size: UInt64(resource.byteCount)
             ) { error in
+                guard !self.rendererTornDown else {
+                    element.returnToQueue()
+                    done()
+                    return
+                }
                 if let error {
                     Self.log.error(
                         "mapping resource \(resource.resourceID) at +\(offset) failed: \(error.localizedDescription, privacy: .public)")
@@ -492,10 +539,12 @@ public final class VirtioGPUDevice: NSObject {
     private func unmapFromGuest(
         _ resource: GPUResource,
         element: VZVirtioQueueElement?,
-        header: VirtioGPU.ControlHeader?
+        header: VirtioGPU.ControlHeader?,
+        completion: (() -> Void)? = nil
     ) {
         guard let region = hostVisibleRegion, let offset = resource.mappedOffset else {
             if let element, let header { respond(element, header.reply(.okNoData)) }
+            completion?()
             return
         }
 
@@ -510,8 +559,19 @@ public final class VirtioGPUDevice: NSObject {
         Self.note("unmap   res=\(resource.resourceID) guest left \(Self.peek(resource))")
 
         enqueueRegionOperation { [weak self] done in
-            guard let self else { done(); return }
+            guard let self, !rendererTornDown else {
+                element?.returnToQueue()
+                completion?()
+                done()
+                return
+            }
             region.unmapMemory(atOffset: offset, size: UInt64(resource.byteCount)) { error in
+                guard !self.rendererTornDown else {
+                    element?.returnToQueue()
+                    completion?()
+                    done()
+                    return
+                }
                 if let error {
                     Self.log.error("unmapping resource \(resource.resourceID) failed: \(error.localizedDescription, privacy: .public)")
                     Self.note("reject  unmap res=\(resource.resourceID) offset=\(offset): \(error.localizedDescription)")
@@ -519,6 +579,7 @@ public final class VirtioGPUDevice: NSObject {
                 if let element, let header {
                     self.respond(element, header.reply(.okNoData))
                 }
+                completion?()
                 done()
             }
         }
@@ -775,26 +836,54 @@ extension VirtioGPUDevice: VZCustomVirtioDeviceDelegate {
     }
 
     /// Drop mappings and Venus contexts; leave the host renderer running.
-    private func clearGuestRendererState() {
-        guard !rendererTornDown else { return }
+    private func clearGuestRendererState(completion: @escaping () -> Void = {}) {
+        let resourceIDs = resources.identifiers
+        let contextIDs = Array(contexts.keys)
         for resource in resources.mapped {
             unmapFromGuest(resource, element: nil, header: nil)
         }
-        for id in resources.identifiers {
-            np_venus_unimport_blob(venus, id)
+        // This operation is queued after every asynchronous aperture unmap.
+        // Renderer mappings must remain alive until the guest mapping is gone.
+        enqueueRegionOperation { [self] done in
+            for id in resourceIDs { np_venus_unimport_blob(venus, id) }
+            for ctxID in contextIDs { np_venus_context_destroy(venus, ctxID) }
+            contexts.removeAll()
+            resources.removeAll()
+            publishedLock.lock()
+            published.removeAll(keepingCapacity: true)
+            retiredPublished.removeAll(keepingCapacity: true)
+            retiredPublishedOrder.removeAll(keepingCapacity: true)
+            publishedLock.unlock()
+            completion()
+            done()
         }
-        for ctxID in contexts.keys {
-            np_venus_context_destroy(venus, ctxID)
-        }
-        contexts.removeAll()
     }
 
     /// Full host-renderer teardown. Safe to call more than once.
     private func shutdownRenderer() {
         guard !rendererTornDown else { return }
         Self.note("tearing down Venus / virglrenderer")
-        clearGuestRendererState()
         rendererTornDown = true
+
+        // `willStop` is the ownership boundary for the whole custom device.
+        // Waiting for individual VZ shared-region unmaps here can deadlock:
+        // Virtualization is allowed to stop delivering their asynchronous
+        // completions once this callback returns. The guest can no longer
+        // access the device, and VZ tears down the complete region itself, so
+        // release renderer objects synchronously and let any late completion
+        // take the guarded path above.
+        let resourceIDs = resources.identifiers
+        let contextIDs = Array(contexts.keys)
+        for id in resourceIDs { np_venus_unimport_blob(venus, id) }
+        for ctxID in contextIDs { np_venus_context_destroy(venus, ctxID) }
+        contexts.removeAll()
+        resources.removeAll()
+        publishedLock.lock()
+        published.removeAll(keepingCapacity: false)
+        retiredPublished.removeAll(keepingCapacity: false)
+        retiredPublishedOrder.removeAll(keepingCapacity: false)
+        publishedLock.unlock()
         np_venus_destroy(venus)
+        rendererDestroyed = true
     }
 }

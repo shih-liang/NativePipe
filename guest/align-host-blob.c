@@ -3,6 +3,8 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
@@ -19,29 +21,44 @@
  */
 #define HOST_PAGE ((uint64_t)16384)
 
+static int trace_enabled(void)
+{
+	const char *value = getenv("NATIVEPIPE_GPU_TRACE");
+	return value && value[0] && strcmp(value, "0") != 0;
+}
+
 static void align_create_blob(struct drm_virtgpu_resource_create_blob *create)
 {
 	if (!create || create->size == 0) return;
 	uint64_t aligned = (create->size + HOST_PAGE - 1) & ~(HOST_PAGE - 1);
 	if (aligned == create->size) return;
-	fprintf(stderr, "[align-blob] CREATE_BLOB size %llu -> %llu\n",
-	        (unsigned long long)create->size, (unsigned long long)aligned);
+	if (trace_enabled()) {
+		fprintf(stderr, "[align-blob] CREATE_BLOB size %llu -> %llu\n",
+		        (unsigned long long)create->size, (unsigned long long)aligned);
+	}
 	create->size = aligned;
 }
 
 __attribute__((constructor))
 static void align_blob_loaded(void)
 {
+	if (!trace_enabled()) return;
 	const char msg[] = "[align-blob] loaded\n";
 	(void)write(STDERR_FILENO, msg, sizeof(msg) - 1);
 }
 
 /* musl: ioctl(int, int, ...). glibc: ioctl(int, unsigned long, ...). */
-int ioctl(int fd, int request, ...)
+#if defined(__GLIBC__)
+typedef unsigned long np_ioctl_request_t;
+#else
+typedef int np_ioctl_request_t;
+#endif
+
+int ioctl(int fd, np_ioctl_request_t request, ...)
 {
-	static int (*next_ioctl)(int, int, ...);
+	static int (*next_ioctl)(int, np_ioctl_request_t, ...);
 	if (!next_ioctl) {
-		next_ioctl = (int (*)(int, int, ...))dlsym(RTLD_NEXT, "ioctl");
+		next_ioctl = (int (*)(int, np_ioctl_request_t, ...))dlsym(RTLD_NEXT, "ioctl");
 	}
 
 	va_list ap;
@@ -65,9 +82,9 @@ int drmIoctl(int fd, unsigned long request, void *arg)
 		align_create_blob(arg);
 	}
 	if (next_drm) return next_drm(fd, request, arg);
-	static int (*next_ioctl)(int, int, ...);
+	static int (*next_ioctl)(int, np_ioctl_request_t, ...);
 	if (!next_ioctl) {
-		next_ioctl = (int (*)(int, int, ...))dlsym(RTLD_NEXT, "ioctl");
+		next_ioctl = (int (*)(int, np_ioctl_request_t, ...))dlsym(RTLD_NEXT, "ioctl");
 	}
-	return next_ioctl(fd, (int)request, arg);
+	return next_ioctl(fd, (np_ioctl_request_t)request, arg);
 }

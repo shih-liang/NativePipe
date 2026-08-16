@@ -1,6 +1,7 @@
 #include "np_venus.h"
 
 #include <dlfcn.h>
+#include <errno.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -8,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <CoreFoundation/CoreFoundation.h>
@@ -61,6 +63,7 @@ struct virgl_syms {
 	void *handle;
 	int (*init)(void *cookie, int flags, struct virgl_renderer_callbacks *cb);
 	void (*cleanup)(void *cookie);
+	void (*reset)(void);
 	void (*poll)(void);
 	void (*get_cap_set)(uint32_t set, uint32_t *max_ver, uint32_t *max_size);
 	void (*fill_caps)(uint32_t set, uint32_t version, void *caps);
@@ -92,11 +95,14 @@ struct imported {
 	struct imported *next;
 };
 
+static void executable_dir(char *out, size_t cap);
+
 // vkr dlopens "libvulkan.dylib" then "libMoltenVK.dylib" by leaf name.
 // Those names are not on the default search path. Redirect both to the
 // MoltenVK dylib so the host ICD loads without a Vulkan loader.
 static void *np_dlopen(const char *path, int mode) {
 	static void *(*next_dlopen)(const char *, int);
+	char bundled_mvk[PATH_MAX] = {0};
 	if (!next_dlopen) {
 		next_dlopen = (void *(*)(const char *, int))dlsym(RTLD_NEXT, "dlopen");
 	}
@@ -105,21 +111,31 @@ static void *np_dlopen(const char *path, int mode) {
 	             strcmp(path, "libMoltenVK.dylib") == 0)) {
 		const char *mvk = getenv("NATIVEPIPE_MOLTENVK");
 		if (!mvk || !mvk[0]) {
+			char exe_dir[PATH_MAX];
+			executable_dir(exe_dir, sizeof(exe_dir));
+			int bundled_len = exe_dir[0]
+			    ? snprintf(bundled_mvk, sizeof(bundled_mvk),
+			               "%s/../Frameworks/libMoltenVK.dylib", exe_dir)
+			    : -1;
+			if (bundled_len > 0 && bundled_len < (int)sizeof(bundled_mvk) &&
+			    access(bundled_mvk, R_OK) == 0) {
+				mvk = bundled_mvk;
+			}
 			static const char *const candidates[] = {
-				"../Frameworks/libMoltenVK.dylib",
 				"vendor/moltenvk-prefix/lib/libMoltenVK.dylib",
 				"/opt/homebrew/opt/molten-vk/lib/libMoltenVK.dylib",
 				NULL,
 			};
-			mvk = candidates[0];
-			for (int i = 0; candidates[i]; i++) {
-				if (access(candidates[i], R_OK) == 0) {
-					mvk = candidates[i];
-					break;
+			if (!mvk || !mvk[0]) {
+				for (int i = 0; candidates[i]; i++) {
+					if (access(candidates[i], R_OK) == 0) {
+						mvk = candidates[i];
+						break;
+					}
 				}
 			}
 		}
-		void *handle = next_dlopen(mvk, mode);
+		void *handle = mvk && mvk[0] ? next_dlopen(mvk, mode) : NULL;
 		if (handle) return handle;
 	}
 	return next_dlopen(path, mode);
@@ -152,8 +168,13 @@ static int np_fstat(int fd, struct stat *st) {
 NP_DYLD_INTERPOSE(np_fstat, fstat);
 
 static void np_virgl_log(int level, const char *message, void *user) {
-	(void)level;
 	(void)user;
+	// virgl log levels are DEBUG=0, INFO=1, WARNING=2, ERROR=3.  Venus
+	// reports linear-modifier emulation at INFO for each swapchain image and
+	// often for every resize frame; forwarding that by default can make stderr
+	// I/O more expensive than rendering.  Keep diagnostics, and expose the
+	// verbose stream only when explicitly tracing the GPU.
+	if (level < 2 && getenv("NATIVEPIPE_GPU_TRACE") == NULL) return;
 	fputs("[virgl] ", stderr);
 	if (message && message[0]) {
 		fputs(message, stderr);
@@ -165,6 +186,8 @@ static void np_virgl_log(int level, const char *message, void *user) {
 }
 
 struct pending_fence {
+	uint32_t ctx_id;
+	uint32_t ring_idx;
 	uint64_t fence_id;
 	np_venus_fence_fn done;
 	void *user;
@@ -180,10 +203,54 @@ struct np_venus {
 	pthread_mutex_t lock;
 	struct imported *blobs;
 	struct pending_fence *fences;
+	bool owns_global_renderer;
 };
 
-// One virglrenderer instance per process. Stock library, no patches.
+// virglrenderer and its in-process vkr server are process-global.  Full
+// cleanup + re-init leaves the UTM macOS renderer able to report a capset but
+// unable to enumerate MoltenVK devices on its second lifetime.  Keep one live
+// renderer for the host process and hand out exclusive VM leases; reset
+// contexts/resources between leases instead of unloading the render server.
 static np_venus *g_venus;
+static np_venus *g_cached_renderer;
+static pthread_mutex_t g_venus_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_venus_changed = PTHREAD_COND_INITIALIZER;
+
+static np_venus *acquire_global_renderer(np_venus *candidate) {
+	struct timespec deadline;
+	clock_gettime(CLOCK_REALTIME, &deadline);
+	deadline.tv_sec += 5;
+
+	pthread_mutex_lock(&g_venus_lock);
+	while (g_venus) {
+		int rc = pthread_cond_timedwait(&g_venus_changed, &g_venus_lock, &deadline);
+		if (rc == ETIMEDOUT) {
+			pthread_mutex_unlock(&g_venus_lock);
+			return NULL;
+		}
+	}
+	np_venus *venus = g_cached_renderer ? g_cached_renderer : candidate;
+	g_venus = venus;
+	venus->owns_global_renderer = true;
+	pthread_mutex_unlock(&g_venus_lock);
+	return venus;
+}
+
+static void cache_global_renderer(np_venus *venus) {
+	pthread_mutex_lock(&g_venus_lock);
+	if (!g_cached_renderer) g_cached_renderer = venus;
+	pthread_mutex_unlock(&g_venus_lock);
+}
+
+static void release_global_renderer(np_venus *venus) {
+	pthread_mutex_lock(&g_venus_lock);
+	if (g_venus == venus) {
+		g_venus = NULL;
+		pthread_cond_broadcast(&g_venus_changed);
+	}
+	venus->owns_global_renderer = false;
+	pthread_mutex_unlock(&g_venus_lock);
+}
 
 static void note(const char *fmt, ...) {
 	if (getenv("NATIVEPIPE_GPU_TRACE") == NULL) return;
@@ -268,7 +335,8 @@ static void *open_virglrenderer(void) {
 	return NULL;
 }
 
-static void write_context_fence(void *cookie, uint32_t ctx_id, uint32_t ring_idx, uint64_t fence_id) {
+static void finish_context_fence(void *cookie, uint32_t ctx_id, uint32_t ring_idx,
+                                 uint64_t fence_id, bool success) {
 	np_venus *venus = cookie;
 	if (!venus) return;
 
@@ -276,7 +344,8 @@ static void write_context_fence(void *cookie, uint32_t ctx_id, uint32_t ring_idx
 	struct pending_fence **slot = &venus->fences;
 	struct pending_fence *hit = NULL;
 	while (*slot) {
-		if ((*slot)->fence_id == fence_id) {
+		if ((*slot)->ctx_id == ctx_id && (*slot)->ring_idx == ring_idx &&
+		    (*slot)->fence_id == fence_id) {
 			hit = *slot;
 			*slot = hit->next;
 			break;
@@ -288,12 +357,16 @@ static void write_context_fence(void *cookie, uint32_t ctx_id, uint32_t ring_idx
 	if (hit) {
 		note("fence retired ctx=%u ring=%u id=%llu", ctx_id, ring_idx,
 		     (unsigned long long)fence_id);
-		hit->done(hit->user, hit->fence_id, true);
+		hit->done(hit->user, hit->fence_id, success);
 		free(hit);
 	} else {
 		note("fence retired ctx=%u ring=%u id=%llu (no waiter)", ctx_id, ring_idx,
 		     (unsigned long long)fence_id);
 	}
+}
+
+static void write_context_fence(void *cookie, uint32_t ctx_id, uint32_t ring_idx, uint64_t fence_id) {
+	finish_context_fence(cookie, ctx_id, ring_idx, fence_id, true);
 }
 
 static void write_fence(void *cookie, uint32_t fence) {
@@ -311,6 +384,7 @@ static int resolve_virgl(struct virgl_syms *virgl) {
 
 	REQ(init, "virgl_renderer_init");
 	REQ(cleanup, "virgl_renderer_cleanup");
+	REQ(reset, "virgl_renderer_reset");
 	REQ(poll, "virgl_renderer_poll");
 	REQ(get_cap_set, "virgl_renderer_get_cap_set");
 	REQ(fill_caps, "virgl_renderer_fill_caps");
@@ -334,18 +408,37 @@ static int resolve_virgl(struct virgl_syms *virgl) {
 }
 
 np_venus *np_venus_create(void) {
-	np_venus *venus = calloc(1, sizeof(*venus));
-	if (!venus) return NULL;
-	pthread_mutex_init(&venus->lock, NULL);
-	g_venus = venus;
+	np_venus *candidate = calloc(1, sizeof(*candidate));
+	if (!candidate) return NULL;
+	pthread_mutex_init(&candidate->lock, NULL);
+	np_venus *venus = acquire_global_renderer(candidate);
+	if (!venus) {
+		note("another VM still owns the process-global renderer; Venus disabled for this device");
+		return candidate;
+	}
+	if (venus != candidate) {
+		pthread_mutex_destroy(&candidate->lock);
+		free(candidate);
+		note("reusing process-global Venus renderer");
+		return venus;
+	}
 
 	if (resolve_virgl(&venus->virgl) != 0) {
 		note("virglrenderer not present; Mesa will not see a Venus capset");
+		if (venus->virgl.handle) dlclose(venus->virgl.handle);
+		memset(&venus->virgl, 0, sizeof(venus->virgl));
+		release_global_renderer(venus);
 		return venus;
 	}
 
 	if (venus->virgl.set_log_callback) {
 		venus->virgl.set_log_callback(np_virgl_log, NULL, NULL);
+	}
+	// MoltenVK defaults to INFO, which prints its complete extension table for
+	// every Venus process.  Warnings and errors remain visible; GPU trace mode
+	// deliberately retains the upstream verbose default.
+	if (!getenv("MVK_CONFIG_LOG_LEVEL") && !getenv("NATIVEPIPE_GPU_TRACE")) {
+		setenv("MVK_CONFIG_LOG_LEVEL", "2", 0);
 	}
 
 	// MoltenVK as ICD. vkr with vulkan-dload dlopens libvulkan / libMoltenVK;
@@ -387,11 +480,13 @@ np_venus *np_venus_create(void) {
 		note("virgl_renderer_init failed");
 		dlclose(venus->virgl.handle);
 		memset(&venus->virgl, 0, sizeof(venus->virgl));
+		release_global_renderer(venus);
 		return venus;
 	}
 
 	venus->virgl.get_cap_set(NP_VENUS_CAPSET_VENUS, &venus->cap_version, &venus->cap_size);
 	venus->live = venus->cap_size > 0;
+	if (venus->live) cache_global_renderer(venus);
 	note("virglrenderer up: Venus capset v%u size=%u live=%d",
 	     venus->cap_version, venus->cap_size, venus->live);
 	return venus;
@@ -399,27 +494,41 @@ np_venus *np_venus_create(void) {
 
 void np_venus_destroy(np_venus *venus) {
 	if (!venus) return;
-	if (g_venus == venus) g_venus = NULL;
+
+	// Release native handles while their virgl resources still exist.
+	while (true) {
+		pthread_mutex_lock(&venus->lock);
+		bool has_blob = venus->blobs != NULL;
+		uint32_t resource_id = has_blob ? venus->blobs->blob.resource_id : 0;
+		pthread_mutex_unlock(&venus->lock);
+		if (!has_blob) break;
+		np_venus_unimport_blob(venus, resource_id);
+	}
+
+	pthread_mutex_lock(&venus->lock);
+	struct pending_fence *fences = venus->fences;
+	venus->fences = NULL;
+	pthread_mutex_unlock(&venus->lock);
+	while (fences) {
+		struct pending_fence *next = fences->next;
+		fences->done(fences->user, fences->fence_id, false);
+		free(fences);
+		fences = next;
+	}
+
+	pthread_mutex_lock(&g_venus_lock);
+	bool persistent = g_cached_renderer == venus;
+	pthread_mutex_unlock(&g_venus_lock);
+	if (persistent) {
+		if (venus->virgl.reset) venus->virgl.reset();
+		if (venus->owns_global_renderer) release_global_renderer(venus);
+		return;
+	}
 
 	if (venus->virgl.cleanup) venus->virgl.cleanup(venus);
 	if (venus->virgl.handle) dlclose(venus->virgl.handle);
+	if (venus->owns_global_renderer) release_global_renderer(venus);
 
-	pthread_mutex_lock(&venus->lock);
-	while (venus->blobs) {
-		struct imported *next = venus->blobs->next;
-		if (venus->blobs->blob.iosurface) {
-			CFRelease(venus->blobs->blob.iosurface);
-		}
-		free(venus->blobs);
-		venus->blobs = next;
-	}
-	while (venus->fences) {
-		struct pending_fence *next = venus->fences->next;
-		venus->fences->done(venus->fences->user, venus->fences->fence_id, false);
-		free(venus->fences);
-		venus->fences = next;
-	}
-	pthread_mutex_unlock(&venus->lock);
 	pthread_mutex_destroy(&venus->lock);
 	free(venus);
 }
@@ -468,16 +577,17 @@ int np_venus_create_blob(np_venus *venus, uint32_t ctx_id, np_venus_blob *blob) 
 	entry->blob = *blob;
 	if (blob->iosurface) CFRetain(blob->iosurface);
 
-	pthread_mutex_lock(&venus->lock);
-	entry->next = venus->blobs;
-	venus->blobs = entry;
-	pthread_mutex_unlock(&venus->lock);
-
 	note("blob res=%u ctx=%u blob_id=%llu %ux%u %llu bytes",
 	     blob->resource_id, ctx_id, (unsigned long long)blob->blob_id,
 	     blob->width, blob->height, (unsigned long long)blob->size);
 
-	if (!venus->live) return 0;
+	if (!venus->live) {
+		pthread_mutex_lock(&venus->lock);
+		entry->next = venus->blobs;
+		venus->blobs = entry;
+		pthread_mutex_unlock(&venus->lock);
+		return 0;
+	}
 
 	struct virgl_renderer_resource_create_blob_args args;
 	memset(&args, 0, sizeof(args));
@@ -497,12 +607,27 @@ int np_venus_create_blob(np_venus *venus, uint32_t ctx_id, np_venus_blob *blob) 
 		     blob->resource_id, (unsigned long long)blob->blob_id,
 		     args.blob_flags, rc,
 		     blob->iosurface ? " (compositor)" : "");
-		return blob->iosurface ? 0 : rc;
+		if (!blob->iosurface) {
+			free(entry);
+			return rc;
+		}
+		// Compositor IOSurfaces are not vkr objects but still belong in the
+		// import table so their CF ownership is tracked consistently.
+		pthread_mutex_lock(&venus->lock);
+		entry->next = venus->blobs;
+		venus->blobs = entry;
+		pthread_mutex_unlock(&venus->lock);
+		return 0;
 	}
 
 	// Mesa Venus: the pages already exist inside vkr. Hand the mapping
 	// back so virtio-gpu maps this pointer, not a second IOSurface.
-	if (venus->virgl.resource_map && !blob->iosurface) {
+	// DEVICE_LOCAL allocations are intentionally Metal-private. Asking vkr to
+	// map every blob anyway makes MoltenVK take a failing vkMapMemory path for
+	// each swapchain image (and for every resize). Only MAPPABLE blobs can have
+	// guest aperture pages.
+	if (venus->virgl.resource_map && !blob->iosurface &&
+	    (args.blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_MAPPABLE)) {
 		void *map = NULL;
 		uint64_t map_size = 0;
 		if (venus->virgl.resource_map(blob->resource_id, &map, &map_size) == 0 && map) {
@@ -518,6 +643,10 @@ int np_venus_create_blob(np_venus *venus, uint32_t ctx_id, np_venus_blob *blob) 
 			     blob->resource_id);
 		}
 	}
+	pthread_mutex_lock(&venus->lock);
+	entry->next = venus->blobs;
+	venus->blobs = entry;
+	pthread_mutex_unlock(&venus->lock);
 	return 0;
 }
 
@@ -632,6 +761,8 @@ int np_venus_submit(np_venus *venus, uint32_t ctx_id, uint32_t ring_idx,
 			return -1;
 		}
 		pending->fence_id = fence_id;
+		pending->ctx_id = ctx_id;
+		pending->ring_idx = ring_idx;
 		pending->done = done;
 		pending->user = user;
 		pthread_mutex_lock(&venus->lock);
@@ -642,7 +773,7 @@ int np_venus_submit(np_venus *venus, uint32_t ctx_id, uint32_t ring_idx,
 
 	int rc = venus->virgl.submit_cmd((void *)payload, (int)ctx_id, (int)(byte_count / 4));
 	if (rc != 0) {
-		if (wants_fence) write_context_fence(venus, ctx_id, ring_idx, fence_id);
+		if (wants_fence) finish_context_fence(venus, ctx_id, ring_idx, fence_id, false);
 		else done(user, fence_id, false);
 		return rc;
 	}
@@ -657,12 +788,12 @@ int np_venus_submit(np_venus *venus, uint32_t ctx_id, uint32_t ring_idx,
 			if (frc != 0) {
 				note("context_create_fence ring=%u id=%llu failed rc=%d; retiring now",
 				     ring_idx, (unsigned long long)fence_id, frc);
-				write_context_fence(venus, ctx_id, ring_idx, fence_id);
+				finish_context_fence(venus, ctx_id, ring_idx, fence_id, false);
 			}
 		} else {
 			// No fence API — the work is queued; poll once and complete.
 			venus->virgl.poll();
-			write_context_fence(venus, ctx_id, ring_idx, fence_id);
+			finish_context_fence(venus, ctx_id, ring_idx, fence_id, false);
 		}
 	} else {
 		done(user, fence_id, true);
