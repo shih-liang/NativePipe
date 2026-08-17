@@ -14,6 +14,8 @@ public enum ExecWire {
     public enum Kind: UInt8, Sendable {
         case data = 1
         case resize = 2
+        /// Four-byte little-endian process exit status. Older peers may send
+        /// an empty payload, which clients interpret as success.
         case exit = 3
     }
 
