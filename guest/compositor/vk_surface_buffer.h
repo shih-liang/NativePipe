@@ -7,12 +7,13 @@
 
 #include <vulkan/vulkan.h>
 
-/* One compositor-owned image. CPU wl_shm writes and GPU operations target the
- * same VkImage/VkDeviceMemory; the exported Venus renderer BO supplies the
+/* One compositor-owned image. CPU wl_shm writes and GPU copy operations target
+ * the same VkImage/VkDeviceMemory; the exported Venus renderer BO supplies the
  * virtio resource id that the host presents as an IOSurface. */
 struct np_vk_surface_buffer {
     VkImage image;
     VkDeviceMemory memory;
+    VkImageLayout layout;
 
     uint32_t resource_id;
     uint32_t width;
