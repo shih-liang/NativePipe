@@ -29,6 +29,14 @@ struct np_vk_surface_buffer {
     size_t size;
 };
 
+/*
+ * The compositor owns Vulkan initialization. Surface allocation receives the
+ * already-created Venus VkPhysicalDevice/VkDevice rather than creating another
+ * Vulkan context.
+ */
+void np_vk_surface_buffer_set_device(VkPhysicalDevice physical,
+                                     VkDevice device);
+
 bool np_vk_surface_buffer_create(uint32_t width,
                                  uint32_t height,
                                  struct np_vk_surface_buffer *out);
