@@ -18,7 +18,8 @@ GENERATED := xdg-shell-server-protocol.h xdg-shell-client-protocol.h xdg-shell-p
 SHARED_SOURCES := compositor.c hostlink.c xdg-shell-protocol.c
 
 # VM compositor: Vulkan only. No manual virtio-gpu context/blob allocation.
-VM_SOURCES := vmpipe_main.c vk_surface_buffer.c
+# np_vk_context owns the Venus VkDevice shared by all surface allocations.
+VM_SOURCES := vmpipe_main.c vk_context.c vk_surface_buffer.c
 
 BINARY := vmpipe-wayland
 
