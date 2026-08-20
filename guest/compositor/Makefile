@@ -34,8 +34,9 @@ SHARED_SOURCES := compositor.c hostlink.c \
                   xdg-decoration-protocol.c text-input-v3-protocol.c \
                   linux-dmabuf-unstable-v1-protocol.c
 
-# No blob.c: these objects are the complete VM resource path.
-VM_SOURCES := surface_store.c virtio_resource.c dmabuf.c \
+# No blob.c: these objects are the complete VM resource path. Both wl_shm and
+# linux-dmabuf commits end at compositor-owned display VkImages/IOSurfaces.
+VM_SOURCES := surface_store.c virtio_resource.c dmabuf.c gpu_copy.c \
               vk_context.c vk_surface_buffer.c vmpipe_main.c
 
 REMOTE_SOURCES := medialink.c ../encoder/encoder.c dmabuf_stub.c remotepipe_main.c
