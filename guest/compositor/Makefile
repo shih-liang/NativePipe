@@ -110,9 +110,12 @@ install-remote: $(REMOTE_BINARY)
 clean:
 	rm -f $(BINARY) $(REMOTE_BINARY) $(CLIENT) $(VKPRESENT) $(ALIGN_BLOB) $(GENERATED)
 
+# The VM compositor now dynamically uses the guest Vulkan loader/Venus ICD.
+# The former fully-static musl build embedded the deleted blob allocator and is
+# intentionally retired rather than silently producing an obsolete binary.
 static:
-	chmod +x build-static.sh
-	./build-static.sh aarch64-linux-musl
-	./build-static.sh x86_64-linux-musl
+	@echo "vmpipe static build retired: Vulkan-native compositor requires the guest Vulkan loader/Venus ICD" >&2
+	@false
+
 static-clean:
 	rm -rf dist .deps
