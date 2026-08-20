@@ -28,7 +28,6 @@ static bool find_host_visible_memory(uint32_t bits,
     VkPhysicalDeviceMemoryProperties props;
     vkGetPhysicalDeviceMemoryProperties(np_physical_device, &props);
 
-    /* Prefer coherent memory so a wl_shm commit is exactly one memcpy. */
     for (uint32_t pass = 0; pass < 2; pass++) {
         for (uint32_t i = 0; i < props.memoryTypeCount; i++) {
             if (!(bits & (1u << i)))
@@ -84,6 +83,7 @@ bool np_vk_surface_buffer_create(uint32_t width,
 
     memset(out, 0, sizeof(*out));
     out->resource_drm_fd = -1;
+    out->layout = VK_IMAGE_LAYOUT_UNDEFINED;
     out->width = width;
     out->height = height;
 
@@ -101,8 +101,10 @@ bool np_vk_surface_buffer_create(uint32_t width,
         .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_LINEAR,
-        .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+        /* CPU wl_shm writes happen through the mapped allocation. GPU clients
+         * are composited by transfer into this same image. Avoid COLOR_ATTACHMENT
+         * so this stays legal on Metal devices without renderLinearTextures. */
+        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                  VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
