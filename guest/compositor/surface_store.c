@@ -7,8 +7,7 @@
 
 int np_surface_store_open(void)
 {
-    /* This fd exists only for linux-dmabuf PRIME/resource-info lookup. It has no
-     * Venus context and never submits rendering commands. */
+    /* Lookup-only render-node fd. No CONTEXT_INIT, no submit path. */
     return np_virtio_open_lookup_node();
 }
 
@@ -32,9 +31,21 @@ bool np_surface_store_create(int lookup_fd, size_t requested_size,
     if (!np_vk_surface_buffer_create(width, height, &out->vk))
         return false;
 
-    /* compositor.c currently computes the host IOSurface row alignment before
-     * allocation. Keep that contract strict until publish_frame is moved into
-     * this module; silently using two different row pitches corrupts rows. */
+    /* publish_frame performs the CPU copy outside this module, so the mapped
+     * allocation must be coherent. This keeps wl_shm at exactly one memcpy and
+     * avoids a hidden flush protocol between the Wayland state machine and the
+     * allocator. */
+    if (!out->vk.coherent) {
+        fprintf(stderr, "[surface-store] compositor image memory is not HOST_COHERENT\n");
+        np_vk_surface_buffer_destroy(&out->vk);
+        memset(out, 0, sizeof(*out));
+        return false;
+    }
+
+    /* Until publish_frame itself moves here, compositor.c and Vulkan must agree
+     * on row pitch exactly. The host IOSurface path uses the same 128-byte row
+     * alignment, so a mismatch is a configuration error rather than something
+     * that can be papered over safely. */
     if (requested_stride != out->vk.stride) {
         fprintf(stderr,
                 "[surface-store] Vulkan rowPitch=%u differs from compositor stride=%u\n",
