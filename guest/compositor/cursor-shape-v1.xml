@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="cursor_shape_v1">
+  <copyright>
+    Copyright 2018 The Chromium Authors
+    Copyright 2023 Simon Ser
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice (including the next
+    paragraph) shall be included in all copies or substantial portions of the
+    Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+  </copyright>
+
+  <interface name="wp_cursor_shape_manager_v1" version="1">
+    <description summary="cursor shape manager">
+      This global offers an alternative, optional way to set cursor images. This
+      new way uses enumerated cursors instead of a wl_surface like
+      wl_pointer.set_cursor does.
+
+      Warning! The protocol described in this file is currently in the testing
+      phase. Backward compatible changes may be added together with the
+      corresponding interface version bump. Backward incompatible changes can
+      only be done by creating a new major version of the extension.
+    </description>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the manager">
+        Destroy the cursor shape manager.
+      </description>
+    </request>
+
+    <request name="get_pointer">
+      <description summary="manage the cursor shape of a pointer device">
+        Obtain a wp_cursor_shape_device_v1 for a wl_pointer object.
+
+        When the pointer capability is removed from the wl_seat, the
+        wp_cursor_shape_device_v1 object becomes inert.
+      </description>
+      <arg name="cursor_shape_device" type="new_id"
+           interface="wp_cursor_shape_device_v1"/>
+      <arg name="pointer" type="object" interface="wl_pointer"/>
+    </request>
+
+    <request name="get_tablet_tool_v2">
+      <description summary="manage the cursor shape of a tablet tool device">
+        Obtain a wp_cursor_shape_device_v1 for a zwp_tablet_tool_v2 object.
+
+        When the zwp_tablet_tool_v2 is removed, the
+        wp_cursor_shape_device_v1 object becomes inert.
+      </description>
+      <arg name="cursor_shape_device" type="new_id"
+           interface="wp_cursor_shape_device_v1"/>
+      <arg name="tablet_tool" type="object" interface="zwp_tablet_tool_v2"/>
+    </request>
+  </interface>
+
+  <interface name="wp_cursor_shape_device_v1" version="1">
+    <description summary="cursor shape for a device">
+      This interface allows clients to set the cursor shape.
+    </description>
+
+    <enum name="shape">
+      <description summary="cursor shapes">
+        This enum describes cursor shapes. The names are taken from the CSS
+        cursor specification.
+      </description>
+      <entry name="default" value="1" summary="default cursor"/>
+      <entry name="context_menu" value="2"
+             summary="a context menu is available"/>
+      <entry name="help" value="3" summary="help is available"/>
+      <entry name="pointer" value="4" summary="link or interactive element"/>
+      <entry name="progress" value="5" summary="progress indicator"/>
+      <entry name="wait" value="6" summary="application is busy"/>
+      <entry name="cell" value="7" summary="cell selection"/>
+      <entry name="crosshair" value="8" summary="simple crosshair"/>
+      <entry name="text" value="9" summary="text selection"/>
+      <entry name="vertical_text" value="10" summary="vertical text selection"/>
+      <entry name="alias" value="11" summary="create an alias"/>
+      <entry name="copy" value="12" summary="copy during drag and drop"/>
+      <entry name="move" value="13" summary="move during drag and drop"/>
+      <entry name="no_drop" value="14" summary="drop is not possible"/>
+      <entry name="not_allowed" value="15" summary="operation is not allowed"/>
+      <entry name="grab" value="16" summary="item can be grabbed"/>
+      <entry name="grabbing" value="17" summary="item is being grabbed"/>
+      <entry name="e_resize" value="18" summary="east resize"/>
+      <entry name="n_resize" value="19" summary="north resize"/>
+      <entry name="ne_resize" value="20" summary="north-east resize"/>
+      <entry name="nw_resize" value="21" summary="north-west resize"/>
+      <entry name="s_resize" value="22" summary="south resize"/>
+      <entry name="se_resize" value="23" summary="south-east resize"/>
+      <entry name="sw_resize" value="24" summary="south-west resize"/>
+      <entry name="w_resize" value="25" summary="west resize"/>
+      <entry name="ew_resize" value="26" summary="horizontal resize"/>
+      <entry name="ns_resize" value="27" summary="vertical resize"/>
+      <entry name="nesw_resize" value="28" summary="north-east south-west resize"/>
+      <entry name="nwse_resize" value="29" summary="north-west south-east resize"/>
+      <entry name="col_resize" value="30" summary="column resize"/>
+      <entry name="row_resize" value="31" summary="row resize"/>
+      <entry name="all_scroll" value="32" summary="scroll in any direction"/>
+      <entry name="zoom_in" value="33" summary="zoom in"/>
+      <entry name="zoom_out" value="34" summary="zoom out"/>
+    </enum>
+
+    <enum name="error">
+      <entry name="invalid_shape" value="1"
+             summary="the specified shape value is invalid"/>
+    </enum>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the cursor shape device">
+        Destroy the cursor shape device. The device cursor shape remains
+        unchanged.
+      </description>
+    </request>
+
+    <request name="set_shape">
+      <description summary="set device cursor to the shape">
+        Set the cursor to an enumerated shape. The serial must match the latest
+        wl_pointer.enter or tablet proximity event sent to the client.
+      </description>
+      <arg name="serial" type="uint" summary="serial of the enter event"/>
+      <arg name="shape" type="uint" enum="shape"/>
+    </request>
+  </interface>
+</protocol>
