@@ -6,23 +6,21 @@ import UniformTypeIdentifiers
 
 /// Where a committed frame's pixels come from.
 ///
-/// A frame carries a `resourceID`, never a buffer. CPU frames name an
-/// IOSurface the compositor filled. GPU frames name a Venus resource
-/// that already lives in MoltenVK on this process — the id is a name,
-/// not a copy.
+/// Local window frames name a compositor-owned Venus image. The frame source
+/// exposes that image as an MTLTexture-shaped object without making this module
+/// depend on the virtual GPU implementation. Remote frames still arrive as an
+/// IOSurface from VideoToolbox.
 @MainActor
 public protocol FrameSource: AnyObject {
     func surface(forResource resourceID: UInt32) -> IOSurfaceRef?
-    func gpuMemory(forResource resourceID: UInt32) -> (UnsafeMutableRawPointer, Int)?
-    func gpuMetalTexture(
+    func metalTexture(
         forResource resourceID: UInt32,
         width: Int, height: Int, bytesPerRow: Int, format: UInt32
     ) -> AnyObject?
 }
 
 extension FrameSource {
-    public func gpuMemory(forResource resourceID: UInt32) -> (UnsafeMutableRawPointer, Int)? { nil }
-    public func gpuMetalTexture(
+    public func metalTexture(
         forResource resourceID: UInt32,
         width: Int, height: Int, bytesPerRow: Int, format: UInt32
     ) -> AnyObject? { nil }
@@ -30,10 +28,9 @@ extension FrameSource {
 
 /// Applies guest window events to `NSWindow`s, and sends host decisions back.
 ///
-/// The entire translation lives here and in `NativeWindow`. There is no
-/// compositor state: no scene graph, no z-order, no damage accumulation, no
-/// frame scheduling. Those are macOS's job, and the guest's Wayland translator
-/// keeps the protocol state on its side.
+/// The guest owns the Wayland scene graph, scale/viewport resolution and frame
+/// scheduling. This bridge receives one already-composited Venus image per xdg
+/// window and asks the NSWindow to copy it into its private display IOSurface.
 @MainActor
 public final class WindowBridge {
     /// Window event tracing, off unless NATIVEPIPE_WINDOW_TRACE is set. Writes to
@@ -48,25 +45,45 @@ public final class WindowBridge {
         FileHandle.standardError.write(Data("[win] \(message())\n".utf8))
     }
 
-    /// A child surface drawn inside its parent's window. Holds its own layer and
-    /// the surface it is showing — the resource table drops its reference as soon
-    /// as the guest is done with it, and a layer must outlive that.
-    private final class Subsurface {
-        let layer = CALayer()
-        var parentSurface: UInt32
-        var displayed: IOSurfaceRef?
-        var origin: CGPoint
+    struct CustomCursorGeometry: Equatable {
+        let imageSize: CGSize
+        let sourcePixels: CGRect
+        let hotSpot: CGPoint
+    }
 
-        init(parentSurface: UInt32, origin: CGPoint) {
-            self.parentSurface = parentSurface
-            self.origin = origin
-            layer.contentsGravity = .resize
-            layer.isOpaque = false
-            layer.anchorPoint = .zero
-            // The parent view is flipped; matching that keeps subsurface offsets
-            // in the same top-down space the client used.
-            layer.isGeometryFlipped = true
-        }
+    struct SurfaceLayerGeometry: Equatable {
+        let bounds: CGRect
+        let contentsRect: CGRect
+        let contentsScale: CGFloat
+    }
+
+    /// Shared CALayer geometry for child surfaces. In particular, Firefox's
+    /// rendering subsurface carries a 1600x1200 buffer, buffer_scale 1 and a
+    /// viewport destination of 800x600; its layer must therefore be 800x600
+    /// points while sampling all 1600x1200 pixels.
+    static func surfaceLayerGeometry(
+        frame: Windowing.Frame, allocationSize: CGSize
+    ) -> SurfaceLayerGeometry {
+        let logical = CGRect(origin: .zero, size: frame.appKitPointSize)
+        return SurfaceLayerGeometry(
+            bounds: logical,
+            contentsRect: frame.contentsRect(
+                for: logical, allocationSize: allocationSize),
+            contentsScale: frame.pixelDensity(for: logical))
+    }
+
+    static func customCursorGeometry(
+        frame: Windowing.Frame, hotSpot requestedHotSpot: CGPoint
+    ) -> CustomCursorGeometry {
+        let logical = frame.appKitPointSize
+        let width = max(logical.width, 1)
+        let height = max(logical.height, 1)
+        return CustomCursorGeometry(
+            imageSize: CGSize(width: width, height: height),
+            sourcePixels: frame.fullViewportBufferPixelRect.integral,
+            hotSpot: CGPoint(
+                x: min(max(requestedHotSpot.x, 0), max(0, width - 1)),
+                y: min(max(requestedHotSpot.y, 0), max(0, height - 1))))
     }
 
     /// A Wayland drag icon is neither a window nor part of the target surface.
@@ -202,16 +219,15 @@ public final class WindowBridge {
         }
     }
 
-    private var subsurfaces: [UInt32: Subsurface] = [:]
     private let dragIcon = DragIconOverlay()
     private var dragIconSurface: UInt32?
     /// A client normally commits the icon immediately before start_drag gives
     /// the surface its role, so retain unroled commits until that event arrives.
     private var pendingSurfaceFrames: [UInt32: Windowing.Frame] = [:]
-    /// GPU commits can beat virtio CREATE_BLOB on the host. Retry until the
-    /// Venus resource and its MTLTexture exist.
-    private var pendingGPUFrames: [UInt32: (frame: Windowing.Frame, window: UInt32)] = [:]
-    private var gpuRetryTimer: Timer?
+    /// A commit can beat virtio CREATE_BLOB publication on the host. Resource
+    /// publication is an event on the main actor, so no polling timer is needed.
+    private var pendingFrames: [UInt32: Windowing.Frame] = [:]
+    private var pointerCursor = NSCursor.arrow
 
     private var windows: [UInt32: NativeWindow] = [:]
     /// Surfaces that exist but have no role yet, and the toplevel each one backs.
@@ -238,6 +254,8 @@ public final class WindowBridge {
     public var windowCount: Int { windows.count }
 
     func window(_ id: UInt32) -> NativeWindow? { windows[id] }
+
+    func currentPointerCursor() -> NSCursor { pointerCursor }
 
     public func send(_ command: Windowing.HostCommand) {
         // Outgoing commands were the one direction with no trace, which made
@@ -275,7 +293,14 @@ public final class WindowBridge {
 
         case .surfaceDestroyed(let surface):
             knownSurfaces.remove(surface)
-            pendingSurfaceFrames.removeValue(forKey: surface)
+            if let frame = pendingSurfaceFrames.removeValue(forKey: surface) {
+                completeCopiedPresentation(
+                    surface: surface, presentationID: frame.presentationID)
+            }
+            if let frame = pendingFrames.removeValue(forKey: surface) {
+                completeCopiedPresentation(
+                    surface: surface, presentationID: frame.presentationID)
+            }
             if dragIconSurface == surface {
                 dragIconSurface = nil
                 dragIcon.hide()
@@ -317,18 +342,10 @@ public final class WindowBridge {
                 native.close()
             }
 
-        case .subsurfaceCreated(let surface, let parent, let x, let y):
-            let child = Subsurface(parentSurface: parent, origin: CGPoint(x: x, y: y))
-            subsurfaces[surface] = child
-            attach(child, for: surface)
-
-        case .subsurfaceMoved(let surface, let x, let y):
-            guard let child = subsurfaces[surface] else { return }
-            child.origin = CGPoint(x: x, y: y)
-            child.layer.frame.origin = child.origin
-
-        case .subsurfaceDestroyed(let surface):
-            subsurfaces.removeValue(forKey: surface)?.layer.removeFromSuperlayer()
+        case .subsurfaceCreated, .subsurfaceMoved, .subsurfaceDestroyed:
+            // Compatibility with an older guest. Current compositors consume
+            // the surface tree and never publish per-child host state.
+            break
 
         case .dragIconChanged(let surface):
             dragIconSurface = surface
@@ -336,10 +353,24 @@ public final class WindowBridge {
                 dragIcon.hide()
                 return
             }
-            if let frame = pendingSurfaceFrames[surface],
-               let ioSurface = frameSource?.surface(forResource: frame.resourceID) {
+            if let frame = pendingSurfaceFrames.removeValue(forKey: surface) {
+                guard let ioSurface = frameSource?.surface(forResource: frame.resourceID) else {
+                    retainDeferred(frame, for: surface)
+                    return
+                }
                 dragIcon.display(ioSurface, frame: frame)
+                completeCopiedPresentation(
+                    surface: surface, presentationID: frame.presentationID)
             }
+
+        case .cursorChanged(let surface, _, _):
+            // A custom surface is installed when its committed pixels arrive.
+            // Until then retain the current AppKit cursor; nil restores arrow.
+            if surface == nil { pointerCursor = .arrow }
+
+        case .cursorShapeChanged(let shape):
+            pointerCursor = NativeCursorResolver.cursor(for: shape)
+            pointerCursor.set()
 
         case .titleChanged(let window, let title):
             windows[window]?.title = title
@@ -359,38 +390,25 @@ public final class WindowBridge {
         case .committed(let surface, let frame):
             if surface == dragIconSurface {
                 guard let ioSurface = frameSource?.surface(forResource: frame.resourceID) else {
-                    Self.note("drag icon commit dropped: no host surface for \(frame.resourceID)")
+                    retainDeferred(frame, for: surface)
+                    Self.note("drag icon commit deferred: no output IOSurface for \(frame.resourceID)")
                     return
                 }
-                pendingSurfaceFrames[surface] = frame
+                pendingFrames.removeValue(forKey: surface)
                 dragIcon.display(ioSurface, frame: frame)
+                completeCopiedPresentation(
+                    surface: surface, presentationID: frame.presentationID)
                 return
             }
-            // A subsurface is contents inside a window, so it takes a layer
-            // rather than a window of its own.
-            if let child = subsurfaces[surface] {
-                guard let ioSurface = frameSource?.surface(forResource: frame.resourceID) else {
-                    Self.note("subsurface commit dropped: no host surface for \(frame.resourceID)")
-                    return
-                }
-                if child.layer.superlayer == nil { attach(child, for: surface) }
-                child.displayed = ioSurface
-                let scale = CGFloat(max(frame.scale, 1))
-                child.layer.contentsScale = scale
-                child.layer.bounds = CGRect(
-                    x: 0, y: 0,
-                    width: CGFloat(frame.width) / scale, height: CGFloat(frame.height) / scale)
-                child.layer.frame.origin = child.origin
-                child.layer.contents = ioSurface
-                return
-            }
-
             guard let windowID = surfaceToWindow[surface] else {
-                pendingSurfaceFrames[surface] = frame
+                retainUnroled(frame, for: surface)
                 Self.note("commit retained: surface \(surface) has no role yet")
                 return
             }
             presentCommitted(surface: surface, windowID: windowID, frame: frame)
+
+        case .frameCallbackRequested(let surface, let presentationID):
+            schedulePresentation(surface: surface, presentationID: presentationID)
 
         case .interactiveMoveRequested(let window, _):
             // Client-side decorations report title-bar drags this way, which is
@@ -442,10 +460,32 @@ public final class WindowBridge {
     }
 
     /// Called when a virtio-gpu resource becomes presentable after CREATE_BLOB.
-    public func retryPendingGPUFrames() {
-        guard !pendingGPUFrames.isEmpty else { return }
-        for (surface, pending) in pendingGPUFrames {
-            presentCommitted(surface: surface, windowID: pending.window, frame: pending.frame)
+    public func retryPendingFrames() {
+        guard !pendingFrames.isEmpty else { return }
+        let snapshot = pendingFrames
+        for (surface, frame) in snapshot {
+            apply(.committed(surface: surface, frame: frame))
+        }
+    }
+
+    /// Replace a frame the host has not installed only after completing the
+    /// superseded presentation id. Once a commit has crossed the guest/host
+    /// boundary, that id owns a guest output-ring slot even if its IOSurface is
+    /// not visible in the host resource table yet.
+    private func retainDeferred(_ frame: Windowing.Frame, for surface: UInt32) {
+        if let previous = pendingFrames.updateValue(frame, forKey: surface),
+           previous.presentationID != frame.presentationID {
+            completeCopiedPresentation(
+                surface: surface, presentationID: previous.presentationID)
+        }
+    }
+
+    /// The same rule applies to a commit that arrives before its xdg role.
+    private func retainUnroled(_ frame: Windowing.Frame, for surface: UInt32) {
+        if let previous = pendingSurfaceFrames.updateValue(frame, forKey: surface),
+           previous.presentationID != frame.presentationID {
+            completeCopiedPresentation(
+                surface: surface, presentationID: previous.presentationID)
         }
     }
 
@@ -454,70 +494,83 @@ public final class WindowBridge {
             Self.note("commit dropped: no window \(windowID)")
             return
         }
-        if frame.source == .gpu {
-            // virgl_hw.h: BGRA8_UNORM=1, RGBA8_UNORM=67.
-            let virglFormat: UInt32 = frame.format == .rgba8888 ? 67 : 1
-            if let metal = frameSource?.gpuMetalTexture(
-                forResource: frame.resourceID,
-                width: frame.width, height: frame.height,
-                bytesPerRow: frame.bytesPerRow, format: virglFormat)
-            {
-                pendingGPUFrames.removeValue(forKey: surface)
-                native.presentGPU(frame: frame, metalTexture: metal)
-            } else if let memory = frameSource?.gpuMemory(forResource: frame.resourceID) {
-                pendingGPUFrames.removeValue(forKey: surface)
-                native.presentGPU(frame: frame, pointer: memory.0, byteCount: memory.1)
-            } else {
-                pendingGPUFrames[surface] = (frame, windowID)
-                Self.note("commit deferred: no host GPU mapping for resource \(frame.resourceID)")
-                scheduleGPURetry()
-                return
+        // virgl_hw.h: BGRA8_UNORM=1, RGBA8_UNORM=67. Window scene output is
+        // always BGRA, but retain the format mapping for legacy/unroled frames.
+        let virglFormat: UInt32 = frame.format == .rgba8888 ? 67 : 1
+        if frame.source != .encoded,
+           let texture = frameSource?.metalTexture(
+               forResource: frame.resourceID,
+               width: frame.width, height: frame.height,
+               bytesPerRow: frame.bytesPerRow, format: virglFormat)
+        {
+            pendingFrames.removeValue(forKey: surface)
+            native.present(
+                frame: frame, metalTexture: texture,
+                copied: { [weak self] success in
+                    guard let self else { return }
+                    self.send(.frameReleased(
+                        surface: surface, presentationID: frame.presentationID))
+                    if !success {
+                        self.send(.framePresented(
+                            surface: surface, presentationID: frame.presentationID))
+                    }
+                },
+                presented: { [weak self] in
+                    self?.send(.framePresented(
+                        surface: surface, presentationID: frame.presentationID))
+                })
+            if Self.frameTrace {
+                Self.note("blit queued window=\(windowID) res=\(frame.resourceID)")
             }
-        } else if frame.source == .encoded {
-            // Decode can lag a few milliseconds behind the committed event when
-            // both arrive over separate TCP sockets; retry like the GPU path.
-            guard let ioSurface = frameSource?.surface(forResource: frame.resourceID) else {
-                pendingGPUFrames[surface] = (frame, windowID)
-                Self.note("commit deferred: no decoded surface for resource \(frame.resourceID)")
-                scheduleGPURetry()
-                return
-            }
-            pendingGPUFrames.removeValue(forKey: surface)
-            native.present(frame: frame, surface: ioSurface)
-            dumpFirstFrame(frame, surface: ioSurface)
-        } else {
-            guard let ioSurface = frameSource?.surface(forResource: frame.resourceID) else {
-                Self.note("commit dropped: no host surface for resource \(frame.resourceID)")
-                NSLog("NativePipe: commit referenced unknown resource \(frame.resourceID)")
-                return
-            }
-            pendingGPUFrames.removeValue(forKey: surface)
-            native.present(frame: frame, surface: ioSurface)
-            dumpFirstFrame(frame, surface: ioSurface)
+            native.traceLayerGeometry()
+            injectTestInput(windowID)
+            scheduleResizeProbe(native)
+            return
         }
+
+        guard let ioSurface = frameSource?.surface(forResource: frame.resourceID) else {
+            retainDeferred(frame, for: surface)
+            Self.note("commit deferred: no Metal texture or IOSurface for resource \(frame.resourceID)")
+            return
+        }
+        pendingFrames.removeValue(forKey: surface)
+        native.present(frame: frame, surface: ioSurface)
+        dumpFrameIfRequested(frame, surfaceID: surface, surface: ioSurface)
         if Self.frameTrace {
-            Self.note("presented window=\(windowID) res=\(frame.resourceID)")
+            Self.note("installed window=\(windowID) res=\(frame.resourceID)")
         }
+        native.traceLayerGeometry()
         injectTestInput(windowID)
         scheduleResizeProbe(native)
     }
 
-    private func scheduleGPURetry() {
-        guard gpuRetryTimer == nil else { return }
-        gpuRetryTimer = Timer.scheduledTimer(withTimeInterval: 0.01, repeats: true) { [weak self] timer in
-            MainActor.assumeIsolated {
-                guard let self else {
-                    timer.invalidate()
-                    return
-                }
-                if self.pendingGPUFrames.isEmpty {
-                    timer.invalidate()
-                    self.gpuRetryTimer = nil
-                    return
-                }
-                self.retryPendingGPUFrames()
+    private func schedulePresentation(surface: UInt32, presentationID: UInt32) {
+        guard presentationID != 0 else { return }
+        if let native = nativeWindowOwningSurface(surface) ?? windows.values.first(where: { $0.window != nil }) {
+            if nativeWindowOwningSurface(surface) != nil {
+                native.awaitPresentation(surface: surface, presentationID: presentationID)
+            } else {
+                completeCopiedPresentation(
+                    surface: surface, presentationID: presentationID)
             }
+        } else {
+            // An unroled or occluded surface has no latching deadline. FIFO v1
+            // explicitly permits clearing its constraint early for forward
+            // progress, and a frame callback must not deadlock the client.
+            send(.framePresented(surface: surface, presentationID: presentationID))
+            send(.frameReleased(surface: surface, presentationID: presentationID))
         }
+    }
+
+    private func completeCopiedPresentation(surface: UInt32, presentationID: UInt32) {
+        guard presentationID != 0 else { return }
+        send(.framePresented(surface: surface, presentationID: presentationID))
+        send(.frameReleased(surface: surface, presentationID: presentationID))
+    }
+
+    private func nativeWindowOwningSurface(_ surface: UInt32) -> NativeWindow? {
+        guard let windowID = surfaceToWindow[surface] else { return nil }
+        return windows[windowID]
     }
 
     /// Writes the first presented frame to NATIVEPIPE_WINDOW_DUMP, if set.
@@ -525,11 +578,26 @@ public final class WindowBridge {
     /// Read straight out of the IOSurface the guest wrote through the aperture,
     /// so it is the actual memory CoreAnimation samples rather than a re-render.
     private static let dumpPath = ProcessInfo.processInfo.environment["NATIVEPIPE_WINDOW_DUMP"]
+    private static let dumpDirectory = ProcessInfo.processInfo.environment["NATIVEPIPE_WINDOW_DUMP_DIR"]
     private var dumped = false
+    private var dumpedFrameSignatures: Set<String> = []
 
-    private func dumpFirstFrame(_ frame: Windowing.Frame, surface: IOSurfaceRef) {
-        guard let path = Self.dumpPath, !dumped else { return }
-        dumped = true
+    private func dumpFrameIfRequested(
+        _ frame: Windowing.Frame, surfaceID: UInt32, surface: IOSurfaceRef
+    ) {
+        let path: String
+        if let directory = Self.dumpDirectory {
+            let signature = "\(surfaceID)-\(frame.resourceID)-\(frame.width)x\(frame.height)"
+            guard dumpedFrameSignatures.count < 32,
+                  dumpedFrameSignatures.insert(signature).inserted else { return }
+            try? FileManager.default.createDirectory(
+                atPath: directory, withIntermediateDirectories: true)
+            path = (directory as NSString).appendingPathComponent("\(signature).png")
+        } else {
+            guard let firstPath = Self.dumpPath, !dumped else { return }
+            dumped = true
+            path = firstPath
+        }
 
         IOSurfaceLock(surface, .readOnly, nil)
         defer { IOSurfaceUnlock(surface, .readOnly, nil) }
@@ -574,24 +642,6 @@ public final class WindowBridge {
                 }
             }
         }
-    }
-
-    /// Hangs a subsurface's layer under whichever window ultimately owns it.
-    /// Parents nest, so the chain is walked until it reaches a surface that has
-    /// a window; a subsurface committed before its parent has one is retried on
-    /// its next commit.
-    private func attach(_ child: Subsurface, for surface: UInt32) {
-        var ancestor = child.parentSurface
-        var hops = 0
-        while subsurfaces[ancestor] != nil, hops < 16 {
-            ancestor = subsurfaces[ancestor]!.parentSurface
-            hops += 1
-        }
-        guard let windowID = surfaceToWindow[ancestor],
-              let layer = windows[windowID]?.contentLayer
-        else { return }
-        layer.addSublayer(child.layer)
-        child.layer.frame.origin = child.origin
     }
 
     /// Asks the client to take down every popup belonging to a window. Wayland
@@ -662,11 +712,16 @@ public final class WindowBridge {
     }
 
     public func closeAll() {
-        gpuRetryTimer?.invalidate()
-        gpuRetryTimer = nil
-        pendingGPUFrames.removeAll()
-        for (_, child) in subsurfaces { child.layer.removeFromSuperlayer() }
-        subsurfaces.removeAll()
+        for (surface, frame) in pendingSurfaceFrames {
+            completeCopiedPresentation(
+                surface: surface, presentationID: frame.presentationID)
+        }
+        pendingSurfaceFrames.removeAll()
+        for (surface, frame) in pendingFrames {
+            completeCopiedPresentation(
+                surface: surface, presentationID: frame.presentationID)
+        }
+        pendingFrames.removeAll()
         for (_, window) in windows { window.close() }
         windows.removeAll()
         surfaceToWindow.removeAll()

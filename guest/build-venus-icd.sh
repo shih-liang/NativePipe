@@ -13,17 +13,21 @@ ARCH=$(apk --print-arch)
 VERSIONED_ICD="${PREFIX}/share/vulkan/icd.d/virtio_icd.${ARCH}.json"
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PATCH="${SCRIPT_DIR}/../../../scripts/patches/mesa-venus-blob-alignment.patch"
-
-if [ -s "${PREFIX}/lib/libvulkan_virtio.so" ] && [ -s "${VERSIONED_ICD}" ]; then
-	mkdir -p "$STABLE_DIR"
-	ln -sfn "$VERSIONED_ICD" "$STABLE_ICD"
-	echo "$STABLE_ICD"
-	exit 0
-fi
+STAMP="${PREFIX}/.nativepipe-patch-sha256"
 
 if [ ! -r "$PATCH" ]; then
 	echo "NativePipe Mesa patch is missing: $PATCH" >&2
 	exit 1
+fi
+PATCH_SHA=$(sha256sum "$PATCH")
+PATCH_SHA=${PATCH_SHA%% *}
+
+if [ -s "${PREFIX}/lib/libvulkan_virtio.so" ] && [ -s "${VERSIONED_ICD}" ] &&
+   [ "$(cat "$STAMP" 2>/dev/null || true)" = "$PATCH_SHA" ]; then
+	mkdir -p "$STABLE_DIR"
+	ln -sfn "$VERSIONED_ICD" "$STABLE_ICD"
+	echo "$STABLE_ICD"
+	exit 0
 fi
 
 WORK=$(mktemp -d /tmp/nativepipe-mesa.XXXXXX)
@@ -50,8 +54,13 @@ apk add --no-progress --virtual "$BUILD_DEPS" \
 	vulkan-loader-dev zlib-dev
 
 ARCHIVE="${WORK}/mesa-${MESA_VERSION}.tar.xz"
-wget -q -O "$ARCHIVE" \
-	"https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz"
+CACHED_ARCHIVE=${NATIVEPIPE_MESA_ARCHIVE:-/tmp/mesa-${MESA_VERSION}.tar.xz}
+if [ -r "$CACHED_ARCHIVE" ]; then
+	cp "$CACHED_ARCHIVE" "$ARCHIVE"
+else
+	wget -q -O "$ARCHIVE" \
+		"https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz"
+fi
 echo "${MESA_SHA256}  ${ARCHIVE}" | sha256sum -c -
 
 SOURCE="${WORK}/source"
@@ -75,6 +84,7 @@ meson install -C "${SOURCE}/build"
 
 test -s "${PREFIX}/lib/libvulkan_virtio.so"
 test -s "$VERSIONED_ICD"
+printf '%s\n' "$PATCH_SHA" > "$STAMP"
 mkdir -p "$STABLE_DIR"
 ln -sfn "$VERSIONED_ICD" "$STABLE_ICD"
 echo "$STABLE_ICD"

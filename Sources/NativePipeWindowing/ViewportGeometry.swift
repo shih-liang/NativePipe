@@ -1,6 +1,61 @@
 import CoreGraphics
 import NativePipeProtocol
 
+/// The single transform at the AppKit/Wayland window boundary.
+///
+/// Wayland describes the complete surface tree in surface-local logical units,
+/// while the AppKit content view represents only xdg_surface.window_geometry.
+/// Buffer scale and wp_viewport do not participate in this transform: they map
+/// pixels into logical surface coordinates before the window boundary.
+struct SurfaceCoordinateSpace: Equatable {
+    let windowGeometry: CGRect
+    let contentSize: CGSize
+
+    init(_ geometry: Windowing.Rect, contentSize: CGSize? = nil) {
+        windowGeometry = CGRect(
+            x: geometry.x, y: geometry.y,
+            width: geometry.width, height: geometry.height)
+        self.contentSize = contentSize ?? windowGeometry.size
+    }
+
+    /// CALayer bounds for the scene viewport. Setting its frame to the AppKit
+    /// content bounds maps the entire committed tree as one unit while a client
+    /// is still catching up with a live resize.
+    /// The guest compositor has already cropped the complete surface tree to
+    /// xdg_surface.window_geometry. The host scene therefore always starts at
+    /// zero; the geometry origin remains only for translating input back into
+    /// the root wl_surface coordinate space.
+    var sceneBounds: CGRect {
+        CGRect(origin: .zero, size: windowGeometry.size)
+    }
+
+    var sceneScale: CGSize {
+        CGSize(
+            width: windowGeometry.width > 0 ? contentSize.width / windowGeometry.width : 1,
+            height: windowGeometry.height > 0 ? contentSize.height / windowGeometry.height : 1)
+    }
+
+    private var surfaceUnitsPerContentPoint: CGSize {
+        CGSize(
+            width: contentSize.width > 0 ? windowGeometry.width / contentSize.width : 1,
+            height: contentSize.height > 0 ? windowGeometry.height / contentSize.height : 1)
+    }
+
+    func surfacePoint(fromContent point: CGPoint) -> CGPoint {
+        let scale = surfaceUnitsPerContentPoint
+        return CGPoint(
+            x: windowGeometry.minX + point.x * scale.width,
+            y: windowGeometry.minY + point.y * scale.height)
+    }
+
+    func contentPoint(fromSurface point: CGPoint) -> CGPoint {
+        let scale = surfaceUnitsPerContentPoint
+        return CGPoint(
+            x: scale.width != 0 ? (point.x - windowGeometry.minX) / scale.width : 0,
+            y: scale.height != 0 ? (point.y - windowGeometry.minY) / scale.height : 0)
+    }
+}
+
 extension Windowing.Frame {
     /// The crop before viewporter scales it, expressed in coordinates after
     /// wl_surface buffer scale (the coordinate system defined by the protocol).
@@ -55,6 +110,21 @@ extension Windowing.Frame {
 
     var fullViewportBufferPixelRect: CGRect {
         bufferPixelRect(for: CGRect(origin: .zero, size: logicalSurfaceSize))
+    }
+
+    /// CoreAnimation crop for an active frame stored at the top-left of a
+    /// larger capacity allocation.
+    func contentsRect(for logical: CGRect, allocationSize: CGSize) -> CGRect {
+        let crop = bufferPixelRect(for: logical).intersection(
+            CGRect(x: 0, y: 0, width: width, height: height))
+        guard !crop.isNull, !crop.isEmpty,
+              allocationSize.width > 0, allocationSize.height > 0
+        else { return CGRect(x: 0, y: 0, width: 1, height: 1) }
+        return CGRect(
+            x: crop.minX / allocationSize.width,
+            y: crop.minY / allocationSize.height,
+            width: crop.width / allocationSize.width,
+            height: crop.height / allocationSize.height)
     }
 
     func pixelDensity(for logical: CGRect) -> CGFloat {

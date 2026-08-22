@@ -11,7 +11,9 @@
 
 struct np_gpu_copy_source {
     VkImage image;
+    VkImageView view;
     VkDeviceMemory memory;
+    VkImageLayout layout;
     VkFormat format;
     uint32_t width;
     uint32_t height;
@@ -30,10 +32,20 @@ bool np_gpu_copy_source_import(int fd, uint32_t drm_format,
                                struct np_gpu_copy_source *out);
 void np_gpu_copy_source_destroy(struct np_gpu_copy_source *source);
 
-/* Synchronous MVP copy. Implicit dma-buf synchronization supplies producer
- * completion; the fence guarantees the display IOSurface is complete before
- * the existing host frame message is emitted. */
+/* Makes a linear snapshot legal for mapped CPU writes before wl_shm copies. */
+bool np_gpu_prepare_host_write(struct np_vk_surface_buffer *image);
+
+/* Synchronous copy. Implicit dma-buf synchronization supplies producer
+ * completion; the fence guarantees the compositor scene image is complete
+ * before the host frame message is emitted. */
 bool np_gpu_copy_to_display(struct np_gpu_copy_source *source,
                             struct np_vk_surface_buffer *display);
+bool np_gpu_copy_to_display_region(struct np_gpu_copy_source *source,
+                                   struct np_vk_surface_buffer *display,
+                                   int32_t source_x0, int32_t source_y0,
+                                   int32_t source_x1, int32_t source_y1,
+                                   int32_t destination_x0, int32_t destination_y0,
+                                   int32_t destination_x1, int32_t destination_y1,
+                                   bool clear);
 
 #endif

@@ -1,32 +1,36 @@
 // Shared Wayland compositor core (linked into vmpipe-wayland / remotepipe-wayland).
 //
-// This is a *translator*, not a compositor. It runs the Wayland protocol state
-// machine — surface roles, commit atomicity, buffer release timing — and
-// forwards what macOS needs to put a window on screen. It deliberately has no
-// scene graph, no stacking order, no damage accumulation, no decorations and no
-// output composition: macOS already does all of that, and a second opinion would
-// only have to be reconciled with the first.
+// This translates Wayland application windows to AppKit windows. It owns the
+// protocol state machine and composites each xdg surface tree once in the guest;
+// macOS still owns stacking, decorations, focus and desktop composition between
+// those application windows.
 //
 //     wl_surface   #17  ->  NativeSurface #17
 //     xdg_toplevel #23  ->  NativeWindow  #23  ->  NSWindow *
 //
-// Two buffer paths, both named by a virtio-gpu resource id:
-//
-//   * wl_shm  — one memcpy into a host IOSurface. That is the CPU window.
-//   * linux-dmabuf — Mesa Venus already rendered on the host. We only
-//     pass the resource id. The host presents that image on a CAMetalLayer.
+// wl_shm and linux-dmabuf layers both end in one ordinary BGRA scene VkImage.
+// The host retains its exact MTLTexture, blits once into the NSWindow-owned
+// IOSurface, then releases the scene image when that blit completes.
 
 #define _GNU_SOURCE
 
 #include "compositor.h"
+#include "compositor_internal.h"
+#include "perf.h"
 #include "blob.h" /* struct np_blob / np_align_row; VM also links blob.c */
 #include "dmabuf.h"
+#include "gpu_copy.h"
+#include "decoration.h"
 #include "hostlink.h"
+#include "scale.h"
+#include "scene.h"
 #ifdef NP_REMOTE
 #include "medialink.h"
 #include "../encoder/encoder.h"
 #endif
 #include "fractional-scale-v1-server-protocol.h"
+#include "viewporter-server-protocol.h"
+#include "fifo-v1-server-protocol.h"
 #include "xdg-decoration-server-protocol.h"
 #include "text-input-v3-server-protocol.h"
 #include "xdg-shell-server-protocol.h"
@@ -51,199 +55,15 @@
 #define SEAT_VERSION 5
 #define OUTPUT_VERSION 2
 
-/// An empty box has width 0; a full-surface box is set by damage_full().
-struct np_box {
-	int32_t x, y, width, height;
-};
-
-struct np_server {
-	struct wl_display *display;
-	struct wl_list surfaces;  // np_surface.link
-	struct np_host host;
-#ifdef NP_REMOTE
-	struct np_media media;
-#endif
-	int drm_fd;
-	uint32_t next_id;
-	int output_scale;
-	int output_width;
-	int output_height;
-	/// Bound wl_output resources, so a scale change reaches clients that already
-	/// have one. Announcing it only at bind time would leave every existing
-	/// window rendering at the old density.
-	struct wl_list outputs;
-
-	// Input. Devices are tracked per binding so events can be delivered only to
-	// the client that owns the focused surface.
-	struct wl_list pointers;
-	struct wl_list keyboards;
-	int keymap_fd;
-	/// The current clipboard owner, and the data devices that need telling about
-	/// it. Selection is per seat, and there is one seat.
-	struct wl_resource *selection_source;
-	struct wl_list data_devices;
-	/// Set when the macOS pasteboard owns the selection instead of a guest
-	/// client. The two are mutually exclusive, which is what makes "who owns the
-	/// clipboard" a single question rather than a merge.
-	char *host_mime[24];
-	int host_mime_count;
-	uint32_t next_clip_token;
-	/// In-flight clipboard transfers. Both directions go through a pipe that is
-	/// driven by the event loop rather than a blocking read or write: the peer
-	/// on the other end is an unrelated process that may never read, and a
-	/// clipboard must not be able to wedge the compositor.
-	struct wl_list clip_reads;
-	struct wl_list clip_writes;
-	/// zwp_text_input_v3 bindings. Composition happens on the Mac, so the only
-	/// state kept here is which client is asking for it.
-	struct wl_list text_inputs;
-	/// Active Wayland drag. Guest-to-guest DnD stays entirely in this compositor;
-	/// a future NSPasteboard bridge is only needed when the pointer crosses into
-	/// a native macOS application.
-	struct wl_resource *drag_source;
-	struct wl_resource *drag_origin;
-	struct wl_resource *drag_icon;
-	uint32_t drag_focus_window;
-	bool drag_dropped;
-	double pointer_x, pointer_y;
-	size_t keymap_size;
-	uint32_t focused_window;
-	uint32_t pointer_window;
-	/// The accepted host socket must be part of the Wayland event loop. Watching
-	/// only listen_fd lets the host connect, but its later input commands cannot
-	/// wake an idle compositor.
-	struct wl_event_source *host_connection_source;
-	int watched_host_fd;
-	uint32_t watched_host_mask;
-};
-
-struct np_input {
-	struct wl_list link;
-	struct wl_resource *resource;
-	struct np_server *server;
-};
-
-struct np_output {
-	struct wl_list link;
-	struct wl_resource *resource;
-};
-
-struct np_frame_callback {
-	struct wl_list link;
-	struct wl_resource *resource;
-	struct wl_event_source *timer;
-};
-
-struct np_surface {
-	struct wl_list link;
-	struct np_server *server;
-	struct wl_resource *resource;
-	uint32_t id;
-	/// wl_surface.frame requests are double buffered like the rest of surface
-	/// state. They become eligible only when the request's commit arrives.
-	struct wl_list pending_frame_callbacks;
-
-	// Wayland state is double buffered: nothing takes effect until commit.
-	struct wl_resource *pending_buffer;
-	bool pending_buffer_set;
-	int pending_scale;
-	int scale;
-
-	// xdg_surface / xdg_toplevel, once the surface takes a role.
-	struct wl_resource *xdg_surface;
-	struct wl_resource *toplevel;
-	struct wl_resource *popup;
-	struct wl_resource *decoration;
-	/// wp_fractional_scale_v1, if the client asked for one. Scale reaches a
-	/// surface through this rather than through wl_output, because on macOS the
-	/// density belongs to the window's current screen — two windows can differ.
-	struct wl_resource *fractional_scale;
-	int reported_scale;
-	uint32_t window_id;
-	uint32_t configure_serial;
-	// xdg_surface window geometry is double-buffered and takes effect on the
-	// next wl_surface.commit. It excludes CSD shadow/resize margins from the
-	// wl_surface without changing the surface coordinate system itself.
-	bool pending_geometry_set;
-	int32_t pending_geometry_x, pending_geometry_y;
-	int32_t pending_geometry_width, pending_geometry_height;
-	bool geometry_set;
-	int32_t geometry_x, geometry_y;
-	int32_t geometry_width, geometry_height;
-
-	// Two host allocations, alternated. One is being shown while the other is
-	// written, which stops the guest's memcpy from racing CoreAnimation's read.
-	// It also matters for a reason that is easy to miss: assigning the *same*
-	// IOSurface to CALayer.contents again is not a change, so a single buffer
-	// updates only when the compositor happens to redraw for another reason.
-	struct np_blob blobs[2];
-	int back;
-	uint32_t blob_stride;
-	uint32_t alloc_width;
-	uint32_t alloc_height;
-
-	// Subsurface role, if this surface has one. A subsurface is part of its
-	// parent's contents rather than a window of its own.
-	struct wl_resource *subsurface;
-	struct np_surface *parent;
-	int32_t sub_x, sub_y;
-	/// Synchronised is the default: a commit is cached and takes effect when the
-	/// parent commits, so a compound widget updates in one piece.
-	bool sync;
-	struct wl_resource *cached_buffer;
-	bool has_cached_buffer;
-
-	// Damage the client reported for the frame being assembled, and what each
-	// blob still owes. A blob last written two frames ago is stale wherever
-	// either of those frames touched it, so the copy into it has to cover both —
-	// buffer age, in the EGL sense.
-	struct np_box pending;
-	struct np_box owed[2];
-
-	// Enough to rebuild this surface's announcement for a host that attached
-	// after the fact. A client tells the compositor its title once, so without a
-	// copy the information is gone the moment it is forwarded.
-	char *title;
-	char *app_id;
-	/// Set by xdg_popup.grab. `focus_restore_window` is whatever held focus at
-	/// that moment, so a submenu restores its menu and the menu restores the
-	/// toplevel without anyone tracking a stack.
-	bool has_grab;
-	uint32_t focus_restore_window;
-	/// Whether a decoration mode has been negotiated, and which one. Only the
-	/// zxdg_toplevel_decoration_v1 resource is otherwise kept, and that does not
-	/// record the mode it settled on.
-	bool decoration_negotiated;
-	bool decoration_server_side;
-	const char *last_format;
-	int32_t last_width, last_height;
-	uint32_t last_resource_id;
-	uint32_t last_stride;
-	const char *last_source;
-	bool has_published;
-
-	/// The frame message waiting to go out for this surface.
-	///
-	/// A commit says "this surface now shows this resource" — a latest value, not
-	/// an event with history. Queueing every one lets a busy client outrun the
-	/// host and fill the channel, and the overflow then lands on the control
-	/// traffic sharing it. Replacing the pending message instead bounds the
-	/// backlog by the number of surfaces rather than by time.
-	cJSON *pending_frame;
-#ifdef NP_REMOTE
-	struct np_encoder *encoder;
-	uint16_t last_epoch;
-#endif
-};
-
-
 static struct np_server *g_server;
 
 /// Set NP_TRACE=1 to see what arrives from the host. Mouse motion is left out
 /// because it would bury everything else.
 static bool trace_enabled(void) {
 	static int enabled = -1;
-	if (enabled < 0) enabled = getenv("NP_TRACE") != NULL;
+	if (enabled < 0)
+		enabled = (getenv("NP_TRACE") != NULL ||
+		           access("/run/nativepipe-trace", F_OK) == 0) ? 1 : 0;
 	return enabled == 1;
 }
 
@@ -252,10 +72,56 @@ static bool trace_enabled(void) {
 // releases its synchronised children, and a released child publishes a frame.
 static void flush_sync_children(struct np_surface *parent);
 static void flush_pending_frames(struct np_server *server);
-static void publish_surface_buffer(struct np_surface *surface, struct wl_resource *buffer);
-static void publish_gpu_frame(struct np_surface *surface, struct np_gpu_buffer *gpu);
+static void apply_unblocked_updates(struct np_surface *surface);
+static void request_host_refresh(struct np_surface *surface,
+                                 uint32_t presentation_id);
+static void publish_surface_buffer(struct np_surface *surface, struct wl_resource *buffer,
+                                   uint32_t presentation_id);
+static void publish_gpu_frame(struct np_surface *surface, struct np_gpu_buffer *gpu,
+                              uint32_t presentation_id);
+static void frame_add_viewport(struct np_surface *surface, cJSON *frame);
+static bool parent_has_pending_subsurface_state(struct np_surface *parent);
+static void apply_pending_subsurface_state(struct np_surface *parent);
+
+static void drop_stack_ops_referencing(struct np_server *server,
+	                                   struct np_surface *surface)
+{
+	struct np_surface *owner;
+	wl_list_for_each(owner, &server->surfaces, link) {
+		struct np_subsurface_stack_op *op, *tmp;
+		wl_list_for_each_safe(op, tmp, &owner->pending_stack_ops, link) {
+			if (op->child != surface && op->sibling != surface) continue;
+			wl_list_remove(&op->link);
+			free(op);
+		}
+	}
+}
+
+static void detach_from_parent(struct np_surface *surface)
+{
+	if (!surface) return;
+	drop_stack_ops_referencing(surface->server, surface);
+	if (surface->parent) {
+		wl_list_remove(&surface->sibling_link);
+		wl_list_init(&surface->sibling_link);
+		surface->parent = NULL;
+	}
+}
+
+static void detach_subsurface_tree_links(struct np_surface *surface)
+{
+	if (!surface) return;
+	detach_from_parent(surface);
+	struct np_surface *child, *tmp;
+	wl_list_for_each_safe(child, tmp, &surface->children, sibling_link) {
+		wl_list_remove(&child->sibling_link);
+		wl_list_init(&child->sibling_link);
+		child->parent = NULL;
+	}
+}
 #ifdef NP_REMOTE
-static void publish_frame_remote(struct np_surface *surface, struct wl_shm_buffer *shm);
+static void publish_frame_remote(struct np_surface *surface, struct wl_shm_buffer *shm,
+                                 uint32_t presentation_id);
 static void encoder_emit(void *user, const uint8_t *data, size_t size, uint64_t pts_ns,
                          uint16_t bitstream_epoch, uint16_t width, uint16_t height);
 static uint64_t monotonic_ns(void);
@@ -266,7 +132,14 @@ static void input_resource_destroy(struct wl_resource *resource);
 // A popup takes keyboard focus when it grabs, which is well before the input
 // code that owns focus appears below.
 static void set_keyboard_focus(struct np_server *server, uint32_t window_id);
+static bool same_client(struct wl_resource *a, struct wl_resource *b);
 static struct np_surface *surface_by_window(struct np_server *server, uint32_t window_id);
+static struct np_surface *surface_by_id(struct np_server *server, uint32_t surface_id);
+static void finish_host_toplevel_configure(struct np_surface *surface,
+	                                       uint32_t serial);
+static void clear_pointer_focus_for_drag(struct np_server *server);
+static void restore_pointer_focus_after_drag(struct np_server *server,
+                                             struct np_surface *surface);
 
 static uint32_t now_ms(void) {
 	struct timespec ts;
@@ -320,6 +193,14 @@ static struct np_surface *surface_by_window(struct np_server *server, uint32_t w
 	return NULL;
 }
 
+static struct np_surface *surface_by_id(struct np_server *server, uint32_t surface_id) {
+	struct np_surface *surface;
+	wl_list_for_each(surface, &server->surfaces, link) {
+		if (surface->id == surface_id) return surface;
+	}
+	return NULL;
+}
+
 static cJSON *object_with_u32(const char *key, uint32_t value) {
 	cJSON *object = cJSON_CreateObject();
 	cJSON_AddNumberToObject(object, key, value);
@@ -358,18 +239,17 @@ static void frame_callback_destroy(struct wl_resource *resource) {
 	struct np_frame_callback *callback = wl_resource_get_user_data(resource);
 	if (!callback) return;
 	if (!wl_list_empty(&callback->link)) wl_list_remove(&callback->link);
-	if (callback->timer) wl_event_source_remove(callback->timer);
 	free(callback);
 }
 
-static int frame_callback_fire(void *data) {
-	struct np_frame_callback *callback = data;
-	struct wl_event_source *timer = callback->timer;
-	callback->timer = NULL;
-	if (timer) wl_event_source_remove(timer);
+static void frame_callback_fire(struct np_frame_callback *callback) {
+	if (!callback) return;
+	if (!wl_list_empty(&callback->link)) {
+		wl_list_remove(&callback->link);
+		wl_list_init(&callback->link);
+	}
 	wl_callback_send_done(callback->resource, now_ms());
 	wl_resource_destroy(callback->resource);
-	return 0;
 }
 
 static void surface_frame(struct wl_client *client, struct wl_resource *resource, uint32_t id) {
@@ -391,21 +271,59 @@ static void surface_frame(struct wl_client *client, struct wl_resource *resource
 	wl_list_insert(surface->pending_frame_callbacks.prev, &callback->link);
 }
 
-static void schedule_frame_callbacks(struct np_surface *surface) {
+static uint32_t next_presentation_id(struct np_server *server) {
+	uint32_t id = ++server->next_presentation_id;
+	if (!id) id = ++server->next_presentation_id;
+	return id;
+}
+
+/// Associate only the callbacks still in pending surface state with this
+/// commit. Older callbacks retain the presentation which already owns them.
+static bool bind_frame_callbacks(struct np_surface *surface, uint32_t presentation_id) {
+	bool bound = false;
+	struct np_frame_callback *callback;
+	wl_list_for_each(callback, &surface->pending_frame_callbacks, link) {
+		if (callback->presentation_id) continue;
+		callback->presentation_id = presentation_id;
+		bound = true;
+	}
+	return bound;
+}
+
+static void rebind_frame_callbacks(struct np_surface *surface,
+	                               uint32_t from, uint32_t to) {
+	if (!from || !to || from == to) return;
+	struct np_frame_callback *callback;
+	wl_list_for_each(callback, &surface->pending_frame_callbacks, link) {
+		if (callback->presentation_id == from)
+			callback->presentation_id = to;
+	}
+}
+
+static void complete_presentation(struct np_surface *surface, uint32_t presentation_id) {
 	struct np_frame_callback *callback, *tmp;
 	wl_list_for_each_safe(callback, tmp, &surface->pending_frame_callbacks, link) {
-		wl_list_remove(&callback->link);
-		wl_list_init(&callback->link);
-		callback->timer = wl_event_loop_add_timer(
-			wl_display_get_event_loop(surface->server->display), frame_callback_fire, callback);
-		if (!callback->timer) {
-			wl_resource_destroy(callback->resource);
-			continue;
-		}
-		// Fallback until host presentation feedback is carried on the control
-		// channel. Crucially this starts after commit, never at frame request time.
-		wl_event_source_timer_update(callback->timer, 16);
+		if (callback->presentation_id == presentation_id)
+			frame_callback_fire(callback);
 	}
+}
+
+static void release_presentation(struct np_server *server,
+	                             struct np_surface *owner,
+	                             uint32_t presentation_id)
+{
+	struct np_surface *root = np_scene_root(owner);
+	np_scene_presented(root ? root : owner, presentation_id);
+	struct np_surface *surface;
+	wl_list_for_each(surface, &server->surfaces, link) {
+		for (int i = 0; i < 2; i++) {
+			if (surface->blob_presentation_id[i] == presentation_id)
+				surface->blob_presentation_id[i] = 0;
+		}
+		apply_unblocked_updates(surface);
+	}
+	flush_pending_frames(server);
+	wl_display_flush_clients(server->display);
 }
 
 static void surface_set_opaque_region(struct wl_client *client, struct wl_resource *resource,
@@ -420,6 +338,9 @@ static void surface_set_buffer_scale(struct wl_client *client, struct wl_resourc
                                      int32_t scale) {
 	struct np_surface *surface = wl_resource_get_user_data(resource);
 	surface->pending_scale = scale > 0 ? scale : 1;
+	if (trace_enabled())
+		fprintf(stderr, "[configure] surface=%u pending buffer scale=%d\n",
+		        surface->id, surface->pending_scale);
 }
 
 /// Damage already in buffer pixels. This bounds the one copy: a client that
@@ -449,7 +370,7 @@ static void encoder_emit(void *user, const uint8_t *data, size_t size, uint64_t 
 }
 
 static void queue_encoded_committed(struct np_surface *surface, int32_t width, int32_t height,
-                                    const char *format_name) {
+                                    const char *format_name, uint32_t presentation_id) {
 	uint16_t epoch = surface->encoder ? np_encoder_epoch(surface->encoder) : surface->last_epoch;
 	surface->last_epoch = epoch;
 	cJSON *frame = cJSON_CreateObject();
@@ -461,6 +382,7 @@ static void queue_encoded_committed(struct np_surface *surface, int32_t width, i
 	cJSON_AddStringToObject(frame, "source", "encoded");
 	cJSON_AddStringToObject(frame, "codec", "h264");
 	cJSON_AddNumberToObject(frame, "bitstreamEpoch", epoch);
+	cJSON_AddNumberToObject(frame, "presentationID", presentation_id);
 	cJSON_AddNumberToObject(frame, "scale", surface->scale);
 	if (surface->geometry_set) {
 		cJSON *geometry = cJSON_CreateObject();
@@ -470,6 +392,7 @@ static void queue_encoded_committed(struct np_surface *surface, int32_t width, i
 		cJSON_AddNumberToObject(geometry, "height", surface->geometry_height);
 		cJSON_AddItemToObject(frame, "windowGeometry", geometry);
 	}
+	frame_add_viewport(surface, frame);
 	cJSON_AddItemToObject(frame, "damage", cJSON_CreateArray());
 
 	surface->last_format = format_name;
@@ -485,10 +408,12 @@ static void queue_encoded_committed(struct np_surface *surface, int32_t width, i
 	cJSON_AddItemToObject(body, "frame", frame);
 	if (surface->pending_frame) cJSON_Delete(surface->pending_frame);
 	surface->pending_frame = body;
+	surface->pending_presentation_id = presentation_id;
 }
 
 /// Remote path: encode wl_shm pixels to H.264 and ship NPEN on the media port.
-static void publish_frame_remote(struct np_surface *surface, struct wl_shm_buffer *shm) {
+static void publish_frame_remote(struct np_surface *surface, struct wl_shm_buffer *shm,
+                                 uint32_t presentation_id) {
 	wl_shm_buffer_begin_access(shm);
 	const unsigned char *source = wl_shm_buffer_get_data(shm);
 	int32_t width = wl_shm_buffer_get_width(shm);
@@ -523,18 +448,128 @@ static void publish_frame_remote(struct np_surface *surface, struct wl_shm_buffe
 	}
 	wl_shm_buffer_end_access(shm);
 	box_clear(&surface->pending);
-	queue_encoded_committed(surface, width, height, format_name);
+	queue_encoded_committed(surface, width, height, format_name, presentation_id);
 }
 
 #endif
 
-/// The one copy. Pixels leave the client's pool and land in host memory.
-static void publish_frame(struct np_surface *surface, struct wl_shm_buffer *shm) {
-#ifdef NP_REMOTE
-	publish_frame_remote(surface, shm);
-#else
-	struct np_server *server = surface->server;
+/// Allocate the two presentation images owned by this Wayland surface. Client
+/// swapchain images are inputs only; their count never changes this ring size.
+static uint32_t grow_output_extent(uint32_t current, uint32_t required,
+	                               uint32_t quantum) {
+	uint64_t target = required;
+	if (current) {
+		uint64_t grown = (uint64_t)current + current / 2u;
+		if (grown > target) target = grown;
+	}
+	target = (target + quantum - 1u) / quantum * quantum;
+	return target > UINT32_MAX ? 0 : (uint32_t)target;
+}
 
+static bool ensure_output_ring(struct np_surface *surface,
+                               uint32_t width, uint32_t height,
+                               uint32_t minimum_stride, bool *reallocated) {
+#ifdef NP_REMOTE
+	(void)surface; (void)width; (void)height; (void)minimum_stride;
+	if (reallocated) *reallocated = false;
+	return true;
+#else
+	if (reallocated) *reallocated = false;
+	if (surface->blobs[0].data && width <= surface->alloc_width &&
+	    height <= surface->alloc_height &&
+	    minimum_stride <= surface->blob_stride)
+		return true;
+
+	uint32_t row_width = minimum_stride / 4u + (minimum_stride % 4u != 0);
+	if (row_width > width) width = row_width;
+	uint32_t capacity_width = grow_output_extent(
+		surface->alloc_width, width, 128);
+	uint32_t capacity_height = grow_output_extent(
+		surface->alloc_height, height, 64);
+	if (!capacity_width || !capacity_height || capacity_width > UINT32_MAX / 4u)
+		return false;
+	uint32_t capacity_stride = capacity_width * 4u;
+
+	for (int i = 0; i < 2; i++)
+		np_blob_destroy(surface->server->drm_fd, &surface->blobs[i]);
+	surface->blob_presentation_id[0] = 0;
+	surface->blob_presentation_id[1] = 0;
+	surface->pending_blob_index = -1;
+
+	size_t requested_size = (size_t)capacity_stride * (size_t)capacity_height;
+	for (int i = 0; i < 2; i++) {
+		if (!np_blob_create(surface->server->drm_fd, requested_size,
+		                    capacity_width, capacity_height, capacity_stride,
+		                    &surface->blobs[i])) {
+			for (int j = 0; j < 2; j++)
+				np_blob_destroy(surface->server->drm_fd, &surface->blobs[j]);
+			surface->blob_stride = 0;
+			surface->alloc_width = 0;
+			surface->alloc_height = 0;
+			return false;
+		}
+	}
+	if (surface->blobs[0].vk.stride != surface->blobs[1].vk.stride) {
+		fprintf(stderr, "[wayland] presentation images have different row pitches\n");
+		for (int i = 0; i < 2; i++)
+			np_blob_destroy(surface->server->drm_fd, &surface->blobs[i]);
+		return false;
+	}
+
+	surface->blob_stride = surface->blobs[0].vk.stride;
+	surface->alloc_width = capacity_width;
+	surface->alloc_height = capacity_height;
+	surface->back = 0;
+	box_clear(&surface->owed[0]);
+	box_clear(&surface->owed[1]);
+	if (reallocated) *reallocated = true;
+	return true;
+#endif
+}
+
+/// Pick the image not owned by WindowServer. A locally queued frame has not
+/// crossed the host channel yet, so replacing it may reuse that same image.
+static int output_ring_slot(struct np_surface *surface) {
+#ifdef NP_REMOTE
+	(void)surface;
+	return 0;
+#else
+	if (surface->pending_blob_index >= 0)
+		return surface->pending_blob_index;
+	if (!surface->blob_presentation_id[surface->back])
+		return surface->back;
+	int other = 1 - surface->back;
+	return surface->blob_presentation_id[other] ? -1 : other;
+#endif
+}
+
+static void reserve_output_slot(struct np_surface *surface, int slot,
+	                            uint32_t presentation_id) {
+#ifndef NP_REMOTE
+	if (surface->pending_blob_index >= 0 && surface->pending_blob_index != slot)
+		surface->blob_presentation_id[surface->pending_blob_index] = 0;
+	surface->blob_presentation_id[slot] = presentation_id;
+	surface->pending_blob_index = slot;
+	surface->back = 1 - slot;
+#else
+	(void)surface; (void)slot; (void)presentation_id;
+#endif
+}
+
+static void mark_snapshot_current(struct np_surface *surface, int slot)
+{
+	/* Role resolution happens after an unroled cursor/drag surface may have
+	 * committed, so ownership is converted from a host frame to a guest-only
+	 * snapshot in flush_pending_frames, not here. */
+	surface->current_blob_index = slot;
+}
+
+/// The one copy. Pixels leave the client's pool and land in host memory.
+static void publish_frame(struct np_surface *surface, struct wl_shm_buffer *shm,
+                          uint32_t presentation_id) {
+#ifdef NP_REMOTE
+	publish_frame_remote(surface, shm, presentation_id);
+#else
 	wl_shm_buffer_begin_access(shm);
 	const unsigned char *source = wl_shm_buffer_get_data(shm);
 	int32_t width = wl_shm_buffer_get_width(shm);
@@ -549,47 +584,37 @@ static void publish_frame(struct np_surface *surface, struct wl_shm_buffer *shm)
 	//
 	// The row is padded to the host's display alignment, without which
 	// CoreAnimation shows nothing at all.
-	size_t dst_stride = np_align_row((size_t)stride);
-	size_t needed = dst_stride * (size_t)height;
+	size_t minimum_stride = (size_t)stride;
 	bool reallocated = false;
 
-	if (surface->blobs[0].data == NULL || surface->blob_stride != (uint32_t)dst_stride ||
-	    surface->alloc_height != (uint32_t)height) {
-		for (int i = 0; i < 2; i++) np_blob_destroy(server->drm_fd, &surface->blobs[i]);
-		for (int i = 0; i < 2; i++) {
-			if (!np_blob_create(server->drm_fd, needed, (uint32_t)width, (uint32_t)height,
-			                    (uint32_t)dst_stride, &surface->blobs[i])) {
-				for (int j = 0; j < 2; j++) np_blob_destroy(server->drm_fd, &surface->blobs[j]);
-				surface->blob_stride = 0;
-				surface->alloc_width = 0;
-				surface->alloc_height = 0;
-				wl_shm_buffer_end_access(shm);
-				return;
-			}
-		}
-		surface->blob_stride = (uint32_t)dst_stride;
-		surface->alloc_width = (uint32_t)width;
-		surface->alloc_height = (uint32_t)height;
-		surface->back = 0;
-		// Both buffers are empty, so neither can be updated incrementally. This
-		// is also why a size change must reallocate: reusing a buffer across a
-		// resize leaves the newly exposed region holding the previous frame in
-		// one buffer and not the other, which alternates as a flicker.
-		reallocated = true;
+	if (!ensure_output_ring(surface, (uint32_t)width, (uint32_t)height,
+	                        (uint32_t)minimum_stride, &reallocated)) {
+		wl_shm_buffer_end_access(shm);
+		return;
 	}
 
 	// What this blob is missing: what changed now, plus what it missed while the
 	// other one was on screen.
 	struct np_box copy = surface->pending;
-	box_union(&copy, surface->owed[surface->back].x, surface->owed[surface->back].y,
-	          surface->owed[surface->back].width, surface->owed[surface->back].height);
+	int slot = output_ring_slot(surface);
+	if (slot < 0) {
+		wl_shm_buffer_end_access(shm);
+		return;
+	}
+	box_union(&copy, surface->owed[slot].x, surface->owed[slot].y,
+	          surface->owed[slot].width, surface->owed[slot].height);
 	if (reallocated || copy.width == 0 || copy.height == 0) {
 		copy.x = 0; copy.y = 0; copy.width = width; copy.height = height;
 	}
 	box_clip(&copy, width, height);
 
-	struct np_blob *blob = &surface->blobs[surface->back];
+	struct np_blob *blob = &surface->blobs[slot];
+	if (!np_gpu_prepare_host_write(&blob->vk)) {
+		wl_shm_buffer_end_access(shm);
+		return;
+	}
 	unsigned char *destination = blob->data;
+	size_t dst_stride = blob->vk.stride;
 	size_t span = (size_t)copy.width * 4;
 	size_t offset = (size_t)copy.x * 4;
 	for (int32_t row = copy.y; row < copy.y + copy.height; row++) {
@@ -598,17 +623,16 @@ static void publish_frame(struct np_surface *surface, struct wl_shm_buffer *shm)
 	}
 	wl_shm_buffer_end_access(shm);
 
-	box_union(&surface->owed[1 - surface->back], surface->pending.x, surface->pending.y,
+	box_union(&surface->owed[1 - slot], surface->pending.x, surface->pending.y,
 	          surface->pending.width, surface->pending.height);
 	if (reallocated) {
-		surface->owed[1 - surface->back].x = 0;
-		surface->owed[1 - surface->back].y = 0;
-		surface->owed[1 - surface->back].width = width;
-		surface->owed[1 - surface->back].height = height;
+		surface->owed[1 - slot].x = 0;
+		surface->owed[1 - slot].y = 0;
+		surface->owed[1 - slot].width = width;
+		surface->owed[1 - slot].height = height;
 	}
-	box_clear(&surface->owed[surface->back]);
+	box_clear(&surface->owed[slot]);
 	box_clear(&surface->pending);
-	surface->back = 1 - surface->back;
 
 	// ARGB8888 and XRGB8888 are both BGRA byte order on a little-endian guest,
 	// which is what CoreAnimation samples.
@@ -624,6 +648,7 @@ static void publish_frame(struct np_surface *surface, struct wl_shm_buffer *shm)
 	cJSON_AddStringToObject(frame, "format", format_name);
 	cJSON_AddStringToObject(frame, "source", "cpu");
 	cJSON_AddNumberToObject(frame, "scale", surface->scale);
+	cJSON_AddNumberToObject(frame, "presentationID", presentation_id);
 	if (surface->geometry_set) {
 		cJSON *geometry = cJSON_CreateObject();
 		cJSON_AddNumberToObject(geometry, "x", surface->geometry_x);
@@ -632,6 +657,7 @@ static void publish_frame(struct np_surface *surface, struct wl_shm_buffer *shm)
 		cJSON_AddNumberToObject(geometry, "height", surface->geometry_height);
 		cJSON_AddItemToObject(frame, "windowGeometry", geometry);
 	}
+	frame_add_viewport(surface, frame);
 	cJSON_AddItemToObject(frame, "damage", cJSON_CreateArray());
 
 	surface->last_format = format_name;   // a string literal; nothing to own
@@ -647,14 +673,23 @@ static void publish_frame(struct np_surface *surface, struct wl_shm_buffer *shm)
 	cJSON_AddItemToObject(body, "frame", frame);
 
 	// Supersedes whatever this surface was about to report.
-	if (surface->pending_frame) cJSON_Delete(surface->pending_frame);
+	if (surface->pending_frame) {
+		rebind_frame_callbacks(surface, surface->pending_presentation_id, presentation_id);
+		if (surface->fifo_barrier_presentation_id == surface->pending_presentation_id)
+			surface->fifo_barrier_presentation_id = presentation_id;
+		cJSON_Delete(surface->pending_frame);
+	}
+	reserve_output_slot(surface, slot, presentation_id);
+	mark_snapshot_current(surface, slot);
 	surface->pending_frame = body;
+	surface->pending_presentation_id = presentation_id;
 #endif
 }
 
-/// Venus / linux-dmabuf: the resource already is the host GPU image.
-/// Name it. Do not copy.
-static void publish_gpu_frame(struct np_surface *surface, struct np_gpu_buffer *gpu) {
+/// Legacy unroled-surface path (cursor/drag icon): copy the imported client
+/// image into a publishable compositor buffer. Toplevels use scene.c instead.
+static void publish_gpu_frame(struct np_surface *surface, struct np_gpu_buffer *gpu,
+                              uint32_t presentation_id) {
 #ifdef NP_REMOTE
 	(void)gpu;
 	// MVP remote path encodes wl_shm (cairo/GTK). Real dmabuf → VAAPI import
@@ -668,6 +703,19 @@ static void publish_gpu_frame(struct np_surface *surface, struct np_gpu_buffer *
 		fprintf(stderr, "[wayland] gpu attach surface=%u res=%u %dx%d\n",
 		        surface->id, gpu->resource_id, gpu->width, gpu->height);
 	}
+	if (!ensure_output_ring(surface, (uint32_t)gpu->width, (uint32_t)gpu->height,
+	                        (uint32_t)gpu->stride, NULL)) {
+		fprintf(stderr, "[wayland] could not allocate output ring surface=%u\n",
+		        surface->id);
+		return;
+	}
+	int slot = output_ring_slot(surface);
+	if (slot < 0) return;
+	struct np_blob *blob = &surface->blobs[slot];
+	if (!np_gpu_buffer_copy_to_output(gpu, &blob->vk))
+		return;
+	box_clear(&surface->pending);
+
 	const char *format_name = gpu->format == 0x34325241 /* AR24 */ ? "bgra8888"
 		: gpu->format == 0x34325258 /* XR24 */ ? "bgrx8888"
 		: gpu->format == 0x34324241 /* AB24 */ ? "rgba8888"
@@ -675,13 +723,14 @@ static void publish_gpu_frame(struct np_surface *surface, struct np_gpu_buffer *
 		: "rgba8888";
 
 	cJSON *frame = cJSON_CreateObject();
-	cJSON_AddNumberToObject(frame, "resourceID", gpu->resource_id);
+	cJSON_AddNumberToObject(frame, "resourceID", blob->resource_id);
 	cJSON_AddNumberToObject(frame, "width", gpu->width);
 	cJSON_AddNumberToObject(frame, "height", gpu->height);
-	cJSON_AddNumberToObject(frame, "bytesPerRow", gpu->stride);
+	cJSON_AddNumberToObject(frame, "bytesPerRow", blob->vk.stride);
 	cJSON_AddStringToObject(frame, "format", format_name);
 	cJSON_AddStringToObject(frame, "source", "gpu");
 	cJSON_AddNumberToObject(frame, "scale", surface->scale);
+	cJSON_AddNumberToObject(frame, "presentationID", presentation_id);
 	if (surface->geometry_set) {
 		cJSON *geometry = cJSON_CreateObject();
 		cJSON_AddNumberToObject(geometry, "x", surface->geometry_x);
@@ -690,85 +739,627 @@ static void publish_gpu_frame(struct np_surface *surface, struct np_gpu_buffer *
 		cJSON_AddNumberToObject(geometry, "height", surface->geometry_height);
 		cJSON_AddItemToObject(frame, "windowGeometry", geometry);
 	}
+	frame_add_viewport(surface, frame);
 	cJSON_AddItemToObject(frame, "damage", cJSON_CreateArray());
 
 	surface->last_format = format_name;
 	surface->last_width = gpu->width;
 	surface->last_height = gpu->height;
-	surface->last_resource_id = gpu->resource_id;
-	surface->last_stride = (uint32_t)gpu->stride;
+	surface->last_resource_id = blob->resource_id;
+	surface->last_stride = blob->vk.stride;
 	surface->last_source = "gpu";
 	surface->has_published = true;
 
 	cJSON *body = cJSON_CreateObject();
 	cJSON_AddNumberToObject(body, "surface", surface->id);
 	cJSON_AddItemToObject(body, "frame", frame);
-	if (surface->pending_frame) cJSON_Delete(surface->pending_frame);
+	if (surface->pending_frame) {
+		rebind_frame_callbacks(surface, surface->pending_presentation_id, presentation_id);
+		if (surface->fifo_barrier_presentation_id == surface->pending_presentation_id)
+			surface->fifo_barrier_presentation_id = presentation_id;
+		cJSON_Delete(surface->pending_frame);
+	}
+	reserve_output_slot(surface, slot, presentation_id);
+	mark_snapshot_current(surface, slot);
 	surface->pending_frame = body;
+	surface->pending_presentation_id = presentation_id;
 #endif
 }
 
-/// Sends one frame message per surface that has one, at most once per loop.
+static cJSON *scene_committed_body(struct np_surface *root,
+	                               const struct np_scene_frame *scene,
+	                               uint32_t presentation_id)
+{
+	cJSON *frame = cJSON_CreateObject();
+	cJSON_AddNumberToObject(frame, "resourceID", scene->resource_id);
+	cJSON_AddNumberToObject(frame, "width", scene->width);
+	cJSON_AddNumberToObject(frame, "height", scene->height);
+	cJSON_AddNumberToObject(frame, "bytesPerRow", scene->stride);
+	cJSON_AddStringToObject(frame, "format", "bgra8888");
+	/* The scene output is always an ordinary Venus/MTLHeap image, even when all
+	 * inputs were wl_shm. `source` describes the host access path, not the
+	 * original client renderer. */
+	cJSON_AddStringToObject(frame, "source", "gpu");
+	cJSON_AddNumberToObject(frame, "scale", scene->scale);
+	cJSON_AddNumberToObject(frame, "presentationID", presentation_id);
+	cJSON *geometry = cJSON_CreateObject();
+	cJSON_AddNumberToObject(geometry, "x", scene->geometry_x);
+	cJSON_AddNumberToObject(geometry, "y", scene->geometry_y);
+	cJSON_AddNumberToObject(geometry, "width", scene->geometry_width);
+	cJSON_AddNumberToObject(geometry, "height", scene->geometry_height);
+	cJSON_AddItemToObject(frame, "windowGeometry", geometry);
+	cJSON_AddItemToObject(frame, "damage", cJSON_CreateArray());
+
+	cJSON *body = cJSON_CreateObject();
+	cJSON_AddNumberToObject(body, "surface", root->id);
+	cJSON_AddItemToObject(body, "frame", frame);
+	return body;
+}
+
+/// Publish one atomic frame per xdg window. Surface snapshots, viewport state,
+/// window geometry and synchronized child commits are consumed together here;
+/// no subsurface image or transform crosses the host boundary.
 static void flush_pending_frames(struct np_server *server) {
 	struct np_surface *surface;
+#ifndef NP_REMOTE
 	wl_list_for_each(surface, &server->surfaces, link) {
 		if (!surface->pending_frame) continue;
+		struct np_surface *root = np_scene_root(surface);
+		if (!root) continue;
+
+		if (!root->scene_presentation_id)
+			root->scene_presentation_id = next_presentation_id(server);
+		uint32_t old = surface->pending_presentation_id;
+		uint32_t scene_id = root->scene_presentation_id;
+		rebind_frame_callbacks(surface, old, scene_id);
+		if (surface->fifo_barrier_presentation_id == old)
+			surface->fifo_barrier_presentation_id = scene_id;
+
+		/* The per-surface image is now a compositor snapshot. Only the root's
+		 * scene output is owned by WindowServer. */
+		for (int i = 0; i < 2; i++) {
+			if (surface->blob_presentation_id[i] == old)
+				surface->blob_presentation_id[i] = 0;
+		}
+		surface->pending_blob_index = -1;
+		cJSON_Delete(surface->pending_frame);
+		surface->pending_frame = NULL;
+		surface->pending_presentation_id = 0;
+		root->scene_dirty = true;
+	}
+
+	wl_list_for_each(surface, &server->surfaces, link) {
+		if (!surface->scene_dirty || np_scene_root(surface) != surface)
+			continue;
+		/* A root detach has no pixels to publish. Older queued state can
+		 * still reach this point (or the client can detach while a scene is
+		 * dirty), so retire the impossible scene rather than retrying it on
+		 * every future window's frame. */
+		if (!surface->has_published) {
+			uint32_t presentation_id = surface->scene_presentation_id;
+			surface->scene_dirty = false;
+			surface->scene_presentation_id = 0;
+			request_host_refresh(surface, presentation_id);
+			continue;
+		}
+		struct np_scene_frame scene;
+		if (!np_scene_compose(surface, surface->scene_presentation_id, &scene))
+			continue;
+		np_host_send(&server->host, "committed",
+		             scene_committed_body(surface, &scene,
+		                                  surface->scene_presentation_id));
+		np_perf_count(NP_PERF_COMMIT_SENT);
+		surface->scene_dirty = false;
+		surface->scene_presentation_id = 0;
+	}
+#endif
+
+	/* Unroled surfaces (cursor and drag icon) and the remote encoder retain the
+	 * ordinary one-surface frame path. */
+	wl_list_for_each(surface, &server->surfaces, link) {
+		if (!surface->pending_frame) continue;
+#ifndef NP_REMOTE
+		if (np_scene_root(surface)) continue;
+#endif
 		cJSON *body = surface->pending_frame;
 		surface->pending_frame = NULL;
+		surface->pending_presentation_id = 0;
+		surface->pending_blob_index = -1;
 		np_host_send(&server->host, "committed", body);
+	}
+	// Subsurface positions are guest scene state. Consume their dirty marker;
+	// the host deliberately has no per-child transform to update.
+	wl_list_for_each(surface, &server->surfaces, link) {
+		if (!surface->host_sub_position_dirty) continue;
+		surface->host_sub_position_dirty = false;
+	}
+}
+
+static bool output_ring_has_host_frame(struct np_surface *surface) {
+#ifdef NP_REMOTE
+	(void)surface;
+	return false;
+#else
+	for (int i = 0; i < 2; i++) {
+		if (surface->blob_presentation_id[i] && i != surface->pending_blob_index)
+			return true;
+	}
+	return false;
+#endif
+}
+
+/// Test whether applying this update can write a ring image without replacing
+/// one that CoreAnimation may still sample. This is protocol ownership only;
+/// IOSurface use-count APIs are deliberately not involved.
+static bool surface_update_can_apply(struct np_surface_update *update) {
+#ifdef NP_REMOTE
+	(void)update;
+	return true;
+#else
+	struct np_surface *surface = update->surface;
+	if (np_scene_root(surface))
+		return true;
+	if (!update->buffer_set || !update->buffer || !surface->blobs[0].data)
+		return true;
+
+	int32_t width = 0, height = 0, stride = 0;
+	struct wl_shm_buffer *shm = wl_shm_buffer_get(update->buffer);
+	if (shm) {
+		width = wl_shm_buffer_get_width(shm);
+		height = wl_shm_buffer_get_height(shm);
+		stride = wl_shm_buffer_get_stride(shm);
+	} else {
+		struct np_gpu_buffer *gpu = np_gpu_buffer_get(update->buffer);
+		if (!gpu) return true;
+		width = gpu->width;
+		height = gpu->height;
+		stride = gpu->stride;
+	}
+	if ((uint32_t)width > surface->alloc_width ||
+	    (uint32_t)height > surface->alloc_height ||
+	    (uint32_t)stride > surface->blob_stride)
+		return !output_ring_has_host_frame(surface);
+	return output_ring_slot(surface) >= 0;
+#endif
+}
+
+static bool has_unbound_frame_callbacks(struct np_surface *surface) {
+	struct np_frame_callback *callback;
+	wl_list_for_each(callback, &surface->pending_frame_callbacks, link) {
+		if (!callback->presentation_id) return true;
+	}
+	return false;
+}
+
+static void update_buffer_destroyed(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct np_surface_update *update =
+		wl_container_of(listener, update, buffer_destroy);
+	update->buffer = NULL;
+	wl_list_remove(&listener->link);
+	wl_list_init(&listener->link);
+}
+
+static void cached_buffer_destroyed(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct np_surface *surface =
+		wl_container_of(listener, surface, cached_buffer_destroy);
+	surface->cached_buffer = NULL;
+	wl_list_remove(&listener->link);
+	wl_list_init(&listener->link);
+}
+
+static void clear_cached_buffer_listener(struct np_surface *surface) {
+	if (!wl_list_empty(&surface->cached_buffer_destroy.link))
+		wl_list_remove(&surface->cached_buffer_destroy.link);
+	wl_list_init(&surface->cached_buffer_destroy.link);
+}
+
+static void current_buffer_destroyed(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct np_surface *surface =
+		wl_container_of(listener, surface, current_buffer_destroy);
+	surface->current_buffer = NULL;
+	wl_list_remove(&listener->link);
+	wl_list_init(&listener->link);
+}
+
+static void set_current_buffer(struct np_surface *surface,
+	                           struct wl_resource *buffer) {
+	if (surface->current_buffer == buffer) return;
+	if (!wl_list_empty(&surface->current_buffer_destroy.link))
+		wl_list_remove(&surface->current_buffer_destroy.link);
+	wl_list_init(&surface->current_buffer_destroy.link);
+	if (surface->current_buffer)
+		wl_buffer_send_release(surface->current_buffer);
+	surface->current_buffer = buffer;
+	if (buffer) {
+		surface->current_buffer_destroy.notify = current_buffer_destroyed;
+		wl_resource_add_destroy_listener(buffer, &surface->current_buffer_destroy);
+	}
+}
+
+/* A scene update is a latest-value marker, not a host frame. flush_pending_frames
+ * consumes it after all synchronized child commits have become current and
+ * emits exactly one window-level scene texture for the root. */
+static void queue_scene_update(struct np_surface *surface,
+	                           uint32_t presentation_id) {
+	if (!presentation_id) return;
+	if (surface->pending_frame) {
+		rebind_frame_callbacks(surface, surface->pending_presentation_id,
+		                       presentation_id);
+		if (surface->fifo_barrier_presentation_id ==
+		    surface->pending_presentation_id)
+			surface->fifo_barrier_presentation_id = presentation_id;
+		cJSON_Delete(surface->pending_frame);
+	}
+	surface->pending_frame = cJSON_CreateObject();
+	surface->pending_presentation_id = presentation_id;
+	surface->pending_blob_index = -1;
+}
+
+static void surface_update_destroy(struct np_surface_update *update, bool release_buffer) {
+	if (!update) return;
+	if (!wl_list_empty(&update->link)) wl_list_remove(&update->link);
+	if (!wl_list_empty(&update->buffer_destroy.link))
+		wl_list_remove(&update->buffer_destroy.link);
+	if (release_buffer && update->buffer)
+		wl_buffer_send_release(update->buffer);
+	free(update);
+}
+
+static struct np_surface_update *snapshot_surface_update(struct np_surface *surface) {
+	bool callbacks = has_unbound_frame_callbacks(surface);
+	bool scale_changed = surface->pending_scale != surface->scale;
+	bool child_position_changed = parent_has_pending_subsurface_state(surface);
+	bool needs_refresh = surface->pending_buffer_set || callbacks ||
+	                     surface->pending_fifo_set_barrier ||
+	                     surface->pending_fifo_wait_barrier ||
+	                     surface->pending_viewport_changed ||
+	                     surface->pending_geometry_set || scale_changed ||
+	                     child_position_changed;
+	if (!needs_refresh && !surface->pending_geometry_set &&
+	    !scale_changed && !child_position_changed &&
+	    !surface->host_configure_acked)
+		return NULL;
+
+	struct np_surface_update *update = calloc(1, sizeof(*update));
+	if (!update) return NULL;
+	wl_list_init(&update->link);
+	wl_list_init(&update->buffer_destroy.link);
+	update->surface = surface;
+	update->buffer = surface->pending_buffer;
+	update->buffer_set = surface->pending_buffer_set;
+	update->scale = surface->pending_scale;
+	update->geometry_set = surface->pending_geometry_set;
+	update->geometry_x = surface->pending_geometry_x;
+	update->geometry_y = surface->pending_geometry_y;
+	update->geometry_width = surface->pending_geometry_width;
+	update->geometry_height = surface->pending_geometry_height;
+	update->viewport_changed = surface->pending_viewport_changed;
+	update->viewport = surface->pending_viewport;
+	update->damage = surface->pending;
+	update->set_fifo_barrier = surface->pending_fifo_set_barrier;
+	update->finishes_host_configure_serial = surface->host_configure_acked
+		? surface->host_configure_acked_serial : 0;
+
+	if (update->buffer) {
+		update->buffer_destroy.notify = update_buffer_destroyed;
+		wl_resource_add_destroy_listener(update->buffer, &update->buffer_destroy);
+	}
+
+	surface->pending_buffer = NULL;
+	surface->pending_buffer_set = false;
+	surface->pending_geometry_set = false;
+	surface->pending_viewport_changed = false;
+	box_clear(&surface->pending);
+
+	bool wait_fifo = surface->pending_fifo_wait_barrier;
+	surface->pending_fifo_set_barrier = false;
+	surface->pending_fifo_wait_barrier = false;
+	surface->host_configure_acked = false;
+
+	if (needs_refresh) {
+		update->presentation_id = next_presentation_id(surface->server);
+		bind_frame_callbacks(surface, update->presentation_id);
+	}
+
+	if ((!wl_list_empty(&surface->blocked_updates) ||
+	     (wait_fifo && surface->fifo_barrier_active) ||
+	     !surface_update_can_apply(update)) &&
+	    !(surface->subsurface && surface->sync)) {
+		wl_list_insert(surface->blocked_updates.prev, &update->link);
+		return NULL;
+	}
+	return update;
+}
+
+static void request_host_refresh(struct np_surface *surface, uint32_t presentation_id) {
+	if (!presentation_id) return;
+	struct np_surface *owner = np_scene_root(surface);
+	if (!owner) owner = surface;
+	cJSON *body = cJSON_CreateObject();
+	cJSON_AddNumberToObject(body, "surface", owner->id);
+	cJSON_AddNumberToObject(body, "presentationID", presentation_id);
+	np_host_send(&surface->server->host, "frameCallbackRequested", body);
+}
+
+static void frame_add_viewport(struct np_surface *surface, cJSON *frame) {
+	if (surface->viewport_state.source_set) {
+		cJSON *source = cJSON_CreateObject();
+		cJSON_AddNumberToObject(source, "x",
+		                        wl_fixed_to_double(surface->viewport_state.source_x));
+		cJSON_AddNumberToObject(source, "y",
+		                        wl_fixed_to_double(surface->viewport_state.source_y));
+		cJSON_AddNumberToObject(source, "width",
+		                        wl_fixed_to_double(surface->viewport_state.source_width));
+		cJSON_AddNumberToObject(source, "height",
+		                        wl_fixed_to_double(surface->viewport_state.source_height));
+		cJSON_AddItemToObject(frame, "viewportSource", source);
+	}
+	if (surface->viewport_state.destination_set) {
+		cJSON *destination = cJSON_CreateObject();
+		cJSON_AddNumberToObject(destination, "width",
+		                        surface->viewport_state.destination_width);
+		cJSON_AddNumberToObject(destination, "height",
+		                        surface->viewport_state.destination_height);
+		cJSON_AddItemToObject(frame, "viewportDestination", destination);
+	}
+}
+
+/// A viewport-only commit changes how the already attached buffer is sampled.
+/// Re-send that buffer's description instead of acknowledging only its frame
+/// callback; the host needs the new source/destination even though the pixels
+/// and resource identity did not change.
+static bool queue_last_published_frame(struct np_surface *surface,
+	                                  uint32_t presentation_id) {
+	if (!surface->has_published) return false;
+	if (np_scene_root(surface) && surface->current_buffer) {
+		queue_scene_update(surface, presentation_id);
+		return true;
+	}
+	if (!surface->last_resource_id) return false;
+	cJSON *frame = cJSON_CreateObject();
+	cJSON_AddNumberToObject(frame, "resourceID", surface->last_resource_id);
+	cJSON_AddNumberToObject(frame, "width", surface->last_width);
+	cJSON_AddNumberToObject(frame, "height", surface->last_height);
+	cJSON_AddNumberToObject(frame, "bytesPerRow", surface->last_stride);
+	cJSON_AddStringToObject(frame, "format", surface->last_format);
+	if (surface->last_source)
+		cJSON_AddStringToObject(frame, "source", surface->last_source);
+	cJSON_AddNumberToObject(frame, "scale", surface->scale);
+	cJSON_AddNumberToObject(frame, "presentationID", presentation_id);
+	if (surface->geometry_set) {
+		cJSON *geometry = cJSON_CreateObject();
+		cJSON_AddNumberToObject(geometry, "x", surface->geometry_x);
+		cJSON_AddNumberToObject(geometry, "y", surface->geometry_y);
+		cJSON_AddNumberToObject(geometry, "width", surface->geometry_width);
+		cJSON_AddNumberToObject(geometry, "height", surface->geometry_height);
+		cJSON_AddItemToObject(frame, "windowGeometry", geometry);
+	}
+	frame_add_viewport(surface, frame);
+	cJSON_AddItemToObject(frame, "damage", cJSON_CreateArray());
+
+	cJSON *body = cJSON_CreateObject();
+	cJSON_AddNumberToObject(body, "surface", surface->id);
+	cJSON_AddItemToObject(body, "frame", frame);
+	if (surface->pending_frame) {
+		rebind_frame_callbacks(surface, surface->pending_presentation_id,
+		                       presentation_id);
+		cJSON_Delete(surface->pending_frame);
+	}
+	surface->pending_frame = body;
+	surface->pending_presentation_id = presentation_id;
+	return true;
+}
+
+static bool parent_has_pending_subsurface_state(struct np_surface *parent) {
+	if (!wl_list_empty(&parent->pending_stack_ops)) return true;
+	struct np_surface *child;
+	wl_list_for_each(child, &parent->children, sibling_link) {
+		if (child->pending_sub_position_set) return true;
+	}
+	return false;
+}
+
+static void restack_subsurface(struct np_surface *child,
+	                          struct np_surface *sibling, bool above)
+{
+	struct np_surface *parent = child->parent;
+	if (!parent || !sibling) return;
+	wl_list_remove(&child->sibling_link);
+	if (sibling == parent) {
+		/* Just above/below the parent is the boundary between the two groups. */
+		struct wl_list *boundary = &parent->children;
+		struct np_surface *candidate;
+		wl_list_for_each(candidate, &parent->children, sibling_link) {
+			if (candidate->above_parent) {
+				boundary = &candidate->sibling_link;
+				break;
+			}
+		}
+		wl_list_insert(boundary->prev, &child->sibling_link);
+		child->above_parent = above;
+		return;
+	}
+	child->above_parent = sibling->above_parent;
+	if (above)
+		wl_list_insert(&sibling->sibling_link, &child->sibling_link);
+	else
+		wl_list_insert(sibling->sibling_link.prev, &child->sibling_link);
+}
+
+/// Position and z-order are double-buffered state of the parent. Applying
+/// either in the request handler races ahead of the parent's buffer commit.
+static void apply_pending_subsurface_state(struct np_surface *parent) {
+	struct np_surface *child;
+	wl_list_for_each(child, &parent->children, sibling_link) {
+		if (!child->pending_sub_position_set) continue;
+		child->sub_x = child->pending_sub_x;
+		child->sub_y = child->pending_sub_y;
+		child->pending_sub_position_set = false;
+		child->host_sub_position_dirty = true;
+	}
+	struct np_subsurface_stack_op *op, *tmp;
+	wl_list_for_each_safe(op, tmp, &parent->pending_stack_ops, link) {
+		restack_subsurface(op->child, op->sibling, op->above);
+		wl_list_remove(&op->link);
+		free(op);
+	}
+}
+
+static void apply_surface_update(struct np_surface_update *update) {
+	if (!update) return;
+	struct np_surface *surface = update->surface;
+	bool scale_changed = surface->scale != update->scale;
+	surface->scale = update->scale;
+	if (update->geometry_set) {
+		surface->geometry_set = true;
+		surface->geometry_x = update->geometry_x;
+		surface->geometry_y = update->geometry_y;
+		surface->geometry_width = update->geometry_width;
+		surface->geometry_height = update->geometry_height;
+	}
+	if (update->viewport_changed)
+		surface->viewport_state = update->viewport;
+	apply_pending_subsurface_state(surface);
+	surface->pending = update->damage;
+
+	if (trace_enabled()) {
+		fprintf(stderr, "[wayland] apply commit surface=%u buffer=%s present=%u%s\n",
+		        surface->id, update->buffer_set ? (update->buffer ? "set" : "gone") : "unchanged",
+		        update->presentation_id, update->set_fifo_barrier ? " fifo" : "");
+	}
+
+	bool cached_sync_commit = false;
+	if (update->buffer_set) {
+		// A synchronised subsurface's commit takes effect with its parent. FIFO
+		// wait constraints are explicitly ignored for this mode.
+		if (surface->subsurface && surface->sync) {
+			if (surface->has_cached_buffer) {
+				if (surface->cached_buffer)
+					wl_buffer_send_release(surface->cached_buffer);
+				clear_cached_buffer_listener(surface);
+				rebind_frame_callbacks(surface, surface->cached_presentation_id,
+				                       update->presentation_id);
+			}
+			surface->cached_buffer = update->buffer;
+			surface->has_cached_buffer = true;
+			surface->cached_presentation_id = update->presentation_id;
+			surface->cached_set_fifo_barrier = update->set_fifo_barrier;
+			if (surface->cached_buffer) {
+				surface->cached_buffer_destroy.notify = cached_buffer_destroyed;
+				wl_resource_add_destroy_listener(surface->cached_buffer,
+				                                 &surface->cached_buffer_destroy);
+			}
+			update->buffer = NULL;
+			cached_sync_commit = true;
+		} else if (np_scene_root(surface)) {
+			publish_surface_buffer(surface, update->buffer, update->presentation_id);
+		} else if (update->buffer) {
+			publish_surface_buffer(surface, update->buffer, update->presentation_id);
+		} else if (update->presentation_id) {
+			request_host_refresh(surface, update->presentation_id);
+		}
+	} else if (update->presentation_id) {
+		if (!((update->viewport_changed || update->geometry_set || scale_changed) &&
+		      queue_last_published_frame(surface, update->presentation_id)))
+			request_host_refresh(surface, update->presentation_id);
+	}
+
+	if (update->set_fifo_barrier && !cached_sync_commit) {
+		surface->fifo_barrier_active = true;
+		surface->fifo_barrier_presentation_id = update->presentation_id;
+	}
+	if (update->finishes_host_configure_serial)
+		finish_host_toplevel_configure(
+			surface, update->finishes_host_configure_serial);
+	flush_sync_children(surface);
+	surface_update_destroy(update, false);
+}
+
+static void apply_unblocked_updates(struct np_surface *surface) {
+	while (!surface->fifo_barrier_active &&
+	       !wl_list_empty(&surface->blocked_updates)) {
+		struct np_surface_update *update =
+			wl_container_of(surface->blocked_updates.next, update, link);
+		if (!surface_update_can_apply(update)) break;
+		wl_list_remove(&update->link);
+		wl_list_init(&update->link);
+		apply_surface_update(update);
 	}
 }
 
 static void surface_commit(struct wl_client *client, struct wl_resource *resource) {
+	(void)client;
 	struct np_surface *surface = wl_resource_get_user_data(resource);
-	surface->scale = surface->pending_scale;
-	if (surface->pending_geometry_set) {
-		surface->geometry_set = true;
-		surface->geometry_x = surface->pending_geometry_x;
-		surface->geometry_y = surface->pending_geometry_y;
-		surface->geometry_width = surface->pending_geometry_width;
-		surface->geometry_height = surface->pending_geometry_height;
-		surface->pending_geometry_set = false;
-	}
-	schedule_frame_callbacks(surface);
-
-	if (!surface->pending_buffer_set) {
-		if (trace_enabled()) {
-			fprintf(stderr, "[wayland] commit surface=%u (no buffer)\n", surface->id);
-		}
-		return;
-	}
-	struct wl_resource *buffer = surface->pending_buffer;
-	surface->pending_buffer = NULL;
-	surface->pending_buffer_set = false;
-	if (trace_enabled()) {
-		fprintf(stderr, "[wayland] commit surface=%u buffer=%s\n",
-		        surface->id, buffer ? "set" : "null");
-	}
-
-	// A synchronised subsurface's commit does not take effect until its parent
-	// commits, so the buffer is held rather than copied.
-	if (surface->subsurface && surface->sync) {
-		if (surface->has_cached_buffer && surface->cached_buffer) {
-			wl_buffer_send_release(surface->cached_buffer);
-		}
-		surface->cached_buffer = buffer;
-		surface->has_cached_buffer = buffer != NULL;
-		flush_sync_children(surface);
-		return;
-	}
-
-	publish_surface_buffer(surface, buffer);
-	flush_sync_children(surface);
+	struct np_surface_update *update = snapshot_surface_update(surface);
+	if (update) apply_surface_update(update);
 }
 
-static void publish_surface_buffer(struct np_surface *surface, struct wl_resource *buffer) {
-	if (!buffer) return;  // client detached its buffer
+static void publish_surface_buffer(struct np_surface *surface, struct wl_resource *buffer,
+                                   uint32_t presentation_id) {
+	struct np_surface *root = np_scene_root(surface);
+	if (trace_enabled())
+		fprintf(stderr,
+		        "[wayland] publish surface=%u root=%u top=%d popup=%d sub=%d buffer=%s\n",
+		        surface->id, root ? root->id : 0, surface->toplevel != NULL,
+		        surface->popup != NULL, surface->subsurface != NULL,
+		        buffer ? "set" : "gone");
+	if (root) {
+		set_current_buffer(surface, buffer);
+		if (!buffer) {
+			surface->has_published = false;
+			/* A detached child changes its containing window, so the root scene
+			 * must be recomposed without that child. A detached root has no scene
+			 * to compose. Queueing one left scene_dirty set forever because
+			 * np_scene_compose correctly rejects a root with no published buffer;
+			 * every unrelated presentation then retried the impossible frame. */
+			if (surface == root)
+				request_host_refresh(surface, presentation_id);
+			else
+				queue_scene_update(surface, presentation_id);
+			return;
+		}
 
-	// Attach is where this compositor binds the window to a resource.
-	// wl_shm → copy into a host IOSurface. A GPU buffer is already a
-	// Venus resource on the host; we only name it. A swapchain present
-	// is the next attach of the next image — nothing else to wire.
+		struct wl_shm_buffer *shm = wl_shm_buffer_get(buffer);
+		struct np_gpu_buffer *gpu = np_gpu_buffer_get(buffer);
+		if (shm) {
+			surface->last_width = wl_shm_buffer_get_width(shm);
+			surface->last_height = wl_shm_buffer_get_height(shm);
+			surface->last_stride = (uint32_t)wl_shm_buffer_get_stride(shm);
+			uint32_t format = wl_shm_buffer_get_format(shm);
+			surface->last_format = format == WL_SHM_FORMAT_ARGB8888 ? "bgra8888"
+				: format == WL_SHM_FORMAT_XRGB8888 ? "bgrx8888"
+				: "rgba8888";
+			surface->last_source = "cpu";
+		} else if (gpu) {
+			surface->last_width = gpu->width;
+			surface->last_height = gpu->height;
+			surface->last_stride = (uint32_t)gpu->stride;
+			surface->last_format = gpu->format == 0x34325241 ? "bgra8888"
+				: gpu->format == 0x34325258 ? "bgrx8888"
+				: gpu->format == 0x34324241 ? "rgba8888"
+				: "rgba8888";
+			surface->last_source = "gpu";
+		} else {
+			set_current_buffer(surface, NULL);
+			if (trace_enabled())
+				fprintf(stderr, "[wayland] scene surface=%u: unsupported buffer\n",
+				        surface->id);
+			return;
+		}
+		surface->has_published = true;
+		queue_scene_update(surface, presentation_id);
+		return;
+	}
+
+	if (!buffer) return;  // client detached its unroled buffer
+
+	// Attach is where this compositor binds the window to a source resource.
+	// wl_shm is copied by the CPU; a linux-dmabuf/Venus image is copied by guest
+	// Vulkan. Unroled surfaces retain the compatibility two-image buffer path;
+	// xdg windows are composed once by scene.c.
 	struct wl_shm_buffer *shm = wl_shm_buffer_get(buffer);
 	struct np_gpu_buffer *gpu = np_gpu_buffer_get(buffer);
 	// Unroled surfaces include cursors and drag icons. A drag icon is commonly
@@ -777,13 +1368,15 @@ static void publish_surface_buffer(struct np_surface *surface, struct wl_resourc
 	// image. Publish it and let the host retain the latest frame until a role is
 	// announced; cursor frames remain harmless cached orphans.
 	if (shm) {
-		publish_frame(surface, shm);
+		publish_frame(surface, shm, presentation_id);
 	} else if (gpu) {
-		publish_gpu_frame(surface, gpu);
+		publish_gpu_frame(surface, gpu, presentation_id);
 	} else if (trace_enabled()) {
 		fprintf(stderr, "[wayland] commit surface=%u: buffer is neither shm nor gpu\n",
 		        surface->id);
 	}
+	if (presentation_id && surface->pending_presentation_id != presentation_id)
+		request_host_refresh(surface, presentation_id);
 
 	// Released as soon as the copy is done: the client may reuse it, and the
 	// host is looking at our blob, not at this buffer.
@@ -804,9 +1397,140 @@ static const struct wl_surface_interface surface_implementation = {
 	.offset = surface_offset,
 };
 
+// ---------------------------------------------------------------------------
+// wp_fifo_manager_v1
+// ---------------------------------------------------------------------------
+
+static void fifo_resource_destroy(struct wl_resource *resource) {
+	struct np_fifo *fifo = wl_resource_get_user_data(resource);
+	if (!fifo) return;
+	if (fifo->surface && fifo->surface->fifo == fifo)
+		fifo->surface->fifo = NULL;
+	free(fifo);
+}
+
+static void fifo_destroy_request(struct wl_client *client,
+	                             struct wl_resource *resource) {
+	(void)client;
+	wl_resource_destroy(resource);
+}
+
+static struct np_surface *fifo_surface_or_error(struct wl_resource *resource) {
+	struct np_fifo *fifo = wl_resource_get_user_data(resource);
+	if (fifo && fifo->surface) return fifo->surface;
+	wl_resource_post_error(resource, WP_FIFO_V1_ERROR_SURFACE_DESTROYED,
+	                       "the associated wl_surface was destroyed");
+	return NULL;
+}
+
+static void fifo_set_barrier(struct wl_client *client,
+	                         struct wl_resource *resource) {
+	(void)client;
+	struct np_surface *surface = fifo_surface_or_error(resource);
+	if (surface) surface->pending_fifo_set_barrier = true;
+}
+
+static void fifo_wait_barrier(struct wl_client *client,
+	                          struct wl_resource *resource) {
+	(void)client;
+	struct np_surface *surface = fifo_surface_or_error(resource);
+	if (surface) surface->pending_fifo_wait_barrier = true;
+}
+
+static const struct wp_fifo_v1_interface fifo_implementation = {
+	.set_barrier = fifo_set_barrier,
+	.wait_barrier = fifo_wait_barrier,
+	.destroy = fifo_destroy_request,
+};
+
+static void fifo_manager_destroy(struct wl_client *client,
+	                             struct wl_resource *resource) {
+	(void)client;
+	wl_resource_destroy(resource);
+}
+
+static void fifo_manager_get_fifo(struct wl_client *client,
+	                              struct wl_resource *manager_resource,
+	                              uint32_t id,
+	                              struct wl_resource *surface_resource) {
+	struct np_surface *surface = wl_resource_get_user_data(surface_resource);
+	if (!surface) return;
+	if (surface->fifo) {
+		wl_resource_post_error(manager_resource,
+		                       WP_FIFO_MANAGER_V1_ERROR_ALREADY_EXISTS,
+		                       "a fifo object already exists for this surface");
+		return;
+	}
+	if (surface->has_cached_buffer) {
+		if (surface->cached_buffer) wl_buffer_send_release(surface->cached_buffer);
+		clear_cached_buffer_listener(surface);
+		surface->cached_buffer = NULL;
+		surface->has_cached_buffer = false;
+	}
+
+	struct np_fifo *fifo = calloc(1, sizeof(*fifo));
+	if (!fifo) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	fifo->surface = surface;
+	fifo->resource = wl_resource_create(client, &wp_fifo_v1_interface, 1, id);
+	if (!fifo->resource) {
+		free(fifo);
+		wl_client_post_no_memory(client);
+		return;
+	}
+	surface->fifo = fifo;
+	wl_resource_set_implementation(fifo->resource, &fifo_implementation,
+	                               fifo, fifo_resource_destroy);
+}
+
+static const struct wp_fifo_manager_v1_interface fifo_manager_implementation = {
+	.destroy = fifo_manager_destroy,
+	.get_fifo = fifo_manager_get_fifo,
+};
+
+static void fifo_manager_bind(struct wl_client *client, void *data,
+	                          uint32_t version, uint32_t id) {
+	(void)data;
+	struct wl_resource *resource = wl_resource_create(
+		client, &wp_fifo_manager_v1_interface, version > 1 ? 1 : version, id);
+	if (!resource) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	wl_resource_set_implementation(resource, &fifo_manager_implementation,
+	                               NULL, NULL);
+}
+
 static void surface_resource_destroy(struct wl_resource *resource) {
 	struct np_surface *surface = wl_resource_get_user_data(resource);
 	if (!surface) return;
+
+	/* A client disconnect destroys all of its protocol resources, but libwayland
+	 * does not promise that role objects are destroyed before wl_surface.  Every
+	 * role resource stores this np_surface as user data, so detach those pointers
+	 * before freeing it.  Their later destroy callbacks will then be harmless
+	 * instead of reading freed memory and corrupting the next client connection. */
+	if (surface->xdg_surface)
+		wl_resource_set_user_data(surface->xdg_surface, NULL);
+	if (surface->toplevel)
+		wl_resource_set_user_data(surface->toplevel, NULL);
+	if (surface->popup)
+		wl_resource_set_user_data(surface->popup, NULL);
+	if (surface->decoration)
+		wl_resource_set_user_data(surface->decoration, NULL);
+	if (surface->fractional_scale)
+		wl_resource_set_user_data(surface->fractional_scale, NULL);
+	if (surface->viewport)
+		wl_resource_set_user_data(surface->viewport, NULL);
+	if (surface->subsurface)
+		wl_resource_set_user_data(surface->subsurface, NULL);
+
+	if (surface->fifo) {
+		surface->fifo->surface = NULL;
+		surface->fifo = NULL;
+	}
 	if (surface->server->drag_icon == resource) {
 		cJSON *body = cJSON_CreateObject();
 		cJSON_AddNullToObject(body, "surface");
@@ -814,12 +1538,9 @@ static void surface_resource_destroy(struct wl_resource *resource) {
 		surface->server->drag_icon = NULL;
 	}
 
-	// Children outlive their parent's resource in principle, and a stale pointer
-	// here would later be compared against a reused allocation.
-	struct np_surface *child;
-	wl_list_for_each(child, &surface->server->surfaces, link) {
-		if (child->parent == surface) child->parent = NULL;
-	}
+	// Children may outlive their parent's resource. Remove both active stacking
+	// links and unapplied restack operations before any pointer can go stale.
+	detach_subsurface_tree_links(surface);
 	if (surface->toplevel) {
 		np_host_send(&surface->server->host, "toplevelDestroyed",
 		             object_with_u32("window", surface->window_id));
@@ -827,10 +1548,6 @@ static void surface_resource_destroy(struct wl_resource *resource) {
 	if (surface->popup) {
 		np_host_send(&surface->server->host, "popupDestroyed",
 		             object_with_u32("window", surface->window_id));
-	}
-	if (surface->subsurface) {
-		np_host_send(&surface->server->host, "subsurfaceDestroyed",
-		             object_with_u32("surface", surface->id));
 	}
 	np_host_send(&surface->server->host, "surfaceDestroyed",
 	             object_with_u32("surface", surface->id));
@@ -842,6 +1559,12 @@ static void surface_resource_destroy(struct wl_resource *resource) {
 	wl_list_for_each_safe(callback, callback_tmp, &surface->pending_frame_callbacks, link) {
 		wl_resource_destroy(callback->resource);
 	}
+	struct np_surface_update *update, *update_tmp;
+	wl_list_for_each_safe(update, update_tmp, &surface->blocked_updates, link) {
+		surface_update_destroy(update, true);
+	}
+	clear_cached_buffer_listener(surface);
+	set_current_buffer(surface, NULL);
 #ifdef NP_REMOTE
 	if (surface->encoder) {
 		np_encoder_destroy(surface->encoder);
@@ -852,6 +1575,7 @@ static void surface_resource_destroy(struct wl_resource *resource) {
 	free(surface->app_id);
 	surface->title = surface->app_id = NULL;
 #ifndef NP_REMOTE
+	np_scene_destroy(surface);
 	for (int i = 0; i < 2; i++) np_blob_destroy(surface->server->drm_fd, &surface->blobs[i]);
 #endif
 	wl_list_remove(&surface->link);
@@ -877,16 +1601,36 @@ struct np_data_source {
 };
 
 struct np_data_offer {
+	struct wl_list link;
 	struct np_server *server;
+	struct wl_resource *resource;
+	struct wl_resource *device;
 	struct wl_resource *source;
 	/// True when the bytes live on the macOS pasteboard, in which case `source`
 	/// is NULL and a receive has to make a round trip to the host.
 	bool from_host;
 	bool dnd;
+	bool active;
+	bool dropped;
+	bool finished;
+	char *accepted_mime;
 	uint32_t actions;
 	uint32_t preferred_action;
 	uint32_t chosen_action;
 };
+
+static void detach_offers_for_source(struct np_server *server,
+	                                  struct wl_resource *source,
+	                                  bool finished) {
+	if (!server || !source) return;
+	struct np_data_offer *offer;
+	wl_list_for_each(offer, &server->data_offers, link) {
+		if (offer->source != source) continue;
+		offer->source = NULL;
+		offer->active = false;
+		if (finished) offer->finished = true;
+	}
+}
 
 // Defined with the clipboard transport further down; the selection can change
 // from here, when a source is destroyed.
@@ -921,6 +1665,12 @@ static const struct wl_data_source_interface data_source_implementation = {
 
 static void data_source_resource_destroy(struct wl_resource *resource) {
 	struct np_data_source *source = wl_resource_get_user_data(resource);
+	if (g_server) {
+		/* Offers outlive their source resource in the protocol. Detach the weak
+		 * resource pointer before libwayland frees it so late destroy/finish
+		 * requests cannot address a reused wl_resource. */
+		detach_offers_for_source(g_server, resource, false);
+	}
 	if (g_server && g_server->selection_source == resource) {
 		g_server->selection_source = NULL;
 		announce_selection_to_host(g_server);
@@ -960,20 +1710,62 @@ static void data_offer_destroy_handler(struct wl_client *client, struct wl_resou
 	wl_resource_destroy(resource);
 }
 static void data_offer_resource_destroy(struct wl_resource *resource) {
-	free(wl_resource_get_user_data(resource));
+	struct np_data_offer *offer = wl_resource_get_user_data(resource);
+	if (!offer) return;
+	if (offer->dnd && offer->source && !offer->finished &&
+	    (offer->active || offer->dropped) &&
+	    offer->server->drag_source == offer->source) {
+		/* Destroying the current offer before finish is the destination's
+		 * cancellation path (notably for the ASK action). Never leave the source
+		 * waiting forever for dnd_finished. */
+		struct wl_resource *source = offer->source;
+		wl_data_source_send_cancelled(source);
+		detach_offers_for_source(offer->server, source, false);
+		offer->server->drag_source = NULL;
+		offer->server->drag_origin = NULL;
+		offer->server->drag_focus_window = 0;
+		offer->server->drag_dropped = false;
+		if (offer->server->drag_icon) {
+			cJSON *body = cJSON_CreateObject();
+			cJSON_AddNullToObject(body, "surface");
+			np_host_send(&offer->server->host, "dragIconChanged", body);
+			offer->server->drag_icon = NULL;
+		}
+	}
+	wl_list_remove(&offer->link);
+	free(offer->accepted_mime);
+	free(offer);
 }
+
+static bool nullable_string_equal(const char *a, const char *b) {
+	if (!a || !b) return a == b;
+	return strcmp(a, b) == 0;
+}
+
 static void data_offer_accept(struct wl_client *client, struct wl_resource *resource,
                               uint32_t serial, const char *mime_type) {
 	struct np_data_offer *offer = wl_resource_get_user_data(resource);
-	if (offer && offer->source) wl_data_source_send_target(offer->source, mime_type);
+	if (!offer || nullable_string_equal(offer->accepted_mime, mime_type)) return;
+	char *accepted = mime_type ? strdup(mime_type) : NULL;
+	if (mime_type && !accepted) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	free(offer->accepted_mime);
+	offer->accepted_mime = accepted;
+	if (offer->source) wl_data_source_send_target(offer->source, mime_type);
 }
 static void data_offer_finish(struct wl_client *client, struct wl_resource *resource) {
 	struct np_data_offer *offer = wl_resource_get_user_data(resource);
-	if (!offer || !offer->dnd || !offer->source) return;
-	if (wl_resource_get_version(offer->source) >= 3) {
-		wl_data_source_send_dnd_finished(offer->source);
+	if (!offer || !offer->dnd || !offer->source || !offer->dropped ||
+	    !offer->accepted_mime || !offer->chosen_action || offer->finished)
+		return;
+	struct wl_resource *source = offer->source;
+	if (wl_resource_get_version(source) >= 3) {
+		wl_data_source_send_dnd_finished(source);
 	}
-	if (offer->server->drag_source == offer->source) {
+	detach_offers_for_source(offer->server, source, true);
+	if (offer->server->drag_source == source) {
 		offer->server->drag_source = NULL;
 		offer->server->drag_origin = NULL;
 		offer->server->drag_icon = NULL;
@@ -984,7 +1776,7 @@ static void data_offer_finish(struct wl_client *client, struct wl_resource *reso
 static void data_offer_set_actions(struct wl_client *client, struct wl_resource *resource,
                                    uint32_t actions, uint32_t preferred) {
 	struct np_data_offer *offer = wl_resource_get_user_data(resource);
-	if (!offer || !offer->source) return;
+	if (!offer || !offer->dnd || !offer->source || offer->dropped) return;
 	struct np_data_source *source = wl_resource_get_user_data(offer->source);
 	if (!source) return;
 	offer->actions = actions;
@@ -997,6 +1789,11 @@ static void data_offer_set_actions(struct wl_client *client, struct wl_resource 
 		chosen = WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE;
 	if (!chosen && (available & WL_DATA_DEVICE_MANAGER_DND_ACTION_ASK))
 		chosen = WL_DATA_DEVICE_MANAGER_DND_ACTION_ASK;
+	/* GTK updates set_actions from every drag motion. Emitting the unchanged
+	 * result makes its action callback send set_actions again, creating an
+	 * unbounded client/server feedback loop. The protocol describes an action
+	 * change notification, so silence is required when negotiation is stable. */
+	if (chosen == offer->chosen_action) return;
 	offer->chosen_action = chosen;
 	wl_data_offer_send_action(resource, chosen);
 	if (wl_resource_get_version(offer->source) >= 3) {
@@ -1026,8 +1823,11 @@ static struct wl_resource *create_data_offer(struct np_server *server,
 		return NULL;
 	}
 	state->server = server;
+	state->resource = offer;
+	state->device = device;
 	state->source = source_resource;
 	state->dnd = dnd;
+	wl_list_insert(&server->data_offers, &state->link);
 	wl_resource_set_implementation(offer, &data_offer_implementation, state,
 	                               data_offer_resource_destroy);
 	return offer;
@@ -1342,19 +2142,10 @@ static void send_selection_to(struct np_server *server, struct wl_resource *devi
 	if (!server->selection_source && server->host_mime_count > 0) {
 		// The Mac owns the clipboard. The offer is real as far as the client is
 		// concerned; only the fetch is different.
-		struct wl_resource *offer = wl_resource_create(
-			wl_resource_get_client(device), &wl_data_offer_interface,
-			wl_resource_get_version(device), 0);
+		struct wl_resource *offer = create_data_offer(server, device, NULL, false);
 		if (!offer) return;
-		struct np_data_offer *state = calloc(1, sizeof(*state));
-		if (!state) {
-			wl_resource_destroy(offer);
-			return;
-		}
-		state->server = server;
+		struct np_data_offer *state = wl_resource_get_user_data(offer);
 		state->from_host = true;
-		wl_resource_set_implementation(offer, &data_offer_implementation, state,
-		                               data_offer_resource_destroy);
 		wl_data_device_send_data_offer(device, offer);
 		for (int i = 0; i < server->host_mime_count; i++) {
 			wl_data_offer_send_offer(offer, server->host_mime[i]);
@@ -1383,6 +2174,25 @@ static void drag_send_leave(struct np_server *server, uint32_t window_id) {
 	wl_list_for_each(device, &server->data_devices, link) {
 		if (wl_resource_get_client(device->resource) !=
 		    wl_resource_get_client(surface->resource)) continue;
+		struct np_data_offer *offer;
+		wl_list_for_each(offer, &server->data_offers, link) {
+			if (!offer->active || offer->device != device->resource ||
+			    offer->source != server->drag_source) continue;
+			offer->active = false;
+			if (offer->accepted_mime) {
+				free(offer->accepted_mime);
+				offer->accepted_mime = NULL;
+				wl_data_source_send_target(offer->source, NULL);
+			}
+			if (offer->chosen_action) {
+				offer->chosen_action = WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE;
+				wl_data_offer_send_action(offer->resource,
+				                          WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE);
+				if (wl_resource_get_version(offer->source) >= 3)
+					wl_data_source_send_action(offer->source,
+					                           WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE);
+			}
+		}
 		wl_data_device_send_leave(device->resource);
 	}
 }
@@ -1398,6 +2208,8 @@ static void drag_send_enter(struct np_server *server, struct np_surface *surface
 		struct wl_resource *offer = create_data_offer(
 			server, device->resource, server->drag_source, true);
 		if (!offer) continue;
+		struct np_data_offer *state = wl_resource_get_user_data(offer);
+		if (state) state->active = true;
 		announce_offer(device->resource, offer, server->drag_source, true);
 		wl_data_device_send_enter(device->resource, serial, surface->resource, x, y, offer);
 	}
@@ -1410,6 +2222,16 @@ static void drag_send_motion(struct np_server *server, struct np_surface *surfac
 	wl_list_for_each(device, &server->data_devices, link) {
 		if (wl_resource_get_client(device->resource) !=
 		    wl_resource_get_client(surface->resource)) continue;
+		bool active = false;
+		struct np_data_offer *offer;
+		wl_list_for_each(offer, &server->data_offers, link) {
+			if (offer->active && offer->device == device->resource &&
+			    offer->source == server->drag_source) {
+				active = true;
+				break;
+			}
+		}
+		if (!active) continue;
 		wl_data_device_send_motion(device->resource, time, x, y);
 	}
 }
@@ -1418,7 +2240,9 @@ static void drag_finish_on_button_release(struct np_server *server) {
 	if (!server->drag_source) return;
 	struct np_surface *surface = surface_by_window(server, server->drag_focus_window);
 	if (!surface) {
-		wl_data_source_send_cancelled(server->drag_source);
+		struct wl_resource *source = server->drag_source;
+		wl_data_source_send_cancelled(source);
+		detach_offers_for_source(server, source, false);
 		server->drag_source = NULL;
 		server->drag_origin = NULL;
 		if (server->drag_icon) {
@@ -1430,22 +2254,52 @@ static void drag_finish_on_button_release(struct np_server *server) {
 		server->drag_focus_window = 0;
 		return;
 	}
+	bool dropped = false;
 	struct np_input *device;
 	wl_list_for_each(device, &server->data_devices, link) {
 		if (wl_resource_get_client(device->resource) !=
 		    wl_resource_get_client(surface->resource)) continue;
+		struct np_data_offer *match = NULL;
+		struct np_data_offer *offer;
+		wl_list_for_each(offer, &server->data_offers, link) {
+			if (offer->active && offer->device == device->resource &&
+			    offer->source == server->drag_source) {
+				match = offer;
+				break;
+			}
+		}
+		if (!match) continue;
+		match->active = false;
+		bool accepted = wl_resource_get_version(match->resource) < 3 ||
+		                (match->accepted_mime && match->chosen_action !=
+		                 WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE);
+		if (!accepted) {
+			wl_data_device_send_leave(device->resource);
+			continue;
+		}
+		match->dropped = true;
 		wl_data_device_send_drop(device->resource);
+		dropped = true;
 	}
-	if (wl_resource_get_version(server->drag_source) >= 3) {
+	if (dropped && wl_resource_get_version(server->drag_source) >= 3) {
 		wl_data_source_send_dnd_drop_performed(server->drag_source);
 	}
-	server->drag_dropped = true;
+	server->drag_dropped = dropped;
+	if (!dropped) {
+		struct wl_resource *source = server->drag_source;
+		wl_data_source_send_cancelled(source);
+		detach_offers_for_source(server, source, false);
+		server->drag_source = NULL;
+		server->drag_origin = NULL;
+	}
 	if (server->drag_icon) {
 		cJSON *body = cJSON_CreateObject();
 		cJSON_AddNullToObject(body, "surface");
 		np_host_send(&server->host, "dragIconChanged", body);
 		server->drag_icon = NULL;
 	}
+	server->drag_focus_window = 0;
+	restore_pointer_focus_after_drag(server, surface);
 }
 
 static void data_device_start_drag(struct wl_client *client, struct wl_resource *resource,
@@ -1455,12 +2309,21 @@ static void data_device_start_drag(struct wl_client *client, struct wl_resource 
 	if (!entry || !source || !origin) return;
 	struct np_server *server = entry->server;
 	if (server->drag_source && server->drag_source != source) {
-		wl_data_source_send_cancelled(server->drag_source);
+		struct wl_resource *previous = server->drag_source;
+		wl_data_source_send_cancelled(previous);
+		detach_offers_for_source(server, previous, false);
 	}
 	server->drag_source = source;
 	server->drag_origin = origin;
 	server->drag_icon = icon;
 	server->drag_dropped = false;
+	/* A data-device drag replaces the default pointer grab. The ordinary
+	 * wl_pointer focus must leave before wl_data_device.enter takes ownership of
+	 * the same physical pointer. GDK relies on this ordering: its DnD enter
+	 * installs the drop focus without first clearing the normal pointer focus. */
+	struct np_surface *surface = surface_by_window(server, server->pointer_window);
+	if (!surface) surface = wl_resource_get_user_data(origin);
+	clear_pointer_focus_for_drag(server);
 	cJSON *icon_body = cJSON_CreateObject();
 	if (icon) {
 		struct np_surface *icon_surface = wl_resource_get_user_data(icon);
@@ -1470,8 +2333,6 @@ static void data_device_start_drag(struct wl_client *client, struct wl_resource 
 		cJSON_AddNullToObject(icon_body, "surface");
 	}
 	np_host_send(&server->host, "dragIconChanged", icon_body);
-	struct np_surface *surface = surface_by_window(server, server->pointer_window);
-	if (!surface) surface = wl_resource_get_user_data(origin);
 	drag_send_enter(server, surface, fixed_from(server->pointer_x), fixed_from(server->pointer_y));
 }
 
@@ -1576,10 +2437,22 @@ static void flush_sync_children(struct np_surface *parent) {
 	struct np_surface *child;
 	wl_list_for_each(child, &parent->server->surfaces, link) {
 		if (child->parent != parent || !child->sync || !child->has_cached_buffer) continue;
-		struct wl_resource *buffer = child->cached_buffer;
-		child->cached_buffer = NULL;
+			struct wl_resource *buffer = child->cached_buffer;
+		uint32_t presentation_id = child->cached_presentation_id;
+		bool set_barrier = child->cached_set_fifo_barrier;
+			child->cached_buffer = NULL;
+			clear_cached_buffer_listener(child);
 		child->has_cached_buffer = false;
-		publish_surface_buffer(child, buffer);
+		child->cached_presentation_id = 0;
+		child->cached_set_fifo_barrier = false;
+		if (buffer || np_scene_root(child))
+			publish_surface_buffer(child, buffer, presentation_id);
+		else if (presentation_id)
+			request_host_refresh(child, presentation_id);
+		if (set_barrier) {
+			child->fifo_barrier_active = true;
+			child->fifo_barrier_presentation_id = presentation_id;
+		}
 	}
 }
 
@@ -1590,22 +2463,53 @@ static void subsurface_destroy_handler(struct wl_client *client, struct wl_resou
 static void subsurface_set_position(struct wl_client *client, struct wl_resource *resource,
                                     int32_t x, int32_t y) {
 	struct np_surface *surface = wl_resource_get_user_data(resource);
-	surface->sub_x = x;
-	surface->sub_y = y;
-	cJSON *body = cJSON_CreateObject();
-	cJSON_AddNumberToObject(body, "surface", surface->id);
-	cJSON_AddNumberToObject(body, "x", x);
-	cJSON_AddNumberToObject(body, "y", y);
-	np_host_send(&surface->server->host, "subsurfaceMoved", body);
+	(void)client;
+	if (!surface) return;
+	surface->pending_sub_position_set = true;
+	surface->pending_sub_x = x;
+	surface->pending_sub_y = y;
+	if (trace_enabled())
+		fprintf(stderr, "[wayland] subsurface position surface=%u parent=%u %d,%d\n",
+		        surface->id, surface->parent ? surface->parent->id : 0, x, y);
+}
+
+static void queue_subsurface_restack(struct wl_resource *resource,
+	                                 struct wl_resource *sibling_resource,
+	                                 bool above)
+{
+	struct np_surface *surface = wl_resource_get_user_data(resource);
+	struct np_surface *sibling = wl_resource_get_user_data(sibling_resource);
+	if (!surface || !surface->parent || !sibling || sibling == surface ||
+	    (sibling != surface->parent && sibling->parent != surface->parent)) {
+		wl_resource_post_error(resource, WL_SUBSURFACE_ERROR_BAD_SURFACE,
+		                       "reference surface is not a sibling or parent");
+		return;
+	}
+	struct np_subsurface_stack_op *op = calloc(1, sizeof(*op));
+	if (!op) {
+		wl_client_post_no_memory(wl_resource_get_client(resource));
+		return;
+	}
+	op->child = surface;
+	op->sibling = sibling;
+	op->above = above;
+	/* Append: requests modify pending z-order in wire order. */
+	wl_list_insert(surface->parent->pending_stack_ops.prev, &op->link);
+	if (trace_enabled())
+		fprintf(stderr, "[wayland] subsurface place_%s surface=%u sibling=%u\n",
+		        above ? "above" : "below", surface->id, sibling->id);
 }
 
 static void subsurface_place_above(struct wl_client *client, struct wl_resource *resource,
                                    struct wl_resource *sibling) {
-	// Z-order among siblings is CoreAnimation's to keep; the layers are added in
-	// creation order and nothing so far reorders them.
+	(void)client;
+	queue_subsurface_restack(resource, sibling, true);
 }
 static void subsurface_place_below(struct wl_client *client, struct wl_resource *resource,
-                                   struct wl_resource *sibling) {}
+                                   struct wl_resource *sibling) {
+	(void)client;
+	queue_subsurface_restack(resource, sibling, false);
+}
 
 static void subsurface_set_sync(struct wl_client *client, struct wl_resource *resource) {
 	((struct np_surface *)wl_resource_get_user_data(resource))->sync = true;
@@ -1615,9 +2519,18 @@ static void subsurface_set_desync(struct wl_client *client, struct wl_resource *
 	surface->sync = false;
 	if (surface->has_cached_buffer) {
 		struct wl_resource *buffer = surface->cached_buffer;
+		uint32_t presentation_id = surface->cached_presentation_id;
+		bool set_barrier = surface->cached_set_fifo_barrier;
 		surface->cached_buffer = NULL;
+		clear_cached_buffer_listener(surface);
 		surface->has_cached_buffer = false;
-		publish_surface_buffer(surface, buffer);
+		surface->cached_presentation_id = 0;
+		surface->cached_set_fifo_barrier = false;
+		publish_surface_buffer(surface, buffer, presentation_id);
+		if (set_barrier) {
+			surface->fifo_barrier_active = true;
+			surface->fifo_barrier_presentation_id = presentation_id;
+		}
 	}
 }
 
@@ -1633,10 +2546,8 @@ static const struct wl_subsurface_interface subsurface_implementation = {
 static void subsurface_resource_destroy(struct wl_resource *resource) {
 	struct np_surface *surface = wl_resource_get_user_data(resource);
 	if (!surface) return;
-	np_host_send(&surface->server->host, "subsurfaceDestroyed",
-	             object_with_u32("surface", surface->id));
 	surface->subsurface = NULL;
-	surface->parent = NULL;
+	detach_from_parent(surface);
 }
 
 static void subcompositor_destroy_handler(struct wl_client *client, struct wl_resource *resource) {
@@ -1659,13 +2570,13 @@ static void subcompositor_get_subsurface(struct wl_client *client, struct wl_res
 	                               subsurface_resource_destroy);
 	surface->parent = parent;
 	surface->sync = true;  // the protocol's default
+	surface->above_parent = true;
+	/* A new subsurface is initially top-most among its siblings and parent. */
+	wl_list_insert(parent->children.prev, &surface->sibling_link);
+	if (trace_enabled())
+		fprintf(stderr, "[wayland] subsurface created surface=%u parent=%u\n",
+		        surface->id, parent->id);
 
-	cJSON *body = cJSON_CreateObject();
-	cJSON_AddNumberToObject(body, "surface", surface->id);
-	cJSON_AddNumberToObject(body, "parent", parent->id);
-	cJSON_AddNumberToObject(body, "x", surface->sub_x);
-	cJSON_AddNumberToObject(body, "y", surface->sub_y);
-	np_host_send(&surface->server->host, "subsurfaceCreated", body);
 }
 
 static const struct wl_subcompositor_interface subcompositor_implementation = {
@@ -1695,11 +2606,26 @@ static void compositor_create_surface(struct wl_client *client, struct wl_resour
 		wl_client_post_no_memory(client);
 		return;
 	}
+	/* Zero is a valid process fd. Empty presentation slots must carry the
+	 * explicit -1 sentinel so their first/repeated destroy cannot close stdin —
+	 * or the next Wayland client socket if accept() later reuses fd 0. */
+	for (size_t i = 0; i < sizeof(surface->blobs) / sizeof(surface->blobs[0]); i++)
+		surface->blobs[i].vk.resource_drm_fd = -1;
+	for (size_t i = 0; i < sizeof(surface->scene.images) / sizeof(surface->scene.images[0]); i++)
+		surface->scene.images[i].vk.resource_drm_fd = -1;
 	surface->server = server;
 	surface->id = server->next_id++;
 	surface->scale = 1;
 	surface->pending_scale = 1;
+	surface->pending_blob_index = -1;
+	surface->current_blob_index = -1;
+	wl_list_init(&surface->children);
+	wl_list_init(&surface->sibling_link);
+	wl_list_init(&surface->pending_stack_ops);
 	wl_list_init(&surface->pending_frame_callbacks);
+	wl_list_init(&surface->blocked_updates);
+	wl_list_init(&surface->cached_buffer_destroy.link);
+	wl_list_init(&surface->current_buffer_destroy.link);
 	surface->resource = wl_resource_create(
 		client, &wl_surface_interface, wl_resource_get_version(resource), id);
 	if (!surface->resource) {
@@ -1714,12 +2640,7 @@ static void compositor_create_surface(struct wl_client *client, struct wl_resour
 	// A surface learns integer buffer scale from the outputs it has entered.
 	// Advertising wl_output.scale without enter leaves GTK/Qt with no applicable
 	// output and therefore no well-defined surface scale.
-	struct np_output *output;
-	wl_list_for_each(output, &server->outputs, link) {
-		if (wl_resource_get_client(output->resource) == client) {
-			wl_surface_send_enter(surface->resource, output->resource);
-		}
-	}
+	np_scale_surface_enter_outputs(surface, client);
 	np_host_send(&server->host, "surfaceCreated", object_with_u32("surface", surface->id));
 }
 
@@ -1831,10 +2752,8 @@ static void toplevel_resize(struct wl_client *client, struct wl_resource *resour
 	np_host_send(&surface->server->host, "interactiveResizeRequested", body);
 }
 
-static void send_size_constraints(struct np_surface *surface, const char *key,
-                                  int32_t width, int32_t height) {
-	cJSON *body = cJSON_CreateObject();
-	cJSON_AddNumberToObject(body, "window", surface->window_id);
+static void add_size_constraint(cJSON *body, const char *key,
+                                int32_t width, int32_t height) {
 	if (width > 0 && height > 0) {
 		cJSON *size = cJSON_CreateObject();
 		cJSON_AddNumberToObject(size, "width", width);
@@ -1843,17 +2762,36 @@ static void send_size_constraints(struct np_surface *surface, const char *key,
 	} else {
 		cJSON_AddNullToObject(body, key);
 	}
+}
+
+static void send_size_constraints(struct np_surface *surface) {
+	cJSON *body = cJSON_CreateObject();
+	cJSON_AddNumberToObject(body, "window", surface->window_id);
+	/* Always publish a complete snapshot.  Optional associated values cannot
+	 * distinguish an omitted key from an explicit protocol reset after JSON
+	 * decoding, and a partial update was also lost when NSWindow did not exist
+	 * yet. */
+	add_size_constraint(body, "minimum", surface->minimum_width,
+	                    surface->minimum_height);
+	add_size_constraint(body, "maximum", surface->maximum_width,
+	                    surface->maximum_height);
 	np_host_send(&surface->server->host, "sizeConstraintsChanged", body);
 }
 
 static void toplevel_set_max_size(struct wl_client *client, struct wl_resource *resource,
                                   int32_t width, int32_t height) {
-	send_size_constraints(wl_resource_get_user_data(resource), "maximum", width, height);
+	struct np_surface *surface = wl_resource_get_user_data(resource);
+	surface->maximum_width = width;
+	surface->maximum_height = height;
+	send_size_constraints(surface);
 }
 
 static void toplevel_set_min_size(struct wl_client *client, struct wl_resource *resource,
                                   int32_t width, int32_t height) {
-	send_size_constraints(wl_resource_get_user_data(resource), "minimum", width, height);
+	struct np_surface *surface = wl_resource_get_user_data(resource);
+	surface->minimum_width = width;
+	surface->minimum_height = height;
+	send_size_constraints(surface);
 }
 
 static void toplevel_request_flag(struct np_surface *surface, const char *name, bool enabled) {
@@ -1907,6 +2845,101 @@ static void toplevel_resource_destroy(struct wl_resource *resource) {
 	surface->toplevel = NULL;
 }
 
+enum np_configure_state_bits {
+	NP_CONFIGURE_MAXIMIZED = 1u << 0,
+	NP_CONFIGURE_FULLSCREEN = 1u << 1,
+	NP_CONFIGURE_RESIZING = 1u << 2,
+	NP_CONFIGURE_ACTIVATED = 1u << 3,
+};
+
+static void append_toplevel_state(struct wl_array *states, uint32_t value) {
+	uint32_t *slot = wl_array_add(states, sizeof(*slot));
+	if (slot) *slot = value;
+}
+
+static void send_host_toplevel_configure(struct np_surface *surface,
+	                                     int32_t width, int32_t height,
+	                                     uint32_t state_bits) {
+	if (!surface || !surface->toplevel || !surface->xdg_surface) return;
+	struct wl_array states;
+	wl_array_init(&states);
+	if (state_bits & NP_CONFIGURE_MAXIMIZED)
+		append_toplevel_state(&states, XDG_TOPLEVEL_STATE_MAXIMIZED);
+	if (state_bits & NP_CONFIGURE_FULLSCREEN)
+		append_toplevel_state(&states, XDG_TOPLEVEL_STATE_FULLSCREEN);
+	if (state_bits & NP_CONFIGURE_RESIZING)
+		append_toplevel_state(&states, XDG_TOPLEVEL_STATE_RESIZING);
+	if (state_bits & NP_CONFIGURE_ACTIVATED)
+		append_toplevel_state(&states, XDG_TOPLEVEL_STATE_ACTIVATED);
+
+	// Host sizes arrive in AppKit points. A Wayland configure is also expressed
+	// in logical window-geometry coordinates; buffer_scale only controls how many
+	// pixels the client attaches and must not be applied to this size.
+	xdg_toplevel_send_configure(surface->toplevel, width, height, &states);
+	wl_array_release(&states);
+	uint32_t serial = ++surface->configure_serial;
+	if (!serial) serial = ++surface->configure_serial;
+	xdg_surface_send_configure(surface->xdg_surface, serial);
+	if (trace_enabled())
+		fprintf(stderr,
+		        "[configure] send surface=%u serial=%u size=%dx%d states=0x%x\n",
+		        surface->id, serial, width, height, state_bits);
+	surface->host_configure_in_flight = true;
+	surface->host_configure_serial = serial;
+}
+
+static void queue_host_toplevel_configure(struct np_surface *surface,
+	                                      int32_t width, int32_t height,
+	                                      uint32_t state_bits) {
+	/* Keep at most one xdg configure awaiting acknowledgement. Vulkan WSI often
+	 * rebuilds its whole swapchain for every acknowledged size; forwarding every
+	 * AppKit display tick can therefore make it allocate and destroy several
+	 * images faster than it can render any of them. This is latest-value
+	 * coalescing, not a frame gate: the queued size is sent as soon as the client
+	 * acknowledges the current configure, without waiting for a buffer commit. */
+	if (surface->host_configure_in_flight) {
+		surface->host_configure_pending = true;
+		surface->host_configure_pending_width = width;
+		surface->host_configure_pending_height = height;
+		surface->host_configure_pending_state_bits = state_bits;
+		return;
+	}
+	send_host_toplevel_configure(surface, width, height, state_bits);
+}
+
+static void send_pending_host_toplevel_configure(struct np_surface *surface) {
+	if (!surface || surface->host_configure_in_flight ||
+	    !surface->host_configure_pending)
+		return;
+	int32_t width = surface->host_configure_pending_width;
+	int32_t height = surface->host_configure_pending_height;
+	uint32_t state_bits = surface->host_configure_pending_state_bits;
+	surface->host_configure_pending = false;
+	send_host_toplevel_configure(surface, width, height, state_bits);
+}
+
+static void finish_host_toplevel_configure(struct np_surface *surface,
+	                                       uint32_t serial) {
+	if (!surface || !serial) return;
+	if (trace_enabled())
+		fprintf(stderr,
+		        "[configure] commit surface=%u acked=%u current=%u serial=%u pending=%d\n",
+		        surface->id, surface->host_configure_acked_serial,
+		        surface->host_configure_serial, serial,
+		        surface->host_configure_pending);
+	// A commit for an older acknowledged configure must not complete a newer
+	// configure emitted while that commit was queued or blocked on FIFO/output
+	// ring availability.
+	if (serial == surface->host_configure_serial) {
+		surface->host_configure_in_flight = false;
+		send_pending_host_toplevel_configure(surface);
+	}
+	if (surface->host_configure_acked_serial == serial) {
+		surface->host_configure_acked_serial = 0;
+		surface->host_configure_acked = false;
+	}
+}
+
 static void xdg_surface_get_toplevel(struct wl_client *client, struct wl_resource *resource,
                                      uint32_t id) {
 	struct np_surface *surface = wl_resource_get_user_data(resource);
@@ -1924,16 +2957,16 @@ static void xdg_surface_get_toplevel(struct wl_client *client, struct wl_resourc
 	cJSON_AddNumberToObject(body, "window", surface->window_id);
 	cJSON_AddNumberToObject(body, "surface", surface->id);
 	np_host_send(&surface->server->host, "toplevelCreated", body);
+	/* Decoration policy is compositor state.  Send the client-side default
+	 * before the first frame so AppKit never constructs a transient second
+	 * titlebar around a CSD window. */
+	np_decoration_use_client_default(surface);
 
 	// Give the client a concrete initial size. Sending 0x0 means "you choose",
 	// but the host also waits for the first frame before creating NSWindow; that
 	// leaves some clients trying to allocate a zero-sized Cairo shm surface.
 	// The client may still clamp or replace this suggestion before committing.
-	struct wl_array states;
-	wl_array_init(&states);
-	xdg_toplevel_send_configure(surface->toplevel, 800, 600, &states);
-	wl_array_release(&states);
-	xdg_surface_send_configure(surface->xdg_surface, ++surface->configure_serial);
+	send_host_toplevel_configure(surface, 800, 600, 0);
 }
 
 /// Where the client wants a popup, expressed relative to a rectangle on its
@@ -2144,13 +3177,40 @@ static void xdg_surface_set_window_geometry(struct wl_client *client, struct wl_
 	surface->pending_geometry_y = y;
 	surface->pending_geometry_width = width;
 	surface->pending_geometry_height = height;
+	if (trace_enabled())
+		fprintf(stderr, "[wayland] window geometry surface=%u %d,%d %dx%d\n",
+		        surface->id, x, y, width, height);
 }
 
 static void xdg_surface_ack_configure(struct wl_client *client, struct wl_resource *resource,
-                                      uint32_t serial) {}
+	                                  uint32_t serial) {
+	(void)client;
+	struct np_surface *surface = wl_resource_get_user_data(resource);
+	if (!surface || !surface->host_configure_in_flight || !serial ||
+	    serial > surface->host_configure_serial)
+		return;
+	// Acking a serial discards every older configure. Accept the newest ack seen
+	// so far, but never an impossible serial newer than the compositor emitted.
+	if (surface->host_configure_acked_serial &&
+	    serial < surface->host_configure_acked_serial)
+		return;
+	surface->host_configure_acked_serial = serial;
+	surface->host_configure_acked = true;
+	if (trace_enabled())
+		fprintf(stderr,
+		        "[configure] ack surface=%u serial=%u current=%u pending=%d\n",
+		        surface->id, serial, surface->host_configure_serial,
+		        surface->host_configure_pending);
+}
 
 static void xdg_surface_destroy_handler(struct wl_client *client, struct wl_resource *resource) {
 	wl_resource_destroy(resource);
+}
+
+static void xdg_surface_resource_destroy(struct wl_resource *resource) {
+	struct np_surface *surface = wl_resource_get_user_data(resource);
+	if (surface && surface->xdg_surface == resource)
+		surface->xdg_surface = NULL;
 }
 
 static const struct xdg_surface_interface xdg_surface_implementation = {
@@ -2171,7 +3231,7 @@ static void wm_base_get_xdg_surface(struct wl_client *client, struct wl_resource
 		return;
 	}
 	wl_resource_set_implementation(surface->xdg_surface, &xdg_surface_implementation,
-	                               surface, NULL);
+	                               surface, xdg_surface_resource_destroy);
 }
 
 static void wm_base_destroy_handler(struct wl_client *client, struct wl_resource *resource) {
@@ -2211,97 +3271,6 @@ static void wm_base_bind(struct wl_client *client, void *data, uint32_t version,
 		return;
 	}
 	wl_resource_set_implementation(resource, &wm_base_implementation, data, NULL);
-}
-
-// ---------------------------------------------------------------------------
-// xdg-decoration
-// ---------------------------------------------------------------------------
-
-static void decoration_destroy_handler(struct wl_client *client,
-                                       struct wl_resource *resource) {
-	wl_resource_destroy(resource);
-}
-
-static void decoration_configure_server_side(struct wl_resource *resource) {
-	struct np_surface *surface = wl_resource_get_user_data(resource);
-	if (surface && surface->toplevel) {
-		cJSON *body = cJSON_CreateObject();
-		cJSON_AddNumberToObject(body, "window", surface->window_id);
-		cJSON_AddBoolToObject(body, "serverSide", true);
-		surface->decoration_negotiated = true;
-		surface->decoration_server_side = true;
-		np_host_send(&surface->server->host, "decorationModeChanged", body);
-	}
-	zxdg_toplevel_decoration_v1_send_configure(
-		resource, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
-	// Do not send a second xdg_surface.configure here. vkcube (and Mesa
-	// WSI roundtrips on the same wl_display) would dispatch it re-entrantly
-	// and Alpine's cube has been observed to SIGSEGV in ack_configure.
-}
-
-static void decoration_set_mode(struct wl_client *client, struct wl_resource *resource,
-                                uint32_t mode) {
-	decoration_configure_server_side(resource);
-}
-
-static void decoration_unset_mode(struct wl_client *client, struct wl_resource *resource) {
-	decoration_configure_server_side(resource);
-}
-
-static const struct zxdg_toplevel_decoration_v1_interface decoration_implementation = {
-	.destroy = decoration_destroy_handler,
-	.set_mode = decoration_set_mode,
-	.unset_mode = decoration_unset_mode,
-};
-
-static void decoration_resource_destroy(struct wl_resource *resource) {
-	struct np_surface *surface = wl_resource_get_user_data(resource);
-	if (surface && surface->decoration == resource) surface->decoration = NULL;
-}
-
-static void decoration_manager_destroy_handler(struct wl_client *client,
-                                               struct wl_resource *resource) {
-	wl_resource_destroy(resource);
-}
-
-static void decoration_manager_get_toplevel_decoration(
-	struct wl_client *client, struct wl_resource *manager, uint32_t id,
-	struct wl_resource *toplevel_resource) {
-	struct np_surface *surface = wl_resource_get_user_data(toplevel_resource);
-	if (!surface || surface->decoration) {
-		wl_resource_post_error(manager,
-			ZXDG_TOPLEVEL_DECORATION_V1_ERROR_ALREADY_CONSTRUCTED,
-			"toplevel already has a decoration object");
-		return;
-	}
-	struct wl_resource *decoration = wl_resource_create(
-		client, &zxdg_toplevel_decoration_v1_interface,
-		wl_resource_get_version(manager), id);
-	if (!decoration) {
-		wl_client_post_no_memory(client);
-		return;
-	}
-	surface->decoration = decoration;
-	wl_resource_set_implementation(decoration, &decoration_implementation, surface,
-	                               decoration_resource_destroy);
-	decoration_configure_server_side(decoration);
-}
-
-static const struct zxdg_decoration_manager_v1_interface decoration_manager_implementation = {
-	.destroy = decoration_manager_destroy_handler,
-	.get_toplevel_decoration = decoration_manager_get_toplevel_decoration,
-};
-
-static void decoration_manager_bind(struct wl_client *client, void *data,
-                                    uint32_t version, uint32_t id) {
-	struct wl_resource *resource = wl_resource_create(
-		client, &zxdg_decoration_manager_v1_interface, (int)version, id);
-	if (!resource) {
-		wl_client_post_no_memory(client);
-		return;
-	}
-	wl_resource_set_implementation(
-		resource, &decoration_manager_implementation, data, NULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -2362,6 +3331,15 @@ static bool create_keymap(struct np_server *server) {
 static void input_resource_destroy(struct wl_resource *resource) {
 	struct np_input *input = wl_resource_get_user_data(resource);
 	if (!input) return;
+	/* np_input is shared by pointer, keyboard and data-device bindings. Only a
+	 * data device can be referenced by an offer; clear that non-owning pointer
+	 * before libwayland may recycle the wl_resource allocation. */
+	struct np_data_offer *offer;
+	wl_list_for_each(offer, &input->server->data_offers, link) {
+		if (offer->device != resource) continue;
+		offer->device = NULL;
+		offer->active = false;
+	}
 	wl_list_remove(&input->link);
 	free(input);
 }
@@ -2476,121 +3454,45 @@ static void pointer_frame(struct wl_resource *pointer) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// wp_fractional_scale_v1
-// ---------------------------------------------------------------------------
-
-/// The protocol counts in 120ths, so 120 is 1x and 240 is 2x.
-#define NP_SCALE_UNIT 120
-
-static void send_preferred_scale(struct np_surface *surface, int scale) {
-	if (!surface->fractional_scale || scale <= 0) return;
-	if (surface->reported_scale == scale) return;
-	surface->reported_scale = scale;
-	wp_fractional_scale_v1_send_preferred_scale(surface->fractional_scale,
-	                                            (uint32_t)(scale * NP_SCALE_UNIT));
-}
-
-static void fractional_scale_destroy_handler(struct wl_client *client,
-                                             struct wl_resource *resource) {
-	wl_resource_destroy(resource);
-}
-
-static const struct wp_fractional_scale_v1_interface fractional_scale_implementation = {
-	.destroy = fractional_scale_destroy_handler,
-};
-
-static void fractional_scale_resource_destroy(struct wl_resource *resource) {
-	struct np_surface *surface = wl_resource_get_user_data(resource);
-	if (surface) surface->fractional_scale = NULL;
-}
-
-static void fractional_manager_destroy_handler(struct wl_client *client,
-                                               struct wl_resource *resource) {
-	wl_resource_destroy(resource);
-}
-
-static void fractional_manager_get_scale(struct wl_client *client, struct wl_resource *resource,
-                                         uint32_t id, struct wl_resource *surface_resource) {
-	struct np_surface *surface = wl_resource_get_user_data(surface_resource);
-	struct wl_resource *scale = wl_resource_create(
-		client, &wp_fractional_scale_v1_interface, wl_resource_get_version(resource), id);
-	if (!scale) {
-		wl_client_post_no_memory(client);
-		return;
-	}
-	wl_resource_set_implementation(scale, &fractional_scale_implementation, surface,
-	                               fractional_scale_resource_destroy);
-	surface->fractional_scale = scale;
-	surface->reported_scale = 0;
-	send_preferred_scale(surface, surface->server->output_scale);
-}
-
-static const struct wp_fractional_scale_manager_v1_interface fractional_manager_implementation = {
-	.destroy = fractional_manager_destroy_handler,
-	.get_fractional_scale = fractional_manager_get_scale,
-};
-
-static void __attribute__((unused)) fractional_manager_bind(
-    struct wl_client *client, void *data, uint32_t version, uint32_t id) {
-	struct wl_resource *resource = wl_resource_create(
-		client, &wp_fractional_scale_manager_v1_interface, (int)version, id);
-	if (!resource) {
-		wl_client_post_no_memory(client);
-		return;
-	}
-	wl_resource_set_implementation(resource, &fractional_manager_implementation, data, NULL);
-}
-
-/// One output standing in for the macOS display the window is on. It never
-/// scans out; it exists so clients can learn the scale to render at.
-static void output_resource_destroy(struct wl_resource *resource) {
-	struct np_output *output = wl_resource_get_user_data(resource);
-	if (!output) return;
-	wl_list_remove(&output->link);
-	free(output);
-}
-
-static void output_send_state(struct np_server *server, struct wl_resource *resource) {
-	uint32_t version = (uint32_t)wl_resource_get_version(resource);
-	if (version >= WL_OUTPUT_SCALE_SINCE_VERSION) {
-		wl_output_send_scale(resource, server->output_scale);
-	}
-	if (version >= WL_OUTPUT_DONE_SINCE_VERSION) wl_output_send_done(resource);
-}
-
-static void output_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id) {
-	struct np_server *server = data;
-	struct wl_resource *resource =
-		wl_resource_create(client, &wl_output_interface, (int)version, id);
-	if (!resource) {
-		wl_client_post_no_memory(client);
-		return;
-	}
-	struct np_output *output = calloc(1, sizeof(*output));
-	if (output) {
-		output->resource = resource;
-		wl_list_insert(&server->outputs, &output->link);
-		wl_resource_set_implementation(resource, NULL, output, output_resource_destroy);
-	}
-	// A zero physical size is technically usable as "unknown", but it leaves
-	// DPI calculation up to client-toolkit fallbacks.  GTK/Pango on the minimal
-	// Alpine image turns that into pathological widget requisitions (millions of
-	// pixels high).  Describe the built-in display consistently with the mode:
-	// 3024x1964 at roughly 220 dpi.
-	wl_output_send_geometry(resource, 0, 0, 345, 224, WL_OUTPUT_SUBPIXEL_UNKNOWN,
-	                        "Apple", "NativePipe", WL_OUTPUT_TRANSFORM_NORMAL);
-	wl_output_send_mode(resource, WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED,
-	                    server->output_width, server->output_height, 60000);
-	output_send_state(server, resource);
-
-	// Also cover clients that created a surface before binding wl_output.
-	struct np_surface *surface;
-	wl_list_for_each(surface, &server->surfaces, link) {
-		if (wl_resource_get_client(surface->resource) == client) {
-			wl_surface_send_enter(surface->resource, resource);
+/// A data-device drag replaces the default pointer grab. Clear ordinary
+/// wl_pointer focus before sending wl_data_device.enter, matching the ordering
+/// used by full compositors. Without this leave, GDK carries widget hover state
+/// into the DnD grab and the first post-drag click merely repairs that state.
+static void clear_pointer_focus_for_drag(struct np_server *server) {
+	if (!server || !server->pointer_window) return;
+	struct np_surface *surface = surface_by_window(server, server->pointer_window);
+	if (surface) {
+		uint32_t serial = wl_display_next_serial(server->display);
+		struct np_input *entry;
+		wl_list_for_each(entry, &server->pointers, link) {
+			if (!same_client(entry->resource, surface->resource)) continue;
+			wl_pointer_send_leave(entry->resource, serial, surface->resource);
+			pointer_frame(entry->resource);
 		}
 	}
+	server->pointer_window = 0;
+}
+
+/// Ending the DnD grab and finishing its data transfer are separate moments.
+/// Re-establish ordinary pointer focus immediately at button release; waiting
+/// for wl_data_offer.finish makes the window ignore input while the target is
+/// still reading the dragged bytes.
+static void restore_pointer_focus_after_drag(struct np_server *server,
+	                                         struct np_surface *surface) {
+	if (!server || !surface) return;
+	uint32_t serial = wl_display_next_serial(server->display);
+	struct np_input *entry;
+
+	/* clear_pointer_focus_for_drag() already sent the leave at grab start. At
+	 * grab end the default pointer focus is empty, so only enter is valid here. */
+	wl_list_for_each(entry, &server->pointers, link) {
+		if (!same_client(entry->resource, surface->resource)) continue;
+		wl_pointer_send_enter(entry->resource, serial, surface->resource,
+		                      fixed_from(server->pointer_x),
+		                      fixed_from(server->pointer_y));
+		pointer_frame(entry->resource);
+	}
+	server->pointer_window = surface->window_id;
 }
 
 // ---------------------------------------------------------------------------
@@ -2953,7 +3855,7 @@ static void handle_pointer_position(struct np_server *server, uint32_t window_id
 	struct np_input *entry;
 	uint32_t serial = wl_display_next_serial(server->display);
 	uint32_t time = now_ms();
-	if (server->drag_source) {
+	if (server->drag_source && !server->drag_dropped) {
 		if (server->drag_focus_window != window_id) {
 			if (server->drag_focus_window) drag_send_leave(server, server->drag_focus_window);
 			drag_send_enter(server, surface, x, y);
@@ -3047,6 +3949,39 @@ static void handle_host_command(const char *name, cJSON *body, void *user_data) 
 		free(text);
 	}
 
+	if (strcmp(name, "framePresented") == 0) {
+		np_perf_count(NP_PERF_PRESENTED);
+		uint32_t surface_id = (uint32_t)json_int(body, "surface", 0);
+		uint32_t presentation_id = (uint32_t)json_int(body, "presentationID", 0);
+		struct np_surface *owner = surface_by_id(server, surface_id);
+		if (!owner || !presentation_id) return;
+
+		/* One window scene may contain commits and callbacks from several
+		 * synchronized surfaces. They all become visible at this one latch. */
+		struct np_surface *surface;
+		wl_list_for_each(surface, &server->surfaces, link) {
+			complete_presentation(surface, presentation_id);
+			if (surface->fifo_barrier_active &&
+			    surface->fifo_barrier_presentation_id == presentation_id) {
+				surface->fifo_barrier_active = false;
+				surface->fifo_barrier_presentation_id = 0;
+			}
+			apply_unblocked_updates(surface);
+		}
+		flush_pending_frames(server);
+		wl_display_flush_clients(server->display);
+		return;
+	}
+
+	if (strcmp(name, "frameReleased") == 0) {
+		uint32_t surface_id = (uint32_t)json_int(body, "surface", 0);
+		uint32_t presentation_id = (uint32_t)json_int(body, "presentationID", 0);
+		struct np_surface *owner = surface_by_id(server, surface_id);
+		if (owner && presentation_id)
+			release_presentation(server, owner, presentation_id);
+		return;
+	}
+
 	if (strcmp(name, "configure") == 0) {
 		uint32_t window_id = (uint32_t)json_int(body, "window", 0);
 		struct np_surface *surface = surface_by_window(server, window_id);
@@ -3056,27 +3991,21 @@ static void handle_host_command(const char *name, cJSON *body, void *user_data) 
 		int width = size ? json_int(size, "width", 0) : 0;
 		int height = size ? json_int(size, "height", 0) : 0;
 
-		// Geometry reaches the client in surface-local pixels divided by the
-		// buffer scale, which is what xdg_toplevel.configure is defined in.
-		struct wl_array states;
-		wl_array_init(&states);
+		uint32_t state_bits = 0;
 		cJSON *state_list = cJSON_GetObjectItemCaseSensitive(body, "states");
 		cJSON *state;
 		cJSON_ArrayForEach(state, state_list) {
 			if (!cJSON_IsString(state)) continue;
-			uint32_t value = 0;
-			if (strcmp(state->valuestring, "maximized") == 0) value = XDG_TOPLEVEL_STATE_MAXIMIZED;
-			else if (strcmp(state->valuestring, "fullscreen") == 0) value = XDG_TOPLEVEL_STATE_FULLSCREEN;
-			else if (strcmp(state->valuestring, "resizing") == 0) value = XDG_TOPLEVEL_STATE_RESIZING;
-			else if (strcmp(state->valuestring, "activated") == 0) value = XDG_TOPLEVEL_STATE_ACTIVATED;
-			if (!value) continue;
-			uint32_t *slot = wl_array_add(&states, sizeof(uint32_t));
-			if (slot) *slot = value;
+			if (strcmp(state->valuestring, "maximized") == 0)
+				state_bits |= NP_CONFIGURE_MAXIMIZED;
+			else if (strcmp(state->valuestring, "fullscreen") == 0)
+				state_bits |= NP_CONFIGURE_FULLSCREEN;
+			else if (strcmp(state->valuestring, "resizing") == 0)
+				state_bits |= NP_CONFIGURE_RESIZING;
+			else if (strcmp(state->valuestring, "activated") == 0)
+				state_bits |= NP_CONFIGURE_ACTIVATED;
 		}
-		xdg_toplevel_send_configure(surface->toplevel, width / surface->scale,
-		                            height / surface->scale, &states);
-		wl_array_release(&states);
-		xdg_surface_send_configure(surface->xdg_surface, ++surface->configure_serial);
+		queue_host_toplevel_configure(surface, width, height, state_bits);
 		// Flushed before allocating: the client starts repainting now, and the
 		// map round trip overlaps that instead of following it.
 		wl_display_flush_clients(server->display);
@@ -3221,7 +4150,8 @@ static void handle_host_command(const char *name, cJSON *body, void *user_data) 
 
 	if (strcmp(name, "pointerLeft") == 0) {
 		uint32_t window_id = (uint32_t)json_int(body, "window", 0);
-		if (server->drag_source && server->drag_focus_window == window_id) {
+		if (server->drag_source && !server->drag_dropped &&
+		    server->drag_focus_window == window_id) {
 			drag_send_leave(server, window_id);
 			server->drag_focus_window = 0;
 		}
@@ -3252,7 +4182,7 @@ static void handle_host_command(const char *name, cJSON *body, void *user_data) 
 			else if (strcmp(which->valuestring, "middle") == 0) code = BTN_MIDDLE;
 		}
 		bool pressed = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(body, "pressed"));
-		if (!pressed && server->drag_source) {
+		if (!pressed && server->drag_source && !server->drag_dropped) {
 			drag_finish_on_button_release(server);
 			wl_display_flush_clients(server->display);
 			return;
@@ -3288,18 +4218,12 @@ static void handle_host_command(const char *name, cJSON *body, void *user_data) 
 		// change every window at once, which is wrong the moment two of them sit
 		// on screens that differ.
 		struct np_surface *surface = surface_by_window(server, (uint32_t)json_int(body, "window", 0));
-		if (surface) send_preferred_scale(surface, scale);
+		if (surface) np_scale_changed(surface, scale);
 
 		// wl_output still carries a scale for clients too old to know about
 		// wp_fractional_scale_v1; the primary display's is the best single
 		// answer available.
-		if (scale != server->output_scale) {
-			server->output_scale = scale;
-			struct np_output *output;
-			wl_list_for_each(output, &server->outputs, link) {
-				output_send_state(server, output->resource);
-			}
-		}
+		np_scale_update_output(server, scale);
 		wl_display_flush_clients(server->display);
 		return;
 	}
@@ -3350,18 +4274,11 @@ static void republish_state(struct np_server *server) {
 			cJSON_AddNumberToObject(body, "surface", surface->id);
 			cJSON_AddNumberToObject(body, "parent",
 			                        surface->parent ? surface->parent->window_id : 0);
-			cJSON_AddNumberToObject(body, "x", surface->sub_x);
-			cJSON_AddNumberToObject(body, "y", surface->sub_y);
+	cJSON_AddNumberToObject(body, "x", surface->sub_x);
+	cJSON_AddNumberToObject(body, "y", surface->sub_y);
 			cJSON_AddNumberToObject(body, "width", surface->last_width);
 			cJSON_AddNumberToObject(body, "height", surface->last_height);
 			np_host_send(&server->host, "popupCreated", body);
-		} else if (surface->subsurface && surface->parent) {
-			body = cJSON_CreateObject();
-			cJSON_AddNumberToObject(body, "surface", surface->id);
-			cJSON_AddNumberToObject(body, "parent", surface->parent->id);
-			cJSON_AddNumberToObject(body, "x", surface->sub_x);
-			cJSON_AddNumberToObject(body, "y", surface->sub_y);
-			np_host_send(&server->host, "subsurfaceCreated", body);
 		}
 
 		if (surface->title) {
@@ -3423,6 +4340,7 @@ static void republish_state(struct np_server *server) {
 			cJSON_AddNumberToObject(geometry, "height", surface->geometry_height);
 			cJSON_AddItemToObject(frame, "windowGeometry", geometry);
 		}
+		frame_add_viewport(surface, frame);
 		cJSON_AddItemToObject(frame, "damage", cJSON_CreateArray());
 
 		cJSON *body = cJSON_CreateObject();
@@ -3501,6 +4419,7 @@ int np_compositor_run(int argc, char **argv) {
 	wl_list_init(&server.pointers);
 	wl_list_init(&server.keyboards);
 	wl_list_init(&server.data_devices);
+	wl_list_init(&server.data_offers);
 	wl_list_init(&server.clip_reads);
 	wl_list_init(&server.clip_writes);
 	wl_list_init(&server.text_inputs);
@@ -3546,15 +4465,12 @@ int np_compositor_run(int argc, char **argv) {
 	wl_global_create(server.display, &xdg_wm_base_interface, XDG_WM_BASE_VERSION,
 	                 &server, wm_base_bind);
 	wl_global_create(server.display, &wl_seat_interface, SEAT_VERSION, &server, seat_bind);
-	wl_global_create(server.display, &wl_output_interface, OUTPUT_VERSION, &server, output_bind);
-	// Do not advertise fractional-scale until wp_viewporter is implemented.
-	// The protocols are a pair: GTK and Qt create a fractional-scale object only
-	// when they can apply its value through a viewport. Advertising half of the
-	// contract produced multi-million-pixel shm buffers and client crashes.
+	np_scale_advertise(server.display, &server);
+	wl_global_create(server.display, &wp_fifo_manager_v1_interface, 1,
+	                 &server, fifo_manager_bind);
 	wl_global_create(server.display, &zwp_text_input_manager_v3_interface, 1,
 	                 &server, text_input_manager_bind);
-	wl_global_create(server.display, &zxdg_decoration_manager_v1_interface, 1,
-	                 &server, decoration_manager_bind);
+	np_decoration_advertise(server.display, &server);
 #ifndef NP_REMOTE
 	np_dmabuf_advertise(server.display, server.drm_fd);
 #endif

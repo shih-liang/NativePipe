@@ -10,6 +10,13 @@ struct np_gpu_buffer *np_gpu_buffer_get(struct wl_resource *buffer) {
 	return NULL;
 }
 
+bool np_gpu_buffer_copy_to_output(struct np_gpu_buffer *buffer,
+                                  struct np_vk_surface_buffer *output) {
+	(void)buffer;
+	(void)output;
+	return false;
+}
+
 void np_dmabuf_advertise(struct wl_display *display, int drm_fd) {
 	(void)display;
 	(void)drm_fd;

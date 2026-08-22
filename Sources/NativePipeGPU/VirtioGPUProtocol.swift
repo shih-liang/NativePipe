@@ -519,23 +519,7 @@ extension VirtioGPU {
         }
     }
 
-    /// Window shape smuggled through `blob_id`, when NativePipe userspace is
-    /// the one creating the blob.
-    ///
-    /// A HOST3D blob is always an IOSurface. The only question is whether that
-    /// surface is already shaped like the window that will show it.
-    /// `CALayer.contents` reads the IOSurface's own width, height and stride,
-    /// so a compositor-created window buffer has to carry those here —
-    /// `RESOURCE_CREATE_BLOB` itself has no place for them.
-    ///
-    /// Mesa Venus uses `blob_id` as a small counter naming a VkDeviceMemory
-    /// already allocated on the host by vkr. Those values never set bits
-    /// 63:48, so they decode as "no geometry" and the device adopts vkr's
-    /// mapping instead of allocating an IOSurface.
-    ///
-    ///     63..48  width      16 bits
-    ///     47..32  height     16 bits
-    ///     31..0   bytesPerRow
+    /// Host-visible geometry used by the legacy 2D framebuffer resource.
     public struct BlobGeometry: Equatable {
         public var width: Int
         public var height: Int
@@ -546,17 +530,6 @@ extension VirtioGPU {
             self.height = height
             self.bytesPerRow = bytesPerRow
         }
-
-        public init?(blobID: UInt64) {
-            let width = Int((blobID >> 48) & 0xFFFF)
-            let height = Int((blobID >> 32) & 0xFFFF)
-            let bytesPerRow = Int(blobID & 0xFFFF_FFFF)
-            guard width > 0, height > 0, bytesPerRow >= width * 4 else { return nil }
-            self.width = width
-            self.height = height
-            self.bytesPerRow = bytesPerRow
-        }
-
         public var byteCount: Int { bytesPerRow * height }
     }
 

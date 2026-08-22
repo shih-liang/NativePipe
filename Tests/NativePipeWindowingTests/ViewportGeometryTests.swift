@@ -19,6 +19,42 @@ final class ViewportGeometryTests: XCTestCase {
         XCTAssertEqual(
             frame.pixelDensity(for: CGRect(x: 0, y: 0, width: 800, height: 600)),
             2)
+
+        let layer = WindowBridge.surfaceLayerGeometry(
+            frame: frame, allocationSize: CGSize(width: 1_600, height: 1_200))
+        XCTAssertEqual(layer.bounds, CGRect(x: 0, y: 0, width: 800, height: 600))
+        XCTAssertEqual(layer.contentsRect, CGRect(x: 0, y: 0, width: 1, height: 1))
+        XCTAssertEqual(layer.contentsScale, 2)
+
+        let coordinates = SurfaceCoordinateSpace(
+            .init(x: 26, y: 23, width: 800, height: 600))
+        // The guest output is already cropped to window_geometry. Its host
+        // scene starts at zero, while input still restores the surface origin.
+        XCTAssertEqual(coordinates.sceneBounds, CGRect(x: 0, y: 0, width: 800, height: 600))
+        XCTAssertEqual(
+            coordinates.surfacePoint(fromContent: .zero),
+            CGPoint(x: 26, y: 23))
+        XCTAssertEqual(
+            coordinates.contentPoint(fromSurface: CGPoint(x: 36, y: 30)),
+            CGPoint(x: 10, y: 7))
+        XCTAssertEqual(
+            coordinates.contentPoint(
+                fromSurface: coordinates.surfacePoint(
+                    fromContent: CGPoint(x: 734.5, y: 418.25))),
+            CGPoint(x: 734.5, y: 418.25))
+
+        // While AppKit is ahead of the client during live resize, the whole
+        // committed tree is stretched and pointer input uses the exact inverse.
+        let resizing = SurfaceCoordinateSpace(
+            .init(x: 26, y: 23, width: 800, height: 600),
+            contentSize: CGSize(width: 400, height: 300))
+        XCTAssertEqual(resizing.sceneScale, CGSize(width: 0.5, height: 0.5))
+        XCTAssertEqual(
+            resizing.surfacePoint(fromContent: CGPoint(x: 200, y: 150)),
+            CGPoint(x: 426, y: 323))
+        XCTAssertEqual(
+            resizing.contentPoint(fromSurface: CGPoint(x: 426, y: 323)),
+            CGPoint(x: 200, y: 150))
     }
 
     func testViewportCropMapsLogicalGeometryBackToBufferPixels() {
@@ -31,6 +67,18 @@ final class ViewportGeometryTests: XCTestCase {
         XCTAssertEqual(
             frame.bufferPixelRect(for: CGRect(x: 2, y: 1, width: 10, height: 5)),
             CGRect(x: 18, y: 10, width: 40, height: 20))
+    }
+
+    func testCapacityIOSurfaceCropUsesAllocationDimensions() {
+        let frame = Windowing.Frame(
+            resourceID: 9, width: 800, height: 500,
+            bytesPerRow: 4_096, format: .bgra8888)
+
+        XCTAssertEqual(
+            frame.contentsRect(
+                for: CGRect(x: 0, y: 0, width: 800, height: 500),
+                allocationSize: CGSize(width: 1_024, height: 640)),
+            CGRect(x: 0, y: 0, width: 0.78125, height: 0.78125))
     }
 
     func testPendingCursorIsNotVisibleBeforeCoalescedInstallation() {
@@ -97,7 +145,7 @@ final class ViewportGeometryTests: XCTestCase {
         XCTAssertEqual(geometry.hotSpot, CGPoint(x: 19, y: 0))
     }
 
-    func testDroppedCPUFrameIsAcknowledgedSoGuestBlobCannotDeadlock() {
+    func testMissingOutputIOSurfaceIsDeferredRatherThanReleased() {
         let bridge = WindowBridge(frameSource: nil)
         var commands: [Windowing.HostCommand] = []
         bridge.output = { commands.append($0) }
@@ -109,48 +157,41 @@ final class ViewportGeometryTests: XCTestCase {
                 resourceID: 99, width: 64, height: 48, bytesPerRow: 256,
                 format: .bgra8888, presentationID: 17)))
 
-        guard let command = commands.last,
-              case .framePresented(let surface, let presentationID) = command
-        else {
-            return XCTFail("dropped CPU frame was not acknowledged")
-        }
-        XCTAssertEqual(surface, 8)
-        XCTAssertEqual(presentationID, 17)
+        XCTAssertFalse(commands.contains {
+            if case .framePresented(surface: 8, presentationID: 17) = $0 { return true }
+            return false
+        })
         bridge.closeAll()
     }
 
-    func testEmptyDamageDoesNotUpdateWindow() {
-        XCTAssertEqual(
-            MetalPresenter.clippedDamageRects([], width: 640, height: 480),
-            [])
-    }
+    func testSupersededDeferredFrameCompletesAndReleasesItsRingSlot() {
+        let bridge = WindowBridge(frameSource: nil)
+        var commands: [Windowing.HostCommand] = []
+        bridge.output = { commands.append($0) }
+        bridge.apply(.surfaceCreated(surface: 8))
+        bridge.apply(.toplevelCreated(window: 3, surface: 8))
 
-    func testGPUEmptyDamageDoesNotUpdateWindow() {
-        XCTAssertEqual(
-            MetalPresenter.clippedDamageRects([], width: 640, height: 480),
-            [])
-    }
+        for presentationID in [UInt32(17), 18] {
+            bridge.apply(.committed(
+                surface: 8,
+                frame: Windowing.Frame(
+                    resourceID: 99, width: 64, height: 48, bytesPerRow: 256,
+                    format: .bgra8888, presentationID: presentationID)))
+        }
 
-    func testFullFrameDamageUsesExplicitRect() {
-        XCTAssertEqual(
-            MetalPresenter.clippedDamageRects(
-                [.init(x: 0, y: 0, width: 640, height: 480)],
-                width: 640, height: 480),
-            [.init(x: 0, y: 0, width: 640, height: 480)])
-    }
-
-    func testResizeOverlapKeepsTopLeftHistory() {
-        XCTAssertEqual(
-            MetalPresenter.overlapCopyRect(
-                oldWidth: 800, oldHeight: 600, newWidth: 1024, newHeight: 768),
-            .init(x: 0, y: 0, width: 800, height: 600))
-        XCTAssertEqual(
-            MetalPresenter.overlapCopyRect(
-                oldWidth: 1024, oldHeight: 768, newWidth: 800, newHeight: 600),
-            .init(x: 0, y: 0, width: 800, height: 600))
-        XCTAssertNil(
-            MetalPresenter.overlapCopyRect(
-                oldWidth: 0, oldHeight: 600, newWidth: 800, newHeight: 600))
+        XCTAssertTrue(commands.contains {
+            if case .framePresented(surface: 8, presentationID: 17) = $0 { return true }
+            return false
+        })
+        XCTAssertTrue(commands.contains {
+            if case .frameReleased(surface: 8, presentationID: 17) = $0 { return true }
+            return false
+        })
+        XCTAssertFalse(commands.contains {
+            if case .frameReleased(surface: 8, presentationID: 18) = $0 { return true }
+            return false
+        })
+        bridge.closeAll()
     }
 
     func testGPUSubsurfaceCommitIsDeferredInsteadOfDropped() {
@@ -179,44 +220,4 @@ final class ViewportGeometryTests: XCTestCase {
         bridge.closeAll()
     }
 
-    func testGPUDamageIsClippedBeforeMetalCopies() {
-        XCTAssertEqual(
-            MetalPresenter.clippedDamageRects(
-                [
-                    .init(x: -5, y: 7, width: 13, height: 9),
-                    .init(x: 95, y: 78, width: Int.max, height: Int.max),
-                    .init(x: 3, y: 4, width: 0, height: 8),
-                    .init(x: 200, y: 4, width: 5, height: 8),
-                ],
-                width: 100, height: 80),
-            [
-                .init(x: 0, y: 7, width: 8, height: 9),
-                .init(x: 95, y: 78, width: 5, height: 2),
-            ])
-        XCTAssertEqual(
-            MetalPresenter.clippedDamageRects(
-                [], width: 100, height: 80, emptyMeansFull: false),
-            [])
-    }
-
-    func testMetalCopyRectsAreClippedToBothTextures() {
-        let clipped = MetalPresenter.clipCopyRect(
-            sourceX: 10, sourceY: -4, destX: 0, destY: 0,
-            width: 80, height: 40,
-            sourceWidth: 64, sourceHeight: 32,
-            destWidth: 50, destHeight: 20)
-        XCTAssertEqual(clipped?.sourceX, 10)
-        XCTAssertEqual(clipped?.sourceY, 0)
-        XCTAssertEqual(clipped?.destX, 0)
-        XCTAssertEqual(clipped?.destY, 4)
-        XCTAssertEqual(clipped?.width, 50)
-        XCTAssertEqual(clipped?.height, 16)
-
-        XCTAssertNil(
-            MetalPresenter.clipCopyRect(
-                sourceX: 64, sourceY: 0, destX: 0, destY: 0,
-                width: 8, height: 8,
-                sourceWidth: 64, sourceHeight: 32,
-                destWidth: 64, destHeight: 32))
-    }
 }

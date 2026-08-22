@@ -42,13 +42,11 @@ bool np_surface_store_create(int lookup_fd, size_t requested_size,
         return false;
     }
 
-    /* Until publish_frame itself moves here, compositor.c and Vulkan must agree
-     * on row pitch exactly. The host IOSurface path uses the same 128-byte row
-     * alignment, so a mismatch is a configuration error rather than something
-     * that can be papered over safely. */
-    if (requested_stride != out->vk.stride) {
+    /* Vulkan owns the linear-image layout.  requested_stride is only the
+     * caller's lower bound; publish_frame uses the returned row pitch. */
+    if (out->vk.stride < requested_stride) {
         fprintf(stderr,
-                "[surface-store] Vulkan rowPitch=%u differs from compositor stride=%u\n",
+                "[surface-store] Vulkan rowPitch=%u is smaller than source stride=%u\n",
                 out->vk.stride, requested_stride);
         np_vk_surface_buffer_destroy(&out->vk);
         memset(out, 0, sizeof(*out));
@@ -73,4 +71,5 @@ void np_surface_store_destroy(int lookup_fd, struct np_blob *buffer)
 
     np_vk_surface_buffer_destroy(&buffer->vk);
     memset(buffer, 0, sizeof(*buffer));
+    buffer->vk.resource_drm_fd = -1;
 }

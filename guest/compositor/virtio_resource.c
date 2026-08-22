@@ -104,11 +104,16 @@ void np_virtio_resource_release(struct np_virtio_resource_ref *ref)
     if (!ref)
         return;
 
-    if (ref->drm_fd >= 0 && ref->bo_handle) {
+    /* A zero-filled owner is empty, not an owner of stdin. Requiring one of
+     * the kernel-assigned identifiers makes release safe before first create
+     * and after an already-completed destroy. */
+    bool owns_fd = ref->drm_fd >= 0 &&
+                   (ref->bo_handle != 0 || ref->resource_id != 0);
+    if (owns_fd && ref->bo_handle) {
         struct drm_gem_close close_req = { .handle = ref->bo_handle };
         ioctl(ref->drm_fd, DRM_IOCTL_GEM_CLOSE, &close_req);
     }
-    if (ref->drm_fd >= 0)
+    if (owns_fd)
         close(ref->drm_fd);
 
     memset(ref, 0, sizeof(*ref));

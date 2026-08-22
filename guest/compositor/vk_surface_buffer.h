@@ -8,10 +8,11 @@
 #include <vulkan/vulkan.h>
 
 /* One compositor-owned image. CPU wl_shm writes and GPU copy operations target
- * the same VkImage/VkDeviceMemory; the exported Venus renderer BO supplies the
- * virtio resource id that the host presents as an IOSurface. */
+ * the same VkImage/VkDeviceMemory; its exported Venus MTLHeap supplies the
+ * ordinary MTLTexture that the host blits into an NSWindow-owned IOSurface. */
 struct np_vk_surface_buffer {
     VkImage image;
+    VkImageView view;
     VkDeviceMemory memory;
     VkImageLayout layout;
 
@@ -23,6 +24,10 @@ struct np_vk_surface_buffer {
     void *mapped;
     size_t size;
     bool coherent;
+    /* True after the mapped CPU view was written and flushed.  Vulkan must
+     * consume that write through a HOST_WRITE barrier before loading or
+     * overwriting the image.  Cleared after a GPU submission writes it. */
+    bool host_dirty;
 
     /* Context-free PRIME import kept alive while the frame can be presented. */
     int resource_drm_fd;
@@ -38,6 +43,7 @@ bool np_vk_surface_buffer_create(uint32_t width,
                                  uint32_t height,
                                  struct np_vk_surface_buffer *out);
 void np_vk_surface_buffer_flush(struct np_vk_surface_buffer *buffer);
+bool np_vk_surface_buffer_invalidate(struct np_vk_surface_buffer *buffer);
 void np_vk_surface_buffer_destroy(struct np_vk_surface_buffer *buffer);
 
 #endif

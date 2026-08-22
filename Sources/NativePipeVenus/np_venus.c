@@ -92,6 +92,10 @@ struct imported {
 	bool mapped_by_renderer;
 	void *mtl_texture;
 	int mtl_handle_type;
+	uint32_t mtl_width;
+	uint32_t mtl_height;
+	uint32_t mtl_stride;
+	uint32_t mtl_format;
 	struct imported *next;
 };
 
@@ -99,12 +103,28 @@ static void executable_dir(char *out, size_t cap);
 
 // vkr dlopens "libvulkan.dylib" then "libMoltenVK.dylib" by leaf name.
 // Those names are not on the default search path. Redirect both to the
-// MoltenVK dylib so the host ICD loads without a Vulkan loader.
+// MoltenVK dylib so the host ICD loads without a Vulkan loader. Diagnostics
+// may explicitly name a Vulkan loader so VKR_DEBUG=validate can insert VVL;
+// the production/App Store path remains the bundled, loader-free MoltenVK.
 static void *np_dlopen(const char *path, int mode) {
 	static void *(*next_dlopen)(const char *, int);
 	char bundled_mvk[PATH_MAX] = {0};
 	if (!next_dlopen) {
 		next_dlopen = (void *(*)(const char *, int))dlsym(RTLD_NEXT, "dlopen");
+	}
+	if (path && (strcmp(path, "libvulkan.dylib") == 0 ||
+	             strcmp(path, "libvulkan.1.dylib") == 0)) {
+		const char *loader = getenv("NATIVEPIPE_VULKAN_LOADER");
+		if (loader && loader[0]) {
+			dlerror();
+			void *handle = next_dlopen(loader, mode);
+			if (handle) {
+				fprintf(stderr, "[venus] validation Vulkan loader %s\n", loader);
+				return handle;
+			}
+			fprintf(stderr, "[venus] validation Vulkan loader %s failed: %s\n",
+			        loader, dlerror());
+		}
 	}
 	if (path && (strcmp(path, "libvulkan.dylib") == 0 ||
 	             strcmp(path, "libvulkan.1.dylib") == 0 ||
@@ -575,11 +595,10 @@ int np_venus_create_blob(np_venus *venus, uint32_t ctx_id, np_venus_blob *blob) 
 	struct imported *entry = calloc(1, sizeof(*entry));
 	if (!entry) return -1;
 	entry->blob = *blob;
-	if (blob->iosurface) CFRetain(blob->iosurface);
 
 	note("blob res=%u ctx=%u blob_id=%llu %ux%u %llu bytes",
 	     blob->resource_id, ctx_id, (unsigned long long)blob->blob_id,
-	     blob->width, blob->height, (unsigned long long)blob->size);
+		     0u, 0u, (unsigned long long)blob->size);
 
 	if (!venus->live) {
 		pthread_mutex_lock(&venus->lock);
@@ -606,18 +625,9 @@ int np_venus_create_blob(np_venus *venus, uint32_t ctx_id, np_venus_blob *blob) 
 		note("resource_create_blob res=%u blob_id=%llu flags=0x%x rc=%d%s",
 		     blob->resource_id, (unsigned long long)blob->blob_id,
 		     args.blob_flags, rc,
-		     blob->iosurface ? " (compositor)" : "");
-		if (!blob->iosurface) {
-			free(entry);
-			return rc;
-		}
-		// Compositor IOSurfaces are not vkr objects but still belong in the
-		// import table so their CF ownership is tracked consistently.
-		pthread_mutex_lock(&venus->lock);
-		entry->next = venus->blobs;
-		venus->blobs = entry;
-		pthread_mutex_unlock(&venus->lock);
-		return 0;
+		     "");
+		free(entry);
+		return rc;
 	}
 
 	// Mesa Venus: the pages already exist inside vkr. Hand the mapping
@@ -626,7 +636,7 @@ int np_venus_create_blob(np_venus *venus, uint32_t ctx_id, np_venus_blob *blob) 
 	// map every blob anyway makes MoltenVK take a failing vkMapMemory path for
 	// each swapchain image (and for every resize). Only MAPPABLE blobs can have
 	// guest aperture pages.
-	if (venus->virgl.resource_map && !blob->iosurface &&
+	if (venus->virgl.resource_map &&
 	    (args.blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_MAPPABLE)) {
 		void *map = NULL;
 		uint64_t map_size = 0;
@@ -663,7 +673,6 @@ void np_venus_unimport_blob(np_venus *venus, uint32_t resource_id) {
 			if (hit->mapped_by_renderer && venus->virgl.resource_unmap) {
 				venus->virgl.resource_unmap(resource_id);
 			}
-			if (hit->blob.iosurface) CFRelease(hit->blob.iosurface);
 			if (hit->mtl_texture) {
 				if (venus->virgl.release_handle_for_scanout && hit->mtl_handle_type) {
 					venus->virgl.release_handle_for_scanout(
@@ -690,10 +699,21 @@ void *np_venus_metal_texture(np_venus *venus, uint32_t resource_id,
 	pthread_mutex_lock(&venus->lock);
 	for (struct imported *cur = venus->blobs; cur; cur = cur->next) {
 		if (cur->blob.resource_id != resource_id) continue;
-		if (cur->mtl_texture) {
+		if (cur->mtl_texture && width <= cur->mtl_width &&
+		    height <= cur->mtl_height && stride == cur->mtl_stride &&
+		    virgl_format == cur->mtl_format) {
 			void *tex = cur->mtl_texture;
 			pthread_mutex_unlock(&venus->lock);
 			return tex;
+		}
+		if (cur->mtl_texture) {
+			if (venus->virgl.release_handle_for_scanout && cur->mtl_handle_type)
+				venus->virgl.release_handle_for_scanout(
+					cur->mtl_handle_type, cur->mtl_texture);
+			else
+				CFRelease(cur->mtl_texture);
+			cur->mtl_texture = NULL;
+			cur->mtl_handle_type = 0;
 		}
 		if (!venus->virgl.create_handle_for_scanout || !width || !height) {
 			pthread_mutex_unlock(&venus->lock);
@@ -705,6 +725,10 @@ void *np_venus_metal_texture(np_venus *venus, uint32_t resource_id,
 		if (type == NP_VIRGL_NATIVE_HANDLE_METAL_TEXTURE && handle) {
 			cur->mtl_texture = handle;
 			cur->mtl_handle_type = type;
+			cur->mtl_width = width;
+			cur->mtl_height = height;
+			cur->mtl_stride = stride;
+			cur->mtl_format = virgl_format;
 			note("blob res=%u scanout metal texture %p %ux%u stride=%u fmt=%u",
 			     resource_id, handle, width, height, stride, virgl_format);
 			pthread_mutex_unlock(&venus->lock);

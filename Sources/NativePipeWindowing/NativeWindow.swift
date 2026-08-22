@@ -1,6 +1,6 @@
 import AppKit
-import IOSurface
-import Metal
+@preconcurrency import IOSurface
+@preconcurrency import Metal
 import NativePipeProtocol
 import QuartzCore
 
@@ -11,15 +11,13 @@ import QuartzCore
 /// macOS already does all of that, and duplicating any of it would mean doing
 /// the work twice and then fighting about which answer wins.
 ///
-/// The compositor (guest NativePipe) classifies the buffer at `attach`
-/// and names a virtio-gpu resource. This window has one layer:
-/// `CAMetalLayer`. CPU and GPU frames both land there.
+/// The guest compositor produces one ordinary Venus image. This window copies
+/// it into a `CAMetalLayer` drawable and presents that drawable through Metal.
+/// Source-buffer ownership ends when the copy completes; CoreAnimation owns
+/// only its drawable pool and never owns a guest/compositor buffer.
 ///
-///   * `wl_shm` → compositor copied into an IOSurface → MTLTexture
-///   * GPU buffer → Venus resource already an MTLTexture on this host
-///
-/// A Vulkan swapchain is just a sequence of GPU attaches. Present does
-/// not need a second bind.
+///   * client buffers → guest window-scene VkImage
+///   * scene VkImage → host Metal blit → CAMetalDrawable → WindowServer
 @MainActor
 final class NativeWindow: NSObject {
     private static let frameTrace = ProcessInfo.processInfo.environment["NATIVEPIPE_FRAME_TRACE"] != nil
@@ -48,26 +46,17 @@ final class NativeWindow: NSObject {
     private weak var bridge: WindowBridge?
 
     private var appID: String?
-    /// Absence of xdg-decoration means the client owns its decorations.
-    /// xdg-decoration is optional, and a client that never binds it has not
-    /// asked for anything — it is not claiming it will draw its own chrome. The
-    /// compositor decides in that case, and the only answer that leaves a usable
-    /// window is server-side. Defaulting to false put such a window in the gap
-    /// between the two: AppKit hid its title bar for a client that was never
-    /// going to draw one.
-    private var serverDecorated = true
+    /// This is a value supplied by the guest compositor, not a host policy.
+    /// Client-side is the safe construction default: it prevents an NSWindow
+    /// titlebar from flashing around the first CSD frame before the protocol
+    /// event arrives. Qt and other SSD clients explicitly request server-side.
+    private var serverDecorated = false
+    private var minimumConstraint: Windowing.Size?
+    private var maximumConstraint: Windowing.Size?
     private var lastConfiguredSize: Windowing.Size?
     private var lastConfiguredStates: [Windowing.ToplevelState] = []
     private var configureSerial: UInt32 = 0
 
-    /// The scale the *client* renders at, from `wl_surface.set_buffer_scale`.
-    ///
-    /// Not `NSWindow.backingScaleFactor`. Converting the window's point size to
-    /// surface pixels with the screen's scale tells a scale-1 client that its
-    /// 480pt window is 960px wide; it redraws at 960x640, the window grows to
-    /// 960pt, and the next configure says 1920. Buffer geometry is the client's
-    /// declaration, so the client's scale is the only correct divisor.
-    private var bufferScale = 1
     /// The xdg-shell window within the full wl_surface. GTK CSD buffers include
     /// transparent shadow margins outside this rectangle. AppKit must size and
     /// clip to the geometry while Wayland input remains surface-local.
@@ -83,6 +72,15 @@ final class NativeWindow: NSObject {
     }
     private var pendingConfigure: PendingConfigure?
     private var configureDisplayLink: CADisplayLink?
+    /// CPU/remote contents installed since the previous display tick. GPU
+    /// frames use the CAMetalDrawable's actual presentation callback instead.
+    private struct Presentation: Hashable {
+        let surface: UInt32
+        let id: UInt32
+    }
+    private var pendingPresentations: [Presentation] = []
+    private let metalDevice = MTLCreateSystemDefaultDevice()
+    private lazy var commandQueue = metalDevice?.makeCommandQueue()
 
     init(windowID: UInt32, surfaceID: UInt32, bridge: WindowBridge, popup: Popup? = nil) {
         self.windowID = windowID
@@ -94,10 +92,9 @@ final class NativeWindow: NSObject {
 
     var isPopup: Bool { popup != nil }
 
-    /// Where subsurface layers are hung. They are part of this window's
-    /// contents, not windows of their own, so CoreAnimation composites them and
-    /// NativePipe does not.
-    var contentLayer: CALayer? { window != nil ? contentView.layer : nil }
+    /// The guest compositor sends one already-composited scene per window.
+    /// This is the only content layer at the host boundary.
+    var rootSurfaceLayer: CALayer? { window != nil ? contentView.surfaceLayer : nil }
 
     // MARK: - Metadata
 
@@ -126,13 +123,19 @@ final class NativeWindow: NSObject {
     }
 
     func setConstraints(minimum: Windowing.Size?, maximum: Windowing.Size?) {
+        minimumConstraint = minimum
+        maximumConstraint = maximum
+        applyConstraints()
+    }
+
+    private func applyConstraints() {
         guard let window else { return }
-        if let minimum {
-            window.contentMinSize = NSSize(width: minimum.width, height: minimum.height)
-        }
-        if let maximum {
-            window.contentMaxSize = NSSize(width: maximum.width, height: maximum.height)
-        }
+        window.contentMinSize = minimumConstraint.map {
+            NSSize(width: $0.width, height: $0.height)
+        } ?? .zero
+        window.contentMaxSize = maximumConstraint.map {
+            NSSize(width: $0.width, height: $0.height)
+        } ?? NSSize(width: 10_000_000, height: 10_000_000)
     }
 
     func setParent(_ parent: NativeWindow?) {
@@ -156,40 +159,124 @@ final class NativeWindow: NSObject {
 
     func present(frame: Windowing.Frame, surface: IOSurfaceRef) {
         prepareWindow(for: frame)
+        let incoming = frame.presentationID == 0 ? nil : Presentation(
+            surface: surfaceID, id: frame.presentationID)
         contentView.displayCPU(
-            surface, frame: frame, geometry: windowGeometry,
-            scale: CGFloat(bufferScale))
+            surface, frame: frame, geometry: windowGeometry)
+        if let incoming {
+            bridge?.send(.frameReleased(
+                surface: incoming.surface, presentationID: incoming.id))
+            awaitPresentation(incoming)
+        }
         if Self.frameTrace {
-            Self.note("present cpu window=\(windowID) frame=\(frame.width)x\(frame.height)@\(frame.scale)")
+            Self.note(
+                "present window=\(windowID) res=\(frame.resourceID) " +
+                "active=\(frame.width)x\(frame.height) stride=\(frame.bytesPerRow) " +
+                "allocation=\(IOSurfaceGetWidth(surface))x\(IOSurfaceGetHeight(surface)) " +
+                "allocationStride=\(IOSurfaceGetBytesPerRow(surface)) " +
+                "scale=\(frame.scale) geometry=\(windowGeometry) " +
+                "viewBounds=\(contentView.bounds)")
         }
     }
 
-    /// Venus image already resident in MoltenVK. Present it the way a
-    /// native macOS Vulkan window does: onto this window's CAMetalLayer.
-    func presentGPU(
-        frame: Windowing.Frame, pointer: UnsafeMutableRawPointer, byteCount: Int
+    /// Copy the compositor's ordinary Venus image into a Core Animation
+    /// drawable. `copied` runs after Metal has stopped reading the source;
+    /// `presented` runs after WindowServer has actually presented the drawable.
+    func present(
+        frame: Windowing.Frame, metalTexture: AnyObject,
+        copied: @escaping @MainActor (Bool) -> Void,
+        presented: @escaping @MainActor () -> Void
     ) {
         prepareWindow(for: frame)
-        contentView.displayGPU(
-            pointer: pointer, byteCount: byteCount, frame: frame,
-            geometry: windowGeometry, scale: CGFloat(bufferScale))
-        if Self.frameTrace {
-            Self.note("present gpu window=\(windowID) frame=\(frame.width)x\(frame.height)@\(frame.scale)")
+        guard let source = metalTexture as? MTLTexture else {
+            Self.note("resource \(frame.resourceID) did not export an MTLTexture")
+            copied(false)
+            return
         }
+        guard let device = metalDevice,
+              let drawable = contentView.nextMetalDrawable(
+                  device: device, frame: frame, geometry: windowGeometry),
+              let queue = commandQueue
+        else {
+            Self.note("could not acquire drawable window=\(windowID) res=\(frame.resourceID)")
+            copied(false)
+            return
+        }
+        let target = drawable.texture
+        guard source.pixelFormat == target.pixelFormat,
+              source.textureType == .type2D,
+              target.textureType == .type2D,
+              source.sampleCount == 1,
+              target.sampleCount == 1,
+              frame.width <= source.width, frame.height <= source.height,
+              frame.width == target.width, frame.height == target.height
+        else {
+            Self.note(
+                "incompatible Metal blit window=\(windowID) res=\(frame.resourceID) " +
+                "source=\(source.width)x\(source.height)/\(source.pixelFormat.rawValue)/" +
+                "type\(source.textureType.rawValue)/samples\(source.sampleCount) " +
+                "target=\(target.width)x\(target.height)/" +
+                "\(target.pixelFormat.rawValue)/type\(target.textureType.rawValue)/" +
+                "samples\(target.sampleCount) frame=\(frame.width)x\(frame.height)")
+            copied(false)
+            return
+        }
+        guard let command = queue.makeCommandBuffer(),
+              let blit = command.makeBlitCommandEncoder()
+        else {
+            Self.note("could not create Metal command encoder window=\(windowID) res=\(frame.resourceID)")
+            copied(false)
+            return
+        }
+
+        blit.copy(
+            from: source, sourceSlice: 0, sourceLevel: 0,
+            sourceOrigin: .init(x: 0, y: 0, z: 0),
+            sourceSize: .init(width: frame.width, height: frame.height, depth: 1),
+            to: target, destinationSlice: 0, destinationLevel: 0,
+            destinationOrigin: .init(x: 0, y: 0, z: 0))
+        blit.endEncoding()
+
+        drawable.addPresentedHandler { _ in
+            DispatchQueue.main.async { presented() }
+        }
+        command.addCompletedHandler { [weak self, source] command in
+            // Capturing source is intentional: the command buffer owns the GPU
+            // reference, while this retains the Swift/CF wrapper through the
+            // completion callback as well.
+            withExtendedLifetime(source) {}
+            DispatchQueue.main.async {
+                let success = command.status == .completed
+                if success, let self, Self.frameTrace {
+                    Self.note(
+                        "drawable complete window=\(self.windowID) res=\(frame.resourceID) " +
+                        "\(frame.width)x\(frame.height)")
+                } else if let error = command.error {
+                    Self.note("Metal blit failed window=\(self?.windowID ?? 0): \(error)")
+                }
+                copied(success)
+            }
+        }
+        command.present(drawable)
+        command.commit()
     }
 
-    func presentGPU(frame: Windowing.Frame, metalTexture: AnyObject) {
-        prepareWindow(for: frame)
-        contentView.displayGPU(
-            metalTexture: metalTexture, frame: frame,
-            geometry: windowGeometry, scale: CGFloat(bufferScale))
-        if Self.frameTrace {
-            Self.note("present gpu-mtl window=\(windowID) frame=\(frame.width)x\(frame.height)@\(frame.scale)")
-        }
+    func awaitPresentation(surface: UInt32, presentationID: UInt32) {
+        guard presentationID != 0 else { return }
+        awaitPresentation(Presentation(surface: surface, id: presentationID))
+    }
+
+    private func awaitPresentation(_ presentation: Presentation) {
+        guard !pendingPresentations.contains(presentation) else { return }
+        pendingPresentations.append(presentation)
+    }
+
+    func traceLayerGeometry() {
+        guard Self.frameTrace else { return }
+        contentView.traceLayerGeometry(windowID: windowID)
     }
 
     private func prepareWindow(for frame: Windowing.Frame) {
-        bufferScale = max(frame.scale, 1)
         windowGeometry = effectiveGeometry(for: frame)
         let pointSize = NSSize(
             width: CGFloat(windowGeometry.width),
@@ -204,10 +291,11 @@ final class NativeWindow: NSObject {
            geometry.width > 0, geometry.height > 0 {
             return geometry
         }
+        let logical = frame.appKitPointSize
         return Windowing.Rect(
             x: 0, y: 0,
-            width: frame.width / max(frame.scale, 1),
-            height: frame.height / max(frame.scale, 1))
+            width: max(1, Int(logical.width.rounded())),
+            height: max(1, Int(logical.height.rounded())))
     }
 
     private func makeWindow(contentSize: NSSize) {
@@ -250,6 +338,12 @@ final class NativeWindow: NSObject {
         // the ordinary responder-chain path on AppKit versions that consult the
         // window flag first. It is false by default.
         window.acceptsMouseMovedEvents = true
+        // xdg_toplevel commonly sends constraints before its first buffer.
+        // NativeWindow exists at that point but NSWindow is materialized only
+        // on the first frame, so replay the cached complete constraint state
+        // before the user can begin an interactive resize.
+        self.window = window
+        applyConstraints()
 
         if let popup {
             window.hasShadow = true
@@ -275,10 +369,12 @@ final class NativeWindow: NSObject {
             window.makeFirstResponder(contentView)
             Self.note("window \(windowID) key=\(window.isKeyWindow) firstResponder=\(String(describing: window.firstResponder))")
         }
-        self.window = window
         let displayLink = contentView.displayLink(
             target: self, selector: #selector(configureDisplayLinkFired(_:)))
-        displayLink.isPaused = true
+        // Keep the link active while the window exists. Repeatedly pausing and
+        // restarting it made sparse content updates degrade to a few callbacks
+        // per second and detached frame pacing from the display clock.
+        displayLink.isPaused = false
         displayLink.add(to: .main, forMode: .common)
         configureDisplayLink = displayLink
 
@@ -331,6 +427,13 @@ final class NativeWindow: NSObject {
 
     func close() {
         pendingConfigure = nil
+        contentView.clearDisplayedSurface()
+        let pending = pendingPresentations
+        pendingPresentations.removeAll()
+        for presentation in pending {
+            bridge?.send(.framePresented(
+                surface: presentation.surface, presentationID: presentation.id))
+        }
         configureDisplayLink?.invalidate()
         configureDisplayLink = nil
         window?.orderOut(nil)
@@ -340,12 +443,14 @@ final class NativeWindow: NSObject {
 
     // MARK: - Geometry
 
-    /// Translates the window's current size into a configure for the client.
+    /// AppKit points and Wayland surface coordinates are both logical units.
+    /// Buffer scale controls attached pixel density and must never change an
+    /// xdg_toplevel.configure size.
     private func sendConfigure(states: [Windowing.ToplevelState]) {
         guard window != nil else { return }
         let size = Windowing.Size(
-            width: max(1, Int(contentView.bounds.width)) * bufferScale,
-            height: max(1, Int(contentView.bounds.height)) * bufferScale)
+            width: max(1, Int(contentView.bounds.width.rounded())),
+            height: max(1, Int(contentView.bounds.height.rounded())))
         guard size != lastConfiguredSize || states != lastConfiguredStates else { return }
 
         pendingConfigure = PendingConfigure(size: size, states: states)
@@ -353,16 +458,23 @@ final class NativeWindow: NSObject {
     }
 
     @objc private func configureDisplayLinkFired(_ displayLink: CADisplayLink) {
+        // Deliver the newest resize before waking a frame-throttled client, so
+        // the draw started by this tick targets the newest logical size.
         flushConfigure()
+
+        // Frame callbacks and FIFO latching are paced by the display clock.
+        // Source buffers were already released by their Metal completion.
+        for presentation in pendingPresentations {
+            bridge?.send(.framePresented(
+                surface: presentation.surface,
+                presentationID: presentation.id))
+        }
+        pendingPresentations.removeAll(keepingCapacity: true)
     }
 
     private func flushConfigure() {
-        guard let pending = pendingConfigure else {
-            configureDisplayLink?.isPaused = true
-            return
-        }
+        guard let pending = pendingConfigure else { return }
         pendingConfigure = nil
-        configureDisplayLink?.isPaused = true
         guard pending.size != lastConfiguredSize || pending.states != lastConfiguredStates else {
             return
         }
@@ -394,9 +506,9 @@ final class NativeWindow: NSObject {
     }
 
     private func surfacePoint(from windowPoint: CGPoint) -> CGPoint {
-        CGPoint(
-            x: windowPoint.x + CGFloat(windowGeometry.x),
-            y: windowPoint.y + CGFloat(windowGeometry.y))
+        SurfaceCoordinateSpace(
+            windowGeometry, contentSize: contentView.bounds.size
+        ).surfacePoint(fromContent: windowPoint)
     }
 
     func pointerLeft() {
@@ -489,8 +601,7 @@ extension NativeWindow: NSWindowDelegate {
 
 // MARK: - Content view
 
-/// The window's only layer is a `CAMetalLayer`. Attach already decided
-/// whether the named resource is an IOSurface or a Venus mapping.
+/// The window's only layer displays the NSWindow-owned IOSurface.
 private final class SurfaceView: NSView {
     /// Set once the window exists; events before that have nowhere to go.
     weak var input: NativeWindow?
@@ -515,7 +626,8 @@ private final class SurfaceView: NSView {
     /// Keycodes whose press was actually forwarded. A release for a press the
     /// IME swallowed would leave the guest's xkb state holding a phantom key.
     private var forwardedPresses: Set<UInt16> = []
-    /// The surface currently on screen, held for as long as it is shown.
+    /// The legacy CPU/remote surface currently on screen, held for as long as
+    /// it is shown. GPU windows present through `metalLayer` instead.
     ///
     /// `ResourceTable` drops its reference the moment the guest unrefs the
     /// resource, which during a resize is while this layer is still displaying
@@ -523,22 +635,47 @@ private final class SurfaceView: NSView {
     /// to guess at when the failure mode is a window that blanks at random.
     /// Held so a CPU IOSurface outlives ResourceTable unref during resize.
     private var displayed: IOSurfaceRef?
-    private var metal: MetalPresenter?
     private var displayedGeometry: Windowing.Rect?
+    /// Maps the committed xdg window geometry to the AppKit content bounds.
+    /// During live resize the client may be one configure behind; scaling this
+    /// container keeps root pixels, subsurfaces and input in one transform.
+    private let sceneLayer = CALayer()
+    /// Pixel contents of the root wl_surface. The NSView backing layer is only
+    /// the xdg window-geometry clip and never carries surface pixels itself.
+    let surfaceLayer = CALayer()
+    /// Streaming GPU content uses Core Animation's drawable pool instead of
+    /// mutating an IOSurface stored in `CALayer.contents`.
+    let metalLayer = CAMetalLayer()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
+        sceneLayer.anchorPoint = .zero
+        sceneLayer.isGeometryFlipped = true
+        surfaceLayer.contentsGravity = .resize
+        surfaceLayer.isOpaque = false
+        surfaceLayer.anchorPoint = .zero
+        surfaceLayer.isGeometryFlipped = true
+        metalLayer.pixelFormat = .bgra8Unorm
+        metalLayer.framebufferOnly = false
+        metalLayer.maximumDrawableCount = 3
+        metalLayer.allowsNextDrawableTimeout = true
+        metalLayer.isOpaque = false
+        metalLayer.anchorPoint = .zero
+        metalLayer.isGeometryFlipped = true
+        metalLayer.isHidden = true
         wantsLayer = true
         layerContentsRedrawPolicy = .never
     }
 
     override func makeBackingLayer() -> CALayer {
-        let layer = CAMetalLayer()
-        layer.pixelFormat = .bgra8Unorm
-        layer.framebufferOnly = false
+        let layer = CALayer()
         layer.isOpaque = false
-        layer.contentsGravity = .resize
         layer.anchorPoint = .zero
+        layer.isGeometryFlipped = true
+        layer.masksToBounds = true
+        sceneLayer.addSublayer(surfaceLayer)
+        sceneLayer.addSublayer(metalLayer)
+        layer.addSublayer(sceneLayer)
         return layer
     }
 
@@ -688,51 +825,97 @@ private final class SurfaceView: NSView {
         input?.key(event.keyCode, pressed: nowDown, flags: event.modifierFlags)
     }
 
-    /// The surface is exactly the size of the frame in it, so the whole thing is
-    /// shown. Padding the allocation and displaying a sub-rectangle was tried and
-    /// reverted: it needs contentsRect, whose origin corner behaves differently
-    /// for an IOSurface than the obvious probe suggests, and the win disappears
-    /// once configures are coalesced to the latest size.
+    /// Configure the Metal presentation layer for this committed scene and
+    /// acquire a drawable from Core Animation's ownership-managed pool.
+    func nextMetalDrawable(
+        device: MTLDevice, frame: Windowing.Frame,
+        geometry: Windowing.Rect
+    ) -> CAMetalDrawable? {
+        displayed = nil
+        displayedGeometry = geometry
+        guard layer != nil, frame.width > 0, frame.height > 0 else { return nil }
+
+        let logical = CGRect(origin: .zero, size: frame.appKitPointSize)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let coordinates = SurfaceCoordinateSpace(geometry, contentSize: bounds.size)
+        sceneLayer.bounds = coordinates.sceneBounds
+        sceneLayer.position = .zero
+        sceneLayer.setAffineTransform(CGAffineTransform(
+            scaleX: coordinates.sceneScale.width,
+            y: coordinates.sceneScale.height))
+        surfaceLayer.isHidden = true
+        metalLayer.device = device
+        metalLayer.bounds = logical
+        metalLayer.frame.origin = .zero
+        metalLayer.contentsScale = frame.pixelDensity(for: logical)
+        metalLayer.drawableSize = CGSize(width: frame.width, height: frame.height)
+        metalLayer.isHidden = false
+        CATransaction.commit()
+
+        return metalLayer.nextDrawable()
+    }
+
+    /// The IOSurface ring has growth capacity so live resize normally changes
+    /// only this active rectangle. Normalize against the allocation, not the
+    /// current client frame, or unused capacity would be stretched on screen.
     func displayCPU(
         _ surface: IOSurfaceRef, frame: Windowing.Frame,
-        geometry: Windowing.Rect, scale: CGFloat
+        geometry: Windowing.Rect
     ) {
         displayed = surface
         displayedGeometry = geometry
-        guard let presenter = presenter() else { return }
-        presenter.present(
-            presenter.texture(from: surface, frame: frame),
-            geometry: geometry, scale: scale)
+        guard layer != nil else { return }
+
+        let logical = CGRect(origin: .zero, size: frame.appKitPointSize)
+        let contentsRect = frame.contentsRect(
+            for: logical,
+            allocationSize: CGSize(
+                width: IOSurfaceGetWidth(surface),
+                height: IOSurfaceGetHeight(surface)))
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let coordinates = SurfaceCoordinateSpace(geometry, contentSize: bounds.size)
+        sceneLayer.bounds = coordinates.sceneBounds
+        sceneLayer.position = .zero
+        sceneLayer.setAffineTransform(CGAffineTransform(
+            scaleX: coordinates.sceneScale.width,
+            y: coordinates.sceneScale.height))
+        surfaceLayer.bounds = logical
+        surfaceLayer.frame.origin = .zero
+        surfaceLayer.contentsScale = frame.pixelDensity(for: logical)
+        surfaceLayer.contentsRect = contentsRect
+        surfaceLayer.contents = surface
+        surfaceLayer.isHidden = false
+        metalLayer.isHidden = true
+        CATransaction.commit()
     }
 
-    func displayGPU(
-        pointer: UnsafeMutableRawPointer, byteCount: Int,
-        frame: Windowing.Frame, geometry: Windowing.Rect, scale: CGFloat
-    ) {
+    func clearDisplayedSurface() {
         displayed = nil
-        displayedGeometry = geometry
-        guard let presenter = presenter() else { return }
-        presenter.present(
-            presenter.texture(pointer: pointer, byteCount: byteCount, frame: frame),
-            geometry: geometry, scale: scale)
+        displayedGeometry = nil
+        guard layer != nil else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        surfaceLayer.contents = nil
+        surfaceLayer.isHidden = true
+        metalLayer.isHidden = true
+        CATransaction.commit()
     }
 
-    func displayGPU(
-        metalTexture: AnyObject, frame: Windowing.Frame,
-        geometry: Windowing.Rect, scale: CGFloat
-    ) {
-        displayed = nil
-        displayedGeometry = geometry
-        guard let presenter = presenter(),
-              let texture = metalTexture as? MTLTexture else { return }
-        presenter.present(texture, geometry: geometry, scale: scale)
-    }
-
-    private func presenter() -> MetalPresenter? {
-        if let metal { return metal }
-        guard let metalLayer = layer as? CAMetalLayer else { return nil }
-        metal = MetalPresenter(layer: metalLayer)
-        return metal
+    func traceLayerGeometry(windowID: UInt32) {
+        guard let backing = layer else { return }
+        let scenePresentation = sceneLayer.presentation() ?? sceneLayer
+        let surfacePresentation = surfaceLayer.presentation() ?? surfaceLayer
+        let metalPresentation = metalLayer.presentation() ?? metalLayer
+        var message = "[nsw] layers window=\(windowID) view=\(bounds) backing=\(backing.bounds) "
+        message += "sceneBounds=\(sceneLayer.bounds) sceneFrame=\(sceneLayer.frame) "
+        message += "scenePresented=\(scenePresentation.frame) surfaceBounds=\(surfaceLayer.bounds) "
+        message += "surfaceFrame=\(surfaceLayer.frame) surfacePresented=\(surfacePresentation.frame) "
+        message += "metalFrame=\(metalLayer.frame) metalPresented=\(metalPresentation.frame) "
+        message += "drawable=\(metalLayer.drawableSize)\n"
+        FileHandle.standardError.write(Data(message.utf8))
     }
 
     /// Stretch the last frame across a live resize. The next attach replaces
@@ -741,10 +924,15 @@ private final class SurfaceView: NSView {
         guard let geometry = displayedGeometry,
               geometry.width > 0, geometry.height > 0
         else { return }
-        let scale = layer?.contentsScale ?? 1
-        (layer as? CAMetalLayer)?.drawableSize = CGSize(
-            width: CGFloat(geometry.width) * scale,
-            height: CGFloat(geometry.height) * scale)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let coordinates = SurfaceCoordinateSpace(geometry, contentSize: bounds.size)
+        sceneLayer.bounds = coordinates.sceneBounds
+        sceneLayer.position = .zero
+        sceneLayer.setAffineTransform(CGAffineTransform(
+            scaleX: coordinates.sceneScale.width,
+            y: coordinates.sceneScale.height))
+        CATransaction.commit()
     }
 }
 
@@ -879,130 +1067,4 @@ extension SurfaceView: NSTextInputClient {
     }
 
     func characterIndex(for point: NSPoint) -> Int { NSNotFound }
-}
-
-/// Presents an already-host texture onto the window's CAMetalLayer.
-///
-/// The layer is the view. CPU and GPU only differ in how the source
-/// texture is obtained; attach already bound the resource.
-private final class MetalPresenter {
-    private let layer: CAMetalLayer
-    private let device: MTLDevice
-    private let queue: MTLCommandQueue
-
-    init?(layer: CAMetalLayer) {
-        guard let device = layer.device ?? MTLCreateSystemDefaultDevice(),
-              let queue = device.makeCommandQueue() else { return nil }
-        self.layer = layer
-        self.device = device
-        self.queue = queue
-        layer.device = device
-    }
-
-    func present(
-        _ source: MTLTexture?,
-        geometry: Windowing.Rect, scale: CGFloat
-    ) {
-        guard let source else { return }
-        let crop = pixelCrop(geometry: geometry, scale: scale, texture: source)
-        layer.contentsScale = scale
-        layer.drawableSize = CGSize(width: crop.width, height: crop.height)
-        guard let drawable = layer.nextDrawable(),
-              let command = queue.makeCommandBuffer(),
-              let blit = command.makeBlitCommandEncoder() else { return }
-        let width = min(crop.width, drawable.texture.width)
-        let height = min(crop.height, drawable.texture.height)
-        blit.copy(
-            from: source, sourceSlice: 0, sourceLevel: 0,
-            sourceOrigin: MTLOrigin(x: crop.x, y: crop.y, z: 0),
-            sourceSize: MTLSize(width: width, height: height, depth: 1),
-            to: drawable.texture, destinationSlice: 0, destinationLevel: 0,
-            destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
-        blit.endEncoding()
-        command.present(drawable)
-        command.commit()
-    }
-
-    func texture(from surface: IOSurfaceRef, frame: Windowing.Frame) -> MTLTexture? {
-        // VideoToolbox (and some GPU paths) hand back an IOSurface whose
-        // width/height/bytesPerRow are padded for the codec. The protocol
-        // frame is the logical size; Metal validates against the IOSurface
-        // itself and aborts on mismatch — so the descriptor must match the
-        // surface, and any crop happens later in `present`.
-        let width = IOSurfaceGetWidth(surface)
-        let height = IOSurfaceGetHeight(surface)
-        let bytesPerRow = IOSurfaceGetBytesPerRow(surface)
-        guard width > 0, height > 0, bytesPerRow > 0 else { return nil }
-
-        let pixelFormat: MTLPixelFormat
-        switch IOSurfaceGetPixelFormat(surface) {
-        case 0x42475241: // 'BGRA'
-            pixelFormat = .bgra8Unorm
-        case 0x52474241: // 'RGBA'
-            pixelFormat = .rgba8Unorm
-        default:
-            pixelFormat = frame.format == .rgba8888 ? .rgba8Unorm : .bgra8Unorm
-        }
-        // 32-bit formats need at least width*4 bytes per row.
-        guard bytesPerRow >= width * 4 else { return nil }
-
-        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: pixelFormat,
-            width: width, height: height, mipmapped: false)
-        descriptor.storageMode = .shared
-        descriptor.usage = [.shaderRead]
-        return device.makeTexture(descriptor: descriptor, iosurface: surface, plane: 0)
-    }
-
-    func texture(
-        pointer: UnsafeMutableRawPointer, byteCount: Int, frame: Windowing.Frame
-    ) -> MTLTexture? {
-        let stride = frame.bytesPerRow
-        let needed = stride * frame.height
-        guard byteCount >= needed else { return nil }
-        let format: MTLPixelFormat = frame.format == .rgba8888 ? .rgba8Unorm : .bgra8Unorm
-        let align = device.minimumLinearTextureAlignment(for: format)
-        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: format, width: frame.width, height: frame.height, mipmapped: false)
-        descriptor.storageMode = .shared
-        descriptor.usage = [.shaderRead]
-
-        if align > 0, stride % align == 0,
-           let buffer = device.makeBuffer(
-            bytesNoCopy: pointer, length: needed,
-            options: .storageModeShared, deallocator: nil) {
-            return buffer.makeTexture(descriptor: descriptor, offset: 0, bytesPerRow: stride)
-        }
-
-        // Stride is not Metal-linear-aligned. One upload into a private
-        // texture, then the blit to the drawable. Still host-side only.
-        descriptor.storageMode = .shared
-        descriptor.usage = [.shaderRead, .shaderWrite]
-        guard let texture = device.makeTexture(descriptor: descriptor) else { return nil }
-        texture.replace(
-            region: MTLRegionMake2D(0, 0, frame.width, frame.height),
-            mipmapLevel: 0,
-            withBytes: pointer,
-            bytesPerRow: stride)
-        return texture
-    }
-
-    /// xdg window geometry in buffer pixels. CSD shadows sit outside it.
-    private func pixelCrop(
-        geometry: Windowing.Rect, scale: CGFloat, texture: MTLTexture
-    ) -> (x: Int, y: Int, width: Int, height: Int) {
-        let s = max(Int(scale), 1)
-        var x = geometry.x * s
-        var y = geometry.y * s
-        var width = geometry.width * s
-        var height = geometry.height * s
-        if width <= 0 || height <= 0 {
-            return (0, 0, texture.width, texture.height)
-        }
-        x = min(max(x, 0), texture.width)
-        y = min(max(y, 0), texture.height)
-        width = min(width, texture.width - x)
-        height = min(height, texture.height - y)
-        return (x, y, max(width, 1), max(height, 1))
-    }
 }

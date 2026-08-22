@@ -4,9 +4,9 @@ import Foundation
 ///
 /// This is deliberately *not* Wayland. The guest side runs the Wayland protocol
 /// state machine — surface roles, commit atomicity, buffer release timing — and
-/// forwards only what macOS needs to put a window on screen. Everything the
-/// design says NativePipe does not do is absent here: no scene graph, no
-/// stacking order, no shadows, no decorations, no compositing, no vsync.
+/// forwards only what macOS needs to put a window on screen. The guest consumes
+/// scene graph, stacking, scale, viewport and synchronized-commit semantics;
+/// the host sees one window-level presentation image.
 ///
 /// The mapping is one-to-one and stays that way:
 ///
@@ -36,10 +36,8 @@ extension Windowing {
             x: Int, y: Int, width: Int, height: Int)
         case popupDestroyed(window: UInt32)
 
-        /// A surface became a child of another, at an offset in the parent's
-        /// surface-local coordinates. Not a window: it is part of the parent's
-        /// contents, and the host gives it a layer inside the parent's view so
-        /// CoreAnimation does the compositing.
+        /// Legacy compatibility events. Current guests composite subsurfaces
+        /// before publishing a frame, so the host ignores these cases.
         case subsurfaceCreated(surface: UInt32, parent: UInt32, x: Int, y: Int)
         case subsurfaceMoved(surface: UInt32, x: Int, y: Int)
         case subsurfaceDestroyed(surface: UInt32)
@@ -48,6 +46,11 @@ extension Windowing {
         /// pointer-following image rather than a window or subsurface. Nil ends
         /// the overlay when the drag completes or is cancelled.
         case dragIconChanged(surface: UInt32?)
+
+        /// A wl_pointer.set_cursor surface and hotspot, or nil for the default
+        /// pointer. Semantic cursor-shape-v1 cursors use the separate case.
+        case cursorChanged(surface: UInt32?, hotspotX: Int, hotspotY: Int)
+        case cursorShapeChanged(shape: CursorShape)
 
         case titleChanged(window: UInt32, title: String)
         case appIDChanged(window: UInt32, appID: String)
@@ -59,6 +62,10 @@ extension Windowing {
 
         /// The client acknowledged a configure and attached matching content.
         case committed(surface: UInt32, frame: Frame)
+
+        /// A committed update carried frame/FIFO state but no new buffer. The
+        /// host completes it on the owning window's next display refresh.
+        case frameCallbackRequested(surface: UInt32, presentationID: UInt32)
 
         /// `xdg_toplevel.move` / `.resize` — the client asking the host to run an
         /// interactive drag. Client-side decorations report their title bar drags
@@ -109,6 +116,31 @@ extension Windowing {
         case textInputSurroundingText(window: UInt32, text: String, cursor: Int, anchor: Int)
     }
 
+    public struct FloatRect: Codable, Sendable, Equatable {
+        public var x: Double
+        public var y: Double
+        public var width: Double
+        public var height: Double
+
+        public init(x: Double, y: Double, width: Double, height: Double) {
+            self.x = x
+            self.y = y
+            self.width = width
+            self.height = height
+        }
+    }
+
+    /// Values assigned by wp_cursor_shape_device_v1.set_shape.
+    public enum CursorShape: UInt32, Codable, Sendable, Equatable {
+        case defaultShape = 1, contextMenu, help, pointer, progress, wait
+        case cell, crosshair, text, verticalText, alias, copy, move
+        case noDrop, notAllowed, grab, grabbing
+        case eResize, nResize, neResize, nwResize
+        case sResize, seResize, swResize, wResize
+        case ewResize, nsResize, neswResize, nwseResize
+        case colResize, rowResize, allScroll, zoomIn, zoomOut
+    }
+
     /// What a committed frame consists of.
     ///
     /// The pixels are not in here. `resourceID` names a virtio-gpu blob that is
@@ -120,8 +152,7 @@ extension Windowing {
         public var height: Int
         public var bytesPerRow: Int
         public var format: PixelFormat
-        /// Buffer scale, so a 2x surface reports its pixel size here and its
-        /// point size after division.
+        /// Pixel density of the final window-level IOSurface.
         public var scale: Int
         /// The visible xdg-shell window inside the wl_surface, in logical
         /// surface coordinates. CSD clients commonly leave transparent shadow
@@ -140,12 +171,23 @@ extension Windowing {
         /// Bumped when the remote encoder is reset so the host rebuilds its
         /// decompression session.
         public var bitstreamEpoch: UInt16
+        /// Nonzero identity used to release a compositor-owned presentation
+        /// only after the host has consumed it.
+        public var presentationID: UInt32
+        /// Legacy per-surface viewporter metadata. Current window frames have
+        /// already consumed this in the guest compositor; cursor/drag surfaces
+        /// can still carry it because they are not part of a window scene.
+        public var viewportSource: FloatRect?
+        public var viewportDestination: Size?
 
         public init(
             resourceID: UInt32, width: Int, height: Int, bytesPerRow: Int,
             format: PixelFormat, scale: Int = 1, windowGeometry: Rect? = nil,
             damage: [Rect] = [], source: FrameSourceKind = .cpu,
-            codec: String? = nil, bitstreamEpoch: UInt16 = 0
+            codec: String? = nil, bitstreamEpoch: UInt16 = 0,
+            presentationID: UInt32 = 0,
+            viewportSource: FloatRect? = nil,
+            viewportDestination: Size? = nil
         ) {
             self.resourceID = resourceID
             self.width = width
@@ -158,11 +200,15 @@ extension Windowing {
             self.source = source
             self.codec = codec
             self.bitstreamEpoch = bitstreamEpoch
+            self.presentationID = presentationID
+            self.viewportSource = viewportSource
+            self.viewportDestination = viewportDestination
         }
 
         enum CodingKeys: String, CodingKey {
             case resourceID, width, height, bytesPerRow, format, scale
             case windowGeometry, damage, source, codec, bitstreamEpoch
+            case presentationID, viewportSource, viewportDestination
         }
 
         public init(from decoder: Decoder) throws {
@@ -178,6 +224,9 @@ extension Windowing {
             source = try c.decodeIfPresent(FrameSourceKind.self, forKey: .source) ?? .cpu
             codec = try c.decodeIfPresent(String.self, forKey: .codec)
             bitstreamEpoch = try c.decodeIfPresent(UInt16.self, forKey: .bitstreamEpoch) ?? 0
+            presentationID = try c.decodeIfPresent(UInt32.self, forKey: .presentationID) ?? 0
+            viewportSource = try c.decodeIfPresent(FloatRect.self, forKey: .viewportSource)
+            viewportDestination = try c.decodeIfPresent(Size.self, forKey: .viewportDestination)
         }
 
         public func encode(to encoder: Encoder) throws {
@@ -193,6 +242,9 @@ extension Windowing {
             if source != .cpu { try c.encode(source, forKey: .source) }
             try c.encodeIfPresent(codec, forKey: .codec)
             if bitstreamEpoch != 0 { try c.encode(bitstreamEpoch, forKey: .bitstreamEpoch) }
+            if presentationID != 0 { try c.encode(presentationID, forKey: .presentationID) }
+            try c.encodeIfPresent(viewportSource, forKey: .viewportSource)
+            try c.encodeIfPresent(viewportDestination, forKey: .viewportDestination)
         }
     }
 
@@ -265,9 +317,9 @@ extension Windowing {
     /// Instructions the host sends down. Geometry, focus and lifetime are macOS
     /// decisions; the guest applies them to the Wayland objects.
     public enum HostCommand: Codable, Sendable {
-        /// The window changed size or state. The client redraws and acks; the
-        /// host does not stretch the old frame in the meantime, which is what
-        /// keeps resizing from looking rubbery.
+        /// The window changed size or state. `size` is in logical window-
+        /// geometry coordinates (AppKit points), never backing pixels. The
+        /// client's wl_surface buffer scale determines pixel density separately.
         case configure(window: UInt32, size: Size, states: [ToplevelState], serial: UInt32)
         /// User clicked the close button. This is a request — the client decides.
         case close(window: UInt32)
@@ -286,6 +338,14 @@ extension Windowing {
         case pointerLeft(window: UInt32)
         case pointerButton(window: UInt32, button: PointerButton, pressed: Bool)
         case pointerScroll(window: UInt32, dx: Double, dy: Double, isPrecise: Bool)
+
+        /// The frame reached the host display clock. This completes Wayland
+        /// frame callbacks and FIFO barriers, but does not make the currently
+        /// displayed IOSurface writable again.
+        case framePresented(surface: UInt32, presentationID: UInt32)
+        /// A later CALayer contents transaction no longer references this
+        /// frame, so its guest output-ring slot can be reused safely.
+        case frameReleased(surface: UInt32, presentationID: UInt32)
 
         // MARK: Clipboard — the mirror image of the guest's three events.
 

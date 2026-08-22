@@ -1,5 +1,6 @@
 #include "compositor.h"
 #include "gpu_copy.h"
+#include "scene_renderer.h"
 #include "vk_context.h"
 #include "vk_surface_buffer.h"
 
@@ -20,8 +21,16 @@ int main(int argc, char **argv)
         np_vk_context_destroy(&vk);
         return 1;
     }
+	if (!np_scene_renderer_init(&vk)) {
+		fprintf(stderr, "[wayland] failed to initialize scene renderer\n");
+		np_gpu_copy_finish();
+		np_vk_surface_buffer_clear_device();
+		np_vk_context_destroy(&vk);
+		return 1;
+	}
 
     int result = np_compositor_run(argc, argv);
+	np_scene_renderer_finish();
     np_gpu_copy_finish();
     np_vk_surface_buffer_clear_device();
     np_vk_context_destroy(&vk);

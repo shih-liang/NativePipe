@@ -37,7 +37,7 @@ let package = Package(
         // and IOSurface, and knows nothing about VM bundles or the guest agent.
         .target(
             name: "NativePipeGPU",
-            dependencies: ["NativePipeVenus"],
+            dependencies: ["NativePipeVenus", "NativePipeProtocol"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         // Wayland guest events ↔ NSWindow / clipboard / key codes.
@@ -73,8 +73,13 @@ let package = Package(
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .testTarget(
+            name: "NativePipeWindowingTests",
+            dependencies: ["NativePipeWindowing", "NativePipeProtocol"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .testTarget(
             name: "NativePipeGPUTests",
-            dependencies: ["NativePipeGPU"],
+            dependencies: ["NativePipeGPU", "NativePipeProtocol"],
             path: "Tests/NativePipeGPUTests",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),

@@ -22,7 +22,7 @@ public final class RemoteDisplayController {
             self?.session.send(command)
         }
         frames.setFrameAvailableHandler { [weak self] _ in
-            self?.bridge.retryPendingGPUFrames()
+            self?.bridge.retryPendingFrames()
         }
         session.onEvent = { [weak self] event in
             Task { @MainActor in

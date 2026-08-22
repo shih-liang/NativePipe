@@ -1,24 +1,28 @@
 #define _GNU_SOURCE
 
 /* linux-dmabuf is an input protocol only. Client resources never become
- * NativePipe display resources directly: each wl_buffer owns a compositor
- * VkImage/IOSurface mirror, and commit copies the client image into that mirror
- * before compositor.c publishes its resource id. */
+ * NativePipe display resources directly. Each wl_buffer owns only an imported
+ * source VkImage; scene.c composites it into the window's ordinary scene
+ * VkImage when the commit becomes active. */
 
 #include "dmabuf.h"
 #include "gpu_copy.h"
 #include "linux-dmabuf-unstable-v1-server-protocol.h"
+#include "perf.h"
 #include "vk_surface_buffer.h"
 
 #include <drm/drm.h>
 #include <drm/virtgpu_drm.h>
 
 #include <errno.h>
+#include <fcntl.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -31,6 +35,13 @@ struct np_dmabuf {
     /* Borrowed lookup-only render-node fd owned by the compositor surface store.
      * It has no DRM/Venus context. */
     int drm_fd;
+    dev_t device;
+};
+
+struct np_dmabuf_format_table_entry {
+    uint32_t format;
+    uint32_t padding;
+    uint64_t modifier;
 };
 
 struct np_params {
@@ -42,9 +53,8 @@ struct np_params {
 };
 
 struct np_gpu_buffer_object {
-    struct np_gpu_buffer info;          /* publishes display.resource_id */
+    struct np_gpu_buffer info;          /* identifies the imported source */
     struct np_gpu_copy_source source;   /* client dma-buf, compositor-local VkImage */
-    struct np_vk_surface_buffer display;/* compositor-owned IOSurface VkImage */
 
     uint32_t client_bo_handle;          /* lifetime reference only */
     uint32_t client_resource_id;        /* diagnostic only; never sent to host */
@@ -81,13 +91,29 @@ static void gpu_buffer_free(struct np_gpu_buffer_object *gpu)
         return;
 
     np_gpu_copy_source_destroy(&gpu->source);
-    np_vk_surface_buffer_destroy(&gpu->display);
-
     if (gpu->client_bo_handle && gpu->drm_fd >= 0) {
         struct drm_gem_close closer = { .handle = gpu->client_bo_handle };
         ioctl(gpu->drm_fd, DRM_IOCTL_GEM_CLOSE, &closer);
     }
     free(gpu);
+}
+
+static bool wait_for_client_render(struct np_gpu_buffer_object *gpu)
+{
+	uint64_t start = np_perf_now_ns();
+    struct drm_virtgpu_3d_wait wait = {
+        .handle = gpu->client_bo_handle,
+        .flags = 0,
+    };
+    if (ioctl(gpu->drm_fd, DRM_IOCTL_VIRTGPU_WAIT, &wait) == 0) {
+		np_perf_record(NP_PERF_CLIENT_WAIT, np_perf_now_ns() - start);
+        return true;
+	}
+	np_perf_record(NP_PERF_CLIENT_WAIT, np_perf_now_ns() - start);
+
+    fprintf(stderr, "[wayland] WAIT client_res=%u: %s\n",
+            gpu->client_resource_id, strerror(errno));
+    return false;
 }
 
 static void gpu_buffer_resource_destroy(struct wl_resource *resource)
@@ -151,18 +177,10 @@ static struct wl_resource *make_gpu_buffer(struct wl_client *client, uint32_t id
         return NULL;
     }
 
-    if (!np_vk_surface_buffer_create((uint32_t)width, (uint32_t)height,
-                                     &gpu->display)) {
-        fprintf(stderr, "[wayland] failed to allocate display VkImage for client res=%u\n",
-                client_res);
-        gpu_buffer_free(gpu);
-        return NULL;
-    }
-
-    gpu->info.resource_id = gpu->display.resource_id;
+    gpu->info.resource_id = client_res;
     gpu->info.width = width;
     gpu->info.height = height;
-    gpu->info.stride = (int32_t)gpu->display.stride;
+    gpu->info.stride = (int32_t)params->stride;
     gpu->info.format = format;
 
     close(params->fd);
@@ -177,9 +195,11 @@ static struct wl_resource *make_gpu_buffer(struct wl_client *client, uint32_t id
     wl_resource_set_implementation(buffer, &gpu_buffer_implementation, gpu,
                                    gpu_buffer_resource_destroy);
 
-    fprintf(stderr,
-            "[wayland] gpu buffer client_res=%u -> display_res=%u %dx%d stride=%u\n",
-            client_res, gpu->display.resource_id, width, height, gpu->display.stride);
+    if (getenv("NP_TRACE")) {
+        fprintf(stderr,
+                "[wayland] gpu source client_res=%u %dx%d stride=%u\n",
+                client_res, width, height, params->stride);
+    }
     return buffer;
 }
 
@@ -304,29 +324,138 @@ static const uint64_t k_modifiers[] = {
     DRM_FORMAT_MOD_INVALID,
 };
 
-/* v4 feedback is deliberately not advertised. Mesa Venus previously performed
- * a re-entrant Wayland roundtrip from CreateSwapchain on this minimal server;
- * v3 modifier events are sufficient for the linear import path used here. */
-static void unsupported_feedback(struct wl_client *client, struct wl_resource *resource,
-                                 uint32_t id)
+static void feedback_destroy(struct wl_client *client, struct wl_resource *resource)
 {
-    (void)client; (void)id;
-    wl_resource_post_error(resource, 0, "linux-dmabuf feedback requires v4");
+    (void)client;
+    wl_resource_destroy(resource);
 }
 
-static void unsupported_surface_feedback(struct wl_client *client,
-                                         struct wl_resource *resource,
-                                         uint32_t id, struct wl_resource *surface)
+static const struct zwp_linux_dmabuf_feedback_v1_interface feedback_implementation = {
+    .destroy = feedback_destroy,
+};
+
+static bool write_all(int fd, const void *data, size_t size)
+{
+    const uint8_t *bytes = data;
+    while (size) {
+        ssize_t written = write(fd, bytes, size);
+        if (written < 0) {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+        bytes += written;
+        size -= (size_t)written;
+    }
+    return true;
+}
+
+static int create_format_table(void)
+{
+    struct np_dmabuf_format_table_entry entries[
+        sizeof(k_formats) / sizeof(k_formats[0]) *
+        sizeof(k_modifiers) / sizeof(k_modifiers[0])];
+    size_t entry = 0;
+    for (size_t f = 0; f < sizeof(k_formats) / sizeof(k_formats[0]); f++) {
+        for (size_t m = 0; m < sizeof(k_modifiers) / sizeof(k_modifiers[0]); m++) {
+            entries[entry++] = (struct np_dmabuf_format_table_entry) {
+                .format = k_formats[f],
+                .modifier = k_modifiers[m],
+            };
+        }
+    }
+
+    int fd = memfd_create("nativepipe-dmabuf-feedback",
+                          MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (fd < 0)
+        return -1;
+    if (!write_all(fd, entries, sizeof(entries)) ||
+        fcntl(fd, F_ADD_SEALS,
+              F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static void send_feedback(struct wl_resource *feedback, struct np_dmabuf *dmabuf)
+{
+    int table_fd = create_format_table();
+    if (table_fd < 0) {
+        wl_resource_post_no_memory(feedback);
+        return;
+    }
+
+    struct wl_array device;
+    struct wl_array indices;
+    wl_array_init(&device);
+    wl_array_init(&indices);
+
+    dev_t *device_value = wl_array_add(&device, sizeof(*device_value));
+    uint16_t *format_indices = wl_array_add(
+        &indices,
+        sizeof(uint16_t) * sizeof(k_formats) / sizeof(k_formats[0]) *
+            sizeof(k_modifiers) / sizeof(k_modifiers[0]));
+    if (!device_value || !format_indices) {
+        wl_array_release(&indices);
+        wl_array_release(&device);
+        close(table_fd);
+        wl_resource_post_no_memory(feedback);
+        return;
+    }
+
+    *device_value = dmabuf->device;
+    for (size_t i = 0; i < indices.size / sizeof(*format_indices); i++)
+        format_indices[i] = (uint16_t)i;
+
+    zwp_linux_dmabuf_feedback_v1_send_format_table(
+        feedback, table_fd,
+        (uint32_t)(sizeof(struct np_dmabuf_format_table_entry) *
+                   indices.size / sizeof(*format_indices)));
+    zwp_linux_dmabuf_feedback_v1_send_main_device(feedback, &device);
+    zwp_linux_dmabuf_feedback_v1_send_tranche_target_device(feedback, &device);
+    zwp_linux_dmabuf_feedback_v1_send_tranche_flags(feedback, 0);
+    zwp_linux_dmabuf_feedback_v1_send_tranche_formats(feedback, &indices);
+    zwp_linux_dmabuf_feedback_v1_send_tranche_done(feedback);
+    zwp_linux_dmabuf_feedback_v1_send_done(feedback);
+
+    wl_array_release(&indices);
+    wl_array_release(&device);
+    close(table_fd);
+}
+
+static void create_feedback(struct wl_client *client, struct wl_resource *resource,
+                            uint32_t id)
+{
+    struct wl_resource *feedback = wl_resource_create(
+        client, &zwp_linux_dmabuf_feedback_v1_interface, 1, id);
+    if (!feedback) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    wl_resource_set_implementation(feedback, &feedback_implementation, NULL, NULL);
+    send_feedback(feedback, wl_resource_get_user_data(resource));
+}
+
+static void get_default_feedback(struct wl_client *client,
+                                 struct wl_resource *resource, uint32_t id)
+{
+    create_feedback(client, resource, id);
+}
+
+static void get_surface_feedback(struct wl_client *client,
+                                 struct wl_resource *resource, uint32_t id,
+                                 struct wl_resource *surface)
 {
     (void)surface;
-    unsupported_feedback(client, resource, id);
+    create_feedback(client, resource, id);
 }
 
 static const struct zwp_linux_dmabuf_v1_interface dmabuf_implementation = {
     .destroy = dmabuf_destroy,
     .create_params = dmabuf_create_params,
-    .get_default_feedback = unsupported_feedback,
-    .get_surface_feedback = unsupported_surface_feedback,
+    .get_default_feedback = get_default_feedback,
+    .get_surface_feedback = get_surface_feedback,
 };
 
 static void send_formats(struct wl_resource *resource)
@@ -348,8 +477,8 @@ static void dmabuf_bind(struct wl_client *client, void *data,
                         uint32_t version, uint32_t id)
 {
     struct np_dmabuf *dmabuf = data;
-    if (version > 3)
-        version = 3;
+    if (version > 4)
+        version = 4;
     struct wl_resource *resource = wl_resource_create(
         client, &zwp_linux_dmabuf_v1_interface, version, id);
     if (!resource) {
@@ -357,7 +486,10 @@ static void dmabuf_bind(struct wl_client *client, void *data,
         return;
     }
     wl_resource_set_implementation(resource, &dmabuf_implementation, dmabuf, NULL);
-    send_formats(resource);
+    /* format/modifier events are forbidden for v4 bindings; those clients get
+     * the same pairs from the immutable feedback table instead. */
+    if (version < 4)
+        send_formats(resource);
 }
 
 void np_dmabuf_advertise(struct wl_display *display, int drm_fd)
@@ -375,9 +507,10 @@ void np_dmabuf_advertise(struct wl_display *display, int drm_fd)
     if (!dmabuf)
         return;
     dmabuf->drm_fd = drm_fd;
+    dmabuf->device = st.st_rdev;
 
-    wl_global_create(display, &zwp_linux_dmabuf_v1_interface, 3, dmabuf, dmabuf_bind);
-    fprintf(stderr, "[wayland] linux-dmabuf v3 mirrors into compositor VkImages\n");
+    wl_global_create(display, &zwp_linux_dmabuf_v1_interface, 4, dmabuf, dmabuf_bind);
+    fprintf(stderr, "[wayland] linux-dmabuf v4 imports compositor source images\n");
 }
 
 struct np_gpu_buffer *np_gpu_buffer_get(struct wl_resource *buffer)
@@ -390,13 +523,68 @@ struct np_gpu_buffer *np_gpu_buffer_get(struct wl_resource *buffer)
     if (!gpu)
         return NULL;
 
-    if (!np_gpu_copy_to_display(&gpu->source, &gpu->display)) {
-        fprintf(stderr, "[wayland] gpu copy client_res=%u -> display_res=%u failed\n",
-                gpu->client_resource_id, gpu->display.resource_id);
-        return NULL;
-    }
-
-    gpu->info.resource_id = gpu->display.resource_id;
-    gpu->info.stride = (int32_t)gpu->display.stride;
     return &gpu->info;
+}
+
+bool np_gpu_buffer_prepare_scene(struct np_gpu_buffer *buffer,
+                                 struct np_gpu_scene_image *image)
+{
+    if (!buffer || !image)
+        return false;
+    struct np_gpu_buffer_object *gpu =
+        (struct np_gpu_buffer_object *)((char *)buffer -
+            offsetof(struct np_gpu_buffer_object, info));
+    if (!gpu->source.image || !gpu->source.view || !wait_for_client_render(gpu))
+        return false;
+    image->image = gpu->source.image;
+    image->view = gpu->source.view;
+    image->layout = &gpu->source.layout;
+    gpu->source.initialized = true;
+    return true;
+}
+
+bool np_gpu_buffer_copy_to_output(struct np_gpu_buffer *buffer,
+                                  struct np_vk_surface_buffer *output)
+{
+    if (!buffer || !output)
+        return false;
+
+    struct np_gpu_buffer_object *gpu =
+        (struct np_gpu_buffer_object *)((char *)buffer -
+            offsetof(struct np_gpu_buffer_object, info));
+
+    /* linux-dmabuf has implicit synchronization unless an explicit-sync
+     * protocol was negotiated. Waiting on the imported GEM handle observes
+     * the dma-resv fence installed by the client's Venus submission. */
+    if (!wait_for_client_render(gpu))
+        return false;
+
+    if (!np_gpu_copy_to_display(&gpu->source, output)) {
+        fprintf(stderr, "[wayland] gpu copy client_res=%u -> output_res=%u failed\n",
+                gpu->client_resource_id, output->resource_id);
+        return false;
+    }
+    return true;
+}
+
+bool np_gpu_buffer_copy_to_output_region(
+    struct np_gpu_buffer *buffer, struct np_vk_surface_buffer *output,
+    int32_t source_x0, int32_t source_y0,
+    int32_t source_x1, int32_t source_y1,
+    int32_t destination_x0, int32_t destination_y0,
+    int32_t destination_x1, int32_t destination_y1,
+    bool clear)
+{
+    if (!buffer || !output)
+        return false;
+    struct np_gpu_buffer_object *gpu =
+        (struct np_gpu_buffer_object *)((char *)buffer -
+            offsetof(struct np_gpu_buffer_object, info));
+    if (!wait_for_client_render(gpu))
+        return false;
+    return np_gpu_copy_to_display_region(
+        &gpu->source, output,
+        source_x0, source_y0, source_x1, source_y1,
+        destination_x0, destination_y0, destination_x1, destination_y1,
+        clear);
 }

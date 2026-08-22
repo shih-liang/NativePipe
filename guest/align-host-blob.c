@@ -16,8 +16,12 @@
  * guest drm_mm hands out offsets from CREATE size, so an unaligned CREATE
  * puts the next blob at an offset the host cannot map.
  *
- * vmpipe-wayland already rounds its own blobs. This interposer does
- * the same for every other process (vulkaninfo, vkcube, GTK vulkan).
+ * Every guest-mappable blob consumes space in the same drm_mm aperture.  A
+ * single 4 KiB VkDeviceMemory blob therefore misaligns all following rings,
+ * even when every ring itself is rounded.  Round every USE_MAPPABLE blob; the
+ * host renderer applies the same rule before allocating host-visible Vulkan
+ * memory, so the vkr allocation and RESOURCE_CREATE_BLOB signatures agree.
+ * DEVICE_LOCAL / Metal-heap blobs are not mappable and remain untouched.
  */
 #define HOST_PAGE ((uint64_t)16384)
 
@@ -30,6 +34,15 @@ static int trace_enabled(void)
 static void align_create_blob(struct drm_virtgpu_resource_create_blob *create)
 {
 	if (!create || create->size == 0) return;
+	if (trace_enabled()) {
+		fprintf(stderr,
+		        "[align-blob] CREATE_BLOB mem=%u flags=0x%x blob_id=%llu size=%llu%s\n",
+		        create->blob_mem, create->blob_flags,
+		        (unsigned long long)create->blob_id,
+		        (unsigned long long)create->size,
+		        create->blob_id == 0 ? " ring" : "");
+	}
+	if (!(create->blob_flags & VIRTGPU_BLOB_FLAG_USE_MAPPABLE)) return;
 	uint64_t aligned = (create->size + HOST_PAGE - 1) & ~(HOST_PAGE - 1);
 	if (aligned == create->size) return;
 	if (trace_enabled()) {

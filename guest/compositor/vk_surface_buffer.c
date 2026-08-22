@@ -7,18 +7,22 @@
 
 static VkDevice np_device;
 static VkPhysicalDevice np_physical_device;
+static PFN_vkGetMemoryFdKHR np_get_memory_fd;
 
 void np_vk_surface_buffer_set_device(VkPhysicalDevice physical,
                                      VkDevice device)
 {
     np_physical_device = physical;
     np_device = device;
+    np_get_memory_fd = (PFN_vkGetMemoryFdKHR)
+        vkGetDeviceProcAddr(device, "vkGetMemoryFdKHR");
 }
 
 void np_vk_surface_buffer_clear_device(void)
 {
     np_device = VK_NULL_HANDLE;
     np_physical_device = VK_NULL_HANDLE;
+    np_get_memory_fd = NULL;
 }
 
 static bool find_host_visible_memory(uint32_t bits,
@@ -53,7 +57,8 @@ static void destroy_partial(struct np_vk_surface_buffer *buffer)
     if (!buffer)
         return;
 
-    if (buffer->resource_drm_fd >= 0) {
+    if (buffer->resource_drm_fd >= 0 &&
+        (buffer->resource_bo_handle || buffer->resource_id)) {
         struct np_virtio_resource_ref ref = {
             .drm_fd = buffer->resource_drm_fd,
             .bo_handle = buffer->resource_bo_handle,
@@ -62,12 +67,15 @@ static void destroy_partial(struct np_vk_surface_buffer *buffer)
         np_virtio_resource_release(&ref);
     }
 
-    if (np_device != VK_NULL_HANDLE && buffer->mapped && buffer->memory)
-        vkUnmapMemory(np_device, buffer->memory);
-    if (np_device != VK_NULL_HANDLE && buffer->memory)
-        vkFreeMemory(np_device, buffer->memory, NULL);
+    if (np_device != VK_NULL_HANDLE && buffer->view)
+        vkDestroyImageView(np_device, buffer->view, NULL);
     if (np_device != VK_NULL_HANDLE && buffer->image)
         vkDestroyImage(np_device, buffer->image, NULL);
+    if (np_device != VK_NULL_HANDLE && buffer->mapped && buffer->memory)
+        vkUnmapMemory(np_device, buffer->memory);
+    /* Destroy the bound image before releasing its VkDeviceMemory. */
+    if (np_device != VK_NULL_HANDLE && buffer->memory)
+        vkFreeMemory(np_device, buffer->memory, NULL);
 
     memset(buffer, 0, sizeof(*buffer));
     buffer->resource_drm_fd = -1;
@@ -78,7 +86,8 @@ bool np_vk_surface_buffer_create(uint32_t width,
                                  struct np_vk_surface_buffer *out)
 {
     if (!out || !width || !height ||
-        np_device == VK_NULL_HANDLE || np_physical_device == VK_NULL_HANDLE)
+        np_device == VK_NULL_HANDLE || np_physical_device == VK_NULL_HANDLE ||
+        !np_get_memory_fd)
         return false;
 
     memset(out, 0, sizeof(*out));
@@ -89,7 +98,7 @@ bool np_vk_surface_buffer_create(uint32_t width,
 
     VkExternalMemoryImageCreateInfo external_image = {
         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
-        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
     };
     VkImageCreateInfo image_info = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -101,11 +110,13 @@ bool np_vk_surface_buffer_create(uint32_t width,
         .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_LINEAR,
-        /* CPU wl_shm writes happen through the mapped allocation. GPU clients
-         * are composited by transfer into this same image. Avoid COLOR_ATTACHMENT
-         * so this stays legal on Metal devices without renderLinearTextures. */
+        /* Surface snapshots are sampled and the two window images are render
+         * targets. MoltenVK on Apple GPUs advertises renderLinearTextures, and
+         * the compositor validates these linear-format features at startup. */
         .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                 VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                 VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                 VK_IMAGE_USAGE_SAMPLED_BIT |
+                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };
@@ -127,7 +138,7 @@ bool np_vk_surface_buffer_create(uint32_t width,
 
     VkExportMemoryAllocateInfo export_info = {
         .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
-        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
     };
     VkMemoryDedicatedAllocateInfo dedicated_info = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
@@ -148,6 +159,22 @@ bool np_vk_surface_buffer_create(uint32_t width,
     }
 
     if (vkBindImageMemory(np_device, out->image, out->memory, 0) != VK_SUCCESS) {
+        destroy_partial(out);
+        return false;
+    }
+
+    VkImageViewCreateInfo view_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = out->image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = VK_FORMAT_B8G8R8A8_UNORM,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .levelCount = 1,
+            .layerCount = 1,
+        },
+    };
+    if (vkCreateImageView(np_device, &view_info, NULL, &out->view) != VK_SUCCESS) {
         destroy_partial(out);
         return false;
     }
@@ -178,10 +205,10 @@ bool np_vk_surface_buffer_create(uint32_t width,
     VkMemoryGetFdInfoKHR fd_info = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
         .memory = out->memory,
-        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
     };
     int prime_fd = -1;
-    if (vkGetMemoryFdKHR(np_device, &fd_info, &prime_fd) != VK_SUCCESS || prime_fd < 0) {
+    if (np_get_memory_fd(np_device, &fd_info, &prime_fd) != VK_SUCCESS || prime_fd < 0) {
         destroy_partial(out);
         return false;
     }
@@ -202,7 +229,11 @@ bool np_vk_surface_buffer_create(uint32_t width,
 
 void np_vk_surface_buffer_flush(struct np_vk_surface_buffer *buffer)
 {
-    if (!buffer || !buffer->memory || buffer->coherent || np_device == VK_NULL_HANDLE)
+    if (!buffer || !buffer->memory || np_device == VK_NULL_HANDLE)
+        return;
+
+    buffer->host_dirty = true;
+    if (buffer->coherent)
         return;
 
     VkMappedMemoryRange range = {
@@ -212,6 +243,22 @@ void np_vk_surface_buffer_flush(struct np_vk_surface_buffer *buffer)
         .size = VK_WHOLE_SIZE,
     };
     vkFlushMappedMemoryRanges(np_device, 1, &range);
+}
+
+bool np_vk_surface_buffer_invalidate(struct np_vk_surface_buffer *buffer)
+{
+    if (!buffer || !buffer->memory || np_device == VK_NULL_HANDLE)
+        return false;
+    if (buffer->coherent)
+        return true;
+
+    VkMappedMemoryRange range = {
+        .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+        .memory = buffer->memory,
+        .offset = 0,
+        .size = VK_WHOLE_SIZE,
+    };
+    return vkInvalidateMappedMemoryRanges(np_device, 1, &range) == VK_SUCCESS;
 }
 
 void np_vk_surface_buffer_destroy(struct np_vk_surface_buffer *buffer)

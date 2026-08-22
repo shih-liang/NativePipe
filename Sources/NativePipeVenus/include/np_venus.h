@@ -35,11 +35,6 @@ typedef struct np_venus_blob {
 	uint32_t blob_flags;
 	void *pointer;
 	uint64_t size;
-	uint32_t width;
-	uint32_t height;
-	uint32_t bytes_per_row;
-	/// CFTypeRef / IOSurfaceRef. Retained for the life of the blob.
-	void *iosurface;
 } np_venus_blob;
 
 /// Opens the renderer. Always returns an object: without virglrenderer the
@@ -70,19 +65,16 @@ void np_venus_context_destroy(np_venus *venus, uint32_t ctx_id);
 
 /// Registers a HOST3D blob with virglrenderer.
 ///
-/// Compositor (guest vmpipe-wayland): `iosurface` is the window buffer
-/// already allocated on the host; vkr has no VkDeviceMemory for this
-/// `blob_id` and create_blob is allowed to fail.
-///
-/// Mesa Venus: `iosurface` is NULL. `blob_id == 0` is vkr shm (command
-/// ring). A non-zero `blob_id` names a VkDeviceMemory vkr already
-/// allocated. On success `blob->pointer` is that host mapping.
+/// `blob_id == 0` is vkr shm (command ring). A non-zero `blob_id` names a
+/// VkDeviceMemory vkr already allocated. On success `blob->pointer` is that
+/// host mapping when the memory is CPU-mappable; DEVICE_LOCAL images remain
+/// ordinary MTLHeap resources.
 /// Returns the virglrenderer errno; compositor callers may ignore it.
 int np_venus_create_blob(np_venus *venus, uint32_t ctx_id, np_venus_blob *blob);
 
 void np_venus_unimport_blob(np_venus *venus, uint32_t resource_id);
 
-/// CFRetain'd MTLTexture for a Venus swapchain image, or NULL.
+/// Borrowed MTLTexture for a Venus image, or NULL.
 /// `width`/`height`/`stride`/`virgl_format` come from the Wayland commit;
 /// UTM's create_handle_for_scanout builds an MTLTexture view of the MTLHeap.
 void *np_venus_metal_texture(np_venus *venus, uint32_t resource_id,

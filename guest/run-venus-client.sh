@@ -32,7 +32,11 @@ if [ ! -f /usr/share/vulkan/icd.d/virtio_icd.json ] && \
 	}
 fi
 
-ICD=$(ls /usr/share/vulkan/icd.d/virtio_icd*.json 2>/dev/null | head -1 || true)
+if [ -r /opt/nativepipe/venus/virtio_icd.json ]; then
+	ICD=/opt/nativepipe/venus/virtio_icd.json
+else
+	ICD=$(ls /usr/share/vulkan/icd.d/virtio_icd*.json 2>/dev/null | head -1 || true)
+fi
 if [ -n "$ICD" ]; then
 	export VK_DRIVER_FILES="$ICD"
 	export VK_ICD_FILENAMES="$ICD"
@@ -41,9 +45,16 @@ fi
 # Round Mesa Venus blob sizes to the host page. See align-host-blob.c.
 # Copy off the virtiofs share: some guests refuse PROT_EXEC mmap there.
 ALIGN_SRC=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/align-host-blob.so
-ALIGN_SO=/tmp/align-host-blob.so
-if [ -f "$ALIGN_SRC" ]; then
+ALIGN_INSTALLED=/usr/libexec/nativepipe/nativepipe-align-host-blob.so
+if [ -r "$ALIGN_INSTALLED" ]; then
+	ALIGN_SO=$ALIGN_INSTALLED
+elif [ -f "$ALIGN_SRC" ]; then
+	ALIGN_SO=$XDG_RUNTIME_DIR/nativepipe-align-host-blob.so
 	cp "$ALIGN_SRC" "$ALIGN_SO"
+else
+	ALIGN_SO=$ALIGN_SRC
+fi
+if [ -r "$ALIGN_SO" ]; then
 	export LD_PRELOAD="$ALIGN_SO${LD_PRELOAD:+:$LD_PRELOAD}"
 fi
 
@@ -62,11 +73,12 @@ fi
 	echo "--- vulkaninfo ---"
 	# A setgid vulkaninfo would run AT_SECURE and ignore LD_PRELOAD.
 	VKINFO=$(command -v vulkaninfo)
-	cp "$VKINFO" /tmp/vulkaninfo
-	chmod 755 /tmp/vulkaninfo
+	VKINFO_COPY=$XDG_RUNTIME_DIR/nativepipe-vulkaninfo
+	cp "$VKINFO" "$VKINFO_COPY"
+	chmod 755 "$VKINFO_COPY"
 } > "$LOG_DIR/vulkaninfo-setup.log"
 
-/tmp/vulkaninfo > "$LOG_DIR/vulkaninfo.log" 2>&1 || {
+"$VKINFO_COPY" > "$LOG_DIR/vulkaninfo.log" 2>&1 || {
 	echo "vulkaninfo failed: $?" >> "$LOG_DIR/vulkaninfo.log"
 }
 

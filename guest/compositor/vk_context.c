@@ -1,23 +1,27 @@
-#define _GNU_SOURCE
-
 #include "vk_context.h"
 
 #include <stdio.h>
 #include <string.h>
-#include <sys/random.h>
 
 static bool pick_physical_device(struct np_vk_context *ctx)
 {
     uint32_t count = 0;
-    if (vkEnumeratePhysicalDevices(ctx->instance, &count, NULL) != VK_SUCCESS || count == 0)
+    VkResult result = vkEnumeratePhysicalDevices(ctx->instance, &count, NULL);
+    if (result != VK_SUCCESS || count == 0) {
+        fprintf(stderr, "[vk-context] enumerate physical devices: result=%d count=%u\n",
+                result, count);
         return false;
+    }
 
     VkPhysicalDevice devices[8];
     if (count > 8)
         count = 8;
 
-    if (vkEnumeratePhysicalDevices(ctx->instance, &count, devices) != VK_SUCCESS)
+    result = vkEnumeratePhysicalDevices(ctx->instance, &count, devices);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "[vk-context] fetch physical devices: %d\n", result);
         return false;
+    }
 
     ctx->physical_device = devices[0];
     return true;
@@ -27,8 +31,10 @@ static bool pick_queue(struct np_vk_context *ctx)
 {
     uint32_t count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(ctx->physical_device, &count, NULL);
-    if (!count)
+    if (!count) {
+        fprintf(stderr, "[vk-context] no queue families\n");
         return false;
+    }
 
     VkQueueFamilyProperties props[16];
     if (count > 16)
@@ -41,25 +47,8 @@ static bool pick_queue(struct np_vk_context *ctx)
             return true;
         }
     }
+    fprintf(stderr, "[vk-context] no graphics queue family\n");
     return false;
-}
-
-static bool make_engine_name(char out[64])
-{
-    unsigned char token[16];
-    if (getrandom(token, sizeof(token), 0) != (ssize_t)sizeof(token))
-        return false;
-
-    static const char hex[] = "0123456789abcdef";
-    const char *prefix = "NativePipeDisplay/1/";
-    size_t n = strlen(prefix);
-    memcpy(out, prefix, n);
-    for (size_t i = 0; i < sizeof(token); i++) {
-        out[n + i * 2] = hex[token[i] >> 4];
-        out[n + i * 2 + 1] = hex[token[i] & 15];
-    }
-    out[n + sizeof(token) * 2] = '\0';
-    return true;
 }
 
 bool np_vk_context_init(struct np_vk_context *ctx)
@@ -68,20 +57,11 @@ bool np_vk_context_init(struct np_vk_context *ctx)
         return false;
     memset(ctx, 0, sizeof(*ctx));
 
-    char engine_name[64];
-    if (!make_engine_name(engine_name)) {
-        fprintf(stderr, "[vk-context] could not generate display context token\n");
-        return false;
-    }
-
-    /* The host vkr backend recognizes this application/token pair while
-     * decoding vkCreateInstance and grants IOSurface allocation only to this
-     * Venus context. The token prevents accidental matches by normal clients. */
     VkApplicationInfo app = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-        .pApplicationName = "vmpipe-wayland-gpu-blit",
+        .pApplicationName = "NativePipe compositor",
         .applicationVersion = 1,
-        .pEngineName = engine_name,
+        .pEngineName = "NativePipe scene",
         .engineVersion = 1,
         .apiVersion = VK_API_VERSION_1_1,
     };
@@ -90,8 +70,11 @@ bool np_vk_context_init(struct np_vk_context *ctx)
         .pApplicationInfo = &app,
     };
 
-    if (vkCreateInstance(&instance_info, NULL, &ctx->instance) != VK_SUCCESS)
+    VkResult result = vkCreateInstance(&instance_info, NULL, &ctx->instance);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "[vk-context] vkCreateInstance failed: %d\n", result);
         return false;
+    }
     if (!pick_physical_device(ctx) || !pick_queue(ctx))
         goto fail_instance;
 
@@ -115,11 +98,14 @@ bool np_vk_context_init(struct np_vk_context *ctx)
         .ppEnabledExtensionNames = extensions,
     };
 
-    if (vkCreateDevice(ctx->physical_device, &device_info, NULL, &ctx->device) != VK_SUCCESS)
+    result = vkCreateDevice(ctx->physical_device, &device_info, NULL, &ctx->device);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "[vk-context] vkCreateDevice failed: %d\n", result);
         goto fail_instance;
+    }
 
     vkGetDeviceQueue(ctx->device, ctx->graphics_queue_family, 0, &ctx->graphics_queue);
-    fprintf(stderr, "[vk-context] compositor Venus device initialized (%s)\n", engine_name);
+    fprintf(stderr, "[vk-context] compositor Venus device initialized\n");
     return true;
 
 fail_instance:

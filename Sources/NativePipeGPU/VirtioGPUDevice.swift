@@ -9,10 +9,12 @@ import os
 /// NativePipe compositor. One instance can expose both a Venus render node and
 /// an optional KMS scanout; no Apple graphics device is required in that mode.
 ///
-///   * CREATE_BLOB from the compositor → IOSurface, mapped into the guest,
-///     shown by `CALayer.contents` (CPU windows).
-///   * CREATE_BLOB from Mesa Venus → adopt vkr's existing mapping. The
-///     window presents that mapping on a CAMetalLayer (GPU windows).
+///   * CREATE_BLOB from Mesa Venus → ordinary renderer allocations. The guest
+///     compositor's window-scene image is an exact BGRA Metal texture.
+///   * The host retains that texture without exporting pixels, blits it into
+///     the NSWindow-owned IOSurface, and releases the scene image on completion.
+///   * IOSurface-backed resources remain only for the optional legacy 2D
+///     framebuffer path.
 ///   * SUBMIT_3D → virglrenderer (vkr) → MoltenVK. Venus is not here.
 ///
 /// All delegate callbacks arrive on `deviceQueue`, so the state below is queue
@@ -29,7 +31,6 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
     /// Written into the first words of every fresh blob so the guest can prove
     /// it is reading host memory rather than zeroed guest pages. Mirrored in
     /// `guest/tools/blobtest.c`.
-    static let hostProbePattern: UInt32 = 0xA5A5_A5A5
 
     private static func note(_ message: @autoclosure () -> String) {
         guard trace else { return }
@@ -86,8 +87,8 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
     }
 
     /// Immutable description of the resource currently bound to scanout 0.
-    /// Consumers resolve `resourceID` through `surface`, `gpuMemory`, or
-    /// `gpuMetalTexture`; the frame itself never carries an unsafe pointer.
+    /// Raw blob access is scanout plumbing only; application windows resolve
+    /// the compositor scene through `gpuMetalTexture(forResource:...)`.
     public struct ScanoutFrame: Equatable, Sendable {
         public let resourceID: UInt32
         public let rectangle: VirtioGPU.Rect
@@ -99,7 +100,9 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
         public let serial: UInt64
     }
 
-    /// Host view of one virtio-gpu resource, for the window to present.
+    /// Published host view of one virtio-gpu resource. `surface` belongs only
+    /// to the legacy 2D framebuffer path; application windows request the
+    /// compositor's Metal texture by resource id.
     public struct PublishedBuffer {
         public var surface: IOSurfaceRef?
         public var pointer: UnsafeMutableRawPointer?
@@ -128,13 +131,13 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
         publishedLock.unlock()
     }
 
-    /// The IOSurface behind a CPU/compositor resource, or nil.
+    /// The IOSurface behind a legacy 2D framebuffer resource, or nil.
     public func surface(forResource resourceID: UInt32) -> IOSurfaceRef? {
         buffer(forResource: resourceID)?.surface
     }
 
-    /// Mapping of a Venus resource that already lives in MoltenVK. The
-    /// window presents this through a CAMetalLayer; nothing is copied.
+    /// Mapping of a Venus resource for the optional full-VM scanout path.
+    /// Application windows never call this API.
     public func gpuMemory(forResource resourceID: UInt32) -> (UnsafeMutableRawPointer, Int)? {
         guard let published = buffer(forResource: resourceID), published.surface == nil,
               published.pointer != nil else {
@@ -143,7 +146,8 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
         return (published.pointer!, published.byteCount)
     }
 
-    /// OPTIMAL swapchain image as an MTLTexture via UTM scanout handle API.
+    /// A Venus image exported as an MTLTexture. Application windows use this
+    /// as the source of their private display-IOSurface blit.
     public func gpuMetalTexture(
         forResource resourceID: UInt32,
         width: Int, height: Int, bytesPerRow: Int, format: UInt32
@@ -883,19 +887,7 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
         header: VirtioGPU.ControlHeader,
         element: VZVirtioQueueElement
     ) {
-        let geometry = VirtioGPU.BlobGeometry(blobID: request.blobID)
-        if geometry != nil {
-            do {
-                let resource = try resources.createBlob(
-                    id: request.resourceID, size: request.size, geometry: geometry,
-                    blobID: request.blobID)
-                importIntoVenus(resource, contextID: header.contextID)
-                finishCreateBlob(resource, geometry: geometry, header: header, element: element)
-            } catch {
-                Self.log.error("could not create compositor blob: \(error.localizedDescription, privacy: .public)")
-                respond(element, header.reply(.errOutOfMemory))
-            }
-        } else if np_venus_is_live(venus) {
+        if np_venus_is_live(venus) {
             adoptVenusBlob(request, header: header, element: element, attempt: 0)
         } else {
             Self.note(
@@ -974,9 +966,28 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
         header: VirtioGPU.ControlHeader?,
         completion: (() -> Void)? = nil
     ) {
-        guard let region = hostVisibleRegion, let offset = resource.mappedOffset else {
-            if let element, let header { respond(element, header.reply(.okNoData)) }
+        let finish = { [weak self] in
+            if let element, let header {
+                if let self, !self.rendererTornDown {
+                    self.respond(element, header.reply(.okNoData))
+                } else {
+                    element.returnToQueue()
+                }
+            }
             completion?()
+        }
+
+        // UNMAP and UNREF are separate virtio commands and can both be queued
+        // before VZ calls the asynchronous unmap completion. `mappedOffset` is
+        // already nil by then, but the resource is not safe to release yet.
+        // Make every later teardown action wait for the one real VZ unmap.
+        if resource.unmapInFlight {
+            resource.afterUnmap.append(finish)
+            return
+        }
+
+        guard let region = hostVisibleRegion, let offset = resource.mappedOffset else {
+            finish()
             return
         }
 
@@ -985,6 +996,7 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
         // completion runs later, so leaving `mappedOffset` set until then would
         // let the unref unmap the same range a second time.
         resource.mappedOffset = nil
+        resource.unmapInFlight = true
 
         // Read back before the mapping goes away: whatever the guest wrote is
         // still sitting in these pages.
@@ -992,26 +1004,24 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
 
         enqueueRegionOperation { [weak self] done in
             guard let self, !rendererTornDown else {
-                element?.returnToQueue()
-                completion?()
+                resource.unmapInFlight = false
+                let waiters = resource.afterUnmap
+                resource.afterUnmap.removeAll(keepingCapacity: false)
+                finish()
+                waiters.forEach { $0() }
                 done()
                 return
             }
             region.unmapMemory(atOffset: offset, size: UInt64(resource.byteCount)) { error in
-                guard !self.rendererTornDown else {
-                    element?.returnToQueue()
-                    completion?()
-                    done()
-                    return
-                }
-                if let error {
+                if let error, !self.rendererTornDown {
                     Self.log.error("unmapping resource \(resource.resourceID) failed: \(error.localizedDescription, privacy: .public)")
                     Self.note("reject  unmap res=\(resource.resourceID) offset=\(offset): \(error.localizedDescription)")
                 }
-                if let element, let header {
-                    self.respond(element, header.reply(.okNoData))
-                }
-                completion?()
+                resource.unmapInFlight = false
+                let waiters = resource.afterUnmap
+                resource.afterUnmap.removeAll(keepingCapacity: false)
+                finish()
+                waiters.forEach { $0() }
                 done()
             }
         }
@@ -1019,47 +1029,19 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
 
     // MARK: - Venus
 
-    /// Compositor blob: tell vkr the resource exists. Failure is normal —
-    /// packed geometry is not a Venus object id.
-    private func importIntoVenus(_ resource: GPUResource, contextID: UInt32) {
-        var blob = np_venus_blob(
-            resource_id: resource.resourceID,
-            blob_id: resource.blobID,
-            blob_flags: VirtioGPU.BlobFlag.useMappable,
-            pointer: resource.baseAddress,
-            size: UInt64(resource.byteCount),
-            width: UInt32(resource.geometry?.width ?? 0),
-            height: UInt32(resource.geometry?.height ?? 0),
-            bytes_per_row: UInt32(resource.geometry?.bytesPerRow ?? 0),
-            iosurface: resource.surface.map { Unmanaged.passUnretained($0).toOpaque() })
-        let rc = np_venus_create_blob(venus, contextID, &blob)
-        if rc != 0 {
-            Self.log.error("virglrenderer blob \(resource.resourceID) failed: \(rc)")
-        }
-    }
-
     /// Common tail of RESOURCE_CREATE_BLOB once the backing exists.
     private func finishCreateBlob(
-        _ resource: GPUResource, geometry: VirtioGPU.BlobGeometry?,
+        _ resource: GPUResource,
         header: VirtioGPU.ControlHeader, element: VZVirtioQueueElement
     ) {
-        // Probe words only on compositor IOSurfaces. A Venus mapping is
-        // live GPU memory; stamping it would trash the allocation.
-        if resource.surface != nil, let address = resource.baseAddress {
-            let words = address.bindMemory(
-                to: UInt32.self, capacity: min(4, resource.byteCount / 4))
-            for i in 0..<min(4, resource.byteCount / 4) {
-                words[i] = Self.hostProbePattern
-            }
-        }
         Self.log.info(
             "resource \(resource.resourceID) created, \(resource.byteCount) bytes")
         publish(resource)
-        let shape = geometry.map { "\($0.width)x\($0.height)@\($0.bytesPerRow)" } ?? "linear"
-        Self.note("create  res=\(resource.resourceID) size=\(resource.byteCount) \(shape)")
+        Self.note("create  res=\(resource.resourceID) size=\(resource.byteCount) venus")
         notifyResourcePublished(resource.resourceID)
         respond(element, header.reply(.okNoData))
     }
+
 
     /// Mesa Venus blob: vkr holds (or is about to hold) the VkDeviceMemory.
     /// Bind it and adopt the host mapping so RESOURCE_MAP_BLOB shows the same
@@ -1076,9 +1058,7 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
             blob_id: request.blobID,
             blob_flags: request.blobFlags,
             pointer: nil,
-            size: request.size,
-            width: 0, height: 0, bytes_per_row: 0,
-            iosurface: nil)
+            size: request.size)
         if np_venus_create_blob(venus, header.contextID, &blob) == 0 {
             do {
                 let resource: GPUResource
@@ -1093,8 +1073,10 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
                         id: request.resourceID, size: blob.size,
                         blobID: request.blobID)
                 }
-                finishCreateBlob(resource, geometry: nil, header: header, element: element)
+                finishCreateBlob(resource, header: header, element: element)
             } catch {
+                Self.note(
+                    "reject  create res=\(request.resourceID) blob_id=\(request.blobID): \(error.localizedDescription)")
                 Self.log.error(
                     "could not adopt vkr mapping for res \(request.resourceID): \(error.localizedDescription, privacy: .public)")
                 respond(element, header.reply(.errOutOfMemory))
