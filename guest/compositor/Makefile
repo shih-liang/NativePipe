@@ -1,7 +1,8 @@
 # Built inside the guest / remote Linux host.
 #
-# VM build: one compositor-owned Venus VkDevice. Window storage is
-# VkImage/VkDeviceMemory; there is no manual virtio CONTEXT_INIT/blob allocator.
+# VM build: one compositor-owned Venus VkDevice used only for wl_shm upload
+# textures. Client GPU windows retain their original linux-dmabuf textures;
+# there is no manual virtio CONTEXT_INIT/blob allocator.
 # Remote build keeps the existing encoded transport and does not link Vulkan.
 
 PKGS          := wayland-server libcjson xkbcommon
@@ -32,6 +33,7 @@ DECORATION_XML := $(PROTOCOL_DIR)/unstable/xdg-decoration/xdg-decoration-unstabl
 TEXT_INPUT_XML := $(PROTOCOL_DIR)/unstable/text-input/text-input-unstable-v3.xml
 DMABUF_XML     := $(PROTOCOL_DIR)/unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml
 FIFO_XML       := fifo-v1.xml
+SYNCOBJ_XML    := linux-drm-syncobj-v1.xml
 
 GENERATED := xdg-shell-server-protocol.h xdg-shell-client-protocol.h xdg-shell-protocol.c \
              viewporter-server-protocol.h viewporter-protocol.c \
@@ -40,21 +42,22 @@ GENERATED := xdg-shell-server-protocol.h xdg-shell-client-protocol.h xdg-shell-p
              text-input-v3-server-protocol.h text-input-v3-client-protocol.h \
              text-input-v3-protocol.c \
              linux-dmabuf-unstable-v1-server-protocol.h linux-dmabuf-unstable-v1-protocol.c \
-             fifo-v1-server-protocol.h fifo-v1-protocol.c
+             fifo-v1-server-protocol.h fifo-v1-protocol.c \
+             linux-drm-syncobj-v1-server-protocol.h linux-drm-syncobj-v1-protocol.c
 
-SHARED_SOURCES := compositor.c decoration.c scale.c scene.c perf.c hostlink.c \
+SHARED_SOURCES := compositor.c decoration.c scale.c scene.c region.c perf.c hostlink.c \
                   xdg-shell-protocol.c viewporter-protocol.c fractional-scale-v1-protocol.c \
                   xdg-decoration-protocol.c text-input-v3-protocol.c \
                   linux-dmabuf-unstable-v1-protocol.c fifo-v1-protocol.c
 
-# No blob.c: these objects are the complete VM resource path. Both wl_shm and
-# linux-dmabuf commits end at an ordinary compositor scene VkImage.
-VM_SOURCES := surface_store.c virtio_resource.c dmabuf.c gpu_copy.c \
-              scene_renderer.c vk_context.c vk_surface_buffer.c vmpipe_main.c
+# linux-dmabuf remains in the client's existing Venus texture. Only wl_shm
+# needs compositor-owned Vulkan storage, one texture per wl_buffer.
+VM_SOURCES := virtio_resource.c dmabuf.c shm_texture.c \
+              syncobj.c linux-drm-syncobj-v1-protocol.c \
+              vk_context.c vk_surface_buffer.c vmpipe_main.c
 
-SCENE_SHADER_OBJECTS := scene-vert-spv.o scene-frag-spv.o
-
-REMOTE_SOURCES := medialink.c ../encoder/encoder.c dmabuf_stub.c remotepipe_main.c
+REMOTE_SOURCES := medialink.c ../encoder/encoder.c dmabuf_stub.c syncobj_stub.c \
+                  remotepipe_main.c
 
 BINARY        := vmpipe-wayland
 REMOTE_BINARY := remotepipe-wayland
@@ -108,15 +111,14 @@ fifo-v1-server-protocol.h: $(FIFO_XML)
 	wayland-scanner server-header $(FIFO_XML) $@
 fifo-v1-protocol.c: $(FIFO_XML)
 	wayland-scanner private-code $(FIFO_XML) $@
+linux-drm-syncobj-v1-server-protocol.h: $(SYNCOBJ_XML)
+	wayland-scanner server-header $(SYNCOBJ_XML) $@
+linux-drm-syncobj-v1-protocol.c: $(SYNCOBJ_XML)
+	wayland-scanner private-code $(SYNCOBJ_XML) $@
 
-scene-vert-spv.o: shaders/scene.vert.spv
-	$(LD) -r -b binary -o $@ $<
-scene-frag-spv.o: shaders/scene.frag.spv
-	$(LD) -r -b binary -o $@ $<
-
-$(BINARY): $(GENERATED) $(SHARED_SOURCES) $(VM_SOURCES) $(SCENE_SHADER_OBJECTS)
+$(BINARY): $(GENERATED) $(SHARED_SOURCES) $(VM_SOURCES)
 	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) -o $@ \
-		$(SHARED_SOURCES) $(VM_SOURCES) $(SCENE_SHADER_OBJECTS) $(LDLIBS) $(VULKAN_LIBS)
+		$(SHARED_SOURCES) $(VM_SOURCES) $(LDLIBS) $(VULKAN_LIBS)
 
 $(REMOTE_BINARY): $(GENERATED) $(SHARED_SOURCES) $(REMOTE_SOURCES)
 	@if [ -z "$(FFMPEG_LIBS)" ]; then \

@@ -1,15 +1,13 @@
 #define _GNU_SOURCE
 
-/* linux-dmabuf is an input protocol only. Client resources never become
- * NativePipe display resources directly. Each wl_buffer owns only an imported
- * source VkImage; scene.c composites it into the window's ordinary scene
- * VkImage when the commit becomes active. */
+/* linux-dmabuf is an input protocol only. Its virtio resource already names
+ * the host MTLTexture, so importing it into a second guest VkImage would add a
+ * copy and an unnecessary Vulkan lifetime. */
 
 #include "dmabuf.h"
-#include "gpu_copy.h"
 #include "linux-dmabuf-unstable-v1-server-protocol.h"
 #include "perf.h"
-#include "vk_surface_buffer.h"
+#include "syncobj.h"
 
 #include <drm/drm.h>
 #include <drm/virtgpu_drm.h>
@@ -53,13 +51,33 @@ struct np_params {
 };
 
 struct np_gpu_buffer_object {
-    struct np_gpu_buffer info;          /* identifies the imported source */
-    struct np_gpu_copy_source source;   /* client dma-buf, compositor-local VkImage */
+    struct np_gpu_buffer info;          /* identifies the client's host texture */
 
     uint32_t client_bo_handle;          /* lifetime reference only */
     uint32_t client_resource_id;        /* diagnostic only; never sent to host */
     int drm_fd;                         /* borrowed lookup fd */
+	struct wl_resource *resource;
+	uint32_t references;
+	uint32_t current_references;
+	uint32_t host_reads;
+	bool release_pending;
+	struct wl_list sync_releases;
 };
+
+struct np_gpu_sync_release {
+	struct wl_list link;
+	struct np_sync_point *point;
+};
+
+static struct np_gpu_buffer_object *gpu_object(struct np_gpu_buffer *buffer)
+{
+	return buffer ? (struct np_gpu_buffer_object *)buffer : NULL;
+}
+
+static void gpu_buffer_ref(struct np_gpu_buffer_object *gpu)
+{
+	if (gpu) gpu->references++;
+}
 
 static uint32_t resource_from_prime(int drm_fd, int prime_fd, uint32_t *bo_out)
 {
@@ -87,15 +105,40 @@ static uint32_t resource_from_prime(int drm_fd, int prime_fd, uint32_t *bo_out)
 
 static void gpu_buffer_free(struct np_gpu_buffer_object *gpu)
 {
-    if (!gpu)
-        return;
+	if (!gpu) return;
 
-    np_gpu_copy_source_destroy(&gpu->source);
-    if (gpu->client_bo_handle && gpu->drm_fd >= 0) {
-        struct drm_gem_close closer = { .handle = gpu->client_bo_handle };
-        ioctl(gpu->drm_fd, DRM_IOCTL_GEM_CLOSE, &closer);
-    }
-    free(gpu);
+	struct np_gpu_sync_release *release, *tmp;
+	wl_list_for_each_safe(release, tmp, &gpu->sync_releases, link) {
+		wl_list_remove(&release->link);
+		np_sync_point_signal(release->point);
+		free(release);
+	}
+	if (gpu->client_bo_handle && gpu->drm_fd >= 0) {
+		struct drm_gem_close closer = { .handle = gpu->client_bo_handle };
+		ioctl(gpu->drm_fd, DRM_IOCTL_GEM_CLOSE, &closer);
+	}
+	free(gpu);
+}
+
+static void gpu_buffer_unref(struct np_gpu_buffer_object *gpu)
+{
+	if (!gpu || !gpu->references || --gpu->references) return;
+	gpu_buffer_free(gpu);
+}
+
+static void maybe_release_client(struct np_gpu_buffer_object *gpu)
+{
+	if (!gpu || gpu->current_references || gpu->host_reads) return;
+	struct np_gpu_sync_release *release, *tmp;
+	wl_list_for_each_safe(release, tmp, &gpu->sync_releases, link) {
+		wl_list_remove(&release->link);
+		np_sync_point_signal(release->point);
+		free(release);
+	}
+	if (gpu->release_pending && gpu->resource) {
+		gpu->release_pending = false;
+		wl_buffer_send_release(gpu->resource);
+	}
 }
 
 static bool wait_for_client_render(struct np_gpu_buffer_object *gpu)
@@ -103,13 +146,18 @@ static bool wait_for_client_render(struct np_gpu_buffer_object *gpu)
 	uint64_t start = np_perf_now_ns();
     struct drm_virtgpu_3d_wait wait = {
         .handle = gpu->client_bo_handle,
-        .flags = 0,
+        /* Never stall the Wayland event loop behind application rendering.
+         * scene.c retries from a one-shot loop timer while the dma-resv fence
+         * is still busy. */
+        .flags = VIRTGPU_WAIT_NOWAIT,
     };
     if (ioctl(gpu->drm_fd, DRM_IOCTL_VIRTGPU_WAIT, &wait) == 0) {
 		np_perf_record(NP_PERF_CLIENT_WAIT, np_perf_now_ns() - start);
         return true;
 	}
 	np_perf_record(NP_PERF_CLIENT_WAIT, np_perf_now_ns() - start);
+
+	if (errno == EBUSY || errno == EAGAIN) return false;
 
     fprintf(stderr, "[wayland] WAIT client_res=%u: %s\n",
             gpu->client_resource_id, strerror(errno));
@@ -118,7 +166,10 @@ static bool wait_for_client_render(struct np_gpu_buffer_object *gpu)
 
 static void gpu_buffer_resource_destroy(struct wl_resource *resource)
 {
-    gpu_buffer_free(wl_resource_get_user_data(resource));
+	struct np_gpu_buffer_object *gpu = wl_resource_get_user_data(resource);
+	if (!gpu) return;
+	gpu->resource = NULL;
+	gpu_buffer_unref(gpu); /* protocol ownership */
 }
 
 static void gpu_buffer_destroy_request(struct wl_client *client,
@@ -167,15 +218,8 @@ static struct wl_resource *make_gpu_buffer(struct wl_client *client, uint32_t id
     gpu->drm_fd = params->drm_fd;
     gpu->client_bo_handle = client_bo;
     gpu->client_resource_id = client_res;
-
-    if (!np_gpu_copy_source_import(params->fd, format,
-                                   (uint32_t)width, (uint32_t)height,
-                                   params->stride, &gpu->source)) {
-        fprintf(stderr, "[wayland] failed to import client dmabuf res=%u into Vulkan\n",
-                client_res);
-        gpu_buffer_free(gpu);
-        return NULL;
-    }
+	gpu->references = 1;
+	wl_list_init(&gpu->sync_releases);
 
     gpu->info.resource_id = client_res;
     gpu->info.width = width;
@@ -194,6 +238,7 @@ static struct wl_resource *make_gpu_buffer(struct wl_client *client, uint32_t id
     }
     wl_resource_set_implementation(buffer, &gpu_buffer_implementation, gpu,
                                    gpu_buffer_resource_destroy);
+	gpu->resource = buffer;
 
     if (getenv("NP_TRACE")) {
         fprintf(stderr,
@@ -201,6 +246,71 @@ static struct wl_resource *make_gpu_buffer(struct wl_client *client, uint32_t id
                 client_res, width, height, params->stride);
     }
     return buffer;
+}
+
+void np_gpu_buffer_acquire_current(struct np_gpu_buffer *buffer)
+{
+	struct np_gpu_buffer_object *gpu = gpu_object(buffer);
+	if (!gpu) return;
+	gpu->current_references++;
+	gpu->release_pending = false;
+	gpu_buffer_ref(gpu);
+}
+
+void np_gpu_buffer_release_current(struct np_gpu_buffer *buffer)
+{
+	struct np_gpu_buffer_object *gpu = gpu_object(buffer);
+	if (!gpu || !gpu->current_references) return;
+	gpu->current_references--;
+	gpu->release_pending = true;
+	maybe_release_client(gpu);
+	gpu_buffer_unref(gpu);
+}
+
+bool np_gpu_buffer_begin_host_read(struct np_gpu_buffer *buffer)
+{
+	struct np_gpu_buffer_object *gpu = gpu_object(buffer);
+	if (!gpu || !wait_for_client_render(gpu)) return false;
+	gpu->host_reads++;
+	gpu_buffer_ref(gpu);
+	return true;
+}
+
+void np_gpu_buffer_end_host_read(struct np_gpu_buffer *buffer)
+{
+	struct np_gpu_buffer_object *gpu = gpu_object(buffer);
+	if (!gpu || !gpu->host_reads) return;
+	gpu->host_reads--;
+	maybe_release_client(gpu);
+	gpu_buffer_unref(gpu);
+}
+
+bool np_gpu_buffer_is_busy(struct np_gpu_buffer *buffer)
+{
+	struct np_gpu_buffer_object *gpu = gpu_object(buffer);
+	return gpu && gpu->host_reads != 0;
+}
+
+void np_gpu_buffer_queue_release(
+	struct np_gpu_buffer *buffer, struct np_sync_point *point)
+{
+	struct np_gpu_buffer_object *gpu = gpu_object(buffer);
+	if (!point) return;
+	if (!gpu) {
+		np_sync_point_signal(point);
+		return;
+	}
+	struct np_gpu_sync_release *release = calloc(1, sizeof(*release));
+	if (!release) {
+		/* Keep correctness under memory pressure: never signal while Metal may
+		 * still be reading. The point intentionally remains unsignalled. */
+		fprintf(stderr, "[wayland] could not retain explicit release point\n");
+		np_sync_point_destroy(point);
+		return;
+	}
+	release->point = point;
+	wl_list_insert(gpu->sync_releases.prev, &release->link);
+	maybe_release_client(gpu);
 }
 
 static void params_destroy(struct wl_client *client, struct wl_resource *resource)
@@ -510,7 +620,7 @@ void np_dmabuf_advertise(struct wl_display *display, int drm_fd)
     dmabuf->device = st.st_rdev;
 
     wl_global_create(display, &zwp_linux_dmabuf_v1_interface, 4, dmabuf, dmabuf_bind);
-    fprintf(stderr, "[wayland] linux-dmabuf v4 imports compositor source images\n");
+    fprintf(stderr, "[wayland] linux-dmabuf v4 exposes existing Venus textures\n");
 }
 
 struct np_gpu_buffer *np_gpu_buffer_get(struct wl_resource *buffer)
@@ -524,67 +634,4 @@ struct np_gpu_buffer *np_gpu_buffer_get(struct wl_resource *buffer)
         return NULL;
 
     return &gpu->info;
-}
-
-bool np_gpu_buffer_prepare_scene(struct np_gpu_buffer *buffer,
-                                 struct np_gpu_scene_image *image)
-{
-    if (!buffer || !image)
-        return false;
-    struct np_gpu_buffer_object *gpu =
-        (struct np_gpu_buffer_object *)((char *)buffer -
-            offsetof(struct np_gpu_buffer_object, info));
-    if (!gpu->source.image || !gpu->source.view || !wait_for_client_render(gpu))
-        return false;
-    image->image = gpu->source.image;
-    image->view = gpu->source.view;
-    image->layout = &gpu->source.layout;
-    gpu->source.initialized = true;
-    return true;
-}
-
-bool np_gpu_buffer_copy_to_output(struct np_gpu_buffer *buffer,
-                                  struct np_vk_surface_buffer *output)
-{
-    if (!buffer || !output)
-        return false;
-
-    struct np_gpu_buffer_object *gpu =
-        (struct np_gpu_buffer_object *)((char *)buffer -
-            offsetof(struct np_gpu_buffer_object, info));
-
-    /* linux-dmabuf has implicit synchronization unless an explicit-sync
-     * protocol was negotiated. Waiting on the imported GEM handle observes
-     * the dma-resv fence installed by the client's Venus submission. */
-    if (!wait_for_client_render(gpu))
-        return false;
-
-    if (!np_gpu_copy_to_display(&gpu->source, output)) {
-        fprintf(stderr, "[wayland] gpu copy client_res=%u -> output_res=%u failed\n",
-                gpu->client_resource_id, output->resource_id);
-        return false;
-    }
-    return true;
-}
-
-bool np_gpu_buffer_copy_to_output_region(
-    struct np_gpu_buffer *buffer, struct np_vk_surface_buffer *output,
-    int32_t source_x0, int32_t source_y0,
-    int32_t source_x1, int32_t source_y1,
-    int32_t destination_x0, int32_t destination_y0,
-    int32_t destination_x1, int32_t destination_y1,
-    bool clear)
-{
-    if (!buffer || !output)
-        return false;
-    struct np_gpu_buffer_object *gpu =
-        (struct np_gpu_buffer_object *)((char *)buffer -
-            offsetof(struct np_gpu_buffer_object, info));
-    if (!wait_for_client_render(gpu))
-        return false;
-    return np_gpu_copy_to_display_region(
-        &gpu->source, output,
-        source_x0, source_y0, source_x1, source_y1,
-        destination_x0, destination_y0, destination_x1, destination_y1,
-        clear);
 }

@@ -7,9 +7,8 @@
 
 #include <vulkan/vulkan.h>
 
-/* One compositor-owned image. CPU wl_shm writes and GPU copy operations target
- * the same VkImage/VkDeviceMemory; its exported Venus MTLHeap supplies the
- * ordinary MTLTexture that the host blits into an NSWindow-owned IOSurface. */
+/* One compositor-owned wl_shm upload image. Guest CPU writes the mapped linear
+ * VkImage; the host samples its existing MoltenVK texture as one scene layer. */
 struct np_vk_surface_buffer {
     VkImage image;
     VkImageView view;

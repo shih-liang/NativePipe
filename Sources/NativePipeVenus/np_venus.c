@@ -194,7 +194,9 @@ static void np_virgl_log(int level, const char *message, void *user) {
 	// often for every resize frame; forwarding that by default can make stderr
 	// I/O more expensive than rendering.  Keep diagnostics, and expose the
 	// verbose stream only when explicitly tracing the GPU.
-	if (level < 2 && getenv("NATIVEPIPE_GPU_TRACE") == NULL) return;
+	if (level < 2 && getenv("NATIVEPIPE_GPU_TRACE") == NULL &&
+	    (!message || strstr(message, "vkr:") == NULL ||
+	     strstr(message, "failed") == NULL)) return;
 	fputs("[virgl] ", stderr);
 	if (message && message[0]) {
 		fputs(message, stderr);

@@ -11,13 +11,13 @@ import QuartzCore
 /// macOS already does all of that, and duplicating any of it would mean doing
 /// the work twice and then fighting about which answer wins.
 ///
-/// The guest compositor produces one ordinary Venus image. This window copies
-/// it into a `CAMetalLayer` drawable and presents that drawable through Metal.
-/// Source-buffer ownership ends when the copy completes; CoreAnimation owns
-/// only its drawable pool and never owns a guest/compositor buffer.
+/// The guest compositor resolves one atomic scene description per window. This
+/// window composites the scene's existing Venus/Metal textures directly into a
+/// `CAMetalLayer` drawable. Source-buffer ownership ends when Metal completes;
+/// CoreAnimation owns only its drawable pool and never owns a guest buffer.
 ///
-///   * client buffers → guest window-scene VkImage
-///   * scene VkImage → host Metal blit → CAMetalDrawable → WindowServer
+///   * client buffers + guest-resolved layer state
+///   * host Metal blit/render → CAMetalDrawable → WindowServer
 @MainActor
 final class NativeWindow: NSObject {
     private static let frameTrace = ProcessInfo.processInfo.environment["NATIVEPIPE_FRAME_TRACE"] != nil
@@ -80,7 +80,14 @@ final class NativeWindow: NSObject {
     }
     private var pendingPresentations: [Presentation] = []
     private let metalDevice = MTLCreateSystemDefaultDevice()
-    private lazy var commandQueue = metalDevice?.makeCommandQueue()
+    private lazy var sceneRenderer: HostSceneRenderer? = {
+        guard let metalDevice else { return nil }
+        return try? HostSceneRenderer(device: metalDevice)
+    }()
+    private lazy var asyncScenePresenter: AsyncMetalScenePresenter? = {
+        guard let renderer = sceneRenderer else { return nil }
+        return AsyncMetalScenePresenter(layer: contentView.metalLayer, renderer: renderer)
+    }()
 
     init(windowID: UInt32, surfaceID: UInt32, bridge: WindowBridge, popup: Popup? = nil) {
         self.windowID = windowID
@@ -179,86 +186,33 @@ final class NativeWindow: NSObject {
         }
     }
 
-    /// Copy the compositor's ordinary Venus image into a Core Animation
-    /// drawable. `copied` runs after Metal has stopped reading the source;
-    /// `presented` runs after WindowServer has actually presented the drawable.
+
+    /// Draw a complete guest-resolved scene directly from the client's existing
+    /// Metal textures. `readComplete` is distinct from display presentation:
+    /// the former releases Wayland buffers, the latter completes frame/FIFO.
     func present(
-        frame: Windowing.Frame, metalTexture: AnyObject,
-        copied: @escaping @MainActor (Bool) -> Void,
-        presented: @escaping @MainActor () -> Void
+        scene: Windowing.SceneSnapshot, layers: [ResolvedSceneLayer],
+        readComplete: @escaping @MainActor (Bool) -> Void
     ) {
-        prepareWindow(for: frame)
-        guard let source = metalTexture as? MTLTexture else {
-            Self.note("resource \(frame.resourceID) did not export an MTLTexture")
-            copied(false)
-            return
-        }
+        prepareWindow(for: scene)
         guard let device = metalDevice,
-              let drawable = contentView.nextMetalDrawable(
-                  device: device, frame: frame, geometry: windowGeometry),
-              let queue = commandQueue
+              let presenter = asyncScenePresenter,
+              contentView.configureMetalLayer(
+                device: device, scene: scene, geometry: windowGeometry)
         else {
-            Self.note("could not acquire drawable window=\(windowID) res=\(frame.resourceID)")
-            copied(false)
+            Self.note("could not configure Metal scene window=\(windowID)")
+            readComplete(false)
+            awaitPresentation(
+                surface: scene.surface, presentationID: scene.presentationID)
             return
         }
-        let target = drawable.texture
-        guard source.pixelFormat == target.pixelFormat,
-              source.textureType == .type2D,
-              target.textureType == .type2D,
-              source.sampleCount == 1,
-              target.sampleCount == 1,
-              frame.width <= source.width, frame.height <= source.height,
-              frame.width == target.width, frame.height == target.height
-        else {
-            Self.note(
-                "incompatible Metal blit window=\(windowID) res=\(frame.resourceID) " +
-                "source=\(source.width)x\(source.height)/\(source.pixelFormat.rawValue)/" +
-                "type\(source.textureType.rawValue)/samples\(source.sampleCount) " +
-                "target=\(target.width)x\(target.height)/" +
-                "\(target.pixelFormat.rawValue)/type\(target.textureType.rawValue)/" +
-                "samples\(target.sampleCount) frame=\(frame.width)x\(frame.height)")
-            copied(false)
-            return
-        }
-        guard let command = queue.makeCommandBuffer(),
-              let blit = command.makeBlitCommandEncoder()
-        else {
-            Self.note("could not create Metal command encoder window=\(windowID) res=\(frame.resourceID)")
-            copied(false)
-            return
-        }
-
-        blit.copy(
-            from: source, sourceSlice: 0, sourceLevel: 0,
-            sourceOrigin: .init(x: 0, y: 0, z: 0),
-            sourceSize: .init(width: frame.width, height: frame.height, depth: 1),
-            to: target, destinationSlice: 0, destinationLevel: 0,
-            destinationOrigin: .init(x: 0, y: 0, z: 0))
-        blit.endEncoding()
-
-        drawable.addPresentedHandler { _ in
-            DispatchQueue.main.async { presented() }
-        }
-        command.addCompletedHandler { [weak self, source] command in
-            // Capturing source is intentional: the command buffer owns the GPU
-            // reference, while this retains the Swift/CF wrapper through the
-            // completion callback as well.
-            withExtendedLifetime(source) {}
-            DispatchQueue.main.async {
-                let success = command.status == .completed
-                if success, let self, Self.frameTrace {
-                    Self.note(
-                        "drawable complete window=\(self.windowID) res=\(frame.resourceID) " +
-                        "\(frame.width)x\(frame.height)")
-                } else if let error = command.error {
-                    Self.note("Metal blit failed window=\(self?.windowID ?? 0): \(error)")
-                }
-                copied(success)
-            }
-        }
-        command.present(drawable)
-        command.commit()
+        presenter.enqueue(
+            scene: scene, layers: layers, readComplete: readComplete,
+            latched: { [weak self] in
+                self?.bridge?.send(.framePresented(
+                    surface: scene.surface,
+                    presentationID: scene.presentationID))
+            })
     }
 
     func awaitPresentation(surface: UInt32, presentationID: UInt32) {
@@ -284,6 +238,14 @@ final class NativeWindow: NSObject {
         if window == nil {
             makeWindow(contentSize: pointSize)
         }
+    }
+
+    private func prepareWindow(for scene: Windowing.SceneSnapshot) {
+        windowGeometry = scene.windowGeometry
+        let pointSize = NSSize(
+            width: CGFloat(scene.windowGeometry.width),
+            height: CGFloat(scene.windowGeometry.height))
+        if window == nil { makeWindow(contentSize: pointSize) }
     }
 
     private func effectiveGeometry(for frame: Windowing.Frame) -> Windowing.Rect {
@@ -330,6 +292,11 @@ final class NativeWindow: NSObject {
                 backing: .buffered,
                 defer: false)
         }
+        // Swift ARC owns the NSWindow through `self.window`. AppKit's legacy
+        // release-on-close ownership would otherwise deallocate it inside
+        // `close()` while ARC still holds the same object, which is observable
+        // as a SIGSEGV immediately after a guest toplevel is destroyed.
+        window.isReleasedWhenClosed = false
         window.contentView = contentView
         contentView.input = self
         window.delegate = self
@@ -436,8 +403,23 @@ final class NativeWindow: NSObject {
         }
         configureDisplayLink?.invalidate()
         configureDisplayLink = nil
-        window?.orderOut(nil)
-        window?.delegate = nil
+        asyncScenePresenter?.cancelPending()
+        // `orderOut` only hides a window; it does not terminate its AppKit
+        // lifetime.  In particular a popup remains retained by its parent as a
+        // child window, and reconnecting the compositor can then leave an old
+        // generation of invisible/stale NSWindows behind.  This is an
+        // authoritative guest-side destroy, so detach it and close it without
+        // invoking windowShouldClose (which is only for a user's close request).
+        if let window {
+            if let parent = window.parent {
+                parent.removeChildWindow(window)
+            }
+            for child in window.childWindows ?? [] {
+                window.removeChildWindow(child)
+            }
+            window.delegate = nil
+            window.close()
+        }
         window = nil
     }
 
@@ -464,6 +446,10 @@ final class NativeWindow: NSObject {
 
         // Frame callbacks and FIFO latching are paced by the display clock.
         // Source buffers were already released by their Metal completion.
+        flushPresentations()
+    }
+
+    private func flushPresentations() {
         for presentation in pendingPresentations {
             bridge?.send(.framePresented(
                 surface: presentation.surface,
@@ -599,9 +585,122 @@ extension NativeWindow: NSWindowDelegate {
     }
 }
 
+/// `CAMetalLayer.nextDrawable()` may wait tens of milliseconds for
+/// WindowServer. Keeping that wait off AppKit's main thread is essential for
+/// mouse motion, live resize and keyboard delivery. This presenter has one
+/// running item and one latest-value pending slot, so backpressure cannot grow
+/// into an unbounded queue of stale resize frames.
+private final class AsyncMetalScenePresenter: @unchecked Sendable {
+    private struct Work: @unchecked Sendable {
+        let scene: Windowing.SceneSnapshot
+        let layers: [ResolvedSceneLayer]
+        let readComplete: @MainActor (Bool) -> Void
+        let latched: @MainActor () -> Void
+    }
+
+    private let layer: CAMetalLayer
+    private let renderer: HostSceneRenderer
+    private let queue = DispatchQueue(label: "com.nativepipe.metal-present")
+    private let lock = NSLock()
+    private var pending: Work?
+    private var running = false
+
+    init(layer: CAMetalLayer, renderer: HostSceneRenderer) {
+        self.layer = layer
+        self.renderer = renderer
+    }
+
+    func enqueue(
+        scene: Windowing.SceneSnapshot, layers: [ResolvedSceneLayer],
+        readComplete: @escaping @MainActor (Bool) -> Void,
+        latched: @escaping @MainActor () -> Void
+    ) {
+        let work = Work(
+            scene: scene, layers: layers,
+            readComplete: readComplete, latched: latched)
+        lock.lock()
+        let superseded = pending
+        pending = work
+        let shouldStart = !running
+        if shouldStart { running = true }
+        lock.unlock()
+
+        if let superseded {
+            finish(superseded, success: false)
+            latch(superseded)
+        }
+        if shouldStart {
+            queue.async { [weak self] in self?.drain() }
+        }
+    }
+
+    func cancelPending() {
+        lock.lock()
+        let cancelled = pending
+        pending = nil
+        lock.unlock()
+        if let cancelled {
+            finish(cancelled, success: false)
+            latch(cancelled)
+        }
+    }
+
+    private func takeNext() -> Work? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let work = pending else {
+            running = false
+            return nil
+        }
+        pending = nil
+        return work
+    }
+
+    private func drain() {
+        while let work = takeNext() {
+            autoreleasepool {
+                guard let drawable = layer.nextDrawable() else {
+                    finish(work, success: false)
+                    latch(work)
+                    return
+                }
+                do {
+                    try renderer.encode(
+                        scene: work.scene, layers: work.layers,
+                        drawable: drawable
+                    ) { command in
+                        if command.status != .completed, let error = command.error {
+                            FileHandle.standardError.write(
+                                Data("[nsw] Metal scene failed: \(error)\n".utf8))
+                        }
+                        self.finish(work, success: command.status == .completed)
+                    }
+                    // The scene has been accepted into an ordered drawable and
+                    // cannot be overtaken. This is the FIFO latching point;
+                    // source-buffer release remains tied to completion above.
+                    latch(work)
+                } catch {
+                    FileHandle.standardError.write(
+                        Data("[nsw] could not encode Metal scene: \(error)\n".utf8))
+                    finish(work, success: false)
+                    latch(work)
+                }
+            }
+        }
+    }
+
+    private func finish(_ work: Work, success: Bool) {
+        DispatchQueue.main.async { work.readComplete(success) }
+    }
+
+    private func latch(_ work: Work) {
+        DispatchQueue.main.async { work.latched() }
+    }
+}
+
 // MARK: - Content view
 
-/// The window's only layer displays the NSWindow-owned IOSurface.
+/// Hosts either the direct CAMetalDrawable path or the remote decoded surface.
 private final class SurfaceView: NSView {
     /// Set once the window exists; events before that have nowhere to go.
     weak var input: NativeWindow?
@@ -825,17 +924,17 @@ private final class SurfaceView: NSView {
         input?.key(event.keyCode, pressed: nowDown, flags: event.modifierFlags)
     }
 
-    /// Configure the Metal presentation layer for this committed scene and
-    /// acquire a drawable from Core Animation's ownership-managed pool.
-    func nextMetalDrawable(
-        device: MTLDevice, frame: Windowing.Frame,
+    func configureMetalLayer(
+        device: MTLDevice, scene: Windowing.SceneSnapshot,
         geometry: Windowing.Rect
-    ) -> CAMetalDrawable? {
+    ) -> Bool {
         displayed = nil
         displayedGeometry = geometry
-        guard layer != nil, frame.width > 0, frame.height > 0 else { return nil }
+        guard layer != nil, scene.width > 0, scene.height > 0 else { return false }
 
-        let logical = CGRect(origin: .zero, size: frame.appKitPointSize)
+        let logical = CGRect(
+            x: 0, y: 0,
+            width: geometry.width, height: geometry.height)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         let coordinates = SurfaceCoordinateSpace(geometry, contentSize: bounds.size)
@@ -848,17 +947,15 @@ private final class SurfaceView: NSView {
         metalLayer.device = device
         metalLayer.bounds = logical
         metalLayer.frame.origin = .zero
-        metalLayer.contentsScale = frame.pixelDensity(for: logical)
-        metalLayer.drawableSize = CGSize(width: frame.width, height: frame.height)
+        metalLayer.contentsScale = CGFloat(scene.scale)
+        metalLayer.drawableSize = CGSize(width: scene.width, height: scene.height)
         metalLayer.isHidden = false
         CATransaction.commit()
-
-        return metalLayer.nextDrawable()
+        return true
     }
 
-    /// The IOSurface ring has growth capacity so live resize normally changes
-    /// only this active rectangle. Normalize against the allocation, not the
-    /// current client frame, or unused capacity would be stretched on screen.
+    /// Remote decoders may allocate surfaces larger than the active frame.
+    /// Normalize against the allocation so unused capacity is never stretched.
     func displayCPU(
         _ surface: IOSurfaceRef, frame: Windowing.Frame,
         geometry: Windowing.Rect

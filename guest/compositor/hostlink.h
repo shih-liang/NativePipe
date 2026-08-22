@@ -53,6 +53,11 @@ void np_host_accept(struct np_host *host);
 /// Wraps `body` as {"name": body} and writes one frame. Takes ownership of body.
 void np_host_send(struct np_host *host, const char *name, cJSON *body);
 
+/// Writes one already-encoded metadata payload inside NPIP framing. Returns
+/// false when no host is attached or the bounded outbound queue cannot accept
+/// the complete frame; callers then release any resources owned by that frame.
+bool np_host_send_binary(struct np_host *host, const void *payload, size_t length);
+
 /// Drains readable frames and dispatches them. Non-blocking.
 void np_host_pump(struct np_host *host, np_host_handler handler,
                   np_host_binary_handler binary_handler, void *user_data);

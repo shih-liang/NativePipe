@@ -4,9 +4,10 @@ import Foundation
 ///
 /// This is deliberately *not* Wayland. The guest side runs the Wayland protocol
 /// state machine — surface roles, commit atomicity, buffer release timing — and
-/// forwards only what macOS needs to put a window on screen. The guest consumes
-/// scene graph, stacking, scale, viewport and synchronized-commit semantics;
-/// the host sees one window-level presentation image.
+/// forwards only what macOS needs to put a window on screen. The guest resolves
+/// scene graph, stacking, scale, viewport and synchronized-commit semantics
+/// into an immutable layer snapshot. The host samples the already-existing
+/// Metal textures and performs the one composition needed for the drawable.
 ///
 /// The mapping is one-to-one and stays that way:
 ///
@@ -62,6 +63,11 @@ extension Windowing {
 
         /// The client acknowledged a configure and attached matching content.
         case committed(surface: UInt32, frame: Frame)
+
+        /// One atomic xdg-window scene. This case is carried by the bounded
+        /// binary NPSN wire message rather than JSON; `layers` are ordered from
+        /// back to front and name existing virtio-gpu resources.
+        case sceneCommitted(scene: SceneSnapshot)
 
         /// A committed update carried frame/FIFO state but no new buffer. The
         /// host completes it on the owning window's next display refresh.
@@ -130,6 +136,84 @@ extension Windowing {
         }
     }
 
+    /// The buffer transform already applied while resolving a scene layer.
+    /// Raw values intentionally match Wayland's `wl_output_transform` values.
+    public enum BufferTransform: UInt32, Codable, Sendable, Equatable {
+        case normal = 0
+        case rotate90 = 1
+        case rotate180 = 2
+        case rotate270 = 3
+        case flipped = 4
+        case flipped90 = 5
+        case flipped180 = 6
+        case flipped270 = 7
+    }
+
+    /// One source texture in a host-composited xdg-window scene.
+    public struct SceneLayer: Codable, Sendable, Equatable {
+        public var surface: UInt32
+        public var resourceID: UInt32
+        public var width: Int
+        public var height: Int
+        public var bytesPerRow: Int
+        public var format: PixelFormat
+        /// Destination in output pixels, relative to window geometry.
+        public var destination: FloatRect
+        /// Sample rectangle in source-buffer pixels.
+        public var sourcePixels: FloatRect
+        /// Destination-space scissor in output pixels.
+        public var clip: FloatRect
+        public var alpha: Float
+        public var opaque: Bool
+        public var transform: BufferTransform
+
+        public init(
+            surface: UInt32, resourceID: UInt32,
+            width: Int, height: Int, bytesPerRow: Int, format: PixelFormat,
+            destination: FloatRect, sourcePixels: FloatRect, clip: FloatRect,
+            alpha: Float = 1, opaque: Bool = false,
+            transform: BufferTransform = .normal
+        ) {
+            self.surface = surface
+            self.resourceID = resourceID
+            self.width = width
+            self.height = height
+            self.bytesPerRow = bytesPerRow
+            self.format = format
+            self.destination = destination
+            self.sourcePixels = sourcePixels
+            self.clip = clip
+            self.alpha = alpha
+            self.opaque = opaque
+            self.transform = transform
+        }
+    }
+
+    /// Immutable scene state associated with one presentation id.
+    public struct SceneSnapshot: Codable, Sendable, Equatable {
+        public var surface: UInt32
+        public var presentationID: UInt32
+        public var width: Int
+        public var height: Int
+        public var scale: Int
+        public var windowGeometry: Rect
+        public var layers: [SceneLayer]
+
+        public init(
+            surface: UInt32, presentationID: UInt32,
+            width: Int, height: Int, scale: Int,
+            windowGeometry: Rect, layers: [SceneLayer]
+        ) {
+            self.surface = surface
+            self.presentationID = presentationID
+            self.width = width
+            self.height = height
+            self.scale = scale
+            self.windowGeometry = windowGeometry
+            self.layers = layers
+        }
+    }
+
     /// Values assigned by wp_cursor_shape_device_v1.set_shape.
     public enum CursorShape: UInt32, Codable, Sendable, Equatable {
         case defaultShape = 1, contextMenu, help, pointer, progress, wait
@@ -152,7 +236,7 @@ extension Windowing {
         public var height: Int
         public var bytesPerRow: Int
         public var format: PixelFormat
-        /// Pixel density of the final window-level IOSurface.
+        /// Pixel density of this resource's logical surface.
         public var scale: Int
         /// The visible xdg-shell window inside the wl_surface, in logical
         /// surface coordinates. CSD clients commonly leave transparent shadow
@@ -161,9 +245,9 @@ extension Windowing {
         public var windowGeometry: Rect?
         /// Damage in surface-local pixels. Empty means the whole surface.
         public var damage: [Rect]
-        /// How this frame was produced. CPU is a guest memcpy into an
-        /// IOSurface. GPU is a Venus image that already lives in MoltenVK
-        /// on the host — the resource id is only a name, not a copy.
+        /// How this frame was produced. CPU is a guest wl_shm upload into one
+        /// Vulkan texture. GPU already lives in MoltenVK on the host — the
+        /// resource id is only a name, not a copy.
         /// Encoded means a remote H.264 (etc.) stream keyed by resourceID.
         public var source: FrameSourceKind
         /// Codec id for `.encoded` frames (`h264`, …). Nil for cpu/gpu.
@@ -171,8 +255,8 @@ extension Windowing {
         /// Bumped when the remote encoder is reset so the host rebuilds its
         /// decompression session.
         public var bitstreamEpoch: UInt16
-        /// Nonzero identity used to release a compositor-owned presentation
-        /// only after the host has consumed it.
+        /// Nonzero identity used to release presentation source references only
+        /// after the host has consumed them.
         public var presentationID: UInt32
         /// Legacy per-surface viewporter metadata. Current window frames have
         /// already consumed this in the guest compositor; cursor/drag surfaces
@@ -260,7 +344,7 @@ extension Windowing {
         case encoded
     }
 
-    public enum PixelFormat: String, Codable, Sendable {
+    public enum PixelFormat: String, Codable, Sendable, Equatable {
         /// `WL_SHM_FORMAT_ARGB8888` little-endian: premultiplied BGRA bytes.
         case bgra8888
         /// `WL_SHM_FORMAT_XRGB8888` little-endian: the high byte is padding,

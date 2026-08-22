@@ -158,6 +158,28 @@ static bool queue_outbound(struct np_host *host, const unsigned char *bytes, siz
 	return true;
 }
 
+bool np_host_send_binary(struct np_host *host, const void *payload, size_t length) {
+	if (!host || !payload || !length || length > NP_MAX_PAYLOAD ||
+	    host->conn_fd < 0)
+		return false;
+	if (host->out_len + NP_HEADER + length > NP_MAX_OUTBOUND) {
+		fprintf(stderr, "[wayland] window channel backlog full; dropping one event\n");
+		return false;
+	}
+	unsigned char header[NP_HEADER] = {
+		'N', 'P', 'I', 'P', NP_VERSION, 0, 0, 0,
+		(unsigned char)(length & 0xff),
+		(unsigned char)((length >> 8) & 0xff),
+		(unsigned char)((length >> 16) & 0xff),
+		(unsigned char)((length >> 24) & 0xff),
+	};
+	if (!queue_outbound(host, header, sizeof(header)) ||
+	    !queue_outbound(host, payload, length))
+		return false;
+	flush_outbound(host);
+	return true;
+}
+
 void np_host_send(struct np_host *host, const char *name, cJSON *body) {
 	cJSON *envelope = cJSON_CreateObject();
 	cJSON_AddItemToObject(envelope, name, body ? body : cJSON_CreateObject());
@@ -172,31 +194,7 @@ void np_host_send(struct np_host *host, const char *name, cJSON *body) {
 		return;
 	}
 
-	size_t length = strlen(payload);
-	unsigned char header[NP_HEADER];
-	memcpy(header, NP_MAGIC, 4);
-	header[4] = NP_VERSION;
-	header[5] = header[6] = header[7] = 0;
-	header[8] = (unsigned char)(length & 0xff);
-	header[9] = (unsigned char)((length >> 8) & 0xff);
-	header[10] = (unsigned char)((length >> 16) & 0xff);
-	header[11] = (unsigned char)((length >> 24) & 0xff);
-
-	// Queue whole frames, never partial ones: a short write on a non-blocking
-	// socket would splice two frames together and desynchronise the reader.
-	//
-	// When the backlog is full the *new* frame is dropped. Clearing the buffer
-	// instead — which is what this did — truncates whatever frame was half
-	// written, and the reader then sees a bad magic and drops the connection.
-	if (host->out_len + NP_HEADER + length > NP_MAX_OUTBOUND) {
-		fprintf(stderr, "[wayland] window channel backlog full; dropping one event\n");
-		free(payload);
-		return;
-	}
-	if (queue_outbound(host, header, NP_HEADER)) {
-		queue_outbound(host, (const unsigned char *)payload, length);
-		flush_outbound(host);
-	}
+	np_host_send_binary(host, payload, strlen(payload));
 	free(payload);
 }
 

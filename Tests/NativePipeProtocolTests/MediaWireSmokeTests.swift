@@ -3,6 +3,80 @@ import NativePipeProtocol
 import XCTest
 
 final class MediaWireSmokeTests: XCTestCase {
+    private func append<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
+        var value = value.littleEndian
+        Swift.withUnsafeBytes(of: &value) { data.append(contentsOf: $0) }
+    }
+
+    private func append(_ value: Float, to data: inout Data) {
+        append(value.bitPattern, to: &data)
+    }
+
+    func testBinarySceneSnapshotDecodesWithExactBounds() throws {
+        var payload = Data(WindowWire.sceneMagic)
+        append(WindowWire.sceneVersion, to: &payload)
+        append(UInt16(WindowWire.sceneHeaderSize), to: &payload)
+        append(UInt32(WindowWire.sceneHeaderSize + WindowWire.sceneLayerSize), to: &payload)
+        append(UInt32(7), to: &payload)   // root surface
+        append(UInt32(19), to: &payload)  // presentation
+        append(UInt32(800), to: &payload)
+        append(UInt32(600), to: &payload)
+        append(UInt32(2), to: &payload)
+        append(Int32(-8), to: &payload)
+        append(Int32(-4), to: &payload)
+        append(Int32(400), to: &payload)
+        append(Int32(300), to: &payload)
+        append(UInt32(1), to: &payload)
+        append(UInt32(0), to: &payload)
+
+        append(UInt32(9), to: &payload)
+        append(UInt32(123), to: &payload)
+        append(UInt32(800), to: &payload)
+        append(UInt32(600), to: &payload)
+        append(UInt32(3200), to: &payload)
+        append(UInt16(1), to: &payload)
+        append(UInt16(1), to: &payload) // opaque
+        append(UInt32(0), to: &payload)
+        append(UInt32(0), to: &payload)
+        for value: Float in [0, 0, 800, 600] { append(value, to: &payload) }
+        for value: Float in [0, 0, 800, 600] { append(value, to: &payload) }
+        for value: Float in [0, 0, 800, 600] { append(value, to: &payload) }
+        append(Float(1), to: &payload)
+        append(UInt32(0), to: &payload)
+
+        guard case .sceneCommitted(let scene) = try WindowWire.guestEvent(from: payload)
+        else { return XCTFail("not a scene") }
+        XCTAssertEqual(scene.surface, 7)
+        XCTAssertEqual(scene.presentationID, 19)
+        XCTAssertEqual(scene.windowGeometry, .init(x: -8, y: -4, width: 400, height: 300))
+        XCTAssertEqual(scene.layers.count, 1)
+        XCTAssertEqual(scene.layers[0].resourceID, 123)
+        XCTAssertTrue(scene.layers[0].opaque)
+    }
+
+    func testBinarySceneSnapshotRejectsCountBeyondPayload() {
+        var payload = Data(repeating: 0, count: WindowWire.sceneHeaderSize)
+        payload.replaceSubrange(0..<4, with: WindowWire.sceneMagic)
+        func write<T: FixedWidthInteger>(_ value: T, at offset: Int) {
+            var little = value.littleEndian
+            Swift.withUnsafeBytes(of: &little) {
+                payload.replaceSubrange(offset..<(offset + $0.count), with: $0)
+            }
+        }
+        write(WindowWire.sceneVersion, at: 4)
+        write(UInt16(WindowWire.sceneHeaderSize), at: 6)
+        write(UInt32(payload.count), at: 8)
+        write(UInt32(1), at: 12)
+        write(UInt32(1), at: 16)
+        write(UInt32(1), at: 20)
+        write(UInt32(1), at: 24)
+        write(UInt32(1), at: 28)
+        write(Int32(1), at: 40)
+        write(Int32(1), at: 44)
+        write(UInt32(128), at: 48)
+        XCTAssertThrowsError(try WindowWire.guestEvent(from: payload))
+    }
+
     func testNPENRoundTrip() {
         let header = MediaWire.Header(
             surfaceID: 17, width: 320, height: 200,

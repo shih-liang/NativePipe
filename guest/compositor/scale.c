@@ -9,6 +9,55 @@
 
 #define NP_SCALE_UNIT 120
 
+bool np_scale_transform_swaps_axes(int32_t transform)
+{
+	return transform == WL_OUTPUT_TRANSFORM_90 ||
+	       transform == WL_OUTPUT_TRANSFORM_270 ||
+	       transform == WL_OUTPUT_TRANSFORM_FLIPPED_90 ||
+	       transform == WL_OUTPUT_TRANSFORM_FLIPPED_270;
+}
+
+/* Map a normalized point in the transformed/surface-facing buffer back to
+ * the client's original texture. These are the same eight mappings consumed
+ * by HostSceneRenderer, making crop, damage and sampling one coordinate model. */
+static void transformed_to_source(int32_t transform, double u, double v,
+	                              double *source_u, double *source_v)
+{
+	switch (transform) {
+	case WL_OUTPUT_TRANSFORM_90: *source_u = v; *source_v = 1.0 - u; break;
+	case WL_OUTPUT_TRANSFORM_180: *source_u = 1.0 - u; *source_v = 1.0 - v; break;
+	case WL_OUTPUT_TRANSFORM_270: *source_u = 1.0 - v; *source_v = u; break;
+	case WL_OUTPUT_TRANSFORM_FLIPPED: *source_u = 1.0 - u; *source_v = v; break;
+	case WL_OUTPUT_TRANSFORM_FLIPPED_90: *source_u = v; *source_v = u; break;
+	case WL_OUTPUT_TRANSFORM_FLIPPED_180: *source_u = u; *source_v = 1.0 - v; break;
+	case WL_OUTPUT_TRANSFORM_FLIPPED_270: *source_u = 1.0 - v; *source_v = 1.0 - u; break;
+	default: *source_u = u; *source_v = v; break;
+	}
+}
+
+static void transformed_rect_to_source(
+	int32_t transform, double transformed_width, double transformed_height,
+	double source_width, double source_height,
+	double x, double y, double width, double height,
+	double *out_x, double *out_y, double *out_width, double *out_height)
+{
+	double min_x = source_width, min_y = source_height, max_x = 0, max_y = 0;
+	for (int corner = 0; corner < 4; corner++) {
+		double tx = x + ((corner & 1) ? width : 0);
+		double ty = y + ((corner & 2) ? height : 0);
+		double u, v;
+		transformed_to_source(transform, tx / transformed_width,
+		                      ty / transformed_height, &u, &v);
+		double sx = u * source_width, sy = v * source_height;
+		if (sx < min_x) min_x = sx;
+		if (sy < min_y) min_y = sy;
+		if (sx > max_x) max_x = sx;
+		if (sy > max_y) max_y = sy;
+	}
+	*out_x = min_x; *out_y = min_y;
+	*out_width = max_x - min_x; *out_height = max_y - min_y;
+}
+
 bool np_scale_resolve(const struct np_surface *surface,
 	                  uint32_t buffer_width, uint32_t buffer_height,
 	                  struct np_surface_mapping *mapping)
@@ -17,10 +66,14 @@ bool np_scale_resolve(const struct np_surface *surface,
 		return false;
 
 	double scale = surface->scale;
+	double transformed_width = np_scale_transform_swaps_axes(surface->transform)
+		? buffer_height : buffer_width;
+	double transformed_height = np_scale_transform_swaps_axes(surface->transform)
+		? buffer_width : buffer_height;
 	double logical_source_x = 0;
 	double logical_source_y = 0;
-	double logical_source_width = buffer_width / scale;
-	double logical_source_height = buffer_height / scale;
+	double logical_source_width = transformed_width / scale;
+	double logical_source_height = transformed_height / scale;
 	if (surface->viewport_state.source_set) {
 		logical_source_x = wl_fixed_to_double(surface->viewport_state.source_x);
 		logical_source_y = wl_fixed_to_double(surface->viewport_state.source_y);
@@ -29,14 +82,17 @@ bool np_scale_resolve(const struct np_surface *surface,
 	}
 	if (logical_source_x < 0 || logical_source_y < 0 ||
 	    logical_source_width <= 0 || logical_source_height <= 0 ||
-	    (logical_source_x + logical_source_width) * scale > buffer_width + 0.001 ||
-	    (logical_source_y + logical_source_height) * scale > buffer_height + 0.001)
+	    (logical_source_x + logical_source_width) * scale > transformed_width + 0.001 ||
+	    (logical_source_y + logical_source_height) * scale > transformed_height + 0.001)
 		return false;
 
-	mapping->source_x_pixels = logical_source_x * scale;
-	mapping->source_y_pixels = logical_source_y * scale;
-	mapping->source_width_pixels = logical_source_width * scale;
-	mapping->source_height_pixels = logical_source_height * scale;
+	transformed_rect_to_source(
+		surface->transform, transformed_width, transformed_height,
+		buffer_width, buffer_height,
+		logical_source_x * scale, logical_source_y * scale,
+		logical_source_width * scale, logical_source_height * scale,
+		&mapping->source_x_pixels, &mapping->source_y_pixels,
+		&mapping->source_width_pixels, &mapping->source_height_pixels);
 	if (surface->viewport_state.destination_set) {
 		mapping->logical_width = surface->viewport_state.destination_width;
 		mapping->logical_height = surface->viewport_state.destination_height;
@@ -45,6 +101,35 @@ bool np_scale_resolve(const struct np_surface *surface,
 		mapping->logical_height = logical_source_height;
 	}
 	return mapping->logical_width > 0 && mapping->logical_height > 0;
+}
+
+bool np_scale_damage_to_buffer(int32_t transform,
+	                           uint32_t buffer_width, uint32_t buffer_height,
+	                           int32_t scale, int32_t x, int32_t y,
+	                           int32_t width, int32_t height,
+	                           int32_t *buffer_x, int32_t *buffer_y,
+	                           int32_t *buffer_width_out,
+	                           int32_t *buffer_height_out)
+{
+	if (!buffer_width || !buffer_height || scale <= 0 || width <= 0 || height <= 0 ||
+	    !buffer_x || !buffer_y || !buffer_width_out || !buffer_height_out)
+		return false;
+	double transformed_width = np_scale_transform_swaps_axes(transform)
+		? buffer_height : buffer_width;
+	double transformed_height = np_scale_transform_swaps_axes(transform)
+		? buffer_width : buffer_height;
+	double bx, by, bw, bh;
+	transformed_rect_to_source(
+		transform, transformed_width, transformed_height,
+		buffer_width, buffer_height,
+		(double)x * scale, (double)y * scale,
+		(double)width * scale, (double)height * scale,
+		&bx, &by, &bw, &bh);
+	*buffer_x = (int32_t)floor(bx + 0.0001);
+	*buffer_y = (int32_t)floor(by + 0.0001);
+	*buffer_width_out = (int32_t)ceil(bx + bw - *buffer_x - 0.0001);
+	*buffer_height_out = (int32_t)ceil(by + bh - *buffer_y - 0.0001);
+	return true;
 }
 
 static void viewport_destroy(struct wl_client *client, struct wl_resource *resource)

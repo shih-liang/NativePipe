@@ -9,10 +9,10 @@ import os
 /// NativePipe compositor. One instance can expose both a Venus render node and
 /// an optional KMS scanout; no Apple graphics device is required in that mode.
 ///
-///   * CREATE_BLOB from Mesa Venus → ordinary renderer allocations. The guest
-///     compositor's window-scene image is an exact BGRA Metal texture.
-///   * The host retains that texture without exporting pixels, blits it into
-///     the NSWindow-owned IOSurface, and releases the scene image on completion.
+///   * CREATE_BLOB from Mesa Venus → ordinary renderer allocations. Wayland
+///     linux-dmabuf commits continue naming those original client textures.
+///   * The host retains each scene source while Metal composites it directly
+///     into a CAMetalDrawable, then releases the source on GPU completion.
 ///   * IOSurface-backed resources remain only for the optional legacy 2D
 ///     framebuffer path.
 ///   * SUBMIT_3D → virglrenderer (vkr) → MoltenVK. Venus is not here.

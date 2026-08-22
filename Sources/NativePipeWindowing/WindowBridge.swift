@@ -1,15 +1,16 @@
 import AppKit
 import ImageIO
 import IOSurface
+@preconcurrency import Metal
 import NativePipeProtocol
 import UniformTypeIdentifiers
 
 /// Where a committed frame's pixels come from.
 ///
-/// Local window frames name a compositor-owned Venus image. The frame source
-/// exposes that image as an MTLTexture-shaped object without making this module
-/// depend on the virtual GPU implementation. Remote frames still arrive as an
-/// IOSurface from VideoToolbox.
+/// Local scene layers name existing client or wl_shm-upload Venus textures. The
+/// frame source exposes them as MTLTexture-shaped objects without making this
+/// module depend on the virtual GPU implementation. Remote frames still arrive
+/// as an IOSurface from VideoToolbox.
 @MainActor
 public protocol FrameSource: AnyObject {
     func surface(forResource resourceID: UInt32) -> IOSurfaceRef?
@@ -28,9 +29,9 @@ extension FrameSource {
 
 /// Applies guest window events to `NSWindow`s, and sends host decisions back.
 ///
-/// The guest owns the Wayland scene graph, scale/viewport resolution and frame
-/// scheduling. This bridge receives one already-composited Venus image per xdg
-/// window and asks the NSWindow to copy it into its private display IOSurface.
+/// The guest owns Wayland state and resolves it to an immutable layer list.
+/// This bridge resolves every resource id to its existing Metal texture and
+/// asks the NSWindow to composite those textures into a drawable.
 @MainActor
 public final class WindowBridge {
     /// Window event tracing, off unless NATIVEPIPE_WINDOW_TRACE is set. Writes to
@@ -93,7 +94,10 @@ public final class WindowBridge {
     private final class DragIconOverlay {
         private let panel: NSPanel
         private let view = NSView()
-        private var displayedImage: CGImage?
+        private let metalLayer = CAMetalLayer()
+        private var renderer: HostSceneRenderer?
+        private weak var rendererDevice: MTLDevice?
+        private var displayedTexture: MTLTexture?
 
         init() {
             panel = NSPanel(
@@ -102,8 +106,10 @@ public final class WindowBridge {
                 backing: .buffered,
                 defer: false)
             view.wantsLayer = true
-            view.layer?.contentsGravity = .resize
-            view.layer?.isOpaque = false
+            view.layer = metalLayer
+            metalLayer.pixelFormat = .bgra8Unorm
+            metalLayer.isOpaque = false
+            metalLayer.framebufferOnly = true
             panel.contentView = view
             panel.backgroundColor = .clear
             panel.isOpaque = false
@@ -113,92 +119,66 @@ public final class WindowBridge {
             panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
         }
 
-        func display(_ surface: IOSurfaceRef, frame: Windowing.Frame) {
+        func display(
+            _ texture: MTLTexture, frame: Windowing.Frame,
+            readComplete: @escaping (Bool) -> Void,
+            presented: @escaping () -> Void
+        ) -> Bool {
             let scale = CGFloat(max(frame.scale, 1))
             let size = NSSize(
                 width: CGFloat(frame.width) / scale,
                 height: CGFloat(frame.height) / scale)
-
-            // CALayer can present the window-sized IOSurfaces directly, but it
-            // treats a small standalone IOSurface as opaque on some systems.
-            // Wayland ARGB8888 is explicitly premultiplied alpha, so construct
-            // a CGImage with that exact bitmap description for the drag icon.
-            // Icons are tiny and update rarely; this copy is intentionally not
-            // part of the zero-copy application-window path.
-            guard IOSurfaceLock(surface, [.readOnly], nil) == kIOReturnSuccess else { return }
-            defer { IOSurfaceUnlock(surface, [.readOnly], nil) }
-            let base = IOSurfaceGetBaseAddress(surface)
-            let byteCount = frame.bytesPerRow * frame.height
-            let bytes = Data(bytes: base, count: byteCount)
-
-            if WindowBridge.trace, frame.format == .bgra8888 {
-                var minimum: UInt8 = 255
-                var maximum: UInt8 = 0
-                var transparent = 0
-                var translucent = 0
-                bytes.withUnsafeBytes { raw in
-                    guard let data = raw.bindMemory(to: UInt8.self).baseAddress else { return }
-                    for y in 0..<frame.height {
-                        let row = data + y * frame.bytesPerRow
-                        for x in 0..<frame.width {
-                            let alpha = row[x * 4 + 3]
-                            minimum = min(minimum, alpha)
-                            maximum = max(maximum, alpha)
-                            if alpha == 0 { transparent += 1 }
-                            else if alpha != 255 { translucent += 1 }
-                        }
-                    }
-                }
-                WindowBridge.note(
-                    "drag icon alpha min=\(minimum) max=\(maximum) " +
-                    "transparent=\(transparent) translucent=\(translucent) " +
-                    "pixels=\(frame.width * frame.height)")
-            }
-            guard let provider = CGDataProvider(data: bytes as CFData) else { return }
-
-            let alpha: CGImageAlphaInfo
-            let byteOrder: CGBitmapInfo
-            switch frame.format {
-            case .bgra8888:
-                alpha = .premultipliedFirst
-                byteOrder = .byteOrder32Little
-            case .bgrx8888:
-                alpha = .noneSkipFirst
-                byteOrder = .byteOrder32Little
-            case .rgba8888:
-                alpha = .premultipliedLast
-                byteOrder = .byteOrder32Big
-            }
-            let bitmapInfo = byteOrder.union(CGBitmapInfo(rawValue: alpha.rawValue))
-            guard let image = CGImage(
-                width: frame.width,
-                height: frame.height,
-                bitsPerComponent: 8,
-                bitsPerPixel: 32,
-                bytesPerRow: frame.bytesPerRow,
-                space: CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: bitmapInfo,
-                provider: provider,
-                decode: nil,
-                shouldInterpolate: true,
-                intent: .defaultIntent)
-            else { return }
-            displayedImage = image
-
-            if let path = ProcessInfo.processInfo.environment["NATIVEPIPE_DRAG_ICON_DUMP"] {
-                let url = URL(fileURLWithPath: path) as CFURL
-                if let destination = CGImageDestinationCreateWithURL(
-                    url, UTType.png.identifier as CFString, 1, nil
-                ) {
-                    CGImageDestinationAddImage(destination, image, nil)
-                    CGImageDestinationFinalize(destination)
-                }
-            }
             panel.setContentSize(size)
-            view.layer?.contentsScale = scale
-            view.layer?.contents = image
+            metalLayer.device = texture.device
+            metalLayer.contentsScale = scale
+            metalLayer.drawableSize = CGSize(width: frame.width, height: frame.height)
+            metalLayer.frame = view.bounds
+            if renderer == nil || rendererDevice !== texture.device {
+                renderer = try? HostSceneRenderer(device: texture.device)
+                rendererDevice = texture.device
+            }
+            guard let renderer else { return false }
+            displayedTexture = texture
             moveToPointer()
             panel.orderFrontRegardless()
+            guard let drawable = metalLayer.nextDrawable() else { return false }
+
+            let source = frame.fullViewportBufferPixelRect
+            let layer = Windowing.SceneLayer(
+                surface: 1, resourceID: frame.resourceID,
+                width: frame.width, height: frame.height,
+                bytesPerRow: frame.bytesPerRow, format: frame.format,
+                destination: .init(
+                    x: 0, y: 0, width: Double(frame.width), height: Double(frame.height)),
+                sourcePixels: .init(
+                    x: Double(source.origin.x), y: Double(source.origin.y),
+                    width: Double(source.width), height: Double(source.height)),
+                clip: .init(
+                    x: 0, y: 0, width: Double(frame.width), height: Double(frame.height)),
+                alpha: 1, opaque: frame.format == .bgrx8888, transform: .normal)
+            let scene = Windowing.SceneSnapshot(
+                surface: 1, presentationID: frame.presentationID,
+                width: frame.width, height: frame.height, scale: max(frame.scale, 1),
+                windowGeometry: .init(
+                    x: 0, y: 0, width: Int(size.width), height: Int(size.height)),
+                layers: [layer])
+            drawable.addPresentedHandler { _ in
+                DispatchQueue.main.async(execute: presented)
+            }
+            do {
+                try renderer.encode(
+                    scene: scene,
+                    layers: [ResolvedSceneLayer(state: layer, texture: texture)],
+                    drawable: drawable
+                ) { command in
+                    DispatchQueue.main.async {
+                        readComplete(command.status == .completed)
+                    }
+                }
+                return true
+            } catch {
+                return false
+            }
         }
 
         func moveToPointer() {
@@ -214,8 +194,7 @@ public final class WindowBridge {
 
         func hide() {
             panel.orderOut(nil)
-            view.layer?.contents = nil
-            displayedImage = nil
+            displayedTexture = nil
         }
     }
 
@@ -227,6 +206,10 @@ public final class WindowBridge {
     /// A commit can beat virtio CREATE_BLOB publication on the host. Resource
     /// publication is an event on the main actor, so no polling timer is needed.
     private var pendingFrames: [UInt32: Windowing.Frame] = [:]
+    /// A binary scene can race CREATE_BLOB publication for any of its layers.
+    /// Keep only the newest complete snapshot for each window until every
+    /// resource is resolvable; superseded ids are completed explicitly.
+    private var pendingScenes: [UInt32: Windowing.SceneSnapshot] = [:]
     private var pointerCursor = NSCursor.arrow
 
     private var windows: [UInt32: NativeWindow] = [:]
@@ -280,7 +263,11 @@ public final class WindowBridge {
     // MARK: - Event application
 
     public func apply(_ event: Windowing.GuestEvent) {
-        if case .committed(let surface, let frame) = event {
+        if case .sceneCommitted(let scene) = event {
+            Self.note(
+                "scene surface=\(scene.surface) present=\(scene.presentationID) " +
+                "\(scene.width)x\(scene.height) layers=\(scene.layers.count)")
+        } else if case .committed(let surface, let frame) = event {
             Self.note(
                 "commit surface=\(surface) res=\(frame.resourceID) \(frame.width)x\(frame.height) source=\(frame.source)")
         } else {
@@ -301,6 +288,9 @@ public final class WindowBridge {
                 completeCopiedPresentation(
                     surface: surface, presentationID: frame.presentationID)
             }
+            if let scene = pendingScenes.removeValue(forKey: surface) {
+                completeScene(scene)
+            }
             if dragIconSurface == surface {
                 dragIconSurface = nil
                 dragIcon.hide()
@@ -319,6 +309,9 @@ public final class WindowBridge {
             if let frame = pendingSurfaceFrames.removeValue(forKey: surface) {
                 presentCommitted(surface: surface, windowID: window, frame: frame)
             }
+            if let scene = pendingScenes.removeValue(forKey: surface) {
+                present(scene: scene, windowID: window)
+            }
 
         case .popupCreated(let window, let surface, let parent, let x, let y, _, _):
             // Like a toplevel, the NSWindow waits for the first frame; a menu
@@ -329,6 +322,9 @@ public final class WindowBridge {
                 popup: NativeWindow.Popup(parent: parent, origin: CGPoint(x: x, y: y)))
             windows[window] = native
             surfaceToWindow[surface] = window
+            if let scene = pendingScenes.removeValue(forKey: surface) {
+                present(scene: scene, windowID: window)
+            }
 
         case .popupDestroyed(let window):
             if let native = windows.removeValue(forKey: window) {
@@ -354,13 +350,11 @@ public final class WindowBridge {
                 return
             }
             if let frame = pendingSurfaceFrames.removeValue(forKey: surface) {
-                guard let ioSurface = frameSource?.surface(forResource: frame.resourceID) else {
+                guard let texture = texture(for: frame) else {
                     retainDeferred(frame, for: surface)
                     return
                 }
-                dragIcon.display(ioSurface, frame: frame)
-                completeCopiedPresentation(
-                    surface: surface, presentationID: frame.presentationID)
+                presentDragIcon(texture, frame: frame, surface: surface)
             }
 
         case .cursorChanged(let surface, _, _):
@@ -389,15 +383,13 @@ public final class WindowBridge {
 
         case .committed(let surface, let frame):
             if surface == dragIconSurface {
-                guard let ioSurface = frameSource?.surface(forResource: frame.resourceID) else {
+                guard let texture = texture(for: frame) else {
                     retainDeferred(frame, for: surface)
-                    Self.note("drag icon commit deferred: no output IOSurface for \(frame.resourceID)")
+                    Self.note("drag icon commit deferred: no Metal texture for \(frame.resourceID)")
                     return
                 }
                 pendingFrames.removeValue(forKey: surface)
-                dragIcon.display(ioSurface, frame: frame)
-                completeCopiedPresentation(
-                    surface: surface, presentationID: frame.presentationID)
+                presentDragIcon(texture, frame: frame, surface: surface)
                 return
             }
             guard let windowID = surfaceToWindow[surface] else {
@@ -406,6 +398,14 @@ public final class WindowBridge {
                 return
             }
             presentCommitted(surface: surface, windowID: windowID, frame: frame)
+
+        case .sceneCommitted(let scene):
+            guard let windowID = surfaceToWindow[scene.surface] else {
+                retainDeferred(scene)
+                Self.note("scene retained: surface \(scene.surface) has no role yet")
+                return
+            }
+            present(scene: scene, windowID: windowID)
 
         case .frameCallbackRequested(let surface, let presentationID):
             schedulePresentation(surface: surface, presentationID: presentationID)
@@ -461,6 +461,11 @@ public final class WindowBridge {
 
     /// Called when a virtio-gpu resource becomes presentable after CREATE_BLOB.
     public func retryPendingFrames() {
+        let scenes = pendingScenes
+        for (surface, scene) in scenes {
+            guard let windowID = surfaceToWindow[surface] else { continue }
+            present(scene: scene, windowID: windowID)
+        }
         guard !pendingFrames.isEmpty else { return }
         let snapshot = pendingFrames
         for (surface, frame) in snapshot {
@@ -468,10 +473,91 @@ public final class WindowBridge {
         }
     }
 
+    private func retainDeferred(_ scene: Windowing.SceneSnapshot) {
+        if let previous = pendingScenes.updateValue(scene, forKey: scene.surface),
+           previous.presentationID != scene.presentationID {
+            completeScene(previous)
+        }
+    }
+
+    private func completeScene(_ scene: Windowing.SceneSnapshot) {
+        send(.framePresented(
+            surface: scene.surface, presentationID: scene.presentationID))
+        send(.frameReleased(
+            surface: scene.surface, presentationID: scene.presentationID))
+    }
+
+    private func present(scene: Windowing.SceneSnapshot, windowID: UInt32) {
+        guard let native = windows[windowID], let frameSource else {
+            retainDeferred(scene)
+            return
+        }
+        var resolved: [ResolvedSceneLayer] = []
+        resolved.reserveCapacity(scene.layers.count)
+        for layer in scene.layers {
+            let virglFormat: UInt32 = layer.format == .rgba8888 ? 67 : 1
+            guard let object = frameSource.metalTexture(
+                forResource: layer.resourceID,
+                width: layer.width, height: layer.height,
+                bytesPerRow: layer.bytesPerRow, format: virglFormat),
+                let texture = object as? MTLTexture
+            else {
+                retainDeferred(scene)
+                Self.note(
+                    "scene deferred: no Metal texture for resource \(layer.resourceID)")
+                return
+            }
+            resolved.append(ResolvedSceneLayer(state: layer, texture: texture))
+        }
+        pendingScenes.removeValue(forKey: scene.surface)
+        native.present(
+            scene: scene, layers: resolved,
+            readComplete: { [weak self] success in
+                guard let self else { return }
+                self.send(.frameReleased(
+                    surface: scene.surface,
+                    presentationID: scene.presentationID))
+            })
+        native.traceLayerGeometry()
+        injectTestInput(windowID)
+        scheduleResizeProbe(native)
+    }
+
+    private func texture(for frame: Windowing.Frame) -> MTLTexture? {
+        let format: UInt32 = frame.format == .rgba8888 ? 67 : 1
+        return frameSource?.metalTexture(
+            forResource: frame.resourceID,
+            width: frame.width, height: frame.height,
+            bytesPerRow: frame.bytesPerRow, format: format) as? MTLTexture
+    }
+
+    private func presentDragIcon(
+        _ texture: MTLTexture, frame: Windowing.Frame, surface: UInt32
+    ) {
+        let queued = dragIcon.display(
+            texture, frame: frame,
+            readComplete: { [weak self] success in
+                guard let self else { return }
+                self.send(.frameReleased(
+                    surface: surface, presentationID: frame.presentationID))
+                if !success {
+                    self.send(.framePresented(
+                        surface: surface, presentationID: frame.presentationID))
+                }
+            },
+            presented: { [weak self] in
+                self?.send(.framePresented(
+                    surface: surface, presentationID: frame.presentationID))
+            })
+        if !queued {
+            completeCopiedPresentation(
+                surface: surface, presentationID: frame.presentationID)
+        }
+    }
+
     /// Replace a frame the host has not installed only after completing the
-    /// superseded presentation id. Once a commit has crossed the guest/host
-    /// boundary, that id owns a guest output-ring slot even if its IOSurface is
-    /// not visible in the host resource table yet.
+    /// superseded presentation id. Once a commit crosses the guest/host
+    /// boundary, that id retains its source texture until frameReleased.
     private func retainDeferred(_ frame: Windowing.Frame, for surface: UInt32) {
         if let previous = pendingFrames.updateValue(frame, forKey: surface),
            previous.presentationID != frame.presentationID {
@@ -494,43 +580,16 @@ public final class WindowBridge {
             Self.note("commit dropped: no window \(windowID)")
             return
         }
-        // virgl_hw.h: BGRA8_UNORM=1, RGBA8_UNORM=67. Window scene output is
-        // always BGRA, but retain the format mapping for legacy/unroled frames.
-        let virglFormat: UInt32 = frame.format == .rgba8888 ? 67 : 1
-        if frame.source != .encoded,
-           let texture = frameSource?.metalTexture(
-               forResource: frame.resourceID,
-               width: frame.width, height: frame.height,
-               bytesPerRow: frame.bytesPerRow, format: virglFormat)
-        {
-            pendingFrames.removeValue(forKey: surface)
-            native.present(
-                frame: frame, metalTexture: texture,
-                copied: { [weak self] success in
-                    guard let self else { return }
-                    self.send(.frameReleased(
-                        surface: surface, presentationID: frame.presentationID))
-                    if !success {
-                        self.send(.framePresented(
-                            surface: surface, presentationID: frame.presentationID))
-                    }
-                },
-                presented: { [weak self] in
-                    self?.send(.framePresented(
-                        surface: surface, presentationID: frame.presentationID))
-                })
-            if Self.frameTrace {
-                Self.note("blit queued window=\(windowID) res=\(frame.resourceID)")
-            }
-            native.traceLayerGeometry()
-            injectTestInput(windowID)
-            scheduleResizeProbe(native)
+        guard frame.source == .encoded else {
+            completeCopiedPresentation(
+                surface: surface, presentationID: frame.presentationID)
+            Self.note("ignored obsolete local committed frame for surface \(surface)")
             return
         }
 
         guard let ioSurface = frameSource?.surface(forResource: frame.resourceID) else {
             retainDeferred(frame, for: surface)
-            Self.note("commit deferred: no Metal texture or IOSurface for resource \(frame.resourceID)")
+            Self.note("remote frame deferred: no decoded IOSurface for resource \(frame.resourceID)")
             return
         }
         pendingFrames.removeValue(forKey: surface)
@@ -722,6 +781,8 @@ public final class WindowBridge {
                 surface: surface, presentationID: frame.presentationID)
         }
         pendingFrames.removeAll()
+        for (_, scene) in pendingScenes { completeScene(scene) }
+        pendingScenes.removeAll()
         for (_, window) in windows { window.close() }
         windows.removeAll()
         surfaceToWindow.removeAll()

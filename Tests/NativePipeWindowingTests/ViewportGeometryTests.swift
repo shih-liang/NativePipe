@@ -145,17 +145,13 @@ final class ViewportGeometryTests: XCTestCase {
         XCTAssertEqual(geometry.hotSpot, CGPoint(x: 19, y: 0))
     }
 
-    func testMissingOutputIOSurfaceIsDeferredRatherThanReleased() {
+    func testMissingSceneTextureIsDeferredRatherThanReleased() {
         let bridge = WindowBridge(frameSource: nil)
         var commands: [Windowing.HostCommand] = []
         bridge.output = { commands.append($0) }
         bridge.apply(.surfaceCreated(surface: 8))
         bridge.apply(.toplevelCreated(window: 3, surface: 8))
-        bridge.apply(.committed(
-            surface: 8,
-            frame: Windowing.Frame(
-                resourceID: 99, width: 64, height: 48, bytesPerRow: 256,
-                format: .bgra8888, presentationID: 17)))
+        bridge.apply(.sceneCommitted(scene: scene(presentationID: 17)))
 
         XCTAssertFalse(commands.contains {
             if case .framePresented(surface: 8, presentationID: 17) = $0 { return true }
@@ -164,7 +160,7 @@ final class ViewportGeometryTests: XCTestCase {
         bridge.closeAll()
     }
 
-    func testSupersededDeferredFrameCompletesAndReleasesItsRingSlot() {
+    func testSupersededDeferredSceneCompletesAndReleasesItsSources() {
         let bridge = WindowBridge(frameSource: nil)
         var commands: [Windowing.HostCommand] = []
         bridge.output = { commands.append($0) }
@@ -172,11 +168,7 @@ final class ViewportGeometryTests: XCTestCase {
         bridge.apply(.toplevelCreated(window: 3, surface: 8))
 
         for presentationID in [UInt32(17), 18] {
-            bridge.apply(.committed(
-                surface: 8,
-                frame: Windowing.Frame(
-                    resourceID: 99, width: 64, height: 48, bytesPerRow: 256,
-                    format: .bgra8888, presentationID: presentationID)))
+            bridge.apply(.sceneCommitted(scene: scene(presentationID: presentationID)))
         }
 
         XCTAssertTrue(commands.contains {
@@ -192,6 +184,21 @@ final class ViewportGeometryTests: XCTestCase {
             return false
         })
         bridge.closeAll()
+    }
+
+    private func scene(presentationID: UInt32) -> Windowing.SceneSnapshot {
+        Windowing.SceneSnapshot(
+            surface: 8, presentationID: presentationID,
+            width: 64, height: 48, scale: 1,
+            windowGeometry: .init(x: 0, y: 0, width: 64, height: 48),
+            layers: [.init(
+                surface: 8, resourceID: 99,
+                width: 64, height: 48, bytesPerRow: 256,
+                format: .bgra8888,
+                destination: .init(x: 0, y: 0, width: 64, height: 48),
+                sourcePixels: .init(x: 0, y: 0, width: 64, height: 48),
+                clip: .init(x: 0, y: 0, width: 64, height: 48),
+                opaque: true)])
     }
 
     func testGPUSubsurfaceCommitIsDeferredInsteadOfDropped() {

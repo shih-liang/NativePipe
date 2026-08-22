@@ -1,8 +1,8 @@
 #ifndef NP_COMPOSITOR_INTERNAL_H
 #define NP_COMPOSITOR_INTERNAL_H
 
-#include "blob.h"
 #include "hostlink.h"
+#include "region.h"
 #ifdef NP_REMOTE
 #include "medialink.h"
 #include "../encoder/encoder.h"
@@ -12,6 +12,11 @@
 #include <stdint.h>
 #include <wayland-server-core.h>
 
+struct np_gpu_buffer;
+struct np_shm_texture;
+struct np_sync_surface;
+struct np_sync_point;
+
 struct np_box {
 	int32_t x, y, width, height;
 };
@@ -19,6 +24,7 @@ struct np_box {
 struct np_server {
 	struct wl_display *display;
 	struct wl_list surfaces;
+	struct wl_list shm_textures;
 	struct np_host host;
 #ifdef NP_REMOTE
 	struct np_media media;
@@ -51,7 +57,10 @@ struct np_server {
 	size_t keymap_size;
 	uint32_t focused_window;
 	uint32_t pointer_window;
+	uint32_t pointer_surface;
+	uint32_t drag_focus_surface;
 	struct wl_event_source *host_connection_source;
+	struct wl_event_source *scene_retry_timer;
 	int watched_host_fd;
 	uint32_t watched_host_mask;
 };
@@ -96,8 +105,18 @@ struct np_surface_update {
 	int32_t geometry_x, geometry_y, geometry_width, geometry_height;
 	bool viewport_changed;
 	struct np_viewport_state viewport;
+	bool transform_changed;
+	int32_t transform;
+	bool input_region_changed;
+	bool input_region_set;
+	struct np_region_state input_region;
+	bool opaque_region_changed;
+	bool opaque_region_set;
+	struct np_region_state opaque_region;
 	struct np_box damage;
 	bool set_fifo_barrier;
+	struct np_sync_point *acquire_point;
+	struct np_sync_point *release_point;
 	uint32_t finishes_host_configure_serial;
 	uint32_t presentation_id;
 };
@@ -110,22 +129,6 @@ struct np_subsurface_stack_op {
 	struct np_surface *child;
 	struct np_surface *sibling;
 	bool above;
-};
-
-/* One compositor scene image plus the NSWindow's private display IOSurface form
- * the presentation double buffer. The host releases this image as soon as its
- * Metal blit completes; WindowServer never owns it. */
-struct np_scene_output {
-	struct np_blob images[1];
-	uint32_t presentation_id[1];
-	uint32_t alloc_width;
-	uint32_t alloc_height;
-	uint32_t stride;
-};
-
-struct np_retired_scene_output {
-	struct np_scene_output output;
-	struct np_retired_scene_output *next;
 };
 
 struct np_surface {
@@ -146,8 +149,25 @@ struct np_surface {
 	 * part of the scene and is replaced atomically by the next buffer commit. */
 	struct wl_resource *current_buffer;
 	struct wl_listener current_buffer_destroy;
+	struct np_gpu_buffer *current_gpu;
+	struct np_shm_texture *current_shm;
+	struct np_sync_surface *syncobj;
+	struct np_sync_point *current_release_point;
 	int pending_scale;
 	int scale;
+	int32_t pending_transform;
+	int32_t transform;
+	bool pending_transform_changed;
+	bool pending_input_region_changed;
+	bool pending_input_region_set;
+	struct np_region_state pending_input_region;
+	bool input_region_set;
+	struct np_region_state input_region;
+	bool pending_opaque_region_changed;
+	bool pending_opaque_region_set;
+	struct np_region_state pending_opaque_region;
+	bool opaque_region_set;
+	struct np_region_state opaque_region;
 
 	struct wl_resource *xdg_surface;
 	struct wl_resource *toplevel;
@@ -176,17 +196,8 @@ struct np_surface {
 	int32_t geometry_x, geometry_y;
 	int32_t geometry_width, geometry_height;
 
-	struct np_blob blobs[2];
-	int back;
-	int current_blob_index;
-	uint32_t blob_stride;
-	uint32_t alloc_width;
-	uint32_t alloc_height;
 	uint32_t pending_presentation_id;
-	uint32_t blob_presentation_id[2];
-	int pending_blob_index;
-	struct np_scene_output scene;
-	struct np_retired_scene_output *retired_scenes;
+	struct wl_list scene_presentations;
 	bool scene_dirty;
 	uint32_t scene_presentation_id;
 
@@ -209,6 +220,7 @@ struct np_surface {
 	bool has_cached_buffer;
 	uint32_t cached_presentation_id;
 	bool cached_set_fifo_barrier;
+	struct np_sync_point *cached_release_point;
 
 	struct np_box pending;
 	struct np_box owed[2];

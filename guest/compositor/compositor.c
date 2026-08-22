@@ -1,29 +1,32 @@
 // Shared Wayland compositor core (linked into vmpipe-wayland / remotepipe-wayland).
 //
 // This translates Wayland application windows to AppKit windows. It owns the
-// protocol state machine and composites each xdg surface tree once in the guest;
-// macOS still owns stacking, decorations, focus and desktop composition between
-// those application windows.
+// protocol state machine and resolves each xdg surface tree into immutable
+// metadata. The host samples the original Venus textures and performs the one
+// composition pass directly into the NSWindow drawable.
 //
 //     wl_surface   #17  ->  NativeSurface #17
 //     xdg_toplevel #23  ->  NativeWindow  #23  ->  NSWindow *
 //
-// wl_shm and linux-dmabuf layers both end in one ordinary BGRA scene VkImage.
-// The host retains its exact MTLTexture, blits once into the NSWindow-owned
-// IOSurface, then releases the scene image when that blit completes.
+// wl_shm receives one compositor texture per wl_buffer; linux-dmabuf remains in
+// the client's existing texture. Neither path creates a window-level scene
+// image or an intermediate IOSurface.
 
 #define _GNU_SOURCE
 
 #include "compositor.h"
 #include "compositor_internal.h"
 #include "perf.h"
-#include "blob.h" /* struct np_blob / np_align_row; VM also links blob.c */
 #include "dmabuf.h"
-#include "gpu_copy.h"
 #include "decoration.h"
 #include "hostlink.h"
 #include "scale.h"
 #include "scene.h"
+#include "shm_texture.h"
+#include "syncobj.h"
+#ifndef NP_REMOTE
+#include "virtio_resource.h"
+#endif
 #ifdef NP_REMOTE
 #include "medialink.h"
 #include "../encoder/encoder.h"
@@ -67,6 +70,46 @@ static bool trace_enabled(void) {
 	return enabled == 1;
 }
 
+#ifndef NP_REMOTE
+/* Publish the display name only after every server-side endpoint is ready.
+ * guestd treats this file as the session readiness record, so a partially
+ * written or stale file must never be observable by an application launch. */
+static bool publish_session_environment(const char *socket)
+{
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+	if (!runtime || !runtime[0] || !socket || !socket[0]) return false;
+
+	char path[1024];
+	char temporary[1088];
+	snprintf(path, sizeof(path), "%s/nativepipe-wayland.env", runtime);
+	snprintf(temporary, sizeof(temporary), "%s.tmp.%ld", path, (long)getpid());
+
+	int fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+	if (fd < 0) {
+		unlink(temporary);
+		fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+	}
+	if (fd < 0) return false;
+
+	FILE *env = fdopen(fd, "w");
+	if (!env) {
+		close(fd);
+		unlink(temporary);
+		return false;
+	}
+	bool ok = fprintf(env, "WAYLAND_DISPLAY=%s\n", socket) > 0;
+	const char *bus = getenv("DBUS_SESSION_BUS_ADDRESS");
+	if (ok && bus && bus[0])
+		ok = fprintf(env, "DBUS_SESSION_BUS_ADDRESS=%s\n", bus) > 0;
+	if (ok) ok = fflush(env) == 0;
+	if (ok) ok = fsync(fd) == 0;
+	if (fclose(env) != 0) ok = false;
+	if (ok) ok = rename(temporary, path) == 0;
+	if (!ok) unlink(temporary);
+	return ok;
+}
+#endif
+
 
 // Commit handling and the subsurface role refer to each other: a parent's commit
 // releases its synchronised children, and a released child publishes a frame.
@@ -76,12 +119,33 @@ static void apply_unblocked_updates(struct np_surface *surface);
 static void request_host_refresh(struct np_surface *surface,
                                  uint32_t presentation_id);
 static void publish_surface_buffer(struct np_surface *surface, struct wl_resource *buffer,
-                                   uint32_t presentation_id);
-static void publish_gpu_frame(struct np_surface *surface, struct np_gpu_buffer *gpu,
-                              uint32_t presentation_id);
+                                   uint32_t presentation_id,
+                                   struct np_sync_point *release_point);
 static void frame_add_viewport(struct np_surface *surface, cJSON *frame);
 static bool parent_has_pending_subsurface_state(struct np_surface *parent);
 static void apply_pending_subsurface_state(struct np_surface *parent);
+
+static int retry_dirty_scenes(void *data)
+{
+	struct np_server *server = data;
+	struct np_surface *surface;
+	wl_list_for_each(surface, &server->surfaces, link)
+		apply_unblocked_updates(surface);
+	flush_pending_frames(server);
+	wl_display_flush_clients(server->display);
+	return 0;
+}
+
+static void schedule_scene_retry(struct np_server *server)
+{
+	if (!server->scene_retry_timer) {
+		struct wl_event_loop *loop = wl_display_get_event_loop(server->display);
+		server->scene_retry_timer = wl_event_loop_add_timer(
+			loop, retry_dirty_scenes, server);
+	}
+	if (server->scene_retry_timer)
+		wl_event_source_timer_update(server->scene_retry_timer, 1);
+}
 
 static void drop_stack_ops_referencing(struct np_server *server,
 	                                   struct np_surface *surface)
@@ -170,15 +234,6 @@ static void box_union(struct np_box *box, int32_t x, int32_t y, int32_t w, int32
 	box->x = left; box->y = top; box->width = right - left; box->height = bottom - top;
 }
 
-static void box_clip(struct np_box *box, int32_t width, int32_t height) {
-	if (box->x < 0) { box->width += box->x; box->x = 0; }
-	if (box->y < 0) { box->height += box->y; box->y = 0; }
-	if (box->x + box->width > width) box->width = width - box->x;
-	if (box->y + box->height > height) box->height = height - box->y;
-	if (box->width < 0) box->width = 0;
-	if (box->height < 0) box->height = 0;
-}
-
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -232,7 +287,28 @@ static void surface_damage(struct wl_client *client, struct wl_resource *resourc
                            int32_t x, int32_t y, int32_t width, int32_t height) {
 	struct np_surface *surface = wl_resource_get_user_data(resource);
 	int scale = surface->pending_scale > 0 ? surface->pending_scale : 1;
-	box_union(&surface->pending, x * scale, y * scale, width * scale, height * scale);
+	int32_t buffer_width = surface->last_width;
+	int32_t buffer_height = surface->last_height;
+	if (surface->pending_buffer) {
+		struct wl_shm_buffer *shm = wl_shm_buffer_get(surface->pending_buffer);
+		struct np_gpu_buffer *gpu = np_gpu_buffer_get(surface->pending_buffer);
+		if (shm) {
+			buffer_width = wl_shm_buffer_get_width(shm);
+			buffer_height = wl_shm_buffer_get_height(shm);
+		} else if (gpu) {
+			buffer_width = gpu->width;
+			buffer_height = gpu->height;
+		}
+	}
+	int32_t bx, by, bw, bh;
+	if (buffer_width > 0 && buffer_height > 0 &&
+	    np_scale_damage_to_buffer(surface->pending_transform,
+	                              (uint32_t)buffer_width, (uint32_t)buffer_height,
+	                              scale, x, y, width, height,
+	                              &bx, &by, &bw, &bh))
+		box_union(&surface->pending, bx, by, bw, bh);
+	else
+		box_union(&surface->pending, x * scale, y * scale, width * scale, height * scale);
 }
 
 static void frame_callback_destroy(struct wl_resource *resource) {
@@ -316,10 +392,6 @@ static void release_presentation(struct np_server *server,
 	np_scene_presented(root ? root : owner, presentation_id);
 	struct np_surface *surface;
 	wl_list_for_each(surface, &server->surfaces, link) {
-		for (int i = 0; i < 2; i++) {
-			if (surface->blob_presentation_id[i] == presentation_id)
-				surface->blob_presentation_id[i] = 0;
-		}
 		apply_unblocked_updates(surface);
 	}
 	flush_pending_frames(server);
@@ -327,12 +399,39 @@ static void release_presentation(struct np_server *server,
 }
 
 static void surface_set_opaque_region(struct wl_client *client, struct wl_resource *resource,
-                                      struct wl_resource *region) {}
+                                      struct wl_resource *region) {
+	(void)client;
+	struct np_surface *surface = wl_resource_get_user_data(resource);
+	surface->pending_opaque_region_changed = true;
+	surface->pending_opaque_region_set = region != NULL;
+	memset(&surface->pending_opaque_region, 0, sizeof(surface->pending_opaque_region));
+	if (region && !np_region_copy_resource(region, &surface->pending_opaque_region))
+		surface->pending_opaque_region_set = false;
+}
 static void surface_set_input_region(struct wl_client *client, struct wl_resource *resource,
-                                     struct wl_resource *region) {}
+                                     struct wl_resource *region) {
+	(void)client;
+	struct np_surface *surface = wl_resource_get_user_data(resource);
+	surface->pending_input_region_changed = true;
+	surface->pending_input_region_set = region != NULL;
+	memset(&surface->pending_input_region, 0, sizeof(surface->pending_input_region));
+	if (region && !np_region_copy_resource(region, &surface->pending_input_region))
+		surface->pending_input_region_set = false;
+}
 
 static void surface_set_buffer_transform(struct wl_client *client, struct wl_resource *resource,
-                                         int32_t transform) {}
+                                         int32_t transform) {
+	(void)client;
+	if (transform < WL_OUTPUT_TRANSFORM_NORMAL ||
+	    transform > WL_OUTPUT_TRANSFORM_FLIPPED_270) {
+		wl_resource_post_error(resource, WL_SURFACE_ERROR_INVALID_TRANSFORM,
+		                       "invalid buffer transform %d", transform);
+		return;
+	}
+	struct np_surface *surface = wl_resource_get_user_data(resource);
+	surface->pending_transform = transform;
+	surface->pending_transform_changed = true;
+}
 
 static void surface_set_buffer_scale(struct wl_client *client, struct wl_resource *resource,
                                      int32_t scale) {
@@ -453,352 +552,9 @@ static void publish_frame_remote(struct np_surface *surface, struct wl_shm_buffe
 
 #endif
 
-/// Allocate the two presentation images owned by this Wayland surface. Client
-/// swapchain images are inputs only; their count never changes this ring size.
-static uint32_t grow_output_extent(uint32_t current, uint32_t required,
-	                               uint32_t quantum) {
-	uint64_t target = required;
-	if (current) {
-		uint64_t grown = (uint64_t)current + current / 2u;
-		if (grown > target) target = grown;
-	}
-	target = (target + quantum - 1u) / quantum * quantum;
-	return target > UINT32_MAX ? 0 : (uint32_t)target;
-}
 
-static bool ensure_output_ring(struct np_surface *surface,
-                               uint32_t width, uint32_t height,
-                               uint32_t minimum_stride, bool *reallocated) {
-#ifdef NP_REMOTE
-	(void)surface; (void)width; (void)height; (void)minimum_stride;
-	if (reallocated) *reallocated = false;
-	return true;
-#else
-	if (reallocated) *reallocated = false;
-	if (surface->blobs[0].data && width <= surface->alloc_width &&
-	    height <= surface->alloc_height &&
-	    minimum_stride <= surface->blob_stride)
-		return true;
-
-	uint32_t row_width = minimum_stride / 4u + (minimum_stride % 4u != 0);
-	if (row_width > width) width = row_width;
-	uint32_t capacity_width = grow_output_extent(
-		surface->alloc_width, width, 128);
-	uint32_t capacity_height = grow_output_extent(
-		surface->alloc_height, height, 64);
-	if (!capacity_width || !capacity_height || capacity_width > UINT32_MAX / 4u)
-		return false;
-	uint32_t capacity_stride = capacity_width * 4u;
-
-	for (int i = 0; i < 2; i++)
-		np_blob_destroy(surface->server->drm_fd, &surface->blobs[i]);
-	surface->blob_presentation_id[0] = 0;
-	surface->blob_presentation_id[1] = 0;
-	surface->pending_blob_index = -1;
-
-	size_t requested_size = (size_t)capacity_stride * (size_t)capacity_height;
-	for (int i = 0; i < 2; i++) {
-		if (!np_blob_create(surface->server->drm_fd, requested_size,
-		                    capacity_width, capacity_height, capacity_stride,
-		                    &surface->blobs[i])) {
-			for (int j = 0; j < 2; j++)
-				np_blob_destroy(surface->server->drm_fd, &surface->blobs[j]);
-			surface->blob_stride = 0;
-			surface->alloc_width = 0;
-			surface->alloc_height = 0;
-			return false;
-		}
-	}
-	if (surface->blobs[0].vk.stride != surface->blobs[1].vk.stride) {
-		fprintf(stderr, "[wayland] presentation images have different row pitches\n");
-		for (int i = 0; i < 2; i++)
-			np_blob_destroy(surface->server->drm_fd, &surface->blobs[i]);
-		return false;
-	}
-
-	surface->blob_stride = surface->blobs[0].vk.stride;
-	surface->alloc_width = capacity_width;
-	surface->alloc_height = capacity_height;
-	surface->back = 0;
-	box_clear(&surface->owed[0]);
-	box_clear(&surface->owed[1]);
-	if (reallocated) *reallocated = true;
-	return true;
-#endif
-}
-
-/// Pick the image not owned by WindowServer. A locally queued frame has not
-/// crossed the host channel yet, so replacing it may reuse that same image.
-static int output_ring_slot(struct np_surface *surface) {
-#ifdef NP_REMOTE
-	(void)surface;
-	return 0;
-#else
-	if (surface->pending_blob_index >= 0)
-		return surface->pending_blob_index;
-	if (!surface->blob_presentation_id[surface->back])
-		return surface->back;
-	int other = 1 - surface->back;
-	return surface->blob_presentation_id[other] ? -1 : other;
-#endif
-}
-
-static void reserve_output_slot(struct np_surface *surface, int slot,
-	                            uint32_t presentation_id) {
-#ifndef NP_REMOTE
-	if (surface->pending_blob_index >= 0 && surface->pending_blob_index != slot)
-		surface->blob_presentation_id[surface->pending_blob_index] = 0;
-	surface->blob_presentation_id[slot] = presentation_id;
-	surface->pending_blob_index = slot;
-	surface->back = 1 - slot;
-#else
-	(void)surface; (void)slot; (void)presentation_id;
-#endif
-}
-
-static void mark_snapshot_current(struct np_surface *surface, int slot)
-{
-	/* Role resolution happens after an unroled cursor/drag surface may have
-	 * committed, so ownership is converted from a host frame to a guest-only
-	 * snapshot in flush_pending_frames, not here. */
-	surface->current_blob_index = slot;
-}
-
-/// The one copy. Pixels leave the client's pool and land in host memory.
-static void publish_frame(struct np_surface *surface, struct wl_shm_buffer *shm,
-                          uint32_t presentation_id) {
-#ifdef NP_REMOTE
-	publish_frame_remote(surface, shm, presentation_id);
-#else
-	wl_shm_buffer_begin_access(shm);
-	const unsigned char *source = wl_shm_buffer_get_data(shm);
-	int32_t width = wl_shm_buffer_get_width(shm);
-	int32_t height = wl_shm_buffer_get_height(shm);
-	int32_t stride = wl_shm_buffer_get_stride(shm);
-	uint32_t format = wl_shm_buffer_get_format(shm);
-
-	// Exactly the size of the frame, because the host displays the whole
-	// surface. Padding the allocation and showing a sub-rectangle was tried and
-	// reverted; with configures coalesced to the latest size, a reallocation
-	// happens once per settled size rather than once per drag step.
-	//
-	// The row is padded to the host's display alignment, without which
-	// CoreAnimation shows nothing at all.
-	size_t minimum_stride = (size_t)stride;
-	bool reallocated = false;
-
-	if (!ensure_output_ring(surface, (uint32_t)width, (uint32_t)height,
-	                        (uint32_t)minimum_stride, &reallocated)) {
-		wl_shm_buffer_end_access(shm);
-		return;
-	}
-
-	// What this blob is missing: what changed now, plus what it missed while the
-	// other one was on screen.
-	struct np_box copy = surface->pending;
-	int slot = output_ring_slot(surface);
-	if (slot < 0) {
-		wl_shm_buffer_end_access(shm);
-		return;
-	}
-	box_union(&copy, surface->owed[slot].x, surface->owed[slot].y,
-	          surface->owed[slot].width, surface->owed[slot].height);
-	if (reallocated || copy.width == 0 || copy.height == 0) {
-		copy.x = 0; copy.y = 0; copy.width = width; copy.height = height;
-	}
-	box_clip(&copy, width, height);
-
-	struct np_blob *blob = &surface->blobs[slot];
-	if (!np_gpu_prepare_host_write(&blob->vk)) {
-		wl_shm_buffer_end_access(shm);
-		return;
-	}
-	unsigned char *destination = blob->data;
-	size_t dst_stride = blob->vk.stride;
-	size_t span = (size_t)copy.width * 4;
-	size_t offset = (size_t)copy.x * 4;
-	for (int32_t row = copy.y; row < copy.y + copy.height; row++) {
-		memcpy(destination + (size_t)row * dst_stride + offset,
-		       source + (size_t)row * (size_t)stride + offset, span);
-	}
-	wl_shm_buffer_end_access(shm);
-
-	box_union(&surface->owed[1 - slot], surface->pending.x, surface->pending.y,
-	          surface->pending.width, surface->pending.height);
-	if (reallocated) {
-		surface->owed[1 - slot].x = 0;
-		surface->owed[1 - slot].y = 0;
-		surface->owed[1 - slot].width = width;
-		surface->owed[1 - slot].height = height;
-	}
-	box_clear(&surface->owed[slot]);
-	box_clear(&surface->pending);
-
-	// ARGB8888 and XRGB8888 are both BGRA byte order on a little-endian guest,
-	// which is what CoreAnimation samples.
-	const char *format_name = format == WL_SHM_FORMAT_ARGB8888 ? "bgra8888"
-		: format == WL_SHM_FORMAT_XRGB8888 ? "bgrx8888"
-		: "rgba8888";
-
-	cJSON *frame = cJSON_CreateObject();
-	cJSON_AddNumberToObject(frame, "resourceID", blob->resource_id);
-	cJSON_AddNumberToObject(frame, "width", width);
-	cJSON_AddNumberToObject(frame, "height", height);
-	cJSON_AddNumberToObject(frame, "bytesPerRow", (double)dst_stride);
-	cJSON_AddStringToObject(frame, "format", format_name);
-	cJSON_AddStringToObject(frame, "source", "cpu");
-	cJSON_AddNumberToObject(frame, "scale", surface->scale);
-	cJSON_AddNumberToObject(frame, "presentationID", presentation_id);
-	if (surface->geometry_set) {
-		cJSON *geometry = cJSON_CreateObject();
-		cJSON_AddNumberToObject(geometry, "x", surface->geometry_x);
-		cJSON_AddNumberToObject(geometry, "y", surface->geometry_y);
-		cJSON_AddNumberToObject(geometry, "width", surface->geometry_width);
-		cJSON_AddNumberToObject(geometry, "height", surface->geometry_height);
-		cJSON_AddItemToObject(frame, "windowGeometry", geometry);
-	}
-	frame_add_viewport(surface, frame);
-	cJSON_AddItemToObject(frame, "damage", cJSON_CreateArray());
-
-	surface->last_format = format_name;   // a string literal; nothing to own
-	surface->last_width = width;
-	surface->last_height = height;
-	surface->last_resource_id = blob->resource_id;
-	surface->last_stride = (uint32_t)dst_stride;
-	surface->last_source = "cpu";
-	surface->has_published = true;
-
-	cJSON *body = cJSON_CreateObject();
-	cJSON_AddNumberToObject(body, "surface", surface->id);
-	cJSON_AddItemToObject(body, "frame", frame);
-
-	// Supersedes whatever this surface was about to report.
-	if (surface->pending_frame) {
-		rebind_frame_callbacks(surface, surface->pending_presentation_id, presentation_id);
-		if (surface->fifo_barrier_presentation_id == surface->pending_presentation_id)
-			surface->fifo_barrier_presentation_id = presentation_id;
-		cJSON_Delete(surface->pending_frame);
-	}
-	reserve_output_slot(surface, slot, presentation_id);
-	mark_snapshot_current(surface, slot);
-	surface->pending_frame = body;
-	surface->pending_presentation_id = presentation_id;
-#endif
-}
-
-/// Legacy unroled-surface path (cursor/drag icon): copy the imported client
-/// image into a publishable compositor buffer. Toplevels use scene.c instead.
-static void publish_gpu_frame(struct np_surface *surface, struct np_gpu_buffer *gpu,
-                              uint32_t presentation_id) {
-#ifdef NP_REMOTE
-	(void)gpu;
-	// MVP remote path encodes wl_shm (cairo/GTK). Real dmabuf → VAAPI import
-	// is the next step; without virtio RESOURCE_INFO we cannot name a Venus id.
-	fprintf(stderr,
-	        "[wayland] remote: dropping dmabuf frame surface=%u (shm encode only in MVP)\n",
-	        surface->id);
-	return;
-#else
-	if (trace_enabled()) {
-		fprintf(stderr, "[wayland] gpu attach surface=%u res=%u %dx%d\n",
-		        surface->id, gpu->resource_id, gpu->width, gpu->height);
-	}
-	if (!ensure_output_ring(surface, (uint32_t)gpu->width, (uint32_t)gpu->height,
-	                        (uint32_t)gpu->stride, NULL)) {
-		fprintf(stderr, "[wayland] could not allocate output ring surface=%u\n",
-		        surface->id);
-		return;
-	}
-	int slot = output_ring_slot(surface);
-	if (slot < 0) return;
-	struct np_blob *blob = &surface->blobs[slot];
-	if (!np_gpu_buffer_copy_to_output(gpu, &blob->vk))
-		return;
-	box_clear(&surface->pending);
-
-	const char *format_name = gpu->format == 0x34325241 /* AR24 */ ? "bgra8888"
-		: gpu->format == 0x34325258 /* XR24 */ ? "bgrx8888"
-		: gpu->format == 0x34324241 /* AB24 */ ? "rgba8888"
-		: gpu->format == 0x34324258 /* XB24 */ ? "rgba8888"
-		: "rgba8888";
-
-	cJSON *frame = cJSON_CreateObject();
-	cJSON_AddNumberToObject(frame, "resourceID", blob->resource_id);
-	cJSON_AddNumberToObject(frame, "width", gpu->width);
-	cJSON_AddNumberToObject(frame, "height", gpu->height);
-	cJSON_AddNumberToObject(frame, "bytesPerRow", blob->vk.stride);
-	cJSON_AddStringToObject(frame, "format", format_name);
-	cJSON_AddStringToObject(frame, "source", "gpu");
-	cJSON_AddNumberToObject(frame, "scale", surface->scale);
-	cJSON_AddNumberToObject(frame, "presentationID", presentation_id);
-	if (surface->geometry_set) {
-		cJSON *geometry = cJSON_CreateObject();
-		cJSON_AddNumberToObject(geometry, "x", surface->geometry_x);
-		cJSON_AddNumberToObject(geometry, "y", surface->geometry_y);
-		cJSON_AddNumberToObject(geometry, "width", surface->geometry_width);
-		cJSON_AddNumberToObject(geometry, "height", surface->geometry_height);
-		cJSON_AddItemToObject(frame, "windowGeometry", geometry);
-	}
-	frame_add_viewport(surface, frame);
-	cJSON_AddItemToObject(frame, "damage", cJSON_CreateArray());
-
-	surface->last_format = format_name;
-	surface->last_width = gpu->width;
-	surface->last_height = gpu->height;
-	surface->last_resource_id = blob->resource_id;
-	surface->last_stride = blob->vk.stride;
-	surface->last_source = "gpu";
-	surface->has_published = true;
-
-	cJSON *body = cJSON_CreateObject();
-	cJSON_AddNumberToObject(body, "surface", surface->id);
-	cJSON_AddItemToObject(body, "frame", frame);
-	if (surface->pending_frame) {
-		rebind_frame_callbacks(surface, surface->pending_presentation_id, presentation_id);
-		if (surface->fifo_barrier_presentation_id == surface->pending_presentation_id)
-			surface->fifo_barrier_presentation_id = presentation_id;
-		cJSON_Delete(surface->pending_frame);
-	}
-	reserve_output_slot(surface, slot, presentation_id);
-	mark_snapshot_current(surface, slot);
-	surface->pending_frame = body;
-	surface->pending_presentation_id = presentation_id;
-#endif
-}
-
-static cJSON *scene_committed_body(struct np_surface *root,
-	                               const struct np_scene_frame *scene,
-	                               uint32_t presentation_id)
-{
-	cJSON *frame = cJSON_CreateObject();
-	cJSON_AddNumberToObject(frame, "resourceID", scene->resource_id);
-	cJSON_AddNumberToObject(frame, "width", scene->width);
-	cJSON_AddNumberToObject(frame, "height", scene->height);
-	cJSON_AddNumberToObject(frame, "bytesPerRow", scene->stride);
-	cJSON_AddStringToObject(frame, "format", "bgra8888");
-	/* The scene output is always an ordinary Venus/MTLHeap image, even when all
-	 * inputs were wl_shm. `source` describes the host access path, not the
-	 * original client renderer. */
-	cJSON_AddStringToObject(frame, "source", "gpu");
-	cJSON_AddNumberToObject(frame, "scale", scene->scale);
-	cJSON_AddNumberToObject(frame, "presentationID", presentation_id);
-	cJSON *geometry = cJSON_CreateObject();
-	cJSON_AddNumberToObject(geometry, "x", scene->geometry_x);
-	cJSON_AddNumberToObject(geometry, "y", scene->geometry_y);
-	cJSON_AddNumberToObject(geometry, "width", scene->geometry_width);
-	cJSON_AddNumberToObject(geometry, "height", scene->geometry_height);
-	cJSON_AddItemToObject(frame, "windowGeometry", geometry);
-	cJSON_AddItemToObject(frame, "damage", cJSON_CreateArray());
-
-	cJSON *body = cJSON_CreateObject();
-	cJSON_AddNumberToObject(body, "surface", root->id);
-	cJSON_AddItemToObject(body, "frame", frame);
-	return body;
-}
-
-/// Publish one atomic frame per xdg window. Surface snapshots, viewport state,
-/// window geometry and synchronized child commits are consumed together here;
-/// no subsurface image or transform crosses the host boundary.
+/// Publish one atomic layer snapshot per xdg window. Guest Wayland state is
+/// fully resolved, but pixels remain in the original GPU resources.
 static void flush_pending_frames(struct np_server *server) {
 	struct np_surface *surface;
 #ifndef NP_REMOTE
@@ -815,13 +571,6 @@ static void flush_pending_frames(struct np_server *server) {
 		if (surface->fifo_barrier_presentation_id == old)
 			surface->fifo_barrier_presentation_id = scene_id;
 
-		/* The per-surface image is now a compositor snapshot. Only the root's
-		 * scene output is owned by WindowServer. */
-		for (int i = 0; i < 2; i++) {
-			if (surface->blob_presentation_id[i] == old)
-				surface->blob_presentation_id[i] = 0;
-		}
-		surface->pending_blob_index = -1;
 		cJSON_Delete(surface->pending_frame);
 		surface->pending_frame = NULL;
 		surface->pending_presentation_id = 0;
@@ -831,6 +580,7 @@ static void flush_pending_frames(struct np_server *server) {
 	wl_list_for_each(surface, &server->surfaces, link) {
 		if (!surface->scene_dirty || np_scene_root(surface) != surface)
 			continue;
+		if (!np_host_connected(&server->host)) continue;
 		/* A root detach has no pixels to publish. Older queued state can
 		 * still reach this point (or the client can detach while a scene is
 		 * dirty), so retire the impossible scene rather than retrying it on
@@ -842,12 +592,17 @@ static void flush_pending_frames(struct np_server *server) {
 			request_host_refresh(surface, presentation_id);
 			continue;
 		}
-		struct np_scene_frame scene;
-		if (!np_scene_compose(surface, surface->scene_presentation_id, &scene))
+		struct np_scene_packet packet;
+		if (!np_scene_build(surface, surface->scene_presentation_id, &packet)) {
+			schedule_scene_retry(server);
 			continue;
-		np_host_send(&server->host, "committed",
-		             scene_committed_body(surface, &scene,
-		                                  surface->scene_presentation_id));
+		}
+		if (!np_host_send_binary(&server->host, packet.data, packet.size)) {
+			np_scene_presented(surface, surface->scene_presentation_id);
+			free(packet.data);
+			continue;
+		}
+		free(packet.data);
 		np_perf_count(NP_PERF_COMMIT_SENT);
 		surface->scene_dirty = false;
 		surface->scene_presentation_id = 0;
@@ -864,7 +619,6 @@ static void flush_pending_frames(struct np_server *server) {
 		cJSON *body = surface->pending_frame;
 		surface->pending_frame = NULL;
 		surface->pending_presentation_id = 0;
-		surface->pending_blob_index = -1;
 		np_host_send(&server->host, "committed", body);
 	}
 	// Subsurface positions are guest scene state. Consume their dirty marker;
@@ -875,51 +629,23 @@ static void flush_pending_frames(struct np_server *server) {
 	}
 }
 
-static bool output_ring_has_host_frame(struct np_surface *surface) {
-#ifdef NP_REMOTE
-	(void)surface;
-	return false;
-#else
-	for (int i = 0; i < 2; i++) {
-		if (surface->blob_presentation_id[i] && i != surface->pending_blob_index)
-			return true;
-	}
-	return false;
-#endif
-}
-
-/// Test whether applying this update can write a ring image without replacing
-/// one that CoreAnimation may still sample. This is protocol ownership only;
-/// IOSurface use-count APIs are deliberately not involved.
+/// A direct source cannot be written while Metal is sampling it. A commit that
+/// reuses such a buffer remains in protocol order until frameReleased.
 static bool surface_update_can_apply(struct np_surface_update *update) {
 #ifdef NP_REMOTE
 	(void)update;
 	return true;
 #else
 	struct np_surface *surface = update->surface;
-	if (np_scene_root(surface))
-		return true;
-	if (!update->buffer_set || !update->buffer || !surface->blobs[0].data)
-		return true;
-
-	int32_t width = 0, height = 0, stride = 0;
-	struct wl_shm_buffer *shm = wl_shm_buffer_get(update->buffer);
-	if (shm) {
-		width = wl_shm_buffer_get_width(shm);
-		height = wl_shm_buffer_get_height(shm);
-		stride = wl_shm_buffer_get_stride(shm);
-	} else {
-		struct np_gpu_buffer *gpu = np_gpu_buffer_get(update->buffer);
-		if (!gpu) return true;
-		width = gpu->width;
-		height = gpu->height;
-		stride = gpu->stride;
+	if (update->acquire_point && !np_sync_point_ready(update->acquire_point)) {
+		schedule_scene_retry(surface->server);
+		return false;
 	}
-	if ((uint32_t)width > surface->alloc_width ||
-	    (uint32_t)height > surface->alloc_height ||
-	    (uint32_t)stride > surface->blob_stride)
-		return !output_ring_has_host_frame(surface);
-	return output_ring_slot(surface) >= 0;
+	if (!update->buffer_set || !update->buffer) return true;
+	if (wl_shm_buffer_get(update->buffer))
+		return !np_shm_texture_is_busy(surface->server, update->buffer);
+	struct np_gpu_buffer *gpu = np_gpu_buffer_get(update->buffer);
+	return !gpu || !np_gpu_buffer_is_busy(gpu);
 #endif
 }
 
@@ -965,18 +691,137 @@ static void current_buffer_destroyed(struct wl_listener *listener, void *data) {
 }
 
 static void set_current_buffer(struct np_surface *surface,
-	                           struct wl_resource *buffer) {
-	if (surface->current_buffer == buffer) return;
+	                           struct wl_resource *buffer,
+	                           struct np_sync_point *release_point) {
+	if (surface->current_buffer == buffer && buffer && !release_point) return;
 	if (!wl_list_empty(&surface->current_buffer_destroy.link))
 		wl_list_remove(&surface->current_buffer_destroy.link);
 	wl_list_init(&surface->current_buffer_destroy.link);
-	if (surface->current_buffer)
-		wl_buffer_send_release(surface->current_buffer);
+	if (surface->current_gpu) {
+		if (surface->current_release_point) {
+			np_gpu_buffer_queue_release(
+				surface->current_gpu, surface->current_release_point);
+			surface->current_release_point = NULL;
+		}
+		np_gpu_buffer_release_current(surface->current_gpu);
+		surface->current_gpu = NULL;
+	}
+	if (surface->current_release_point) {
+		/* Explicit sync is rejected for shm, but keep destruction robust if a
+		 * partially failed commit left a point behind. */
+		np_sync_point_signal(surface->current_release_point);
+		surface->current_release_point = NULL;
+	}
+	if (surface->current_shm) {
+		np_shm_texture_unref(surface->current_shm);
+		surface->current_shm = NULL;
+	}
 	surface->current_buffer = buffer;
 	if (buffer) {
 		surface->current_buffer_destroy.notify = current_buffer_destroyed;
 		wl_resource_add_destroy_listener(buffer, &surface->current_buffer_destroy);
+		surface->current_gpu = np_gpu_buffer_get(buffer);
+		if (surface->current_gpu) {
+			np_gpu_buffer_acquire_current(surface->current_gpu);
+			surface->current_release_point = release_point;
+		} else if (release_point) {
+			np_sync_point_signal(release_point);
+		}
+	} else if (release_point) {
+		np_sync_point_signal(release_point);
 	}
+}
+
+static void set_current_shm(struct np_surface *surface,
+	                        struct np_shm_texture *texture)
+{
+	if (surface->current_shm == texture) return;
+	if (surface->current_shm) np_shm_texture_unref(surface->current_shm);
+	surface->current_shm = texture;
+	if (texture) np_shm_texture_ref(texture);
+}
+
+/* Cursor and drag-icon surfaces have no xdg root, so they use the low-rate
+ * committed control message. Their pixels still follow the same direct source
+ * lifetime as a scene layer; this is not a second window rendering path. */
+static bool queue_unroled_frame(struct np_surface *surface,
+	                           struct wl_resource *buffer,
+	                           uint32_t presentation_id,
+	                           struct np_sync_point *release_point)
+{
+	struct wl_shm_buffer *shm = wl_shm_buffer_get(buffer);
+	struct np_gpu_buffer *gpu = np_gpu_buffer_get(buffer);
+	uint32_t resource_id = 0, stride = 0, format = 0;
+	int32_t width = 0, height = 0;
+	const char *source = NULL;
+	if (shm) {
+#ifdef NP_REMOTE
+		publish_frame_remote(surface, shm, presentation_id);
+		wl_buffer_send_release(buffer);
+		return true;
+#else
+		struct np_shm_texture *texture = np_shm_texture_upload(
+			surface->server, buffer, &surface->pending);
+		if (!texture) return false;
+		set_current_buffer(surface, buffer, release_point);
+		set_current_shm(surface, texture);
+		resource_id = texture->image.resource_id;
+		stride = texture->stride;
+		width = wl_shm_buffer_get_width(shm);
+		height = wl_shm_buffer_get_height(shm);
+		format = wl_shm_buffer_get_format(shm);
+		source = "cpu";
+		/* The guest copy is complete; subsequent host access targets texture. */
+		wl_buffer_send_release(buffer);
+#endif
+	} else if (gpu) {
+		set_current_buffer(surface, buffer, release_point);
+		resource_id = gpu->resource_id;
+		stride = (uint32_t)gpu->stride;
+		width = gpu->width;
+		height = gpu->height;
+		format = gpu->format;
+		source = "gpu";
+	} else {
+		return false;
+	}
+	if (!np_scene_hold_current(surface, presentation_id)) return false;
+
+	const char *format_name = format == WL_SHM_FORMAT_XRGB8888 ||
+	                          format == 0x34325258u ? "bgrx8888" :
+	                          format == 0x34324241u ||
+	                          format == 0x34324258u ? "rgba8888" : "bgra8888";
+	cJSON *frame = cJSON_CreateObject();
+	cJSON_AddNumberToObject(frame, "resourceID", resource_id);
+	cJSON_AddNumberToObject(frame, "width", width);
+	cJSON_AddNumberToObject(frame, "height", height);
+	cJSON_AddNumberToObject(frame, "bytesPerRow", stride);
+	cJSON_AddStringToObject(frame, "format", format_name);
+	cJSON_AddStringToObject(frame, "source", source);
+	cJSON_AddNumberToObject(frame, "scale", surface->scale);
+	cJSON_AddNumberToObject(frame, "presentationID", presentation_id);
+	frame_add_viewport(surface, frame);
+	cJSON_AddItemToObject(frame, "damage", cJSON_CreateArray());
+	cJSON *body = cJSON_CreateObject();
+	cJSON_AddNumberToObject(body, "surface", surface->id);
+	cJSON_AddItemToObject(body, "frame", frame);
+	if (surface->pending_frame) {
+		uint32_t old = surface->pending_presentation_id;
+		rebind_frame_callbacks(surface, old, presentation_id);
+		np_scene_presented(surface, old);
+		cJSON_Delete(surface->pending_frame);
+	}
+	surface->last_resource_id = resource_id;
+	surface->last_width = width;
+	surface->last_height = height;
+	surface->last_stride = stride;
+	surface->last_format = format_name;
+	surface->last_source = source;
+	surface->has_published = true;
+	surface->pending_frame = body;
+	surface->pending_presentation_id = presentation_id;
+	box_clear(&surface->pending);
+	return true;
 }
 
 /* A scene update is a latest-value marker, not a host frame. flush_pending_frames
@@ -995,7 +840,6 @@ static void queue_scene_update(struct np_surface *surface,
 	}
 	surface->pending_frame = cJSON_CreateObject();
 	surface->pending_presentation_id = presentation_id;
-	surface->pending_blob_index = -1;
 }
 
 static void surface_update_destroy(struct np_surface_update *update, bool release_buffer) {
@@ -1005,6 +849,8 @@ static void surface_update_destroy(struct np_surface_update *update, bool releas
 		wl_list_remove(&update->buffer_destroy.link);
 	if (release_buffer && update->buffer)
 		wl_buffer_send_release(update->buffer);
+	np_sync_point_destroy(update->acquire_point);
+	np_sync_point_signal(update->release_point);
 	free(update);
 }
 
@@ -1016,6 +862,10 @@ static struct np_surface_update *snapshot_surface_update(struct np_surface *surf
 	                     surface->pending_fifo_set_barrier ||
 	                     surface->pending_fifo_wait_barrier ||
 	                     surface->pending_viewport_changed ||
+	                     surface->pending_transform_changed ||
+	                     surface->pending_input_region_changed ||
+	                     surface->pending_opaque_region_changed ||
+	                     np_syncobj_has_pending(surface) ||
 	                     surface->pending_geometry_set || scale_changed ||
 	                     child_position_changed;
 	if (!needs_refresh && !surface->pending_geometry_set &&
@@ -1038,8 +888,22 @@ static struct np_surface_update *snapshot_surface_update(struct np_surface *surf
 	update->geometry_height = surface->pending_geometry_height;
 	update->viewport_changed = surface->pending_viewport_changed;
 	update->viewport = surface->pending_viewport;
+	update->transform_changed = surface->pending_transform_changed;
+	update->transform = surface->pending_transform;
+	update->input_region_changed = surface->pending_input_region_changed;
+	update->input_region_set = surface->pending_input_region_set;
+	update->input_region = surface->pending_input_region;
+	update->opaque_region_changed = surface->pending_opaque_region_changed;
+	update->opaque_region_set = surface->pending_opaque_region_set;
+	update->opaque_region = surface->pending_opaque_region;
 	update->damage = surface->pending;
 	update->set_fifo_barrier = surface->pending_fifo_set_barrier;
+	if (!np_syncobj_take_commit(
+			surface, update->buffer_set, update->buffer,
+			&update->acquire_point, &update->release_point)) {
+		free(update);
+		return NULL;
+	}
 	update->finishes_host_configure_serial = surface->host_configure_acked
 		? surface->host_configure_acked_serial : 0;
 
@@ -1052,6 +916,9 @@ static struct np_surface_update *snapshot_surface_update(struct np_surface *surf
 	surface->pending_buffer_set = false;
 	surface->pending_geometry_set = false;
 	surface->pending_viewport_changed = false;
+	surface->pending_transform_changed = false;
+	surface->pending_input_region_changed = false;
+	surface->pending_opaque_region_changed = false;
 	box_clear(&surface->pending);
 
 	bool wait_fifo = surface->pending_fifo_wait_barrier;
@@ -1064,10 +931,12 @@ static struct np_surface_update *snapshot_surface_update(struct np_surface *surf
 		bind_frame_callbacks(surface, update->presentation_id);
 	}
 
-	if ((!wl_list_empty(&surface->blocked_updates) ||
-	     (wait_fifo && surface->fifo_barrier_active) ||
-	     !surface_update_can_apply(update)) &&
-	    !(surface->subsurface && surface->sync)) {
+	bool synchronized_child = surface->subsurface && surface->sync;
+	bool unavailable = !surface_update_can_apply(update);
+	bool ordered_wait = !synchronized_child &&
+		(!wl_list_empty(&surface->blocked_updates) ||
+		 (wait_fifo && surface->fifo_barrier_active));
+	if (unavailable || ordered_wait) {
 		wl_list_insert(surface->blocked_updates.prev, &update->link);
 		return NULL;
 	}
@@ -1114,11 +983,19 @@ static void frame_add_viewport(struct np_surface *surface, cJSON *frame) {
 static bool queue_last_published_frame(struct np_surface *surface,
 	                                  uint32_t presentation_id) {
 	if (!surface->has_published) return false;
-	if (np_scene_root(surface) && surface->current_buffer) {
+	if (np_scene_root(surface) &&
+	    (surface->current_gpu || surface->current_shm)) {
 		queue_scene_update(surface, presentation_id);
 		return true;
 	}
 	if (!surface->last_resource_id) return false;
+#ifndef NP_REMOTE
+	/* Cursor and drag-icon commits reuse the ordinary metadata envelope, but
+	 * the named texture has exactly the same host-read lifetime as a scene
+	 * layer. Viewport-only commits and reconnect replay must establish a fresh
+	 * hold before the metadata crosses the channel. */
+	if (!np_scene_hold_current(surface, presentation_id)) return false;
+#endif
 	cJSON *frame = cJSON_CreateObject();
 	cJSON_AddNumberToObject(frame, "resourceID", surface->last_resource_id);
 	cJSON_AddNumberToObject(frame, "width", surface->last_width);
@@ -1146,6 +1023,9 @@ static bool queue_last_published_frame(struct np_surface *surface,
 	if (surface->pending_frame) {
 		rebind_frame_callbacks(surface, surface->pending_presentation_id,
 		                       presentation_id);
+#ifndef NP_REMOTE
+		np_scene_presented(surface, surface->pending_presentation_id);
+#endif
 		cJSON_Delete(surface->pending_frame);
 	}
 	surface->pending_frame = body;
@@ -1211,6 +1091,8 @@ static void apply_pending_subsurface_state(struct np_surface *parent) {
 static void apply_surface_update(struct np_surface_update *update) {
 	if (!update) return;
 	struct np_surface *surface = update->surface;
+	np_sync_point_destroy(update->acquire_point);
+	update->acquire_point = NULL;
 	bool scale_changed = surface->scale != update->scale;
 	surface->scale = update->scale;
 	if (update->geometry_set) {
@@ -1222,6 +1104,16 @@ static void apply_surface_update(struct np_surface_update *update) {
 	}
 	if (update->viewport_changed)
 		surface->viewport_state = update->viewport;
+	if (update->transform_changed)
+		surface->transform = update->transform;
+	if (update->input_region_changed) {
+		surface->input_region_set = update->input_region_set;
+		surface->input_region = update->input_region;
+	}
+	if (update->opaque_region_changed) {
+		surface->opaque_region_set = update->opaque_region_set;
+		surface->opaque_region = update->opaque_region;
+	}
 	apply_pending_subsurface_state(surface);
 	surface->pending = update->damage;
 
@@ -1242,11 +1134,15 @@ static void apply_surface_update(struct np_surface_update *update) {
 				clear_cached_buffer_listener(surface);
 				rebind_frame_callbacks(surface, surface->cached_presentation_id,
 				                       update->presentation_id);
+				np_sync_point_signal(surface->cached_release_point);
+				surface->cached_release_point = NULL;
 			}
 			surface->cached_buffer = update->buffer;
 			surface->has_cached_buffer = true;
 			surface->cached_presentation_id = update->presentation_id;
 			surface->cached_set_fifo_barrier = update->set_fifo_barrier;
+			surface->cached_release_point = update->release_point;
+			update->release_point = NULL;
 			if (surface->cached_buffer) {
 				surface->cached_buffer_destroy.notify = cached_buffer_destroyed;
 				wl_resource_add_destroy_listener(surface->cached_buffer,
@@ -1255,9 +1151,13 @@ static void apply_surface_update(struct np_surface_update *update) {
 			update->buffer = NULL;
 			cached_sync_commit = true;
 		} else if (np_scene_root(surface)) {
-			publish_surface_buffer(surface, update->buffer, update->presentation_id);
+			publish_surface_buffer(surface, update->buffer, update->presentation_id,
+			                       update->release_point);
+			update->release_point = NULL;
 		} else if (update->buffer) {
-			publish_surface_buffer(surface, update->buffer, update->presentation_id);
+			publish_surface_buffer(surface, update->buffer, update->presentation_id,
+			                       update->release_point);
+			update->release_point = NULL;
 		} else if (update->presentation_id) {
 			request_host_refresh(surface, update->presentation_id);
 		}
@@ -1279,8 +1179,10 @@ static void apply_surface_update(struct np_surface_update *update) {
 }
 
 static void apply_unblocked_updates(struct np_surface *surface) {
-	while (!surface->fifo_barrier_active &&
-	       !wl_list_empty(&surface->blocked_updates)) {
+	while (!wl_list_empty(&surface->blocked_updates)) {
+		if (surface->fifo_barrier_active &&
+		    !(surface->subsurface && surface->sync))
+			break;
 		struct np_surface_update *update =
 			wl_container_of(surface->blocked_updates.next, update, link);
 		if (!surface_update_can_apply(update)) break;
@@ -1298,7 +1200,25 @@ static void surface_commit(struct wl_client *client, struct wl_resource *resourc
 }
 
 static void publish_surface_buffer(struct np_surface *surface, struct wl_resource *buffer,
-                                   uint32_t presentation_id) {
+                                   uint32_t presentation_id,
+                                   struct np_sync_point *release_point) {
+#ifdef NP_REMOTE
+	if (!buffer) {
+		surface->has_published = false;
+		np_sync_point_signal(release_point);
+		request_host_refresh(surface, presentation_id);
+		return;
+	}
+	struct wl_shm_buffer *remote_shm = wl_shm_buffer_get(buffer);
+	if (remote_shm) {
+		publish_frame_remote(surface, remote_shm, presentation_id);
+		wl_buffer_send_release(buffer);
+	} else {
+		np_sync_point_signal(release_point);
+		request_host_refresh(surface, presentation_id);
+	}
+	return;
+#else
 	struct np_surface *root = np_scene_root(surface);
 	if (trace_enabled())
 		fprintf(stderr,
@@ -1307,8 +1227,8 @@ static void publish_surface_buffer(struct np_surface *surface, struct wl_resourc
 		        surface->popup != NULL, surface->subsurface != NULL,
 		        buffer ? "set" : "gone");
 	if (root) {
-		set_current_buffer(surface, buffer);
 		if (!buffer) {
+			set_current_buffer(surface, NULL, release_point);
 			surface->has_published = false;
 			/* A detached child changes its containing window, so the root scene
 			 * must be recomposed without that child. A detached root has no scene
@@ -1325,15 +1245,28 @@ static void publish_surface_buffer(struct np_surface *surface, struct wl_resourc
 		struct wl_shm_buffer *shm = wl_shm_buffer_get(buffer);
 		struct np_gpu_buffer *gpu = np_gpu_buffer_get(buffer);
 		if (shm) {
+			struct np_shm_texture *texture = np_shm_texture_upload(
+				surface->server, buffer, &surface->pending);
+			if (!texture) {
+				if (trace_enabled())
+					fprintf(stderr, "[wayland] shm upload unavailable surface=%u\n",
+					        surface->id);
+				return;
+			}
+			set_current_buffer(surface, buffer, release_point);
+			set_current_shm(surface, texture);
 			surface->last_width = wl_shm_buffer_get_width(shm);
 			surface->last_height = wl_shm_buffer_get_height(shm);
-			surface->last_stride = (uint32_t)wl_shm_buffer_get_stride(shm);
+			surface->last_stride = texture->stride;
 			uint32_t format = wl_shm_buffer_get_format(shm);
 			surface->last_format = format == WL_SHM_FORMAT_ARGB8888 ? "bgra8888"
 				: format == WL_SHM_FORMAT_XRGB8888 ? "bgrx8888"
 				: "rgba8888";
 			surface->last_source = "cpu";
+			surface->last_resource_id = texture->image.resource_id;
+			wl_buffer_send_release(buffer);
 		} else if (gpu) {
+			set_current_buffer(surface, buffer, release_point);
 			surface->last_width = gpu->width;
 			surface->last_height = gpu->height;
 			surface->last_stride = (uint32_t)gpu->stride;
@@ -1342,8 +1275,9 @@ static void publish_surface_buffer(struct np_surface *surface, struct wl_resourc
 				: gpu->format == 0x34324241 ? "rgba8888"
 				: "rgba8888";
 			surface->last_source = "gpu";
+			surface->last_resource_id = gpu->resource_id;
 		} else {
-			set_current_buffer(surface, NULL);
+			set_current_buffer(surface, NULL, release_point);
 			if (trace_enabled())
 				fprintf(stderr, "[wayland] scene surface=%u: unsupported buffer\n",
 				        surface->id);
@@ -1356,31 +1290,17 @@ static void publish_surface_buffer(struct np_surface *surface, struct wl_resourc
 
 	if (!buffer) return;  // client detached its unroled buffer
 
-	// Attach is where this compositor binds the window to a source resource.
-	// wl_shm is copied by the CPU; a linux-dmabuf/Venus image is copied by guest
-	// Vulkan. Unroled surfaces retain the compatibility two-image buffer path;
-	// xdg windows are composed once by scene.c.
-	struct wl_shm_buffer *shm = wl_shm_buffer_get(buffer);
-	struct np_gpu_buffer *gpu = np_gpu_buffer_get(buffer);
-	// Unroled surfaces include cursors and drag icons. A drag icon is commonly
-	// committed immediately before start_drag assigns its role, so discarding an
-	// unroled commit here makes it impossible for the host to ever show that
-	// image. Publish it and let the host retain the latest frame until a role is
-	// announced; cursor frames remain harmless cached orphans.
-	if (shm) {
-		publish_frame(surface, shm, presentation_id);
-	} else if (gpu) {
-		publish_gpu_frame(surface, gpu, presentation_id);
-	} else if (trace_enabled()) {
+	/* A drag icon is commonly committed immediately before start_drag assigns
+	 * its role. Publish the direct resource now and let the host retain it until
+	 * dragIconChanged supplies that role. */
+	if (!queue_unroled_frame(
+			surface, buffer, presentation_id, release_point) && trace_enabled()) {
 		fprintf(stderr, "[wayland] commit surface=%u: buffer is neither shm nor gpu\n",
 		        surface->id);
 	}
 	if (presentation_id && surface->pending_presentation_id != presentation_id)
 		request_host_refresh(surface, presentation_id);
-
-	// Released as soon as the copy is done: the client may reuse it, and the
-	// host is looking at our blob, not at this buffer.
-	wl_buffer_send_release(buffer);
+#endif
 }
 
 static const struct wl_surface_interface surface_implementation = {
@@ -1537,6 +1457,12 @@ static void surface_resource_destroy(struct wl_resource *resource) {
 		np_host_send(&surface->server->host, "dragIconChanged", body);
 		surface->server->drag_icon = NULL;
 	}
+	if (surface->server->pointer_surface == surface->id) {
+		surface->server->pointer_surface = 0;
+		surface->server->pointer_window = 0;
+	}
+	if (surface->server->drag_focus_surface == surface->id)
+		surface->server->drag_focus_surface = 0;
 
 	// Children may outlive their parent's resource. Remove both active stacking
 	// links and unapplied restack operations before any pointer can go stale.
@@ -1564,7 +1490,10 @@ static void surface_resource_destroy(struct wl_resource *resource) {
 		surface_update_destroy(update, true);
 	}
 	clear_cached_buffer_listener(surface);
-	set_current_buffer(surface, NULL);
+	np_sync_point_signal(surface->cached_release_point);
+	surface->cached_release_point = NULL;
+	set_current_buffer(surface, NULL, NULL);
+	np_syncobj_surface_destroyed(surface);
 #ifdef NP_REMOTE
 	if (surface->encoder) {
 		np_encoder_destroy(surface->encoder);
@@ -1576,7 +1505,6 @@ static void surface_resource_destroy(struct wl_resource *resource) {
 	surface->title = surface->app_id = NULL;
 #ifndef NP_REMOTE
 	np_scene_destroy(surface);
-	for (int i = 0; i < 2; i++) np_blob_destroy(surface->server->drm_fd, &surface->blobs[i]);
 #endif
 	wl_list_remove(&surface->link);
 	free(surface);
@@ -2168,7 +2096,8 @@ static void send_selection_to(struct np_server *server, struct wl_resource *devi
 }
 
 static void drag_send_leave(struct np_server *server, uint32_t window_id) {
-	struct np_surface *surface = surface_by_window(server, window_id);
+	struct np_surface *surface = surface_by_id(server, server->drag_focus_surface);
+	if (!surface) surface = surface_by_window(server, window_id);
 	if (!surface) return;
 	struct np_input *device;
 	wl_list_for_each(device, &server->data_devices, link) {
@@ -2195,6 +2124,7 @@ static void drag_send_leave(struct np_server *server, uint32_t window_id) {
 		}
 		wl_data_device_send_leave(device->resource);
 	}
+	server->drag_focus_surface = 0;
 }
 
 static void drag_send_enter(struct np_server *server, struct np_surface *surface,
@@ -2213,7 +2143,9 @@ static void drag_send_enter(struct np_server *server, struct np_surface *surface
 		announce_offer(device->resource, offer, server->drag_source, true);
 		wl_data_device_send_enter(device->resource, serial, surface->resource, x, y, offer);
 	}
-	server->drag_focus_window = surface->window_id;
+	struct np_surface *root = np_scene_root(surface);
+	server->drag_focus_window = root ? root->window_id : surface->window_id;
+	server->drag_focus_surface = surface->id;
 }
 
 static void drag_send_motion(struct np_server *server, struct np_surface *surface,
@@ -2238,7 +2170,8 @@ static void drag_send_motion(struct np_server *server, struct np_surface *surfac
 
 static void drag_finish_on_button_release(struct np_server *server) {
 	if (!server->drag_source) return;
-	struct np_surface *surface = surface_by_window(server, server->drag_focus_window);
+	struct np_surface *surface = surface_by_id(server, server->drag_focus_surface);
+	if (!surface) surface = surface_by_window(server, server->drag_focus_window);
 	if (!surface) {
 		struct wl_resource *source = server->drag_source;
 		wl_data_source_send_cancelled(source);
@@ -2252,6 +2185,7 @@ static void drag_finish_on_button_release(struct np_server *server) {
 		}
 		server->drag_icon = NULL;
 		server->drag_focus_window = 0;
+		server->drag_focus_surface = 0;
 		return;
 	}
 	bool dropped = false;
@@ -2299,6 +2233,7 @@ static void drag_finish_on_button_release(struct np_server *server) {
 		server->drag_icon = NULL;
 	}
 	server->drag_focus_window = 0;
+	server->drag_focus_surface = 0;
 	restore_pointer_focus_after_drag(server, surface);
 }
 
@@ -2440,15 +2375,19 @@ static void flush_sync_children(struct np_surface *parent) {
 			struct wl_resource *buffer = child->cached_buffer;
 		uint32_t presentation_id = child->cached_presentation_id;
 		bool set_barrier = child->cached_set_fifo_barrier;
+		struct np_sync_point *release_point = child->cached_release_point;
 			child->cached_buffer = NULL;
 			clear_cached_buffer_listener(child);
 		child->has_cached_buffer = false;
 		child->cached_presentation_id = 0;
 		child->cached_set_fifo_barrier = false;
+		child->cached_release_point = NULL;
 		if (buffer || np_scene_root(child))
-			publish_surface_buffer(child, buffer, presentation_id);
+			publish_surface_buffer(child, buffer, presentation_id, release_point);
 		else if (presentation_id)
 			request_host_refresh(child, presentation_id);
+		else
+			np_sync_point_signal(release_point);
 		if (set_barrier) {
 			child->fifo_barrier_active = true;
 			child->fifo_barrier_presentation_id = presentation_id;
@@ -2521,12 +2460,14 @@ static void subsurface_set_desync(struct wl_client *client, struct wl_resource *
 		struct wl_resource *buffer = surface->cached_buffer;
 		uint32_t presentation_id = surface->cached_presentation_id;
 		bool set_barrier = surface->cached_set_fifo_barrier;
+		struct np_sync_point *release_point = surface->cached_release_point;
 		surface->cached_buffer = NULL;
 		clear_cached_buffer_listener(surface);
 		surface->has_cached_buffer = false;
 		surface->cached_presentation_id = 0;
 		surface->cached_set_fifo_barrier = false;
-		publish_surface_buffer(surface, buffer, presentation_id);
+		surface->cached_release_point = NULL;
+		publish_surface_buffer(surface, buffer, presentation_id, release_point);
 		if (set_barrier) {
 			surface->fifo_barrier_active = true;
 			surface->fifo_barrier_presentation_id = presentation_id;
@@ -2606,24 +2547,18 @@ static void compositor_create_surface(struct wl_client *client, struct wl_resour
 		wl_client_post_no_memory(client);
 		return;
 	}
-	/* Zero is a valid process fd. Empty presentation slots must carry the
-	 * explicit -1 sentinel so their first/repeated destroy cannot close stdin —
-	 * or the next Wayland client socket if accept() later reuses fd 0. */
-	for (size_t i = 0; i < sizeof(surface->blobs) / sizeof(surface->blobs[0]); i++)
-		surface->blobs[i].vk.resource_drm_fd = -1;
-	for (size_t i = 0; i < sizeof(surface->scene.images) / sizeof(surface->scene.images[0]); i++)
-		surface->scene.images[i].vk.resource_drm_fd = -1;
 	surface->server = server;
 	surface->id = server->next_id++;
 	surface->scale = 1;
 	surface->pending_scale = 1;
-	surface->pending_blob_index = -1;
-	surface->current_blob_index = -1;
+	surface->transform = WL_OUTPUT_TRANSFORM_NORMAL;
+	surface->pending_transform = WL_OUTPUT_TRANSFORM_NORMAL;
 	wl_list_init(&surface->children);
 	wl_list_init(&surface->sibling_link);
 	wl_list_init(&surface->pending_stack_ops);
 	wl_list_init(&surface->pending_frame_callbacks);
 	wl_list_init(&surface->blocked_updates);
+	wl_list_init(&surface->scene_presentations);
 	wl_list_init(&surface->cached_buffer_destroy.link);
 	wl_list_init(&surface->current_buffer_destroy.link);
 	surface->resource = wl_resource_create(
@@ -2644,28 +2579,10 @@ static void compositor_create_surface(struct wl_client *client, struct wl_resour
 	np_host_send(&server->host, "surfaceCreated", object_with_u32("surface", surface->id));
 }
 
-static void region_destroy_handler(struct wl_client *client, struct wl_resource *resource) {
-	wl_resource_destroy(resource);
-}
-static void region_add(struct wl_client *client, struct wl_resource *resource,
-                       int32_t x, int32_t y, int32_t width, int32_t height) {}
-static void region_subtract(struct wl_client *client, struct wl_resource *resource,
-                            int32_t x, int32_t y, int32_t width, int32_t height) {}
-
-static const struct wl_region_interface region_implementation = {
-	.destroy = region_destroy_handler,
-	.add = region_add,
-	.subtract = region_subtract,
-};
-
 static void compositor_create_region(struct wl_client *client, struct wl_resource *resource,
                                      uint32_t id) {
-	struct wl_resource *region = wl_resource_create(client, &wl_region_interface, 1, id);
-	if (!region) {
-		wl_client_post_no_memory(client);
-		return;
-	}
-	wl_resource_set_implementation(region, &region_implementation, NULL, NULL);
+	(void)resource;
+	np_region_create(client, id);
 }
 
 static const struct wl_compositor_interface compositor_implementation = {
@@ -3460,7 +3377,8 @@ static void pointer_frame(struct wl_resource *pointer) {
 /// into the DnD grab and the first post-drag click merely repairs that state.
 static void clear_pointer_focus_for_drag(struct np_server *server) {
 	if (!server || !server->pointer_window) return;
-	struct np_surface *surface = surface_by_window(server, server->pointer_window);
+	struct np_surface *surface = surface_by_id(server, server->pointer_surface);
+	if (!surface) surface = surface_by_window(server, server->pointer_window);
 	if (surface) {
 		uint32_t serial = wl_display_next_serial(server->display);
 		struct np_input *entry;
@@ -3471,6 +3389,7 @@ static void clear_pointer_focus_for_drag(struct np_server *server) {
 		}
 	}
 	server->pointer_window = 0;
+	server->pointer_surface = 0;
 }
 
 /// Ending the DnD grab and finishing its data transfer are separate moments.
@@ -3480,19 +3399,25 @@ static void clear_pointer_focus_for_drag(struct np_server *server) {
 static void restore_pointer_focus_after_drag(struct np_server *server,
 	                                         struct np_surface *surface) {
 	if (!server || !surface) return;
+	double local_x = server->pointer_x, local_y = server->pointer_y;
+	struct np_surface *root = np_scene_root(surface);
+	struct np_surface *target = np_scene_hit_test(
+		root ? root : surface, server->pointer_x, server->pointer_y,
+		&local_x, &local_y);
+	if (!target) target = surface;
 	uint32_t serial = wl_display_next_serial(server->display);
 	struct np_input *entry;
 
 	/* clear_pointer_focus_for_drag() already sent the leave at grab start. At
 	 * grab end the default pointer focus is empty, so only enter is valid here. */
 	wl_list_for_each(entry, &server->pointers, link) {
-		if (!same_client(entry->resource, surface->resource)) continue;
-		wl_pointer_send_enter(entry->resource, serial, surface->resource,
-		                      fixed_from(server->pointer_x),
-		                      fixed_from(server->pointer_y));
+		if (!same_client(entry->resource, target->resource)) continue;
+		wl_pointer_send_enter(entry->resource, serial, target->resource,
+		                      fixed_from(local_x), fixed_from(local_y));
 		pointer_frame(entry->resource);
 	}
 	server->pointer_window = surface->window_id;
+	server->pointer_surface = target->id;
 }
 
 // ---------------------------------------------------------------------------
@@ -3846,21 +3771,26 @@ static void send_modifiers(struct np_server *server, struct np_surface *surface,
 
 static void handle_pointer_position(struct np_server *server, uint32_t window_id,
                                     wl_fixed_t x, wl_fixed_t y) {
-	struct np_surface *surface = surface_by_window(server, window_id);
-	if (!surface) return;
-	bool entering = server->pointer_window != window_id;
+	struct np_surface *root = surface_by_window(server, window_id);
+	if (!root) return;
 	server->pointer_x = wl_fixed_to_double(x);
 	server->pointer_y = wl_fixed_to_double(y);
+	double local_x = server->pointer_x, local_y = server->pointer_y;
+	struct np_surface *surface = np_scene_hit_test(
+		root, server->pointer_x, server->pointer_y, &local_x, &local_y);
+	if (!surface) surface = root;
+	wl_fixed_t sx = fixed_from(local_x), sy = fixed_from(local_y);
+	bool entering = server->pointer_surface != surface->id;
 
 	struct np_input *entry;
 	uint32_t serial = wl_display_next_serial(server->display);
 	uint32_t time = now_ms();
 	if (server->drag_source && !server->drag_dropped) {
-		if (server->drag_focus_window != window_id) {
+		if (server->drag_focus_surface != surface->id) {
 			if (server->drag_focus_window) drag_send_leave(server, server->drag_focus_window);
-			drag_send_enter(server, surface, x, y);
+			drag_send_enter(server, surface, sx, sy);
 		} else {
-			drag_send_motion(server, surface, time, x, y);
+			drag_send_motion(server, surface, time, sx, sy);
 		}
 		wl_display_flush_clients(server->display);
 		return;
@@ -3869,8 +3799,8 @@ static void handle_pointer_position(struct np_server *server, uint32_t window_id
 	// Tracking areas belonging to two NSWindows can overlap briefly while a
 	// child window is ordered. Repair that host ordering to Wayland's single
 	// pointer-focus, leave-before-enter model.
-	if (entering && server->pointer_window) {
-		struct np_surface *previous = surface_by_window(server, server->pointer_window);
+	if (entering && server->pointer_surface) {
+		struct np_surface *previous = surface_by_id(server, server->pointer_surface);
 		if (previous) {
 			wl_list_for_each(entry, &server->pointers, link) {
 				if (!same_client(entry->resource, previous->resource)) continue;
@@ -3881,11 +3811,12 @@ static void handle_pointer_position(struct np_server *server, uint32_t window_id
 	}
 	wl_list_for_each(entry, &server->pointers, link) {
 		if (!same_client(entry->resource, surface->resource)) continue;
-		if (entering) wl_pointer_send_enter(entry->resource, serial, surface->resource, x, y);
-		else wl_pointer_send_motion(entry->resource, time, x, y);
+		if (entering) wl_pointer_send_enter(entry->resource, serial, surface->resource, sx, sy);
+		else wl_pointer_send_motion(entry->resource, time, sx, sy);
 		pointer_frame(entry->resource);
 	}
 	server->pointer_window = window_id;
+	server->pointer_surface = surface->id;
 	wl_display_flush_clients(server->display);
 }
 
@@ -3900,7 +3831,9 @@ static uint64_t read_le64(const unsigned char *bytes) {
 
 static void handle_pointer_scroll(struct np_server *server, uint32_t window_id,
                                   double dx, double dy) {
-	struct np_surface *surface = surface_by_window(server, window_id);
+	struct np_surface *surface = surface_by_id(server, server->pointer_surface);
+	if (!surface || server->pointer_window != window_id)
+		surface = surface_by_window(server, window_id);
 	if (!surface) return;
 	struct np_input *entry;
 	uint32_t time = now_ms();
@@ -4158,7 +4091,8 @@ static void handle_host_command(const char *name, cJSON *body, void *user_data) 
 		// Ignore a delayed exit from the window that lost focus during the
 		// leave-before-enter repair above.
 		if (server->pointer_window != window_id) return;
-		struct np_surface *surface = surface_by_window(server, window_id);
+		struct np_surface *surface = surface_by_id(server, server->pointer_surface);
+		if (!surface) surface = surface_by_window(server, window_id);
 		if (!surface) return;
 		struct np_input *entry;
 		uint32_t serial = wl_display_next_serial(server->display);
@@ -4168,12 +4102,16 @@ static void handle_host_command(const char *name, cJSON *body, void *user_data) 
 			pointer_frame(entry->resource);
 		}
 		server->pointer_window = 0;
+		server->pointer_surface = 0;
 		wl_display_flush_clients(server->display);
 		return;
 	}
 
 	if (strcmp(name, "pointerButton") == 0) {
-		struct np_surface *surface = surface_by_window(server, (uint32_t)json_int(body, "window", 0));
+		uint32_t window_id = (uint32_t)json_int(body, "window", 0);
+		struct np_surface *surface = server->pointer_window == window_id
+			? surface_by_id(server, server->pointer_surface) : NULL;
+		if (!surface) surface = surface_by_window(server, window_id);
 		if (!surface) return;
 		cJSON *which = cJSON_GetObjectItemCaseSensitive(body, "button");
 		uint32_t code = BTN_LEFT;
@@ -4274,8 +4212,8 @@ static void republish_state(struct np_server *server) {
 			cJSON_AddNumberToObject(body, "surface", surface->id);
 			cJSON_AddNumberToObject(body, "parent",
 			                        surface->parent ? surface->parent->window_id : 0);
-	cJSON_AddNumberToObject(body, "x", surface->sub_x);
-	cJSON_AddNumberToObject(body, "y", surface->sub_y);
+			cJSON_AddNumberToObject(body, "x", surface->sub_x);
+			cJSON_AddNumberToObject(body, "y", surface->sub_y);
 			cJSON_AddNumberToObject(body, "width", surface->last_width);
 			cJSON_AddNumberToObject(body, "height", surface->last_height);
 			np_host_send(&server->host, "popupCreated", body);
@@ -4301,36 +4239,70 @@ static void republish_state(struct np_server *server) {
 		}
 	}
 
-	// Finally the pixels. The host creates an NSWindow only once a frame has
-	// arrived, so replaying the announcements alone would leave it with a window
-	// list and nothing on screen. The last published blob still holds the
-	// contents — the front buffer, since `back` already flipped past it.
+#ifndef NP_REMOTE
+	/* Rebuild each current xdg scene from its retained source textures. Replaying
+	 * the old one-surface `committed` envelope would bypass subsurface ordering,
+	 * viewport/clip state and the new host renderer. All callbacks and FIFO
+	 * barriers outstanding from the lost host are rebound to this new latch. */
+	wl_list_for_each_reverse(surface, &server->surfaces, link) {
+		struct np_surface *root = np_scene_root(surface);
+		if (root != surface || !surface->has_published ||
+		    (!surface->current_gpu && !surface->current_shm))
+			continue;
+		uint32_t presentation_id = next_presentation_id(server);
+		struct np_surface *member;
+		wl_list_for_each(member, &server->surfaces, link) {
+			if (np_scene_root(member) != root) continue;
+			struct np_frame_callback *callback;
+			wl_list_for_each(callback, &member->pending_frame_callbacks, link) {
+				if (callback->presentation_id)
+					callback->presentation_id = presentation_id;
+			}
+			if (member->fifo_barrier_active)
+				member->fifo_barrier_presentation_id = presentation_id;
+		}
+		root->scene_presentation_id = presentation_id;
+		root->scene_dirty = true;
+	}
+
+	/* Cursor and drag-icon surfaces have no xdg root, so they retain the small
+	 * metadata envelope. queue_last_published_frame establishes a new host-read
+	 * hold for the retained texture before it is sent. */
+	wl_list_for_each_reverse(surface, &server->surfaces, link) {
+		if (np_scene_root(surface) || !surface->has_published ||
+		    (!surface->current_gpu && !surface->current_shm))
+			continue;
+		uint32_t presentation_id = next_presentation_id(server);
+		struct np_frame_callback *callback;
+		wl_list_for_each(callback, &surface->pending_frame_callbacks, link) {
+			if (callback->presentation_id)
+				callback->presentation_id = presentation_id;
+		}
+		if (surface->fifo_barrier_active)
+			surface->fifo_barrier_presentation_id = presentation_id;
+		(void)queue_last_published_frame(surface, presentation_id);
+	}
+#else
+	// Remote output is still an encoded per-surface stream, so replay its latest
+	// decoded frame through the ordinary committed envelope.
 	wl_list_for_each_reverse(surface, &server->surfaces, link) {
 		if (!surface->has_published) continue;
 		uint32_t resource_id = surface->last_resource_id;
-		if (!resource_id) {
-			struct np_blob *blob = &surface->blobs[1 - surface->back];
-			resource_id = blob->resource_id;
-		}
 		if (!resource_id) continue;
 
 		cJSON *frame = cJSON_CreateObject();
 		cJSON_AddNumberToObject(frame, "resourceID", resource_id);
 		cJSON_AddNumberToObject(frame, "width", surface->last_width);
 		cJSON_AddNumberToObject(frame, "height", surface->last_height);
-		cJSON_AddNumberToObject(frame, "bytesPerRow",
-		                        (double)(surface->last_stride ? surface->last_stride
-		                                                     : surface->blob_stride));
+		cJSON_AddNumberToObject(frame, "bytesPerRow", surface->last_stride);
 		cJSON_AddStringToObject(frame, "format", surface->last_format);
 		if (surface->last_source) {
 			cJSON_AddStringToObject(frame, "source", surface->last_source);
 		}
-#ifdef NP_REMOTE
 		if (surface->last_source && strcmp(surface->last_source, "encoded") == 0) {
 			cJSON_AddStringToObject(frame, "codec", "h264");
 			cJSON_AddNumberToObject(frame, "bitstreamEpoch", surface->last_epoch);
 		}
-#endif
 		cJSON_AddNumberToObject(frame, "scale", surface->scale);
 		if (surface->geometry_set) {
 			cJSON *geometry = cJSON_CreateObject();
@@ -4351,9 +4323,26 @@ static void republish_state(struct np_server *server) {
 		if (surface->pending_frame) cJSON_Delete(surface->pending_frame);
 		surface->pending_frame = body;
 	}
+#endif
+}
+
+static void discard_disconnected_host_reads(struct np_server *server) {
+#ifndef NP_REMOTE
+	struct np_surface *surface;
+	/* No completion can arrive from the old socket. Releasing these holds is
+	 * safe because that host can no longer submit new Metal work from them. */
+	wl_list_for_each(surface, &server->surfaces, link)
+		np_scene_discard_presentations(surface);
+	wl_list_for_each(surface, &server->surfaces, link)
+		apply_unblocked_updates(surface);
+#else
+	(void)server;
+#endif
 }
 
 static void sync_host_connection_source(struct np_server *server) {
+	if (server->watched_host_fd >= 0 && server->host.conn_fd < 0)
+		discard_disconnected_host_reads(server);
 	// Detected before the mask is computed, so the replay it queues is what
 	// arms the writability watch below.
 	if (server->watched_host_fd < 0 && server->host.conn_fd >= 0)
@@ -4415,6 +4404,7 @@ int np_compositor_run(int argc, char **argv) {
 	server.output_width = 3024;
 	server.output_height = 1964;
 	wl_list_init(&server.surfaces);
+	wl_list_init(&server.shm_textures);
 	wl_list_init(&server.outputs);
 	wl_list_init(&server.pointers);
 	wl_list_init(&server.keyboards);
@@ -4437,7 +4427,7 @@ int np_compositor_run(int argc, char **argv) {
 #ifdef NP_REMOTE
 	fprintf(stderr, "[wayland] remote build: TCP 1025/1026, H.264 encode, no virtio blobs\n");
 #else
-	server.drm_fd = np_blob_open();
+	server.drm_fd = np_virtio_open_lookup_node();
 	if (server.drm_fd < 0) {
 		fprintf(stderr, "[wayland] no virtio-gpu render node; cannot allocate host buffers\n");
 		return 1;
@@ -4473,6 +4463,17 @@ int np_compositor_run(int argc, char **argv) {
 	np_decoration_advertise(server.display, &server);
 #ifndef NP_REMOTE
 	np_dmabuf_advertise(server.display, server.drm_fd);
+	np_syncobj_advertise(server.display, &server);
+#endif
+
+	/* The environment file below is the application-launch readiness record.
+	 * Establish the host transport first so a client cannot observe a live
+	 * Wayland socket while window events still have nowhere to go. */
+#ifdef NP_REMOTE
+	if (!np_host_listen_tcp(&server.host)) return 1;
+	if (!np_media_listen(&server.media)) return 1;
+#else
+	if (!np_host_listen(&server.host)) return 1;
 #endif
 
 	const char *socket = wl_display_add_socket_auto(server.display);
@@ -4481,26 +4482,6 @@ int np_compositor_run(int argc, char **argv) {
 		return 1;
 	}
 	fprintf(stderr, "[wayland] WAYLAND_DISPLAY=%s\n", socket);
-	#ifndef NP_REMOTE
-	// Desktop programs are launched later by root guestd after it drops to the
-	// configured session user. Publish the compositor-selected socket and the
-	// optional D-Bus address rather than assuming wayland-0 forever.
-	{
-		const char *runtime = getenv("XDG_RUNTIME_DIR");
-		if (runtime && runtime[0]) {
-			char path[1024];
-			snprintf(path, sizeof(path), "%s/nativepipe-wayland.env", runtime);
-			FILE *env = fopen(path, "w");
-			if (env) {
-				fprintf(env, "WAYLAND_DISPLAY=%s\n", socket);
-				const char *bus = getenv("DBUS_SESSION_BUS_ADDRESS");
-				if (bus && bus[0])
-					fprintf(env, "DBUS_SESSION_BUS_ADDRESS=%s\n", bus);
-				fclose(env);
-			}
-		}
-	}
-	#endif
 #ifdef NP_REMOTE
 	// So `remotepipe user@host` (and any later shell) can point clients at
 	// *this* compositor even when the session already owns wayland-0 under
@@ -4520,13 +4501,6 @@ int np_compositor_run(int argc, char **argv) {
 		fprintf(stderr, "[wayland] no keymap; keyboard input will not work\n");
 	}
 
-#ifdef NP_REMOTE
-	if (!np_host_listen_tcp(&server.host)) return 1;
-	if (!np_media_listen(&server.media)) return 1;
-#else
-	if (!np_host_listen(&server.host)) return 1;
-#endif
-
 	// The host channel is a file descriptor like any other, so it belongs in the
 	// same event loop as the Wayland clients. Polling it after each dispatch made
 	// the two starve each other: a slow Wayland turn delayed every host command,
@@ -4538,6 +4512,12 @@ int np_compositor_run(int argc, char **argv) {
 	if (server.media.listen_fd >= 0) {
 		wl_event_loop_add_fd(loop, server.media.listen_fd, WL_EVENT_READABLE,
 		                     media_listener_readable, &server);
+	}
+#endif
+#ifndef NP_REMOTE
+	if (!publish_session_environment(socket)) {
+		fprintf(stderr, "[wayland] could not publish the session environment\n");
+		return 1;
 	}
 #endif
 	for (;;) {
@@ -4567,7 +4547,7 @@ int np_compositor_run(int argc, char **argv) {
 	np_host_finish(&server.host);
 	wl_display_destroy(server.display);
 #ifndef NP_REMOTE
-	np_blob_close(server.drm_fd);
+	if (server.drm_fd >= 0) close(server.drm_fd);
 #endif
 	return 0;
 }

@@ -16,9 +16,9 @@ extern "C" {
 ///
 /// Host: this file + virglrenderer (vkr) + MoltenVK. We advertise capset 4,
 /// create vkr contexts, and hand SUBMIT_3D to virglrenderer. MoltenVK is
-/// the ICD. A window buffer is a separate host object (IOSurface) created
-/// by the virtio-gpu device for the compositor; device-local Vulkan memory
-/// stays inside MoltenVK.
+/// the ICD. Window scenes keep their original MoltenVK textures and are
+/// composed directly into CAMetalDrawables; device-local Vulkan memory stays
+/// inside MoltenVK.
 
 typedef struct np_venus np_venus;
 

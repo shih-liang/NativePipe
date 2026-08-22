@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <unistd.h>
 
 struct perf_counter {
 	uint64_t count;
@@ -18,7 +19,8 @@ static int enabled = -1;
 static bool perf_enabled(void)
 {
 	if (enabled < 0)
-		enabled = getenv("NP_PERF_TRACE") != NULL;
+		enabled = getenv("NP_PERF_TRACE") != NULL ||
+		          access("/run/nativepipe-perf", F_OK) == 0;
 	return enabled != 0;
 }
 
