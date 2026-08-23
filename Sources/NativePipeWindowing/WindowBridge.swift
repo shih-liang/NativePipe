@@ -14,10 +14,9 @@ import UniformTypeIdentifiers
 @MainActor
 public protocol FrameSource: AnyObject {
     func surface(forResource resourceID: UInt32) -> IOSurfaceRef?
-    /// True once the virtio-gpu CREATE_RESOURCE/CREATE_BLOB for this id has
-    /// reached the host. A published resource that still cannot produce the
-    /// requested texture is not an ordering race and must not hold a Wayland
-    /// buffer forever.
+    /// True while this id names a live host resource. A published resource
+    /// that still cannot produce the requested texture is not a publication
+    /// race and must not hold a Wayland buffer forever.
     func isResourcePublished(_ resourceID: UInt32) -> Bool
     func metalTexture(
         forResource resourceID: UInt32,
@@ -227,6 +226,7 @@ public final class WindowBridge {
     /// Fired once when a toplevel has both an app id and a materialized
     /// NSWindow. This is the launcher's end-to-end success signal.
     public var onApplicationWindowMapped: ((String) -> Void)?
+    public var applicationIconProvider: ((String) -> NSImage?)?
 
     let clipboard = ClipboardBridge()
 
@@ -238,9 +238,17 @@ public final class WindowBridge {
 
     public var windowCount: Int { windows.count }
 
+    public func refreshApplicationIcons() {
+        for window in windows.values { window.refreshApplicationIcon() }
+    }
+
     func window(_ id: UInt32) -> NativeWindow? { windows[id] }
 
     func currentPointerCursor() -> NSCursor { pointerCursor }
+
+    func applicationIcon(for applicationID: String) -> NSImage? {
+        applicationIconProvider?(applicationID)
+    }
 
     public func send(_ command: Windowing.HostCommand) {
         // Outgoing commands were the one direction with no trace, which made
@@ -269,6 +277,13 @@ public final class WindowBridge {
             Self.note(
                 "scene surface=\(scene.surface) present=\(scene.presentationID) " +
                 "\(scene.width)x\(scene.height) layers=\(scene.layers.count)")
+            for (index, layer) in scene.layers.enumerated() {
+                Self.note(
+                    "  layer[\(index)] surface=\(layer.surface) res=\(layer.resourceID) " +
+                    "buffer=\(layer.width)x\(layer.height) destination=\(layer.destination) " +
+                    "source=\(layer.sourcePixels) clip=\(layer.clip) " +
+                    "format=\(layer.format) opaque=\(layer.opaque)")
+            }
         } else if case .committed(let surface, let frame) = event {
             Self.note(
                 "commit surface=\(surface) res=\(frame.resourceID) \(frame.width)x\(frame.height) source=\(frame.source)")
@@ -435,14 +450,10 @@ public final class WindowBridge {
             break
 
         case .fullscreenRequested(let window, let enabled):
-            guard let nsWindow = windows[window]?.window,
-                  nsWindow.styleMask.contains(.fullScreen) != enabled
-            else { return }
-            nsWindow.toggleFullScreen(nil)
+            windows[window]?.setFullscreen(enabled)
 
         case .maximizeRequested(let window, let enabled):
-            guard let nsWindow = windows[window]?.window, nsWindow.isZoomed != enabled else { return }
-            nsWindow.zoom(nil)
+            windows[window]?.setMaximized(enabled)
 
         case .textInputEnabled(let window, let enabled):
             windows[window]?.setTextInput(enabled: enabled)

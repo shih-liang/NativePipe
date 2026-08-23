@@ -9,6 +9,8 @@ public enum WindowWire {
     public static let motionMagic: [UInt8] = Array("NPMO".utf8)
     public static let motionPayloadSize = 16
     public static let scrollMagic: [UInt8] = Array("NPSC".utf8)
+    public static let configureMagic: [UInt8] = Array("NPCF".utf8)
+    public static let frameTimingMagic: [UInt8] = Array("NPFT".utf8)
     public static let sceneMagic: [UInt8] = Array("NPSN".utf8)
     public static let sceneVersion: UInt16 = 1
     public static let sceneHeaderSize = 56
@@ -111,8 +113,7 @@ public enum WindowWire {
             windowGeometry: geometry, layers: layers))
     }
 
-    /// Encodes the only replaceable high-rate host command. Other commands stay
-    /// JSON for now because their ordering matters and their rate is negligible.
+    /// Encodes high-rate host state without allocating a JSON object.
     public static func fastPayload(for command: Windowing.HostCommand) -> Data? {
         switch command {
         case .pointerMoved(let window, let x, let y):
@@ -129,9 +130,60 @@ public enum WindowWire {
             payload.append(precise ? 1 : 0)
             payload.append(contentsOf: [0, 0, 0])
             return payload
+        case .configure(let window, let size, let states, let serial):
+            guard let width = Int32(exactly: size.width),
+                  let height = Int32(exactly: size.height)
+            else { return nil }
+            var stateBits: UInt32 = 0
+            for state in states {
+                switch state {
+                case .maximized: stateBits |= 1 << 0
+                case .fullscreen: stateBits |= 1 << 1
+                case .resizing: stateBits |= 1 << 2
+                case .activated: stateBits |= 1 << 3
+                }
+            }
+            var payload = Data(configureMagic)
+            append(window, to: &payload)
+            append(width, to: &payload)
+            append(height, to: &payload)
+            append(stateBits, to: &payload)
+            append(serial, to: &payload)
+            return payload
         default:
             return nil
         }
+    }
+
+    /// Batches frame-clock and resource-lifetime feedback into one write while
+    /// preserving every presentation id and its original order.
+    public static func frameTimingPayload(
+        for commands: ArraySlice<Windowing.HostCommand>
+    ) -> Data? {
+        guard !commands.isEmpty, commands.count <= Int(UInt32.max) else { return nil }
+        var payload = Data(frameTimingMagic)
+        append(UInt32(commands.count), to: &payload)
+        for command in commands {
+            let kind: UInt32
+            let surface: UInt32
+            let presentationID: UInt32
+            switch command {
+            case .framePresented(let value, let id):
+                kind = 1
+                surface = value
+                presentationID = id
+            case .frameReleased(let value, let id):
+                kind = 2
+                surface = value
+                presentationID = id
+            default:
+                return nil
+            }
+            append(kind, to: &payload)
+            append(surface, to: &payload)
+            append(presentationID, to: &payload)
+        }
+        return payload
     }
 
     private static func fixed24_8(_ value: Double) -> Int32 {

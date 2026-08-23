@@ -25,7 +25,16 @@ struct np_server {
 	struct wl_display *display;
 	struct wl_list surfaces;
 	struct wl_list shm_textures;
+	/* Guest-to-host events remain on `host`. Host-to-guest paths use separate
+	 * sockets so vsock credit and a slow writer cannot couple unrelated Wayland
+	 * lifetimes. Remote TCP keeps its existing single control stream. */
 	struct np_host host;
+	#ifndef NP_REMOTE
+	struct np_host host_control;
+	struct np_host host_input;
+	struct np_host host_feedback;
+	#endif
+	bool host_session_ready;
 #ifdef NP_REMOTE
 	struct np_media media;
 #endif
@@ -63,6 +72,17 @@ struct np_server {
 	struct wl_event_source *scene_retry_timer;
 	int watched_host_fd;
 	uint32_t watched_host_mask;
+	#ifndef NP_REMOTE
+	struct wl_event_source *host_control_connection_source;
+	struct wl_event_source *host_input_connection_source;
+	struct wl_event_source *host_feedback_connection_source;
+	int watched_host_control_fd;
+	int watched_host_input_fd;
+	int watched_host_feedback_fd;
+	uint32_t watched_host_control_mask;
+	uint32_t watched_host_input_mask;
+	uint32_t watched_host_feedback_mask;
+	#endif
 	char session_socket[128];
 };
 
@@ -97,6 +117,13 @@ struct np_fifo {
 
 struct np_surface_update {
 	struct wl_list link;
+	/* A commit captures the synchronized child CUs that existed at that exact
+	 * commit boundary.  Later child commits remain in the child's queue. */
+	struct wl_list dependencies;
+	/* wl_subsurface position/stacking is double-buffered parent state, so it
+	 * belongs to this parent CU rather than to the live child objects. */
+	struct wl_list subsurface_positions;
+	struct wl_list stack_ops;
 	struct np_surface *surface;
 	struct wl_resource *buffer;
 	struct wl_listener buffer_destroy;
@@ -116,10 +143,17 @@ struct np_surface_update {
 	struct np_region_state opaque_region;
 	struct np_box damage;
 	bool set_fifo_barrier;
+	bool wait_fifo_barrier;
+	bool subsurface_state_changed;
 	struct np_sync_point *acquire_point;
 	struct np_sync_point *release_point;
-	uint32_t finishes_host_configure_serial;
 	uint32_t presentation_id;
+};
+
+struct np_subsurface_position_update {
+	struct wl_list link;
+	struct np_surface *child;
+	int32_t x, y;
 };
 
 /* wl_subsurface stacking is double-buffered state of the parent. Keep the
@@ -190,6 +224,9 @@ struct np_surface {
 	uint32_t host_configure_pending_state_bits;
 	uint32_t host_configure_acked_serial;
 	bool host_configure_acked;
+	/* One-shot idle used to collapse host resize events that were already
+	 * queued when the client became ready for its next configure. */
+	struct wl_event_source *host_configure_idle;
 	bool pending_geometry_set;
 	int32_t pending_geometry_x, pending_geometry_y;
 	int32_t pending_geometry_width, pending_geometry_height;
@@ -216,12 +253,9 @@ struct np_surface {
 	int32_t pending_sub_x, pending_sub_y;
 	bool host_sub_position_dirty;
 	bool sync;
-	struct wl_resource *cached_buffer;
-	struct wl_listener cached_buffer_destroy;
-	bool has_cached_buffer;
-	uint32_t cached_presentation_id;
-	bool cached_set_fifo_barrier;
-	struct np_sync_point *cached_release_point;
+	/* Every wl_surface state change of a synchronized subsurface is latched by
+	 * its parent commit, not just the attached buffer. */
+	struct wl_list synchronized_updates;
 
 	struct np_box pending;
 	struct np_box owed[2];

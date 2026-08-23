@@ -16,6 +16,11 @@
 #define NP_FIRST_RENDER_NODE 128
 #define NP_LAST_RENDER_NODE 191
 
+/* The compositor is single-process and all imports target the same virtio-gpu
+ * render node. Keep one lookup fd so wl_shm resize allocations do not rescan
+ * every DRM render node and repeat the Venus capset ioctl for each new image. */
+static int venus_lookup_fd = -1;
+
 static bool node_has_venus_capset(int fd)
 {
     unsigned char caps[4096];
@@ -33,6 +38,9 @@ static bool node_has_venus_capset(int fd)
 
 int np_virtio_open_lookup_node(void)
 {
+    if (venus_lookup_fd >= 0)
+        return fcntl(venus_lookup_fd, F_DUPFD_CLOEXEC, 3);
+
     for (int minor = NP_FIRST_RENDER_NODE; minor <= NP_LAST_RENDER_NODE; minor++) {
         char path[64];
         snprintf(path, sizeof(path), "/dev/dri/renderD%d", minor);
@@ -41,7 +49,8 @@ int np_virtio_open_lookup_node(void)
             continue;
         if (node_has_venus_capset(fd)) {
             fprintf(stderr, "[virtio] Venus lookup node %s (no DRM context)\n", path);
-            return fd;
+            venus_lookup_fd = fd;
+            return fcntl(venus_lookup_fd, F_DUPFD_CLOEXEC, 3);
         }
         close(fd);
     }

@@ -46,6 +46,7 @@ final class NativeWindow: NSObject {
     private weak var bridge: WindowBridge?
 
     private var appID: String?
+    private var applicationIcon: NSImage?
     /// This is a value supplied by the guest compositor, not a host policy.
     /// Client-side is the safe construction default: it prevents an NSWindow
     /// titlebar from flashing around the first CSD frame before the protocol
@@ -53,6 +54,8 @@ final class NativeWindow: NSObject {
     private var serverDecorated = false
     private var minimumConstraint: Windowing.Size?
     private var maximumConstraint: Windowing.Size?
+    private var requestedMaximized: Bool?
+    private var requestedFullscreen: Bool?
     private var lastConfiguredSize: Windowing.Size?
     private var lastConfiguredStates: [Windowing.ToplevelState] = []
     private var configureSerial: UInt32 = 0
@@ -116,8 +119,14 @@ final class NativeWindow: NSObject {
         // resize the window behind the client's back, and the resulting
         // configure would make the client redraw at a size nobody asked for.
         // Window geometry belongs to the client's first frame and then to the
-        // user. Dock identity will hang off this once the launcher exists.
+        // user.
         appID = value
+        refreshApplicationIcon()
+    }
+
+    func refreshApplicationIcon() {
+        applicationIcon = appID.flatMap { bridge?.applicationIcon(for: $0) }
+        window?.miniwindowImage = applicationIcon
     }
 
     func setServerDecorated(_ enabled: Bool) {
@@ -135,6 +144,20 @@ final class NativeWindow: NSObject {
         minimumConstraint = minimum
         maximumConstraint = maximum
         applyConstraints()
+    }
+
+    func setMaximized(_ enabled: Bool) {
+        requestedMaximized = enabled
+        guard let window, window.isZoomed != enabled else { return }
+        window.zoom(nil)
+    }
+
+    func setFullscreen(_ enabled: Bool) {
+        requestedFullscreen = enabled
+        guard let window,
+              window.styleMask.contains(.fullScreen) != enabled
+        else { return }
+        window.toggleFullScreen(nil)
     }
 
     private func applyConstraints() {
@@ -305,6 +328,7 @@ final class NativeWindow: NSObject {
         // the ordinary responder-chain path on AppKit versions that consult the
         // window flag first. It is false by default.
         window.acceptsMouseMovedEvents = true
+        window.miniwindowImage = applicationIcon
         // xdg_toplevel commonly sends constraints before its first buffer.
         // NativeWindow exists at that point but NSWindow is materialized only
         // on the first frame, so replay the cached complete constraint state
@@ -334,6 +358,11 @@ final class NativeWindow: NSObject {
             if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
             window.makeKeyAndOrderFront(nil)
             window.makeFirstResponder(contentView)
+            // xdg_toplevel state requests can precede the first buffer. The
+            // NativeWindow exists then, but its NSWindow deliberately does
+            // not; replay the requested state once AppKit can apply it.
+            if let requestedMaximized { setMaximized(requestedMaximized) }
+            if let requestedFullscreen { setFullscreen(requestedFullscreen) }
             Self.note("window \(windowID) key=\(window.isKeyWindow) firstResponder=\(String(describing: window.firstResponder))")
         }
         let displayLink = contentView.displayLink(
@@ -603,11 +632,6 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         label: "com.nativepipe.metal-present", qos: .userInteractive)
     private let lock = NSLock()
     private var pending: Work?
-    /// Do not release a superseded source while the first drawable is still
-    /// blocked in WindowServer. Holding the small client swapchain provides
-    /// real backpressure and prevents a finite first application from running
-    /// to completion before its initial NSWindow can map.
-    private var deferredDiscards: [Work] = []
     private var running = false
 
     private enum ProcessResult: Equatable {
@@ -634,11 +658,17 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         lock.lock()
         let superseded = pending
         pending = work
-        if let superseded { deferredDiscards.append(superseded) }
         let shouldStart = !running
         if shouldStart { running = true }
         lock.unlock()
 
+        // This work never reached Metal. Releasing it immediately is what
+        // makes the slot latest-value: retaining every stale resize scene
+        // would pin the client's whole swapchain until drawableSize settles.
+        if let superseded {
+            finish(superseded, success: false)
+            latch(superseded)
+        }
         if shouldStart {
             queue.async { self.drain() }
         }
@@ -647,11 +677,9 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
     func cancelPending() {
         lock.lock()
         let cancelled = pending
-        let discarded = deferredDiscards
         pending = nil
-        deferredDiscards.removeAll(keepingCapacity: true)
         lock.unlock()
-        for work in discarded + (cancelled.map { [$0] } ?? []) {
+        if let work = cancelled {
             finish(work, success: false)
             latch(work)
         }
@@ -703,7 +731,6 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         CATransaction.commit()
 
         guard let drawable = layer.nextDrawable() else {
-            finishDeferredDiscards()
             finish(work, success: false)
             latch(work)
             return .handled
@@ -734,7 +761,6 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
                 }
                 self.finish(work, success: command.status == .completed)
             }
-            finishDeferredDiscards()
             // A drawable has accepted this scene in FIFO order. Queue its
             // Wayland callback for the next display-link tick. Source-buffer
             // release remains tied to Metal completion above.
@@ -742,7 +768,6 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         } catch {
             FileHandle.standardError.write(
                 Data("[nsw] could not encode Metal scene: \(error)\n".utf8))
-            finishDeferredDiscards()
             finish(work, success: false)
             latch(work)
         }
@@ -763,25 +788,20 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         return true
     }
 
-    private func finishDeferredDiscards() {
-        lock.lock()
-        let discarded = deferredDiscards
-        deferredDiscards.removeAll(keepingCapacity: true)
-        lock.unlock()
-        for work in discarded {
-            // The source was never read, but keeping it until an exact drawable
-            // existed prevented the client from outrunning initial presentation.
-            finish(work, success: false)
-            latch(work)
+    private func finish(_ work: Work, success: Bool) {
+        RunLoop.main.perform(
+            inModes: [.common, RunLoop.Mode("NSEventTrackingRunLoopMode")]
+        ) {
+            MainActor.assumeIsolated { work.readComplete(success) }
         }
     }
 
-    private func finish(_ work: Work, success: Bool) {
-        DispatchQueue.main.async { work.readComplete(success) }
-    }
-
     private func latch(_ work: Work) {
-        DispatchQueue.main.async { work.latched() }
+        RunLoop.main.perform(
+            inModes: [.common, RunLoop.Mode("NSEventTrackingRunLoopMode")]
+        ) {
+            MainActor.assumeIsolated { work.latched() }
+        }
     }
 }
 
@@ -812,14 +832,8 @@ private final class SurfaceView: NSView {
     /// Keycodes whose press was actually forwarded. A release for a press the
     /// IME swallowed would leave the guest's xkb state holding a phantom key.
     private var forwardedPresses: Set<UInt16> = []
-    /// The legacy CPU/remote surface currently on screen, held for as long as
-    /// it is shown. GPU windows present through `metalLayer` instead.
-    ///
-    /// `ResourceTable` drops its reference the moment the guest unrefs the
-    /// resource, which during a resize is while this layer is still displaying
-    /// it. Relying on CoreAnimation to have taken a reference is not something
-    /// to guess at when the failure mode is a window that blanks at random.
-    /// Held so a CPU IOSurface outlives ResourceTable unref during resize.
+    /// The legacy CPU/remote surface currently on screen, held for exactly as
+    /// long as it is installed in the layer. GPU windows use `metalLayer`.
     private var displayed: IOSurfaceRef?
     /// Holds client content in AppKit point space without rubber-band scaling.
     /// If AppKit is ahead of the client during resize, the old scene remains at

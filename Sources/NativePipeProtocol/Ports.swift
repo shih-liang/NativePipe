@@ -8,12 +8,23 @@ public enum NativePipePort {
     /// guestd's main RPC endpoint. The host connects, the guest listens.
     public static let control: UInt32 = 1024
 
-    /// Window metadata: NPIP frames of `Windowing.GuestEvent` / `HostCommand`.
+    /// Guest-to-host window events. RemotePipe retains the legacy bidirectional
+    /// stream because SSH/TCP display is a separate compatibility transport.
     public static let surface: UInt32 = 1025
 
     /// Encoded pixel channel (NPEN + H.264 Annex-B). Remote display only;
     /// the local VM path does not use this port.
     public static let media: UInt32 = 1026
+
+    // Local VM window traffic is deliberately split into independent vsock
+    // streams. A blocked frame-release write must never delay a resize or input
+    // event. These start after the dynamic exec range (1030...1285).
+    /// Host-to-guest window state: configure, scale, close and clipboard.
+    public static let windowControl: UInt32 = 1286
+    /// Host-to-guest pointer, keyboard and text-input events.
+    public static let windowInput: UInt32 = 1287
+    /// Host-to-guest frame callback, FIFO and buffer-release feedback.
+    public static let windowFeedback: UInt32 = 1288
 
     /// Reserved: xdg-desktop-portal backend requests.
     public static let portal: UInt32 = 1027

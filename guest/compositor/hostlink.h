@@ -1,8 +1,9 @@
 // The window channel to the host, over vsock or TCP.
 //
-// Same framing as the guestd control channel — "NPIP", version, length, JSON —
-// but a different port and no request/response wrapper: window traffic is a
-// stream of events one way and commands the other.
+// NPIP provides versioned length framing around either JSON metadata or the
+// high-rate binary messages. Local VM events use 1025; host control, input and
+// frame feedback each use their own unidirectional port below. RemotePipe keeps
+// its legacy bidirectional TCP stream on 1025.
 //
 // This carries metadata only. Local VM pixels never travel here — a frame
 // message names a virtio-gpu resource that is already host memory. Remote
@@ -13,9 +14,13 @@
 
 #include <cjson/cJSON.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 /// NativePipePort.surface
 #define NP_SURFACE_PORT 1025
+#define NP_WINDOW_CONTROL_PORT 1286
+#define NP_WINDOW_INPUT_PORT 1287
+#define NP_WINDOW_FEEDBACK_PORT 1288
 
 enum np_host_transport {
 	NP_HOST_VSOCK = 0,
@@ -30,6 +35,7 @@ typedef void (*np_host_binary_handler)(const unsigned char *payload, size_t leng
 struct np_host {
 	int listen_fd;
 	int conn_fd;
+	uint32_t port;
 	enum np_host_transport transport;
 	unsigned char *buffer;
 	size_t buffer_len;
@@ -42,10 +48,12 @@ struct np_host {
 	size_t out_cap;
 };
 
-bool np_host_listen(struct np_host *host);
-/// Listen on 127.0.0.1:NP_SURFACE_PORT for remote / SSH-forwarded hosts.
-bool np_host_listen_tcp(struct np_host *host);
+bool np_host_listen(struct np_host *host, uint32_t port);
+/// Listen on a loopback TCP port for remote / SSH-forwarded hosts.
+bool np_host_listen_tcp(struct np_host *host, uint32_t port);
 void np_host_finish(struct np_host *host);
+/// Close only the current peer, retaining the listener for a clean reconnect.
+void np_host_disconnect(struct np_host *host);
 
 /// Accepts a waiting host connection, if any. Non-blocking.
 void np_host_accept(struct np_host *host);

@@ -24,10 +24,11 @@ static void set_nonblocking(int fd) {
 	if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-bool np_host_listen(struct np_host *host) {
+bool np_host_listen(struct np_host *host, uint32_t port) {
 	memset(host, 0, sizeof(*host));
 	host->listen_fd = -1;
 	host->conn_fd = -1;
+	host->port = port;
 	host->transport = NP_HOST_VSOCK;
 
 	int fd = socket(AF_VSOCK, SOCK_STREAM, 0);
@@ -40,9 +41,9 @@ bool np_host_listen(struct np_host *host) {
 	memset(&addr, 0, sizeof(addr));
 	addr.svm_family = AF_VSOCK;
 	addr.svm_cid = VMADDR_CID_ANY;
-	addr.svm_port = NP_SURFACE_PORT;
+	addr.svm_port = port;
 	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		fprintf(stderr, "[wayland] vsock bind %d: %s\n", NP_SURFACE_PORT, strerror(errno));
+		fprintf(stderr, "[wayland] vsock bind %u: %s\n", port, strerror(errno));
 		close(fd);
 		return false;
 	}
@@ -54,14 +55,15 @@ bool np_host_listen(struct np_host *host) {
 
 	set_nonblocking(fd);
 	host->listen_fd = fd;
-	fprintf(stderr, "[wayland] window channel listening on vsock port %d\n", NP_SURFACE_PORT);
+	fprintf(stderr, "[wayland] window channel listening on vsock port %u\n", port);
 	return true;
 }
 
-bool np_host_listen_tcp(struct np_host *host) {
+bool np_host_listen_tcp(struct np_host *host, uint32_t port) {
 	memset(host, 0, sizeof(*host));
 	host->listen_fd = -1;
 	host->conn_fd = -1;
+	host->port = port;
 	host->transport = NP_HOST_TCP;
 
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -76,9 +78,9 @@ bool np_host_listen_tcp(struct np_host *host) {
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
 	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-	addr.sin_port = htons(NP_SURFACE_PORT);
+	addr.sin_port = htons((uint16_t)port);
 	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		fprintf(stderr, "[wayland] tcp bind %d: %s\n", NP_SURFACE_PORT, strerror(errno));
+		fprintf(stderr, "[wayland] tcp bind %u: %s\n", port, strerror(errno));
 		close(fd);
 		return false;
 	}
@@ -90,7 +92,7 @@ bool np_host_listen_tcp(struct np_host *host) {
 
 	set_nonblocking(fd);
 	host->listen_fd = fd;
-	fprintf(stderr, "[wayland] window channel listening on 127.0.0.1:%d\n", NP_SURFACE_PORT);
+	fprintf(stderr, "[wayland] window channel listening on 127.0.0.1:%u\n", port);
 	return true;
 }
 
@@ -112,17 +114,19 @@ void np_host_accept(struct np_host *host) {
 	host->conn_fd = fd;
 	host->buffer_len = 0;
 	host->out_len = 0;
-	fprintf(stderr, "[wayland] host attached to the window channel\n");
+	fprintf(stderr, "[wayland] host attached on port %u\n", host->port);
 }
 
-static void drop_connection(struct np_host *host) {
+void np_host_disconnect(struct np_host *host) {
+	bool was_connected = host->conn_fd >= 0;
 	if (host->conn_fd >= 0) {
 		close(host->conn_fd);
 		host->conn_fd = -1;
 	}
 	host->buffer_len = 0;
 	host->out_len = 0;
-	fprintf(stderr, "[wayland] host detached\n");
+	if (was_connected)
+		fprintf(stderr, "[wayland] host detached from port %u\n", host->port);
 }
 
 /// Beyond this the host is not draining and the backlog is stale anyway.
@@ -138,7 +142,7 @@ static void flush_outbound(struct np_host *host) {
 			continue;
 		}
 		if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
-		drop_connection(host);
+		np_host_disconnect(host);
 		return;
 	}
 }
@@ -222,12 +226,12 @@ void np_host_pump(struct np_host *host, np_host_handler handler,
 		ssize_t got = recv(host->conn_fd, host->buffer + host->buffer_len,
 		                   host->buffer_cap - host->buffer_len, 0);
 		if (got == 0) {
-			drop_connection(host);
+			np_host_disconnect(host);
 			return;
 		}
 		if (got < 0) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-			drop_connection(host);
+			np_host_disconnect(host);
 			return;
 		}
 		host->buffer_len += (size_t)got;
@@ -238,20 +242,23 @@ void np_host_pump(struct np_host *host, np_host_handler handler,
 		const unsigned char *frame = host->buffer + offset;
 		if (memcmp(frame, NP_MAGIC, 4) != 0 || frame[4] != NP_VERSION) {
 			fprintf(stderr, "[wayland] bad frame on the window channel\n");
-			drop_connection(host);
+			np_host_disconnect(host);
 			return;
 		}
 		uint32_t length = (uint32_t)frame[8] | ((uint32_t)frame[9] << 8) |
 		                  ((uint32_t)frame[10] << 16) | ((uint32_t)frame[11] << 24);
 		if (length > NP_MAX_PAYLOAD) {
-			drop_connection(host);
+			np_host_disconnect(host);
 			return;
 		}
 		if (host->buffer_len - offset < (size_t)NP_HEADER + length) break;
 
 		const unsigned char *payload = frame + NP_HEADER;
 		if (length >= 4 &&
-		    (memcmp(payload, "NPMO", 4) == 0 || memcmp(payload, "NPSC", 4) == 0)) {
+		    (memcmp(payload, "NPMO", 4) == 0 ||
+		     memcmp(payload, "NPSC", 4) == 0 ||
+		     memcmp(payload, "NPCF", 4) == 0 ||
+		     memcmp(payload, "NPFT", 4) == 0)) {
 			if (binary_handler) binary_handler(payload, length, user_data);
 		} else {
 			cJSON *message = cJSON_ParseWithLength((const char *)payload, length);

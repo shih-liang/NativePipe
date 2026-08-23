@@ -122,11 +122,9 @@ static void unpublish_session_environment(void)
 #endif
 
 
-// Commit handling and the subsurface role refer to each other: a parent's commit
-// releases its synchronised children, and a released child publishes a frame.
-static void flush_sync_children(struct np_surface *parent);
 static void flush_pending_frames(struct np_server *server);
 static void apply_unblocked_updates(struct np_surface *surface);
+static void apply_surface_update_now(struct np_surface_update *update);
 static void request_host_refresh(struct np_surface *surface,
                                  uint32_t presentation_id);
 static void publish_surface_buffer(struct np_surface *surface, struct wl_resource *buffer,
@@ -134,7 +132,9 @@ static void publish_surface_buffer(struct np_surface *surface, struct wl_resourc
                                    struct np_sync_point *release_point);
 static void frame_add_viewport(struct np_surface *surface, cJSON *frame);
 static bool parent_has_pending_subsurface_state(struct np_surface *parent);
-static void apply_pending_subsurface_state(struct np_surface *parent);
+static bool capture_subsurface_state(struct np_surface_update *update);
+static void drop_queued_surface_references(struct np_server *server,
+                                           struct np_surface *surface);
 
 static int retry_dirty_scenes(void *data)
 {
@@ -175,6 +175,7 @@ static void drop_stack_ops_referencing(struct np_server *server,
 static void detach_from_parent(struct np_surface *surface)
 {
 	if (!surface) return;
+	drop_queued_surface_references(surface->server, surface);
 	drop_stack_ops_referencing(surface->server, surface);
 	if (surface->parent) {
 		wl_list_remove(&surface->sibling_link);
@@ -405,6 +406,43 @@ static void release_presentation(struct np_server *server,
 	wl_list_for_each(surface, &server->surfaces, link) {
 		apply_unblocked_updates(surface);
 	}
+}
+
+static void process_frame_presented(struct np_server *server,
+	                                uint32_t surface_id,
+	                                uint32_t presentation_id)
+{
+	np_perf_count(NP_PERF_PRESENTED);
+	struct np_surface *owner = surface_by_id(server, surface_id);
+	if (!owner || !presentation_id) return;
+
+	/* One window scene may contain commits and callbacks from several
+	 * synchronized surfaces. They all become visible at this one latch. */
+	struct np_surface *surface;
+	wl_list_for_each(surface, &server->surfaces, link) {
+		complete_presentation(surface, presentation_id);
+		if (surface->fifo_barrier_active &&
+		    surface->fifo_barrier_presentation_id == presentation_id) {
+			surface->fifo_barrier_active = false;
+			surface->fifo_barrier_presentation_id = 0;
+		}
+		apply_unblocked_updates(surface);
+	}
+}
+
+static void process_frame_released(struct np_server *server,
+	                               uint32_t surface_id,
+	                               uint32_t presentation_id)
+{
+	struct np_surface *owner = surface_by_id(server, surface_id);
+	if (owner && presentation_id)
+		release_presentation(server, owner, presentation_id);
+}
+
+static void finish_frame_feedback(struct np_server *server)
+{
+	/* Clients cannot run until this host message handler returns, so flushing
+	 * once after a binary batch preserves semantics and coalesces scene work. */
 	flush_pending_frames(server);
 	wl_display_flush_clients(server->display);
 }
@@ -567,6 +605,9 @@ static void publish_frame_remote(struct np_surface *surface, struct wl_shm_buffe
 /// Publish one atomic layer snapshot per xdg window. Guest Wayland state is
 /// fully resolved, but pixels remain in the original GPU resources.
 static void flush_pending_frames(struct np_server *server) {
+	/* A scene owns client buffers until feedback returns. Never publish into a
+	 * partial multi-port session that cannot return both latch and release. */
+	if (!server->host_session_ready) return;
 	struct np_surface *surface;
 #ifndef NP_REMOTE
 	wl_list_for_each(surface, &server->surfaces, link) {
@@ -648,9 +689,15 @@ static bool surface_update_can_apply(struct np_surface_update *update) {
 	return true;
 #else
 	struct np_surface *surface = update->surface;
+	if (update->wait_fifo_barrier && surface->fifo_barrier_active)
+		return false;
 	if (update->acquire_point && !np_sync_point_ready(update->acquire_point)) {
 		schedule_scene_retry(surface->server);
 		return false;
+	}
+	struct np_surface_update *dependency;
+	wl_list_for_each(dependency, &update->dependencies, link) {
+		if (!surface_update_can_apply(dependency)) return false;
 	}
 	if (!update->buffer_set || !update->buffer) return true;
 	if (wl_shm_buffer_get(update->buffer))
@@ -675,21 +722,6 @@ static void update_buffer_destroyed(struct wl_listener *listener, void *data) {
 	update->buffer = NULL;
 	wl_list_remove(&listener->link);
 	wl_list_init(&listener->link);
-}
-
-static void cached_buffer_destroyed(struct wl_listener *listener, void *data) {
-	(void)data;
-	struct np_surface *surface =
-		wl_container_of(listener, surface, cached_buffer_destroy);
-	surface->cached_buffer = NULL;
-	wl_list_remove(&listener->link);
-	wl_list_init(&listener->link);
-}
-
-static void clear_cached_buffer_listener(struct np_surface *surface) {
-	if (!wl_list_empty(&surface->cached_buffer_destroy.link))
-		wl_list_remove(&surface->cached_buffer_destroy.link);
-	wl_list_init(&surface->cached_buffer_destroy.link);
 }
 
 static void current_buffer_destroyed(struct wl_listener *listener, void *data) {
@@ -856,6 +888,20 @@ static void queue_scene_update(struct np_surface *surface,
 static void surface_update_destroy(struct np_surface_update *update, bool release_buffer) {
 	if (!update) return;
 	if (!wl_list_empty(&update->link)) wl_list_remove(&update->link);
+	struct np_surface_update *dependency, *dependency_tmp;
+	wl_list_for_each_safe(dependency, dependency_tmp, &update->dependencies, link)
+		surface_update_destroy(dependency, release_buffer);
+	struct np_subsurface_position_update *position, *position_tmp;
+	wl_list_for_each_safe(position, position_tmp,
+	                      &update->subsurface_positions, link) {
+		wl_list_remove(&position->link);
+		free(position);
+	}
+	struct np_subsurface_stack_op *op, *op_tmp;
+	wl_list_for_each_safe(op, op_tmp, &update->stack_ops, link) {
+		wl_list_remove(&op->link);
+		free(op);
+	}
 	if (!wl_list_empty(&update->buffer_destroy.link))
 		wl_list_remove(&update->buffer_destroy.link);
 	if (release_buffer && update->buffer)
@@ -865,10 +911,69 @@ static void surface_update_destroy(struct np_surface_update *update, bool releas
 	free(update);
 }
 
+static void surface_update_drop_references(struct np_surface_update *update,
+	                                        struct np_surface *surface)
+{
+	struct np_surface_update *dependency, *dependency_tmp;
+	wl_list_for_each_safe(dependency, dependency_tmp, &update->dependencies, link) {
+		if (dependency->surface == surface) {
+			surface_update_destroy(dependency, true);
+			continue;
+		}
+		surface_update_drop_references(dependency, surface);
+	}
+	struct np_subsurface_position_update *position, *position_tmp;
+	wl_list_for_each_safe(position, position_tmp,
+	                      &update->subsurface_positions, link) {
+		if (position->child != surface) continue;
+		wl_list_remove(&position->link);
+		free(position);
+	}
+	struct np_subsurface_stack_op *op, *op_tmp;
+	wl_list_for_each_safe(op, op_tmp, &update->stack_ops, link) {
+		if (op->child != surface && op->sibling != surface) continue;
+		wl_list_remove(&op->link);
+		free(op);
+	}
+}
+
+/* wl_subsurface.destroy takes effect immediately.  Remove references captured
+ * by an older, still constrained parent CU before detaching the live tree. */
+static void drop_queued_surface_references(struct np_server *server,
+	                                       struct np_surface *surface)
+{
+	struct np_surface *owner;
+	wl_list_for_each(owner, &server->surfaces, link) {
+		struct np_surface_update *update;
+		wl_list_for_each(update, &owner->blocked_updates, link)
+			surface_update_drop_references(update, surface);
+		wl_list_for_each(update, &owner->synchronized_updates, link)
+			surface_update_drop_references(update, surface);
+	}
+}
+
+/* Desynchronized state is effective only when no synchronized ancestor still
+ * latches this surface tree. This matters for nested subsurfaces. */
+static bool subsurface_is_synchronized(struct np_surface *surface) {
+	for (struct np_surface *current = surface;
+	     current && current->subsurface; current = current->parent) {
+		if (current->sync) return true;
+	}
+	return false;
+}
+
 static struct np_surface_update *snapshot_surface_update(struct np_surface *surface) {
 	bool callbacks = has_unbound_frame_callbacks(surface);
 	bool scale_changed = surface->pending_scale != surface->scale;
 	bool child_position_changed = parent_has_pending_subsurface_state(surface);
+	bool synchronized_children = false;
+	struct np_surface *child;
+	wl_list_for_each(child, &surface->children, sibling_link) {
+		if (!wl_list_empty(&child->synchronized_updates)) {
+			synchronized_children = true;
+			break;
+		}
+	}
 	bool needs_refresh = surface->pending_buffer_set || callbacks ||
 	                     surface->pending_fifo_set_barrier ||
 	                     surface->pending_fifo_wait_barrier ||
@@ -878,7 +983,7 @@ static struct np_surface_update *snapshot_surface_update(struct np_surface *surf
 	                     surface->pending_opaque_region_changed ||
 	                     np_syncobj_has_pending(surface) ||
 	                     surface->pending_geometry_set || scale_changed ||
-	                     child_position_changed;
+	                     child_position_changed || synchronized_children;
 	if (!needs_refresh && !surface->pending_geometry_set &&
 	    !scale_changed && !child_position_changed &&
 	    !surface->host_configure_acked)
@@ -887,6 +992,9 @@ static struct np_surface_update *snapshot_surface_update(struct np_surface *surf
 	struct np_surface_update *update = calloc(1, sizeof(*update));
 	if (!update) return NULL;
 	wl_list_init(&update->link);
+	wl_list_init(&update->dependencies);
+	wl_list_init(&update->subsurface_positions);
+	wl_list_init(&update->stack_ops);
 	wl_list_init(&update->buffer_destroy.link);
 	update->surface = surface;
 	update->buffer = surface->pending_buffer;
@@ -909,15 +1017,18 @@ static struct np_surface_update *snapshot_surface_update(struct np_surface *surf
 	update->opaque_region = surface->pending_opaque_region;
 	update->damage = surface->pending;
 	update->set_fifo_barrier = surface->pending_fifo_set_barrier;
+	update->wait_fifo_barrier = surface->pending_fifo_wait_barrier;
 	if (!np_syncobj_take_commit(
 			surface, update->buffer_set, update->buffer,
 			&update->acquire_point, &update->release_point)) {
-		free(update);
+		surface_update_destroy(update, false);
 		return NULL;
 	}
-	update->finishes_host_configure_serial = surface->host_configure_acked
-		? surface->host_configure_acked_serial : 0;
-
+	if (!capture_subsurface_state(update)) {
+		surface_update_destroy(update, false);
+		wl_client_post_no_memory(wl_resource_get_client(surface->resource));
+		return NULL;
+	}
 	if (update->buffer) {
 		update->buffer_destroy.notify = update_buffer_destroyed;
 		wl_resource_add_destroy_listener(update->buffer, &update->buffer_destroy);
@@ -932,7 +1043,6 @@ static struct np_surface_update *snapshot_surface_update(struct np_surface *surf
 	surface->pending_opaque_region_changed = false;
 	box_clear(&surface->pending);
 
-	bool wait_fifo = surface->pending_fifo_wait_barrier;
 	surface->pending_fifo_set_barrier = false;
 	surface->pending_fifo_wait_barrier = false;
 	surface->host_configure_acked = false;
@@ -942,15 +1052,6 @@ static struct np_surface_update *snapshot_surface_update(struct np_surface *surf
 		bind_frame_callbacks(surface, update->presentation_id);
 	}
 
-	bool synchronized_child = surface->subsurface && surface->sync;
-	bool unavailable = !surface_update_can_apply(update);
-	bool ordered_wait = !synchronized_child &&
-		(!wl_list_empty(&surface->blocked_updates) ||
-		 (wait_fifo && surface->fifo_barrier_active));
-	if (unavailable || ordered_wait) {
-		wl_list_insert(surface->blocked_updates.prev, &update->link);
-		return NULL;
-	}
 	return update;
 }
 
@@ -1053,6 +1154,61 @@ static bool parent_has_pending_subsurface_state(struct np_surface *parent) {
 	return false;
 }
 
+/* Capture exactly the child state visible at this parent commit.  Moving the
+ * existing synchronized updates into the CU preserves the protocol dependency
+ * boundary: a later child commit cannot leak into an older parent commit. */
+static bool capture_subsurface_state(struct np_surface_update *update)
+{
+	struct np_surface *parent = update->surface;
+	struct wl_list positions;
+	wl_list_init(&positions);
+	struct np_surface *child;
+	wl_list_for_each(child, &parent->children, sibling_link) {
+		if (!child->pending_sub_position_set) continue;
+		struct np_subsurface_position_update *position =
+			calloc(1, sizeof(*position));
+		if (!position) {
+			struct np_subsurface_position_update *item, *tmp;
+			wl_list_for_each_safe(item, tmp, &positions, link) {
+				wl_list_remove(&item->link);
+				free(item);
+			}
+			return false;
+		}
+		position->child = child;
+		position->x = child->pending_sub_x;
+		position->y = child->pending_sub_y;
+		wl_list_insert(positions.prev, &position->link);
+	}
+
+	struct np_subsurface_position_update *position;
+	wl_list_for_each(position, &positions, link) {
+		position->child->pending_sub_position_set = false;
+	}
+	while (!wl_list_empty(&positions)) {
+		position = wl_container_of(positions.next, position, link);
+		wl_list_remove(&position->link);
+		wl_list_insert(update->subsurface_positions.prev, &position->link);
+		update->subsurface_state_changed = true;
+	}
+	while (!wl_list_empty(&parent->pending_stack_ops)) {
+		struct np_subsurface_stack_op *op = wl_container_of(
+			parent->pending_stack_ops.next, op, link);
+		wl_list_remove(&op->link);
+		wl_list_insert(update->stack_ops.prev, &op->link);
+		update->subsurface_state_changed = true;
+	}
+	wl_list_for_each(child, &parent->children, sibling_link) {
+		while (!wl_list_empty(&child->synchronized_updates)) {
+			struct np_surface_update *dependency = wl_container_of(
+				child->synchronized_updates.next, dependency, link);
+			wl_list_remove(&dependency->link);
+			wl_list_insert(update->dependencies.prev, &dependency->link);
+		}
+	}
+	return true;
+}
+
 static void restack_subsurface(struct np_surface *child,
 	                          struct np_surface *sibling, bool above)
 {
@@ -1082,25 +1238,15 @@ static void restack_subsurface(struct np_surface *child,
 
 /// Position and z-order are double-buffered state of the parent. Applying
 /// either in the request handler races ahead of the parent's buffer commit.
-static void apply_pending_subsurface_state(struct np_surface *parent) {
-	struct np_surface *child;
-	wl_list_for_each(child, &parent->children, sibling_link) {
-		if (!child->pending_sub_position_set) continue;
-		child->sub_x = child->pending_sub_x;
-		child->sub_y = child->pending_sub_y;
-		child->pending_sub_position_set = false;
-		child->host_sub_position_dirty = true;
-	}
-	struct np_subsurface_stack_op *op, *tmp;
-	wl_list_for_each_safe(op, tmp, &parent->pending_stack_ops, link) {
-		restack_subsurface(op->child, op->sibling, op->above);
-		wl_list_remove(&op->link);
-		free(op);
-	}
-}
-
-static void apply_surface_update(struct np_surface_update *update) {
+static void apply_surface_update_now(struct np_surface_update *update) {
 	if (!update) return;
+	while (!wl_list_empty(&update->dependencies)) {
+		struct np_surface_update *dependency = wl_container_of(
+			update->dependencies.next, dependency, link);
+		wl_list_remove(&dependency->link);
+		wl_list_init(&dependency->link);
+		apply_surface_update_now(dependency);
+	}
 	struct np_surface *surface = update->surface;
 	np_sync_point_destroy(update->acquire_point);
 	update->acquire_point = NULL;
@@ -1125,7 +1271,21 @@ static void apply_surface_update(struct np_surface_update *update) {
 		surface->opaque_region_set = update->opaque_region_set;
 		surface->opaque_region = update->opaque_region;
 	}
-	apply_pending_subsurface_state(surface);
+	struct np_subsurface_position_update *position, *position_tmp;
+	wl_list_for_each_safe(position, position_tmp,
+	                      &update->subsurface_positions, link) {
+		position->child->sub_x = position->x;
+		position->child->sub_y = position->y;
+		position->child->host_sub_position_dirty = true;
+		wl_list_remove(&position->link);
+		free(position);
+	}
+	struct np_subsurface_stack_op *op, *op_tmp;
+	wl_list_for_each_safe(op, op_tmp, &update->stack_ops, link) {
+		restack_subsurface(op->child, op->sibling, op->above);
+		wl_list_remove(&op->link);
+		free(op);
+	}
 	surface->pending = update->damage;
 
 	if (trace_enabled()) {
@@ -1134,34 +1294,8 @@ static void apply_surface_update(struct np_surface_update *update) {
 		        update->presentation_id, update->set_fifo_barrier ? " fifo" : "");
 	}
 
-	bool cached_sync_commit = false;
 	if (update->buffer_set) {
-		// A synchronised subsurface's commit takes effect with its parent. FIFO
-		// wait constraints are explicitly ignored for this mode.
-		if (surface->subsurface && surface->sync) {
-			if (surface->has_cached_buffer) {
-				if (surface->cached_buffer)
-					wl_buffer_send_release(surface->cached_buffer);
-				clear_cached_buffer_listener(surface);
-				rebind_frame_callbacks(surface, surface->cached_presentation_id,
-				                       update->presentation_id);
-				np_sync_point_signal(surface->cached_release_point);
-				surface->cached_release_point = NULL;
-			}
-			surface->cached_buffer = update->buffer;
-			surface->has_cached_buffer = true;
-			surface->cached_presentation_id = update->presentation_id;
-			surface->cached_set_fifo_barrier = update->set_fifo_barrier;
-			surface->cached_release_point = update->release_point;
-			update->release_point = NULL;
-			if (surface->cached_buffer) {
-				surface->cached_buffer_destroy.notify = cached_buffer_destroyed;
-				wl_resource_add_destroy_listener(surface->cached_buffer,
-				                                 &surface->cached_buffer_destroy);
-			}
-			update->buffer = NULL;
-			cached_sync_commit = true;
-		} else if (np_scene_root(surface)) {
+		if (np_scene_root(surface)) {
 			publish_surface_buffer(surface, update->buffer, update->presentation_id,
 			                       update->release_point);
 			update->release_point = NULL;
@@ -1173,41 +1307,60 @@ static void apply_surface_update(struct np_surface_update *update) {
 			request_host_refresh(surface, update->presentation_id);
 		}
 	} else if (update->presentation_id) {
-		if (!((update->viewport_changed || update->geometry_set || scale_changed) &&
+		if (!((update->viewport_changed || update->geometry_set || scale_changed ||
+		       update->subsurface_state_changed) &&
 		      queue_last_published_frame(surface, update->presentation_id)))
 			request_host_refresh(surface, update->presentation_id);
 	}
 
-	if (update->set_fifo_barrier && !cached_sync_commit) {
+	if (update->set_fifo_barrier) {
 		surface->fifo_barrier_active = true;
 		surface->fifo_barrier_presentation_id = update->presentation_id;
 	}
-	if (update->finishes_host_configure_serial)
-		finish_host_toplevel_configure(
-			surface, update->finishes_host_configure_serial);
-	flush_sync_children(surface);
 	surface_update_destroy(update, false);
+}
+
+static void apply_surface_update(struct np_surface_update *update) {
+	if (!update) return;
+	if (subsurface_is_synchronized(update->surface)) {
+		wl_list_insert(update->surface->synchronized_updates.prev, &update->link);
+		return;
+	}
+	if (!wl_list_empty(&update->surface->blocked_updates) ||
+	    !surface_update_can_apply(update)) {
+		wl_list_insert(update->surface->blocked_updates.prev, &update->link);
+		return;
+	}
+	apply_surface_update_now(update);
 }
 
 static void apply_unblocked_updates(struct np_surface *surface) {
 	while (!wl_list_empty(&surface->blocked_updates)) {
-		if (surface->fifo_barrier_active &&
-		    !(surface->subsurface && surface->sync))
-			break;
 		struct np_surface_update *update =
 			wl_container_of(surface->blocked_updates.next, update, link);
 		if (!surface_update_can_apply(update)) break;
 		wl_list_remove(&update->link);
 		wl_list_init(&update->link);
-		apply_surface_update(update);
+		apply_surface_update_now(update);
 	}
 }
 
 static void surface_commit(struct wl_client *client, struct wl_resource *resource) {
 	(void)client;
 	struct np_surface *surface = wl_resource_get_user_data(resource);
+	/* Capture this before snapshot_surface_update() consumes the pending ack.
+	 * The xdg-shell configure is complete at this wl_surface.commit boundary,
+	 * even when the resulting buffer update must wait for an acquire fence or
+	 * a FIFO barrier.  Waiting for snapshot_surface_update() to return an
+	 * immediately applicable update accidentally coupled resize flow control
+	 * back to GPU/output availability. */
+	uint32_t configure_serial = surface->host_configure_acked
+		? surface->host_configure_acked_serial : 0;
 	struct np_surface_update *update = snapshot_surface_update(surface);
-	if (update) apply_surface_update(update);
+	if (configure_serial)
+		finish_host_toplevel_configure(surface, configure_serial);
+	if (!update) return;
+	apply_surface_update(update);
 }
 
 static void publish_surface_buffer(struct np_surface *surface, struct wl_resource *buffer,
@@ -1293,6 +1446,17 @@ static void publish_surface_buffer(struct np_surface *surface, struct wl_resourc
 				fprintf(stderr, "[wayland] scene surface=%u: unsupported buffer\n",
 				        surface->id);
 			return;
+		}
+		if (trace_enabled()) {
+			struct np_surface_mapping mapping;
+			if (np_scale_resolve(surface, (uint32_t)surface->last_width,
+			                     (uint32_t)surface->last_height, &mapping))
+				fprintf(stderr,
+				        "[wayland] published surface=%u resource=%u pixels=%dx%d "
+				        "scale=%d logical=%.0fx%.0f\n",
+				        surface->id, surface->last_resource_id,
+				        surface->last_width, surface->last_height, surface->scale,
+				        mapping.logical_width, mapping.logical_height);
 		}
 		surface->has_published = true;
 		queue_scene_update(surface, presentation_id);
@@ -1392,12 +1556,6 @@ static void fifo_manager_get_fifo(struct wl_client *client,
 		                       "a fifo object already exists for this surface");
 		return;
 	}
-	if (surface->has_cached_buffer) {
-		if (surface->cached_buffer) wl_buffer_send_release(surface->cached_buffer);
-		clear_cached_buffer_listener(surface);
-		surface->cached_buffer = NULL;
-		surface->has_cached_buffer = false;
-	}
 
 	struct np_fifo *fifo = calloc(1, sizeof(*fifo));
 	if (!fifo) {
@@ -1492,6 +1650,10 @@ static void surface_resource_destroy(struct wl_resource *resource) {
 		cJSON_Delete(surface->pending_frame);
 		surface->pending_frame = NULL;
 	}
+	if (surface->host_configure_idle) {
+		wl_event_source_remove(surface->host_configure_idle);
+		surface->host_configure_idle = NULL;
+	}
 	struct np_frame_callback *callback, *callback_tmp;
 	wl_list_for_each_safe(callback, callback_tmp, &surface->pending_frame_callbacks, link) {
 		wl_resource_destroy(callback->resource);
@@ -1500,9 +1662,9 @@ static void surface_resource_destroy(struct wl_resource *resource) {
 	wl_list_for_each_safe(update, update_tmp, &surface->blocked_updates, link) {
 		surface_update_destroy(update, true);
 	}
-	clear_cached_buffer_listener(surface);
-	np_sync_point_signal(surface->cached_release_point);
-	surface->cached_release_point = NULL;
+	wl_list_for_each_safe(update, update_tmp, &surface->synchronized_updates, link) {
+		surface_update_destroy(update, true);
+	}
 	set_current_buffer(surface, NULL, NULL);
 	np_syncobj_surface_destroyed(surface);
 #ifdef NP_REMOTE
@@ -2377,35 +2539,6 @@ static void data_manager_bind(struct wl_client *client, void *data, uint32_t ver
 // wl_subcompositor
 // ---------------------------------------------------------------------------
 
-/// Applies the commits that sync subsurfaces have been holding. Called when the
-/// parent commits, which is what "synchronised" means.
-static void flush_sync_children(struct np_surface *parent) {
-	struct np_surface *child;
-	wl_list_for_each(child, &parent->server->surfaces, link) {
-		if (child->parent != parent || !child->sync || !child->has_cached_buffer) continue;
-			struct wl_resource *buffer = child->cached_buffer;
-		uint32_t presentation_id = child->cached_presentation_id;
-		bool set_barrier = child->cached_set_fifo_barrier;
-		struct np_sync_point *release_point = child->cached_release_point;
-			child->cached_buffer = NULL;
-			clear_cached_buffer_listener(child);
-		child->has_cached_buffer = false;
-		child->cached_presentation_id = 0;
-		child->cached_set_fifo_barrier = false;
-		child->cached_release_point = NULL;
-		if (buffer || np_scene_root(child))
-			publish_surface_buffer(child, buffer, presentation_id, release_point);
-		else if (presentation_id)
-			request_host_refresh(child, presentation_id);
-		else
-			np_sync_point_signal(release_point);
-		if (set_barrier) {
-			child->fifo_barrier_active = true;
-			child->fifo_barrier_presentation_id = presentation_id;
-		}
-	}
-}
-
 static void subsurface_destroy_handler(struct wl_client *client, struct wl_resource *resource) {
 	wl_resource_destroy(resource);
 }
@@ -2465,23 +2598,16 @@ static void subsurface_set_sync(struct wl_client *client, struct wl_resource *re
 	((struct np_surface *)wl_resource_get_user_data(resource))->sync = true;
 }
 static void subsurface_set_desync(struct wl_client *client, struct wl_resource *resource) {
+	(void)client;
 	struct np_surface *surface = wl_resource_get_user_data(resource);
 	surface->sync = false;
-	if (surface->has_cached_buffer) {
-		struct wl_resource *buffer = surface->cached_buffer;
-		uint32_t presentation_id = surface->cached_presentation_id;
-		bool set_barrier = surface->cached_set_fifo_barrier;
-		struct np_sync_point *release_point = surface->cached_release_point;
-		surface->cached_buffer = NULL;
-		clear_cached_buffer_listener(surface);
-		surface->has_cached_buffer = false;
-		surface->cached_presentation_id = 0;
-		surface->cached_set_fifo_barrier = false;
-		surface->cached_release_point = NULL;
-		publish_surface_buffer(surface, buffer, presentation_id, release_point);
-		if (set_barrier) {
-			surface->fifo_barrier_active = true;
-			surface->fifo_barrier_presentation_id = presentation_id;
+	if (!subsurface_is_synchronized(surface)) {
+		while (!wl_list_empty(&surface->synchronized_updates)) {
+			struct np_surface_update *update = wl_container_of(
+				surface->synchronized_updates.next, update, link);
+			wl_list_remove(&update->link);
+			wl_list_init(&update->link);
+			apply_surface_update(update);
 		}
 	}
 }
@@ -2570,7 +2696,7 @@ static void compositor_create_surface(struct wl_client *client, struct wl_resour
 	wl_list_init(&surface->pending_frame_callbacks);
 	wl_list_init(&surface->blocked_updates);
 	wl_list_init(&surface->scene_presentations);
-	wl_list_init(&surface->cached_buffer_destroy.link);
+	wl_list_init(&surface->synchronized_updates);
 	wl_list_init(&surface->current_buffer_destroy.link);
 	surface->resource = wl_resource_create(
 		client, &wl_surface_interface, wl_resource_get_version(resource), id);
@@ -2819,13 +2945,10 @@ static void send_host_toplevel_configure(struct np_surface *surface,
 static void queue_host_toplevel_configure(struct np_surface *surface,
 	                                      int32_t width, int32_t height,
 	                                      uint32_t state_bits) {
-	/* Keep at most one xdg configure awaiting acknowledgement. Vulkan WSI often
-	 * rebuilds its whole swapchain for every acknowledged size; forwarding every
-	 * AppKit display tick can therefore make it allocate and destroy several
-	 * images faster than it can render any of them. This is latest-value
-	 * coalescing, not a frame gate: the queued size is sent as soon as the client
-	 * acknowledges the current configure, without waiting for a buffer commit. */
-	if (surface->host_configure_in_flight) {
+	/* Keep at most one configure awaiting a client ack+commit. An already
+	 * scheduled idle is also a coalescing interval: overwrite its value instead
+	 * of immediately sending the first stale host event in the queue. */
+	if (surface->host_configure_in_flight || surface->host_configure_idle) {
 		surface->host_configure_pending = true;
 		surface->host_configure_pending_width = width;
 		surface->host_configure_pending_height = height;
@@ -2846,21 +2969,33 @@ static void send_pending_host_toplevel_configure(struct np_surface *surface) {
 	send_host_toplevel_configure(surface, width, height, state_bits);
 }
 
+static void dispatch_pending_host_toplevel_configure(void *data) {
+	struct np_surface *surface = data;
+	surface->host_configure_idle = NULL;
+	send_pending_host_toplevel_configure(surface);
+}
+
+static void schedule_pending_host_toplevel_configure(struct np_surface *surface) {
+	if (!surface || surface->host_configure_idle ||
+	    !surface->host_configure_pending)
+		return;
+	struct wl_event_loop *loop = wl_display_get_event_loop(surface->server->display);
+	surface->host_configure_idle = wl_event_loop_add_idle(
+		loop, dispatch_pending_host_toplevel_configure, surface);
+}
+
 static void finish_host_toplevel_configure(struct np_surface *surface,
 	                                       uint32_t serial) {
 	if (!surface || !serial) return;
 	if (trace_enabled())
 		fprintf(stderr,
-		        "[configure] commit surface=%u acked=%u current=%u serial=%u pending=%d\n",
+		        "[configure] ready surface=%u acked=%u current=%u serial=%u pending=%d\n",
 		        surface->id, surface->host_configure_acked_serial,
 		        surface->host_configure_serial, serial,
 		        surface->host_configure_pending);
-	// A commit for an older acknowledged configure must not complete a newer
-	// configure emitted while that commit was queued or blocked on FIFO/output
-	// ring availability.
 	if (serial == surface->host_configure_serial) {
 		surface->host_configure_in_flight = false;
-		send_pending_host_toplevel_configure(surface);
+		schedule_pending_host_toplevel_configure(surface);
 	}
 	if (surface->host_configure_acked_serial == serial) {
 		surface->host_configure_acked_serial = 0;
@@ -3863,8 +3998,8 @@ static void handle_pointer_scroll(struct np_server *server, uint32_t window_id,
 	wl_display_flush_clients(server->display);
 }
 
-/// Binary fast path for the only high-rate replaceable command. Its payload is
-/// "NPMO", window u32, x i32 24.8 and y i32 24.8, all little endian.
+/// Binary host-control path. High-rate state and frame feedback never allocate
+/// a cJSON object; the outer NPIP framing still supplies message boundaries.
 static void handle_host_binary(const unsigned char *payload, size_t length, void *user_data) {
 	struct np_server *server = user_data;
 	if (length == 16 && memcmp(payload, "NPMO", 4) == 0) {
@@ -3881,6 +4016,36 @@ static void handle_host_binary(const unsigned char *payload, size_t length, void
 		memcpy(&dx, &dx_bits, sizeof(dx));
 		memcpy(&dy, &dy_bits, sizeof(dy));
 		handle_pointer_scroll(server, read_le32(payload + 4), dx, dy);
+		return;
+	}
+	if (length == 24 && memcmp(payload, "NPCF", 4) == 0) {
+		uint32_t window_id = read_le32(payload + 4);
+		struct np_surface *surface = surface_by_window(server, window_id);
+		if (!surface || !surface->toplevel) return;
+		int32_t width = (int32_t)read_le32(payload + 8);
+		int32_t height = (int32_t)read_le32(payload + 12);
+		uint32_t state_bits = read_le32(payload + 16);
+		/* payload + 20 is the host diagnostic serial. xdg-shell owns the
+		 * independent serial generated by send_host_toplevel_configure(). */
+		queue_host_toplevel_configure(surface, width, height, state_bits);
+		wl_display_flush_clients(server->display);
+		return;
+	}
+	if (length >= 8 && memcmp(payload, "NPFT", 4) == 0) {
+		uint32_t count = read_le32(payload + 4);
+		if ((length - 8) % 12 != 0 || (size_t)count != (length - 8) / 12)
+			return;
+		for (uint32_t i = 0; i < count; i++) {
+			const unsigned char *record = payload + 8 + (size_t)i * 12;
+			uint32_t kind = read_le32(record);
+			uint32_t surface_id = read_le32(record + 4);
+			uint32_t presentation_id = read_le32(record + 8);
+			if (kind == 1)
+				process_frame_presented(server, surface_id, presentation_id);
+			else if (kind == 2)
+				process_frame_released(server, surface_id, presentation_id);
+		}
+		finish_frame_feedback(server);
 	}
 }
 
@@ -3894,35 +4059,18 @@ static void handle_host_command(const char *name, cJSON *body, void *user_data) 
 	}
 
 	if (strcmp(name, "framePresented") == 0) {
-		np_perf_count(NP_PERF_PRESENTED);
 		uint32_t surface_id = (uint32_t)json_int(body, "surface", 0);
 		uint32_t presentation_id = (uint32_t)json_int(body, "presentationID", 0);
-		struct np_surface *owner = surface_by_id(server, surface_id);
-		if (!owner || !presentation_id) return;
-
-		/* One window scene may contain commits and callbacks from several
-		 * synchronized surfaces. They all become visible at this one latch. */
-		struct np_surface *surface;
-		wl_list_for_each(surface, &server->surfaces, link) {
-			complete_presentation(surface, presentation_id);
-			if (surface->fifo_barrier_active &&
-			    surface->fifo_barrier_presentation_id == presentation_id) {
-				surface->fifo_barrier_active = false;
-				surface->fifo_barrier_presentation_id = 0;
-			}
-			apply_unblocked_updates(surface);
-		}
-		flush_pending_frames(server);
-		wl_display_flush_clients(server->display);
+		process_frame_presented(server, surface_id, presentation_id);
+		finish_frame_feedback(server);
 		return;
 	}
 
 	if (strcmp(name, "frameReleased") == 0) {
 		uint32_t surface_id = (uint32_t)json_int(body, "surface", 0);
 		uint32_t presentation_id = (uint32_t)json_int(body, "presentationID", 0);
-		struct np_surface *owner = surface_by_id(server, surface_id);
-		if (owner && presentation_id)
-			release_presentation(server, owner, presentation_id);
+		process_frame_released(server, surface_id, presentation_id);
+		finish_frame_feedback(server);
 		return;
 	}
 
@@ -4182,17 +4330,46 @@ static void handle_host_command(const char *name, cJSON *body, void *user_data) 
 // main
 // ---------------------------------------------------------------------------
 
-static void sync_host_connection_source(struct np_server *server);
+static void sync_host_channels(struct np_server *server);
 
 static int host_channel_readable(int fd, uint32_t mask, void *data) {
 	struct np_server *server = data;
 	if (mask & WL_EVENT_WRITABLE) np_host_flush(&server->host);
 	np_host_pump(&server->host, handle_host_command, handle_host_binary, server);
-	sync_host_connection_source(server);
+	sync_host_channels(server);
 	flush_pending_frames(server);
 	wl_display_flush_clients(server->display);
 	return 0;
 }
+
+#ifndef NP_REMOTE
+static int host_control_channel_readable(int fd, uint32_t mask, void *data) {
+	struct np_server *server = data;
+	(void)fd;
+	if (mask & WL_EVENT_WRITABLE) np_host_flush(&server->host_control);
+	np_host_pump(&server->host_control, handle_host_command, handle_host_binary, server);
+	sync_host_channels(server);
+	return 0;
+}
+
+static int host_input_channel_readable(int fd, uint32_t mask, void *data) {
+	struct np_server *server = data;
+	(void)fd;
+	if (mask & WL_EVENT_WRITABLE) np_host_flush(&server->host_input);
+	np_host_pump(&server->host_input, handle_host_command, handle_host_binary, server);
+	sync_host_channels(server);
+	return 0;
+}
+
+static int host_feedback_channel_readable(int fd, uint32_t mask, void *data) {
+	struct np_server *server = data;
+	(void)fd;
+	if (mask & WL_EVENT_WRITABLE) np_host_flush(&server->host_feedback);
+	np_host_pump(&server->host_feedback, handle_host_command, handle_host_binary, server);
+	sync_host_channels(server);
+	return 0;
+}
+#endif
 
 /// Re-announces every live surface to a host that has just attached.
 ///
@@ -4351,68 +4528,150 @@ static void discard_disconnected_host_reads(struct np_server *server) {
 #endif
 }
 
-static void sync_host_connection_source(struct np_server *server) {
-	if (server->watched_host_fd >= 0 && server->host.conn_fd < 0) {
+static void sync_one_host_source(
+	struct np_server *server, struct np_host *host,
+	struct wl_event_source **source, int *watched_fd, uint32_t *watched_mask,
+	wl_event_loop_fd_func_t callback)
+{
+	/* Writability is watched only while this lane has queued bytes. Each lane has
+	 * independent vsock credit, so a blocked feedback stream cannot park control
+	 * or input behind the same POLLOUT wait. */
+	uint32_t mask = WL_EVENT_READABLE | WL_EVENT_HANGUP | WL_EVENT_ERROR;
+	if (np_host_has_backlog(host)) mask |= WL_EVENT_WRITABLE;
+
+	if (*watched_fd == host->conn_fd) {
+		if (*source && *watched_mask != mask) {
+			wl_event_source_fd_update(*source, mask);
+			*watched_mask = mask;
+		}
+		return;
+	}
+	if (*source) {
+		wl_event_source_remove(*source);
+		*source = NULL;
+	}
+	*watched_fd = host->conn_fd;
+	*watched_mask = mask;
+	if (host->conn_fd >= 0) {
+		struct wl_event_loop *loop = wl_display_get_event_loop(server->display);
+		*source = wl_event_loop_add_fd(
+			loop, host->conn_fd, mask, callback, server);
+	}
+}
+
+static bool all_host_channels_connected(struct np_server *server)
+{
+	if (!np_host_connected(&server->host)) return false;
+#ifndef NP_REMOTE
+	return np_host_connected(&server->host_control) &&
+	       np_host_connected(&server->host_input) &&
+	       np_host_connected(&server->host_feedback);
+#else
+	return true;
+#endif
+}
+
+static void close_host_session(struct np_server *server)
+{
+	np_host_disconnect(&server->host);
+#ifndef NP_REMOTE
+	np_host_disconnect(&server->host_control);
+	np_host_disconnect(&server->host_input);
+	np_host_disconnect(&server->host_feedback);
+#endif
+}
+
+static void sync_host_channels(struct np_server *server) {
+	bool connected = all_host_channels_connected(server);
+	if (server->host_session_ready && !connected) {
+		server->host_session_ready = false;
 #ifndef NP_REMOTE
 		unpublish_session_environment();
 #endif
 		discard_disconnected_host_reads(server);
+		/* Do not pair a newly dialled lane with sockets from the old generation. */
+		close_host_session(server);
+		connected = false;
 	}
-	// Detected before the mask is computed, so the replay it queues is what
-	// arms the writability watch below.
-	if (server->watched_host_fd < 0 && server->host.conn_fd >= 0) {
-		/* channelReady is also the host-side launch gate.  Publish the guest
-		 * session record before sending it: np_host_send may make channelReady
-		 * visible to the host immediately, and guestd can otherwise fork the
-		 * first GUI process before WAYLAND_DISPLAY exists. */
+
+	if (!server->host_session_ready && connected) {
+		/* channelReady is the host launch gate. The environment must be visible
+		 * before the event because the host may launch immediately on receipt. */
 #ifndef NP_REMOTE
 		if (!publish_session_environment(server->session_socket))
 			fprintf(stderr, "[wayland] could not publish the session environment\n");
 #endif
+		server->host_session_ready = true;
 		cJSON *ready = cJSON_CreateObject();
 		cJSON_AddNumberToObject(ready, "sessionID", (double)(uint32_t)getpid());
+#ifdef NP_REMOTE
 		cJSON_AddNumberToObject(ready, "protocolVersion", 1);
+#else
+		cJSON_AddNumberToObject(ready, "protocolVersion", 2);
+#endif
 		np_host_send(&server->host, "channelReady", ready);
 		republish_state(server);
 	}
 
-	// Writability is watched only while something is waiting to go out. Without
-	// it, a socket that returned EAGAIN leaves the backlog parked until some
-	// unrelated fd happens to wake the loop — and with an idle client and a
-	// quiet host, nothing ever does.
-	uint32_t mask = WL_EVENT_READABLE | WL_EVENT_HANGUP | WL_EVENT_ERROR;
-	if (np_host_has_backlog(&server->host)) mask |= WL_EVENT_WRITABLE;
-
-	if (server->watched_host_fd == server->host.conn_fd) {
-		if (server->host_connection_source && server->watched_host_mask != mask) {
-			wl_event_source_fd_update(server->host_connection_source, mask);
-			server->watched_host_mask = mask;
-		}
-		return;
-	}
-
-	if (server->host_connection_source) {
-		wl_event_source_remove(server->host_connection_source);
-		server->host_connection_source = NULL;
-	}
-	server->watched_host_fd = server->host.conn_fd;
-	server->watched_host_mask = mask;
-
-	if (server->host.conn_fd >= 0) {
-		struct wl_event_loop *loop = wl_display_get_event_loop(server->display);
-		server->host_connection_source = wl_event_loop_add_fd(
-			loop, server->host.conn_fd, mask, host_channel_readable, server);
-	}
+	sync_one_host_source(
+		server, &server->host, &server->host_connection_source,
+		&server->watched_host_fd, &server->watched_host_mask,
+		host_channel_readable);
+#ifndef NP_REMOTE
+	sync_one_host_source(
+		server, &server->host_control, &server->host_control_connection_source,
+		&server->watched_host_control_fd, &server->watched_host_control_mask,
+		host_control_channel_readable);
+	sync_one_host_source(
+		server, &server->host_input, &server->host_input_connection_source,
+		&server->watched_host_input_fd, &server->watched_host_input_mask,
+		host_input_channel_readable);
+	sync_one_host_source(
+		server, &server->host_feedback, &server->host_feedback_connection_source,
+		&server->watched_host_feedback_fd, &server->watched_host_feedback_mask,
+		host_feedback_channel_readable);
+#endif
 }
 
 static int host_listener_readable(int fd, uint32_t mask, void *data) {
 	struct np_server *server = data;
+	(void)fd;
+	(void)mask;
 	np_host_pump(&server->host, handle_host_command, handle_host_binary, server);
-	sync_host_connection_source(server);
+	sync_host_channels(server);
 	flush_pending_frames(server);
 	wl_display_flush_clients(server->display);
 	return 0;
 }
+
+#ifndef NP_REMOTE
+static int host_control_listener_readable(int fd, uint32_t mask, void *data) {
+	struct np_server *server = data;
+	(void)fd;
+	(void)mask;
+	np_host_pump(&server->host_control, handle_host_command, handle_host_binary, server);
+	sync_host_channels(server);
+	return 0;
+}
+
+static int host_input_listener_readable(int fd, uint32_t mask, void *data) {
+	struct np_server *server = data;
+	(void)fd;
+	(void)mask;
+	np_host_pump(&server->host_input, handle_host_command, handle_host_binary, server);
+	sync_host_channels(server);
+	return 0;
+}
+
+static int host_feedback_listener_readable(int fd, uint32_t mask, void *data) {
+	struct np_server *server = data;
+	(void)fd;
+	(void)mask;
+	np_host_pump(&server->host_feedback, handle_host_command, handle_host_binary, server);
+	sync_host_channels(server);
+	return 0;
+}
+#endif
 
 #ifdef NP_REMOTE
 static int media_listener_readable(int fd, uint32_t mask, void *data) {
@@ -4447,6 +4706,11 @@ int np_compositor_run(int argc, char **argv) {
 	signal(SIGPIPE, SIG_IGN);
 	server.keymap_fd = -1;
 	server.watched_host_fd = -1;
+#ifndef NP_REMOTE
+	server.watched_host_control_fd = -1;
+	server.watched_host_input_fd = -1;
+	server.watched_host_feedback_fd = -1;
+#endif
 	g_server = &server;
 	(void)argc;
 	(void)argv;
@@ -4505,10 +4769,14 @@ int np_compositor_run(int argc, char **argv) {
 	 * Establish the host transport first so a client cannot observe a live
 	 * Wayland socket while window events still have nowhere to go. */
 #ifdef NP_REMOTE
-	if (!np_host_listen_tcp(&server.host)) return 1;
+	if (!np_host_listen_tcp(&server.host, NP_SURFACE_PORT)) return 1;
 	if (!np_media_listen(&server.media)) return 1;
 #else
-	if (!np_host_listen(&server.host)) return 1;
+	if (!np_host_listen(&server.host, NP_SURFACE_PORT) ||
+	    !np_host_listen(&server.host_control, NP_WINDOW_CONTROL_PORT) ||
+	    !np_host_listen(&server.host_input, NP_WINDOW_INPUT_PORT) ||
+	    !np_host_listen(&server.host_feedback, NP_WINDOW_FEEDBACK_PORT))
+		return 1;
 #endif
 
 	const char *socket = wl_display_add_socket_auto(server.display);
@@ -4550,6 +4818,14 @@ int np_compositor_run(int argc, char **argv) {
 	struct wl_event_loop *loop = wl_display_get_event_loop(server.display);
 	wl_event_loop_add_fd(loop, server.host.listen_fd, WL_EVENT_READABLE,
 	                     host_listener_readable, &server);
+#ifndef NP_REMOTE
+	wl_event_loop_add_fd(loop, server.host_control.listen_fd, WL_EVENT_READABLE,
+	                     host_control_listener_readable, &server);
+	wl_event_loop_add_fd(loop, server.host_input.listen_fd, WL_EVENT_READABLE,
+	                     host_input_listener_readable, &server);
+	wl_event_loop_add_fd(loop, server.host_feedback.listen_fd, WL_EVENT_READABLE,
+	                     host_feedback_listener_readable, &server);
+#endif
 #ifdef NP_REMOTE
 	if (server.media.listen_fd >= 0) {
 		wl_event_loop_add_fd(loop, server.media.listen_fd, WL_EVENT_READABLE,
@@ -4561,6 +4837,11 @@ int np_compositor_run(int argc, char **argv) {
 		wl_display_flush_clients(server.display);
 		wl_event_loop_dispatch(loop, -1);
 		np_host_pump(&server.host, handle_host_command, handle_host_binary, &server);
+#ifndef NP_REMOTE
+		np_host_pump(&server.host_control, handle_host_command, handle_host_binary, &server);
+		np_host_pump(&server.host_input, handle_host_command, handle_host_binary, &server);
+		np_host_pump(&server.host_feedback, handle_host_command, handle_host_binary, &server);
+#endif
 #ifdef NP_REMOTE
 		np_media_pump(&server.media);
 		np_media_accept(&server.media);
@@ -4573,7 +4854,7 @@ int np_compositor_run(int argc, char **argv) {
 			fprintf(stderr, "[media] requested IDR on all encoders\n");
 		}
 #endif
-		sync_host_connection_source(&server);
+		sync_host_channels(&server);
 		flush_pending_frames(&server);
 	}
 
@@ -4581,6 +4862,11 @@ int np_compositor_run(int argc, char **argv) {
 	np_media_finish(&server.media);
 #endif
 	np_host_finish(&server.host);
+#ifndef NP_REMOTE
+	np_host_finish(&server.host_control);
+	np_host_finish(&server.host_input);
+	np_host_finish(&server.host_feedback);
+#endif
 	wl_display_destroy(server.display);
 #ifndef NP_REMOTE
 	if (server.drm_fd >= 0) close(server.drm_fd);

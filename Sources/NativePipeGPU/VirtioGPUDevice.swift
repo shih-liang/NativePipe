@@ -66,16 +66,6 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
     /// `ResourceTable` itself stays queue confined; this is a published mirror.
     private let publishedLock = NSLock()
     private var published: [UInt32: PublishedBuffer] = [:]
-    /// RESOURCE_UNREF can overtake the window-channel commit that names the
-    /// resource: virtio-gpu and vsock are independent queues. Keep a small LRU
-    /// so AppKit can still resolve an already-sent frame.
-    private var retiredPublished: [UInt32: PublishedBuffer] = [:]
-    /// Terminal resource IDs are remembered without retaining their raw Venus
-    /// pointers. This distinguishes a late scene from a not-yet-created one
-    /// without exposing memory after virglrenderer has freed its allocation.
-    private var retiredResourceIDs: Set<UInt32> = []
-    private var retiredPublishedOrder: [UInt32] = []
-    private static let retiredPublishedLimit = 16
     private var latestScanout: ScanoutFrame?
     private var scanoutObservers: [UUID: (ScanoutFrame?) -> Void] = [:]
     private var scanoutDeliveryScheduled = false
@@ -140,14 +130,12 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
         buffer(forResource: resourceID)?.surface
     }
 
-    /// Whether the host has adopted this virtio resource. This deliberately
-    /// does not imply that it is displayable: callers use the distinction to
-    /// separate cross-channel publication races from terminal texture-export
-    /// failures.
+    /// Whether this id currently names a live host resource. Unknown ids are
+    /// treated as the CREATE_BLOB/window-channel ordering case by WindowBridge.
     public func isResourcePublished(_ resourceID: UInt32) -> Bool {
         publishedLock.lock()
         defer { publishedLock.unlock() }
-        return published[resourceID] != nil || retiredResourceIDs.contains(resourceID)
+        return published[resourceID] != nil
     }
 
     /// Mapping of a Venus resource for the optional full-VM scanout path.
@@ -181,7 +169,7 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
     private func buffer(forResource resourceID: UInt32) -> PublishedBuffer? {
         publishedLock.lock()
         defer { publishedLock.unlock() }
-        return published[resourceID] ?? retiredPublished[resourceID]
+        return published[resourceID]
     }
 
     private func publish(_ resource: GPUResource) {
@@ -190,30 +178,13 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
             pointer: resource.baseAddress,
             byteCount: resource.byteCount)
         publishedLock.lock()
-        retiredPublished.removeValue(forKey: resource.resourceID)
-        retiredResourceIDs.remove(resource.resourceID)
-        retiredPublishedOrder.removeAll { $0 == resource.resourceID }
         published[resource.resourceID] = entry
         publishedLock.unlock()
     }
 
     private func unpublish(_ resourceID: UInt32) {
         publishedLock.lock()
-        if let entry = published.removeValue(forKey: resourceID) {
-            // CoreAnimation may still display a legacy IOSurface after UNREF,
-            // so retain that object. A Venus pointer, in contrast, becomes
-            // invalid when virglrenderer unimports the blob and must never be
-            // retained as a PublishedBuffer.
-            if entry.surface != nil { retiredPublished[resourceID] = entry }
-            retiredResourceIDs.insert(resourceID)
-            retiredPublishedOrder.removeAll { $0 == resourceID }
-            retiredPublishedOrder.append(resourceID)
-            while retiredPublishedOrder.count > Self.retiredPublishedLimit {
-                let oldest = retiredPublishedOrder.removeFirst()
-                retiredPublished.removeValue(forKey: oldest)
-                retiredResourceIDs.remove(oldest)
-            }
-        }
+        published.removeValue(forKey: resourceID)
         publishedLock.unlock()
     }
 
@@ -1288,9 +1259,6 @@ extension VirtioGPUDevice: VZCustomVirtioDeviceDelegate {
             resources.removeAll()
             publishedLock.lock()
             published.removeAll(keepingCapacity: true)
-            retiredPublished.removeAll(keepingCapacity: true)
-            retiredResourceIDs.removeAll(keepingCapacity: true)
-            retiredPublishedOrder.removeAll(keepingCapacity: true)
             publishedLock.unlock()
             completion()
             done()
@@ -1320,9 +1288,6 @@ extension VirtioGPUDevice: VZCustomVirtioDeviceDelegate {
         resources.removeAll()
         publishedLock.lock()
         published.removeAll(keepingCapacity: false)
-        retiredPublished.removeAll(keepingCapacity: false)
-        retiredResourceIDs.removeAll(keepingCapacity: false)
-        retiredPublishedOrder.removeAll(keepingCapacity: false)
         publishedLock.unlock()
         np_venus_destroy(venus)
         rendererDestroyed = true
