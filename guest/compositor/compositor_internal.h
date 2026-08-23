@@ -63,6 +63,7 @@ struct np_server {
 	struct wl_event_source *scene_retry_timer;
 	int watched_host_fd;
 	uint32_t watched_host_mask;
+	char session_socket[128];
 };
 
 struct np_input {

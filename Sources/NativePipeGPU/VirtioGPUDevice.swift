@@ -70,6 +70,10 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
     /// resource: virtio-gpu and vsock are independent queues. Keep a small LRU
     /// so AppKit can still resolve an already-sent frame.
     private var retiredPublished: [UInt32: PublishedBuffer] = [:]
+    /// Terminal resource IDs are remembered without retaining their raw Venus
+    /// pointers. This distinguishes a late scene from a not-yet-created one
+    /// without exposing memory after virglrenderer has freed its allocation.
+    private var retiredResourceIDs: Set<UInt32> = []
     private var retiredPublishedOrder: [UInt32] = []
     private static let retiredPublishedLimit = 16
     private var latestScanout: ScanoutFrame?
@@ -136,6 +140,16 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
         buffer(forResource: resourceID)?.surface
     }
 
+    /// Whether the host has adopted this virtio resource. This deliberately
+    /// does not imply that it is displayable: callers use the distinction to
+    /// separate cross-channel publication races from terminal texture-export
+    /// failures.
+    public func isResourcePublished(_ resourceID: UInt32) -> Bool {
+        publishedLock.lock()
+        defer { publishedLock.unlock() }
+        return published[resourceID] != nil || retiredResourceIDs.contains(resourceID)
+    }
+
     /// Mapping of a Venus resource for the optional full-VM scanout path.
     /// Application windows never call this API.
     public func gpuMemory(forResource resourceID: UInt32) -> (UnsafeMutableRawPointer, Int)? {
@@ -177,6 +191,7 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
             byteCount: resource.byteCount)
         publishedLock.lock()
         retiredPublished.removeValue(forKey: resource.resourceID)
+        retiredResourceIDs.remove(resource.resourceID)
         retiredPublishedOrder.removeAll { $0 == resource.resourceID }
         published[resource.resourceID] = entry
         publishedLock.unlock()
@@ -184,13 +199,19 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
 
     private func unpublish(_ resourceID: UInt32) {
         publishedLock.lock()
-        if let entry = published.removeValue(forKey: resourceID), entry.surface != nil {
-            retiredPublished[resourceID] = entry
+        if let entry = published.removeValue(forKey: resourceID) {
+            // CoreAnimation may still display a legacy IOSurface after UNREF,
+            // so retain that object. A Venus pointer, in contrast, becomes
+            // invalid when virglrenderer unimports the blob and must never be
+            // retained as a PublishedBuffer.
+            if entry.surface != nil { retiredPublished[resourceID] = entry }
+            retiredResourceIDs.insert(resourceID)
             retiredPublishedOrder.removeAll { $0 == resourceID }
             retiredPublishedOrder.append(resourceID)
             while retiredPublishedOrder.count > Self.retiredPublishedLimit {
                 let oldest = retiredPublishedOrder.removeFirst()
                 retiredPublished.removeValue(forKey: oldest)
+                retiredResourceIDs.remove(oldest)
             }
         }
         publishedLock.unlock()
@@ -1268,6 +1289,7 @@ extension VirtioGPUDevice: VZCustomVirtioDeviceDelegate {
             publishedLock.lock()
             published.removeAll(keepingCapacity: true)
             retiredPublished.removeAll(keepingCapacity: true)
+            retiredResourceIDs.removeAll(keepingCapacity: true)
             retiredPublishedOrder.removeAll(keepingCapacity: true)
             publishedLock.unlock()
             completion()
@@ -1299,6 +1321,7 @@ extension VirtioGPUDevice: VZCustomVirtioDeviceDelegate {
         publishedLock.lock()
         published.removeAll(keepingCapacity: false)
         retiredPublished.removeAll(keepingCapacity: false)
+        retiredResourceIDs.removeAll(keepingCapacity: false)
         retiredPublishedOrder.removeAll(keepingCapacity: false)
         publishedLock.unlock()
         np_venus_destroy(venus)

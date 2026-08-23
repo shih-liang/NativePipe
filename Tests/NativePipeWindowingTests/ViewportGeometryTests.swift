@@ -28,32 +28,30 @@ final class ViewportGeometryTests: XCTestCase {
 
         let coordinates = SurfaceCoordinateSpace(
             .init(x: 26, y: 23, width: 800, height: 600))
-        // The guest output is already cropped to window_geometry. Its host
-        // scene starts at zero, while input still restores the surface origin.
+        // The guest output and host input protocol are both zero-origin within
+        // window_geometry. Only the guest maps that point back to wl_surface.
         XCTAssertEqual(coordinates.sceneBounds, CGRect(x: 0, y: 0, width: 800, height: 600))
         XCTAssertEqual(
-            coordinates.surfacePoint(fromContent: .zero),
-            CGPoint(x: 26, y: 23))
+            coordinates.windowPoint(fromContent: .zero),
+            .zero)
         XCTAssertEqual(
-            coordinates.contentPoint(fromSurface: CGPoint(x: 36, y: 30)),
+            coordinates.contentPoint(fromWindow: CGPoint(x: 10, y: 7)),
             CGPoint(x: 10, y: 7))
         XCTAssertEqual(
             coordinates.contentPoint(
-                fromSurface: coordinates.surfacePoint(
+                fromWindow: coordinates.windowPoint(
                     fromContent: CGPoint(x: 734.5, y: 418.25))),
             CGPoint(x: 734.5, y: 418.25))
 
-        // While AppKit is ahead of the client during live resize, the whole
-        // committed tree is stretched and pointer input uses the exact inverse.
+        // A live resize never rescales the committed scene or pointer space.
+        // The client receives the newest configure and paints that exact size.
         let resizing = SurfaceCoordinateSpace(
-            .init(x: 26, y: 23, width: 800, height: 600),
-            contentSize: CGSize(width: 400, height: 300))
-        XCTAssertEqual(resizing.sceneScale, CGSize(width: 0.5, height: 0.5))
+            .init(x: 26, y: 23, width: 800, height: 600))
         XCTAssertEqual(
-            resizing.surfacePoint(fromContent: CGPoint(x: 200, y: 150)),
-            CGPoint(x: 426, y: 323))
+            resizing.windowPoint(fromContent: CGPoint(x: 200, y: 150)),
+            CGPoint(x: 200, y: 150))
         XCTAssertEqual(
-            resizing.contentPoint(fromSurface: CGPoint(x: 426, y: 323)),
+            resizing.contentPoint(fromWindow: CGPoint(x: 200, y: 150)),
             CGPoint(x: 200, y: 150))
     }
 
@@ -181,6 +179,30 @@ final class ViewportGeometryTests: XCTestCase {
         })
         XCTAssertFalse(commands.contains {
             if case .frameReleased(surface: 8, presentationID: 18) = $0 { return true }
+            return false
+        })
+        bridge.closeAll()
+    }
+
+    func testPublishedButUnpresentableSceneIsDiscardedAndReleased() {
+        final class PublishedFrameSource: FrameSource {
+            func surface(forResource resourceID: UInt32) -> IOSurfaceRef? { nil }
+            func isResourcePublished(_ resourceID: UInt32) -> Bool { resourceID == 99 }
+        }
+
+        let bridge = WindowBridge(frameSource: PublishedFrameSource())
+        var commands: [Windowing.HostCommand] = []
+        bridge.output = { commands.append($0) }
+        bridge.apply(.surfaceCreated(surface: 8))
+        bridge.apply(.toplevelCreated(window: 3, surface: 8))
+        bridge.apply(.sceneCommitted(scene: scene(presentationID: 17)))
+
+        XCTAssertTrue(commands.contains {
+            if case .framePresented(surface: 8, presentationID: 17) = $0 { return true }
+            return false
+        })
+        XCTAssertTrue(commands.contains {
+            if case .frameReleased(surface: 8, presentationID: 17) = $0 { return true }
             return false
         })
         bridge.closeAll()

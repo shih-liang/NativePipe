@@ -14,6 +14,11 @@ import UniformTypeIdentifiers
 @MainActor
 public protocol FrameSource: AnyObject {
     func surface(forResource resourceID: UInt32) -> IOSurfaceRef?
+    /// True once the virtio-gpu CREATE_RESOURCE/CREATE_BLOB for this id has
+    /// reached the host. A published resource that still cannot produce the
+    /// requested texture is not an ordering race and must not hold a Wayland
+    /// buffer forever.
+    func isResourcePublished(_ resourceID: UInt32) -> Bool
     func metalTexture(
         forResource resourceID: UInt32,
         width: Int, height: Int, bytesPerRow: Int, format: UInt32
@@ -21,6 +26,8 @@ public protocol FrameSource: AnyObject {
 }
 
 extension FrameSource {
+    public func isResourcePublished(_ resourceID: UInt32) -> Bool { false }
+
     public func metalTexture(
         forResource resourceID: UInt32,
         width: Int, height: Int, bytesPerRow: Int, format: UInt32
@@ -96,6 +103,7 @@ public final class WindowBridge {
         private let view = NSView()
         private let metalLayer = CAMetalLayer()
         private var renderer: HostSceneRenderer?
+        private var presenter: AsyncMetalScenePresenter?
         private weak var rendererDevice: MTLDevice?
         private var displayedTexture: MTLTexture?
 
@@ -129,19 +137,19 @@ public final class WindowBridge {
                 width: CGFloat(frame.width) / scale,
                 height: CGFloat(frame.height) / scale)
             panel.setContentSize(size)
-            metalLayer.device = texture.device
-            metalLayer.contentsScale = scale
-            metalLayer.drawableSize = CGSize(width: frame.width, height: frame.height)
             metalLayer.frame = view.bounds
             if renderer == nil || rendererDevice !== texture.device {
                 renderer = try? HostSceneRenderer(device: texture.device)
+                presenter = renderer.map {
+                    AsyncMetalScenePresenter(
+                        layer: metalLayer, device: texture.device, renderer: $0)
+                }
                 rendererDevice = texture.device
             }
-            guard let renderer else { return false }
+            guard let presenter else { return false }
             displayedTexture = texture
             moveToPointer()
             panel.orderFrontRegardless()
-            guard let drawable = metalLayer.nextDrawable() else { return false }
 
             let source = frame.fullViewportBufferPixelRect
             let layer = Windowing.SceneLayer(
@@ -162,23 +170,13 @@ public final class WindowBridge {
                 windowGeometry: .init(
                     x: 0, y: 0, width: Int(size.width), height: Int(size.height)),
                 layers: [layer])
-            drawable.addPresentedHandler { _ in
-                DispatchQueue.main.async(execute: presented)
-            }
-            do {
-                try renderer.encode(
-                    scene: scene,
-                    layers: [ResolvedSceneLayer(state: layer, texture: texture)],
-                    drawable: drawable
-                ) { command in
-                    DispatchQueue.main.async {
-                        readComplete(command.status == .completed)
-                    }
-                }
-                return true
-            } catch {
-                return false
-            }
+            presenter.enqueue(
+                scene: scene,
+                layers: [ResolvedSceneLayer(state: layer, texture: texture)],
+                readComplete: readComplete,
+                latched: {},
+                presented: presented)
+            return true
         }
 
         func moveToPointer() {
@@ -514,6 +512,20 @@ public final class WindowBridge {
                 bytesPerRow: layer.bytesPerRow, format: virglFormat),
                 let texture = object as? MTLTexture
             else {
+                if frameSource.isResourcePublished(layer.resourceID) {
+                    // The guest waits for every scene's frame/FIFO completion
+                    // before it can submit the next swapchain image. Once the
+                    // named resource exists, an export failure cannot be fixed
+                    // by another CREATE_BLOB notification. Drop this frame and
+                    // release its host-read references instead of deadlocking
+                    // the whole client behind one unpresentable image.
+                    pendingScenes.removeValue(forKey: scene.surface)
+                    Self.note(
+                        "scene discarded: published resource " +
+                        "\(layer.resourceID) has no Metal texture")
+                    completeScene(scene)
+                    return
+                }
                 retainDeferred(scene)
                 Self.note(
                     "scene deferred: no Metal texture for resource \(layer.resourceID)")

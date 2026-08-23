@@ -108,6 +108,17 @@ static bool publish_session_environment(const char *socket)
 	if (!ok) unlink(temporary);
 	return ok;
 }
+
+static void unpublish_session_environment(void)
+{
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+	if (!runtime || !runtime[0]) return;
+	char path[1024];
+	snprintf(path, sizeof(path), "%s/nativepipe-wayland.env", runtime);
+	if (unlink(path) < 0 && errno != ENOENT)
+		fprintf(stderr, "[wayland] could not remove session readiness: %s\n",
+		        strerror(errno));
+}
 #endif
 
 
@@ -4341,11 +4352,23 @@ static void discard_disconnected_host_reads(struct np_server *server) {
 }
 
 static void sync_host_connection_source(struct np_server *server) {
-	if (server->watched_host_fd >= 0 && server->host.conn_fd < 0)
+	if (server->watched_host_fd >= 0 && server->host.conn_fd < 0) {
+#ifndef NP_REMOTE
+		unpublish_session_environment();
+#endif
 		discard_disconnected_host_reads(server);
+	}
 	// Detected before the mask is computed, so the replay it queues is what
 	// arms the writability watch below.
 	if (server->watched_host_fd < 0 && server->host.conn_fd >= 0) {
+		/* channelReady is also the host-side launch gate.  Publish the guest
+		 * session record before sending it: np_host_send may make channelReady
+		 * visible to the host immediately, and guestd can otherwise fork the
+		 * first GUI process before WAYLAND_DISPLAY exists. */
+#ifndef NP_REMOTE
+		if (!publish_session_environment(server->session_socket))
+			fprintf(stderr, "[wayland] could not publish the session environment\n");
+#endif
 		cJSON *ready = cJSON_CreateObject();
 		cJSON_AddNumberToObject(ready, "sessionID", (double)(uint32_t)getpid());
 		cJSON_AddNumberToObject(ready, "protocolVersion", 1);
@@ -4428,6 +4451,13 @@ int np_compositor_run(int argc, char **argv) {
 	(void)argc;
 	(void)argv;
 
+#ifndef NP_REMOTE
+	/* A compositor killed before its host socket closes cannot remove its
+	 * readiness record.  Never let a replacement Wayland socket inherit that
+	 * stale launch permission. */
+	unpublish_session_environment();
+#endif
+
 	server.drm_fd = -1;
 #ifdef NP_REMOTE
 	fprintf(stderr, "[wayland] remote build: TCP 1025/1026, H.264 encode, no virtio blobs\n");
@@ -4487,6 +4517,13 @@ int np_compositor_run(int argc, char **argv) {
 		return 1;
 	}
 	fprintf(stderr, "[wayland] WAYLAND_DISPLAY=%s\n", socket);
+#ifndef NP_REMOTE
+	if (strlen(socket) >= sizeof(server.session_socket)) {
+		fprintf(stderr, "[wayland] display name is too long\n");
+		return 1;
+	}
+	strcpy(server.session_socket, socket);
+#endif
 #ifdef NP_REMOTE
 	// So `remotepipe user@host` (and any later shell) can point clients at
 	// *this* compositor even when the session already owns wayland-0 under
@@ -4517,12 +4554,6 @@ int np_compositor_run(int argc, char **argv) {
 	if (server.media.listen_fd >= 0) {
 		wl_event_loop_add_fd(loop, server.media.listen_fd, WL_EVENT_READABLE,
 		                     media_listener_readable, &server);
-	}
-#endif
-#ifndef NP_REMOTE
-	if (!publish_session_environment(socket)) {
-		fprintf(stderr, "[wayland] could not publish the session environment\n");
-		return 1;
 	}
 #endif
 	for (;;) {

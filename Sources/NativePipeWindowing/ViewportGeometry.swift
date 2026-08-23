@@ -8,51 +8,35 @@ import NativePipeProtocol
 /// Buffer scale and wp_viewport do not participate in this transform: they map
 /// pixels into logical surface coordinates before the window boundary.
 struct SurfaceCoordinateSpace: Equatable {
-    let windowGeometry: CGRect
-    let contentSize: CGSize
+    /// The host boundary deliberately retains only the xdg window-geometry
+    /// size. Its origin belongs to the guest surface tree; keeping it out of
+    /// this type makes a second host-side origin translation impossible.
+    private let logicalWindowSize: CGSize
 
-    init(_ geometry: Windowing.Rect, contentSize: CGSize? = nil) {
-        windowGeometry = CGRect(
-            x: geometry.x, y: geometry.y,
+    init(_ geometry: Windowing.Rect) {
+        logicalWindowSize = CGSize(
             width: geometry.width, height: geometry.height)
-        self.contentSize = contentSize ?? windowGeometry.size
     }
 
-    /// CALayer bounds for the scene viewport. Setting its frame to the AppKit
-    /// content bounds maps the entire committed tree as one unit while a client
-    /// is still catching up with a live resize.
+    /// Logical bounds of the committed scene. The host does not fit these
+    /// bounds to a newer AppKit size: it waits for an exact client redraw.
     /// The guest compositor has already cropped the complete surface tree to
     /// xdg_surface.window_geometry. The host scene therefore always starts at
-    /// zero; the geometry origin remains only for translating input back into
-    /// the root wl_surface coordinate space.
+    /// zero. The guest compositor alone retains the geometry origin for the
+    /// later translation into root wl_surface coordinates.
     var sceneBounds: CGRect {
-        CGRect(origin: .zero, size: windowGeometry.size)
+        CGRect(origin: .zero, size: logicalWindowSize)
     }
 
-    var sceneScale: CGSize {
-        CGSize(
-            width: windowGeometry.width > 0 ? contentSize.width / windowGeometry.width : 1,
-            height: windowGeometry.height > 0 ? contentSize.height / windowGeometry.height : 1)
+    /// Convert AppKit content points to the zero-origin xdg window-geometry
+    /// coordinate space carried by the host protocol. The guest compositor is
+    /// the sole owner of the later window-geometry -> root wl_surface offset.
+    func windowPoint(fromContent point: CGPoint) -> CGPoint {
+        point
     }
 
-    private var surfaceUnitsPerContentPoint: CGSize {
-        CGSize(
-            width: contentSize.width > 0 ? windowGeometry.width / contentSize.width : 1,
-            height: contentSize.height > 0 ? windowGeometry.height / contentSize.height : 1)
-    }
-
-    func surfacePoint(fromContent point: CGPoint) -> CGPoint {
-        let scale = surfaceUnitsPerContentPoint
-        return CGPoint(
-            x: windowGeometry.minX + point.x * scale.width,
-            y: windowGeometry.minY + point.y * scale.height)
-    }
-
-    func contentPoint(fromSurface point: CGPoint) -> CGPoint {
-        let scale = surfaceUnitsPerContentPoint
-        return CGPoint(
-            x: scale.width != 0 ? (point.x - windowGeometry.minX) / scale.width : 0,
-            y: scale.height != 0 ? (point.y - windowGeometry.minY) / scale.height : 0)
+    func contentPoint(fromWindow point: CGPoint) -> CGPoint {
+        point
     }
 }
 
