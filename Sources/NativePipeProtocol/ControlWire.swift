@@ -17,12 +17,16 @@ import Foundation
 ///     NPRU  run           id(u64) LaunchSpec
 ///     NPXC  exec          id(u64) cols(u32) rows(u32) LaunchSpec
 ///     NPRE  read path     id(u64) path_len(u16) path
+///     NPWR  write path    id(u64) path(str) mode(u32) size(u64) bytes
 ///     NPCT  list continue id(u64)
 ///     NPCL  list cancel   id(u64)
 ///     NPMS  stat path     id(u64) path_len(u16) path
 ///     NPSH  shutdown      id(u64)
 ///     NPUS  setUser       id(u64) user_len(u16) user flags(u8) [old_len(u16) old]
 ///     NPWP  setPassword   id(u64) user_len(u16) user pass_len(u16) pass
+///     NPIH  init inventory id(u64)
+///     NPIM  init mount    id(u64) identifier(str) partition(u16) writable(u8) reserved(u8)
+///     NPIC  init execute  id(u64) action(u8) automatic(u8) reserved(u16) five strings
 ///
 /// Guest → host:
 ///     NPOK  ok            id(u64)
@@ -34,6 +38,7 @@ import Foundation
 ///     NPFL  file bytes    id(u64) path_len(u16) path size(u64) bytes
 ///     NPLS  dir listing   id(u64) path_len(u16) path flags(u32) count(u32) entries
 ///     NPFS  path stat     id(u64) path_len(u16) path mode(u32) uid(u32) gid(u32) size(u64) mtime(i64)
+///     NPIB  block devices id(u64) count(u16) entries
 ///     NPER  error         id(u64) code(u32) msg_len(u16) msg
 ///
 /// Guest → host events (no request id):
@@ -67,12 +72,16 @@ public enum ControlWire {
     public static let runMagic: [UInt8] = Array("NPRU".utf8)
     public static let execMagic: [UInt8] = Array("NPXC".utf8)
     public static let readMagic: [UInt8] = Array("NPRE".utf8)
+    public static let writeMagic: [UInt8] = Array("NPWR".utf8)
     public static let continueMagic: [UInt8] = Array("NPCT".utf8)
     public static let cancelMagic: [UInt8] = Array("NPCL".utf8)
     public static let statMagic: [UInt8] = Array("NPMS".utf8)
     public static let shutdownMagic: [UInt8] = Array("NPSH".utf8)
     public static let setUserMagic: [UInt8] = Array("NPUS".utf8)
     public static let setPasswordMagic: [UInt8] = Array("NPWP".utf8)
+    public static let initInventoryMagic: [UInt8] = Array("NPIH".utf8)
+    public static let initMountMagic: [UInt8] = Array("NPIM".utf8)
+    public static let initExecuteMagic: [UInt8] = Array("NPIC".utf8)
 
     // Guest → host
     public static let okMagic: [UInt8] = Array("NPOK".utf8)
@@ -84,6 +93,7 @@ public enum ControlWire {
     public static let fileMagic: [UInt8] = Array("NPFL".utf8)
     public static let listMagic: [UInt8] = Array("NPLS".utf8)
     public static let pathStatMagic: [UInt8] = Array("NPFS".utf8)
+    public static let initInventoryResultMagic: [UInt8] = Array("NPIB".utf8)
     public static let errorMagic: [UInt8] = Array("NPER".utf8)
 
     // Events
@@ -117,10 +127,11 @@ public enum ControlWire {
     private static let knownMagics: Set<[UInt8]> = [
         helloMagic, pingMagic, getVersionMagic, refreshEnvironmentMagic, reconcileResourcesMagic,
         resizeMagic, launchMagic, runMagic,
-        execMagic, readMagic, continueMagic, cancelMagic, statMagic, shutdownMagic, setUserMagic,
-        setPasswordMagic, okMagic, versionMagic, infoMagic, launchedMagic, ranMagic,
+        execMagic, readMagic, writeMagic, continueMagic, cancelMagic, statMagic, shutdownMagic,
+        setUserMagic, setPasswordMagic, initInventoryMagic, initMountMagic, initExecuteMagic,
+        okMagic, versionMagic, infoMagic, launchedMagic, ranMagic,
         execSessionMagic, fileMagic, listMagic, pathStatMagic, errorMagic, runtimeReadyMagic,
-        processExitedMagic, logMagic,
+        initInventoryResultMagic, processExitedMagic, logMagic,
     ]
 
     // MARK: - Encode requests
@@ -180,6 +191,38 @@ public enum ControlWire {
             var payload = Data(statMagic)
             append(id, to: &payload)
             appendString(path, to: &payload)
+            return payload
+        case .writePath(let path, let mode, let data):
+            var payload = Data(writeMagic)
+            append(id, to: &payload)
+            appendString(path, to: &payload)
+            append(mode, to: &payload)
+            append(UInt64(data.count), to: &payload)
+            payload.append(data)
+            return payload
+        case .initInventory:
+            var payload = Data(initInventoryMagic)
+            append(id, to: &payload)
+            return payload
+        case .initMount(let identifier, let partition, let writable):
+            var payload = Data(initMountMagic)
+            append(id, to: &payload)
+            appendString(identifier, to: &payload)
+            append(partition, to: &payload)
+            payload.append(writable ? 1 : 0)
+            payload.append(0)
+            return payload
+        case .initExecute(let plan):
+            var payload = Data(initExecuteMagic)
+            append(id, to: &payload)
+            payload.append(plan.action.rawValue)
+            payload.append(plan.automatic ? 1 : 0)
+            payload.append(contentsOf: [0, 0])
+            appendString(plan.diskIdentifier, to: &payload)
+            appendString(plan.root, to: &payload)
+            appendString(plan.payloadTag, to: &payload)
+            appendString(plan.adapterPath, to: &payload)
+            appendString(plan.sourcePath, to: &payload)
             return payload
         case .shutdown:
             var payload = Data(shutdownMagic)
@@ -320,6 +363,25 @@ public enum ControlWire {
                 id: id,
                 result: .pathStat(
                     PathStat(path: path, mode: mode, uid: uid, gid: gid, size: size, mtime: mtime)))
+        }
+        if magic == initInventoryResultMagic {
+            guard let count: UInt16 = take(&offset, from: payload) else { return nil }
+            var devices: [InitBlockDevice] = []
+            devices.reserveCapacity(Int(count))
+            for _ in 0..<count {
+                guard let name = takeString(&offset, from: payload),
+                      let identifier = takeString(&offset, from: payload),
+                      let size: UInt64 = take(&offset, from: payload),
+                      offset + 2 <= payload.count else { return nil }
+                let readOnly = payload[offset] != 0
+                let isPartition = payload[offset + 1] != 0
+                offset += 2
+                devices.append(.init(
+                    name: name, identifier: identifier, sizeBytes: size,
+                    readOnly: readOnly, isPartition: isPartition))
+            }
+            guard offset == payload.count else { return nil }
+            return .response(id: id, result: .initInventory(devices))
         }
         if magic == errorMagic {
             guard let code: UInt32 = take(&offset, from: payload),

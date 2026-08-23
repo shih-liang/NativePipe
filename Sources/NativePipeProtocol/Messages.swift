@@ -37,6 +37,20 @@ public struct Request: Sendable {
         /// `lstat` a guest path: type, permissions, owner, size, mtime.
         case statPath(path: String)
 
+        /// Atomically replace a guest file. The initramfs resolves this path
+        /// beneath the explicitly mounted target root; guestd resolves it in
+        /// the running root. Both endpoints use identical wire semantics.
+        case writePath(path: String, mode: UInt32, data: Data)
+
+        /// Initramfs-only: enumerate disks so the host can choose explicitly.
+        case initInventory
+
+        /// Initramfs-only: mount an explicitly identified disk/partition.
+        case initMount(diskIdentifier: String, partition: UInt16, writable: Bool)
+
+        /// Initramfs-only: perform an explicit boot/install/repair/shell action.
+        case initExecute(InitPlan)
+
         /// Ask the guest to shut down cleanly (guestd calls into the distro init).
         case shutdown
 
@@ -62,6 +76,60 @@ public struct Request: Sendable {
 
         /// Set the password for an existing guest account (`chpasswd`).
         case setPassword(username: String, password: String)
+    }
+}
+
+public enum InitAction: UInt8, Sendable, Codable {
+    case boot = 0
+    case install = 1
+    case repair = 2
+    case shell = 3
+}
+
+public struct InitPlan: Sendable, Codable {
+    public var action: InitAction
+    public var automatic: Bool
+    public var diskIdentifier: String
+    public var root: String
+    public var payloadTag: String
+    public var adapterPath: String
+    public var sourcePath: String
+
+    public init(
+        action: InitAction,
+        automatic: Bool = true,
+        diskIdentifier: String = "",
+        root: String = "",
+        payloadTag: String = "nativepipe-install",
+        adapterPath: String = "/run/nativepipe/payload/adapter.sh",
+        sourcePath: String = "/run/nativepipe/payload/source"
+    ) {
+        self.action = action
+        self.automatic = automatic
+        self.diskIdentifier = diskIdentifier
+        self.root = root
+        self.payloadTag = payloadTag
+        self.adapterPath = adapterPath
+        self.sourcePath = sourcePath
+    }
+}
+
+public struct InitBlockDevice: Sendable {
+    public var name: String
+    public var identifier: String
+    public var sizeBytes: UInt64
+    public var readOnly: Bool
+    public var isPartition: Bool
+
+    public init(
+        name: String, identifier: String, sizeBytes: UInt64,
+        readOnly: Bool, isPartition: Bool
+    ) {
+        self.name = name
+        self.identifier = identifier
+        self.sizeBytes = sizeBytes
+        self.readOnly = readOnly
+        self.isPartition = isPartition
     }
 }
 
@@ -220,6 +288,7 @@ public struct Response: Sendable {
         case execSession(pid: Int32, port: UInt32)
         case pathContents(PathContents)
         case pathStat(PathStat)
+        case initInventory([InitBlockDevice])
         case failure(code: Int32, message: String)
     }
 }
@@ -283,6 +352,8 @@ public enum Event: Sendable {
 
 /// Capability strings a guest may advertise in `GuestInfo.capabilities`.
 public enum GuestCapability {
+    public static let initControl = "init.control"
+    public static let fileWrite = "fs.write"
     public static let consoleResize = "console.resize"
     public static let launch = "process.launch"
     public static let wayland = "display.wayland"

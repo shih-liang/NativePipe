@@ -26,7 +26,8 @@ public enum NativePipePort {
     public static let agent: UInt32 = 1029
 
     /// Interactive PTY exec. After control `exec` succeeds, the host dials
-    /// the guest on this port and the guest accepts once per session.
+    /// the guest on this port and the guest accepts once per session. Dynamic
+    /// PTY listeners occupy 1030...1285.
     public static let exec: UInt32 = 1030
 }
 
