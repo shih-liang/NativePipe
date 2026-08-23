@@ -20,6 +20,11 @@ public enum Windowing {}
 extension Windowing {
     /// Things the guest's translator reports upward.
     public enum GuestEvent: Codable, Sendable {
+        /// The compositor sends this before replaying its authoritative state
+        /// on every new transport connection. A connected vsock alone is not
+        /// evidence that the guest event loop owns and can write the channel.
+        case channelReady(sessionID: UInt32, protocolVersion: UInt32)
+
         case surfaceCreated(surface: UInt32)
         case surfaceDestroyed(surface: UInt32)
 

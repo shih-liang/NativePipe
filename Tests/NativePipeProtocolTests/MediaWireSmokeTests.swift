@@ -104,6 +104,17 @@ final class MediaWireSmokeTests: XCTestCase {
         XCTAssertEqual(decoded.bitstreamEpoch, 3)
     }
 
+    func testWindowChannelReadyRoundTrip() throws {
+        let event = Windowing.GuestEvent.channelReady(sessionID: 42, protocolVersion: 1)
+        let data = try JSONEncoder().encode(event)
+        let decoded = try JSONDecoder().decode(Windowing.GuestEvent.self, from: data)
+        guard case .channelReady(let sessionID, let protocolVersion) = decoded else {
+            return XCTFail("not a channel-ready event")
+        }
+        XCTAssertEqual(sessionID, 42)
+        XCTAssertEqual(protocolVersion, 1)
+    }
+
     func testExecWireSurvivesFragmentationAndMagicInPTYData() throws {
         let bytes = Data("before-NPXT-after".utf8)
         let dataFrame = try ExecWire.data(bytes)

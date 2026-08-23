@@ -98,6 +98,7 @@ final class NativeWindow: NSObject {
     }
 
     var isPopup: Bool { popup != nil }
+    var applicationID: String? { appID }
 
     /// The guest compositor sends one already-composited scene per window.
     /// This is the only content layer at the host boundary.

@@ -4345,8 +4345,13 @@ static void sync_host_connection_source(struct np_server *server) {
 		discard_disconnected_host_reads(server);
 	// Detected before the mask is computed, so the replay it queues is what
 	// arms the writability watch below.
-	if (server->watched_host_fd < 0 && server->host.conn_fd >= 0)
+	if (server->watched_host_fd < 0 && server->host.conn_fd >= 0) {
+		cJSON *ready = cJSON_CreateObject();
+		cJSON_AddNumberToObject(ready, "sessionID", (double)(uint32_t)getpid());
+		cJSON_AddNumberToObject(ready, "protocolVersion", 1);
+		np_host_send(&server->host, "channelReady", ready);
 		republish_state(server);
+	}
 
 	// Writability is watched only while something is waiting to go out. Without
 	// it, a socket that returned EAGAIN leaves the backlog parked until some

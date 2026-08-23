@@ -213,6 +213,7 @@ public final class WindowBridge {
     private var pointerCursor = NSCursor.arrow
 
     private var windows: [UInt32: NativeWindow] = [:]
+    private var mappedApplicationWindows: Set<UInt32> = []
     /// Surfaces that exist but have no role yet, and the toplevel each one backs.
     private var surfaceToWindow: [UInt32: UInt32] = [:]
     private var knownSurfaces: Set<UInt32> = []
@@ -225,6 +226,9 @@ public final class WindowBridge {
     /// Sends a command down to the guest translator. Wired to the vsock channel
     /// in the real path; the demo driver substitutes its own sink.
     public var output: ((Windowing.HostCommand) -> Void)?
+    /// Fired once when a toplevel has both an app id and a materialized
+    /// NSWindow. This is the launcher's end-to-end success signal.
+    public var onApplicationWindowMapped: ((String) -> Void)?
 
     let clipboard = ClipboardBridge()
 
@@ -275,6 +279,10 @@ public final class WindowBridge {
         }
 
         switch event {
+        case .channelReady:
+            // Consumed by WindowChannel as the transport generation boundary.
+            break
+
         case .surfaceCreated(let surface):
             knownSurfaces.insert(surface)
 
@@ -296,6 +304,7 @@ public final class WindowBridge {
                 dragIcon.hide()
             }
             if let windowID = surfaceToWindow.removeValue(forKey: surface) {
+                mappedApplicationWindows.remove(windowID)
                 windows.removeValue(forKey: windowID)?.close()
             }
 
@@ -328,12 +337,14 @@ public final class WindowBridge {
 
         case .popupDestroyed(let window):
             if let native = windows.removeValue(forKey: window) {
+                mappedApplicationWindows.remove(window)
                 surfaceToWindow.removeValue(forKey: native.surfaceID)
                 native.close()
             }
 
         case .toplevelDestroyed(let window):
             if let native = windows.removeValue(forKey: window) {
+                mappedApplicationWindows.remove(window)
                 surfaceToWindow.removeValue(forKey: native.surfaceID)
                 native.close()
             }
@@ -371,6 +382,7 @@ public final class WindowBridge {
 
         case .appIDChanged(let window, let appID):
             windows[window]?.setAppID(appID)
+            notifyApplicationWindowMapped(window)
 
         case .decorationModeChanged(let window, let serverSide):
             windows[window]?.setServerDecorated(serverSide)
@@ -518,6 +530,7 @@ public final class WindowBridge {
                     surface: scene.surface,
                     presentationID: scene.presentationID))
             })
+        notifyApplicationWindowMapped(windowID)
         native.traceLayerGeometry()
         injectTestInput(windowID)
         scheduleResizeProbe(native)
@@ -594,6 +607,7 @@ public final class WindowBridge {
         }
         pendingFrames.removeValue(forKey: surface)
         native.present(frame: frame, surface: ioSurface)
+        notifyApplicationWindowMapped(windowID)
         dumpFrameIfRequested(frame, surfaceID: surface, surface: ioSurface)
         if Self.frameTrace {
             Self.note("installed window=\(windowID) res=\(frame.resourceID)")
@@ -630,6 +644,16 @@ public final class WindowBridge {
     private func nativeWindowOwningSurface(_ surface: UInt32) -> NativeWindow? {
         guard let windowID = surfaceToWindow[surface] else { return nil }
         return windows[windowID]
+    }
+
+    private func notifyApplicationWindowMapped(_ windowID: UInt32) {
+        guard !mappedApplicationWindows.contains(windowID),
+              let native = windows[windowID], !native.isPopup,
+              native.window != nil,
+              let appID = native.applicationID, !appID.isEmpty
+        else { return }
+        mappedApplicationWindows.insert(windowID)
+        onApplicationWindowMapped?(appID)
     }
 
     /// Writes the first presented frame to NATIVEPIPE_WINDOW_DUMP, if set.
@@ -785,6 +809,7 @@ public final class WindowBridge {
         pendingScenes.removeAll()
         for (_, window) in windows { window.close() }
         windows.removeAll()
+        mappedApplicationWindows.removeAll()
         surfaceToWindow.removeAll()
         knownSurfaces.removeAll()
     }
