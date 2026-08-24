@@ -68,17 +68,32 @@ REMOTE_BINARY := remotepipe-wayland
 CLIENT        := shmclient
 VKPRESENT     := vkpresent
 ALIGN_BLOB    := ../align-host-blob.so
+ALIGN_LAYER   := ../vulkan-blob-alignment-layer.so
+ALIGN_TEST    := ../align-host-blob-test
+LAYER_TEST    := ../vulkan-blob-alignment-layer-test
 DISCONNECT_TRACE := ../tools/wayland-disconnect-trace.so
 
-.PHONY: all remote clean install install-remote align-blob disconnect-trace static static-clean
+.PHONY: all remote clean install install-remote align-blob alignment-self-test disconnect-trace static static-clean
 
 all: $(BINARY) $(CLIENT)
 remote: $(REMOTE_BINARY)
-align-blob: $(ALIGN_BLOB)
+align-blob: $(ALIGN_BLOB) $(ALIGN_LAYER)
+alignment-self-test: $(ALIGN_TEST) $(LAYER_TEST)
+	$(ALIGN_TEST)
+	$(LAYER_TEST)
 disconnect-trace: $(DISCONNECT_TRACE)
 
 $(ALIGN_BLOB): ../align-host-blob.c
 	$(CC) -O2 -shared -fPIC -o $@ $< -ldl
+
+$(ALIGN_LAYER): ../vulkan-blob-alignment-layer.c
+	$(CC) -O2 -Wall -Wextra -shared -fPIC -fvisibility=hidden $(VULKAN_CFLAGS) -o $@ $< -pthread
+
+$(ALIGN_TEST): ../align-host-blob.c
+	$(CC) -O2 -Wall -Wextra -DNATIVEPIPE_ALIGNMENT_SELF_TEST -o $@ $< -ldl
+
+$(LAYER_TEST): ../vulkan-blob-alignment-layer.c
+	$(CC) -O2 -Wall -Wextra -DNATIVEPIPE_ALIGNMENT_SELF_TEST $(VULKAN_CFLAGS) -o $@ $< -pthread
 
 $(DISCONNECT_TRACE): ../tools/wayland-disconnect-trace.c
 	$(CC) -O0 -g -Wall -Wextra -shared -fPIC -o $@ $< -ldl
@@ -149,6 +164,7 @@ install-remote: $(REMOTE_BINARY)
 
 clean:
 	rm -f $(BINARY) $(REMOTE_BINARY) $(CLIENT) $(VKPRESENT) $(ALIGN_BLOB) \
+	      $(ALIGN_LAYER) $(ALIGN_TEST) $(LAYER_TEST) \
 	      $(DISCONNECT_TRACE) $(GENERATED) $(SCENE_SHADER_OBJECTS)
 
 # The VM compositor now dynamically uses the guest Vulkan loader/Venus ICD.

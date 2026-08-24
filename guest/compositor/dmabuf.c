@@ -29,6 +29,7 @@
 #define DRM_FORMAT_XRGB8888 0x34325258u
 #define DRM_FORMAT_MOD_LINEAR 0ull
 #define DRM_FORMAT_MOD_INVALID 0x00ffffffffffffffull
+#define DRM_FORMAT_MOD_APPLE_GPU_TILED 0x0c00000000000001ull
 
 struct np_dmabuf {
     /* Borrowed lookup-only render-node fd owned by the compositor surface store.
@@ -228,8 +229,9 @@ static struct wl_resource *make_gpu_buffer(struct wl_client *client, uint32_t id
 	    params->offset != 0 || !supported_format(format))
         return NULL;
 
-    if (params->modifier != DRM_FORMAT_MOD_LINEAR &&
-        params->modifier != DRM_FORMAT_MOD_INVALID) {
+    if (params->modifier != DRM_FORMAT_MOD_INVALID &&
+        params->modifier != DRM_FORMAT_MOD_LINEAR &&
+        params->modifier != DRM_FORMAT_MOD_APPLE_GPU_TILED) {
         fprintf(stderr, "[wayland] unsupported dmabuf modifier 0x%llx\n",
                 (unsigned long long)params->modifier);
         return NULL;
@@ -420,14 +422,26 @@ static bool params_validate_create(
 		return false;
 	}
 	if (!supported_format(format) ||
-	    (params->modifier != DRM_FORMAT_MOD_LINEAR &&
-	     params->modifier != DRM_FORMAT_MOD_INVALID)) {
+	    (params->modifier != DRM_FORMAT_MOD_INVALID &&
+	     params->modifier != DRM_FORMAT_MOD_LINEAR &&
+	     params->modifier != DRM_FORMAT_MOD_APPLE_GPU_TILED)) {
 		wl_resource_post_error(resource,
 			ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INVALID_FORMAT,
 			"unsupported format or modifier");
 		return false;
 	}
 	uint64_t row_bytes = (uint64_t)(uint32_t)width * 4u;
+	if (params->modifier == DRM_FORMAT_MOD_APPLE_GPU_TILED) {
+		/* drm_fourcc.h deliberately defines a synthetic width*cpp pitch for
+		 * Apple tiled images.  The exact VkImage/MTLTexture owns the real layout. */
+		if (params->offset != 0 || params->stride != row_bytes) {
+			wl_resource_post_error(resource,
+				ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_OUT_OF_BOUNDS,
+				"invalid Apple GPU tiled offset or stride convention");
+			return false;
+		}
+		return true;
+	}
 	uint64_t last_row = (uint64_t)(uint32_t)(height - 1) * params->stride;
 	uint64_t required = (uint64_t)params->offset + last_row + row_bytes;
 	if (params->stride < row_bytes || required < last_row || required < row_bytes) {
@@ -537,8 +551,9 @@ static const uint32_t k_formats[] = {
     DRM_FORMAT_XRGB8888,
 };
 static const uint64_t k_modifiers[] = {
+    /* Mesa's standard Apple modifier maps to optimal tiling in VGL. */
+    DRM_FORMAT_MOD_APPLE_GPU_TILED,
     DRM_FORMAT_MOD_LINEAR,
-    DRM_FORMAT_MOD_INVALID,
 };
 
 static void feedback_destroy(struct wl_client *client, struct wl_resource *resource)

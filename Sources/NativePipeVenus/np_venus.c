@@ -592,10 +592,10 @@ void np_venus_context_destroy(np_venus *venus, uint32_t ctx_id) {
 }
 
 int np_venus_create_blob(np_venus *venus, uint32_t ctx_id, np_venus_blob *blob) {
-	if (!venus || !blob || blob->size == 0) return -1;
+	if (!venus || !blob || blob->size == 0) return -EINVAL;
 
 	struct imported *entry = calloc(1, sizeof(*entry));
-	if (!entry) return -1;
+	if (!entry) return -ENOMEM;
 	entry->blob = *blob;
 
 	note("blob res=%u ctx=%u blob_id=%llu %ux%u %llu bytes",
@@ -755,11 +755,6 @@ int np_venus_detach(np_venus *venus, uint32_t ctx_id, uint32_t resource_id) {
 	if (!venus || !venus->live) return 0;
 	venus->virgl.ctx_detach_resource((int)ctx_id, (int)resource_id);
 	return 0;
-}
-
-void np_venus_poll(np_venus *venus) {
-	if (!venus || !venus->live || !venus->virgl.poll) return;
-	venus->virgl.poll();
 }
 
 int np_venus_submit(np_venus *venus, uint32_t ctx_id, uint32_t ring_idx,

@@ -76,7 +76,9 @@ void np_venus_unimport_blob(np_venus *venus, uint32_t resource_id);
 
 /// Borrowed MTLTexture for a Venus image, or NULL.
 /// `width`/`height`/`stride`/`virgl_format` come from the Wayland commit;
-/// UTM's create_handle_for_scanout builds an MTLTexture view of the MTLHeap.
+/// NativePipe retains either the exact exported VkImage texture or a zero-copy
+/// texture view of Mesa WSI's exported linear buffer. The pointer remains valid
+/// until the blob is unimported.
 void *np_venus_metal_texture(np_venus *venus, uint32_t resource_id,
                              uint32_t width, uint32_t height,
                              uint32_t stride, uint32_t virgl_format);
@@ -97,10 +99,6 @@ int np_venus_submit(np_venus *venus, uint32_t ctx_id, uint32_t ring_idx,
                     const void *payload, uint32_t byte_count,
                     bool wants_fence, uint64_t fence_id,
                     np_venus_fence_fn done, void *user);
-
-/// Pump the render-server / ring threads. Call while waiting for a
-/// vkAllocateMemory object to exist before CREATE_BLOB.
-void np_venus_poll(np_venus *venus);
 
 #ifdef __cplusplus
 }

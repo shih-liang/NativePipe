@@ -1037,7 +1037,7 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
         element: VZVirtioQueueElement
     ) {
         if np_venus_is_live(venus) {
-            adoptVenusBlob(request, header: header, element: element, attempt: 0)
+            adoptVenusBlob(request, header: header, element: element)
         } else {
             Self.note(
                 "reject  create res=\(request.resourceID) blob_id=\(request.blobID) — no vkr mapping")
@@ -1203,15 +1203,13 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
     }
 
 
-    /// Mesa Venus blob: vkr holds (or is about to hold) the VkDeviceMemory.
-    /// Bind it and adopt the host mapping so RESOURCE_MAP_BLOB shows the same
-    /// pages. Retries are scheduled instead of blocking the device queue so
-    /// that the ring doorbell queued behind this element can be processed.
+    /// Mesa orders RESOURCE_CREATE_BLOB after vkAllocateMemory with
+    /// vkWaitRingSeqnoMESA. A missing blob here is therefore a terminal
+    /// renderer/protocol error, not an eventually-consistent state.
     private func adoptVenusBlob(
         _ request: VirtioGPU.ResourceCreateBlob,
         header: VirtioGPU.ControlHeader,
-        element: VZVirtioQueueElement,
-        attempt: Int
+        element: VZVirtioQueueElement
     ) {
         var blob = np_venus_blob(
             resource_id: request.resourceID,
@@ -1219,7 +1217,8 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
             blob_flags: request.blobFlags,
             pointer: nil,
             size: request.size)
-        if np_venus_create_blob(venus, header.contextID, &blob) == 0 {
+        let createResult = np_venus_create_blob(venus, header.contextID, &blob)
+        if createResult == 0 {
             do {
                 let resource: GPUResource
                 if let pointer = blob.pointer {
@@ -1243,24 +1242,13 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
             }
             return
         }
-        guard attempt < 400 else {
-            Self.note(
-                "reject  create res=\(request.resourceID) blob_id=\(request.blobID) — vkr object never appeared")
-            respond(element, header.reply(.errOutOfMemory))
-            return
-        }
-        if attempt == 0 || attempt % 100 == 99 {
-            Self.note(
-                "wait    res=\(request.resourceID) blob_id=\(request.blobID) attempt=\(attempt)")
-        }
-        np_venus_poll(venus)
-        deviceQueue.asyncAfter(deadline: .now() + .milliseconds(5)) { [weak self] in
-            guard let self, !self.rendererTornDown else {
-                element.returnToQueue()
-                return
-            }
-            self.adoptVenusBlob(request, header: header, element: element, attempt: attempt + 1)
-        }
+        Self.note(
+            "reject  create res=\(request.resourceID) blob_id=\(request.blobID) rc=\(createResult) — renderer rejected ordered blob creation")
+        Self.log.error(
+            "vkr rejected ordered blob creation for res \(request.resourceID), blob_id \(request.blobID), rc \(createResult)")
+        respond(
+            element,
+            header.reply(createResult == -ENOMEM ? .errOutOfMemory : .errInvalidParameter))
     }
 
     /// Completes a fenced SUBMIT_3D. The C renderer may call back off-queue.

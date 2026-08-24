@@ -47,6 +47,8 @@ fi
 # Copy off the virtiofs share: some guests refuse PROT_EXEC mmap there.
 ALIGN_SRC=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/align-host-blob.so
 ALIGN_INSTALLED=/usr/libexec/nativepipe/nativepipe-align-host-blob.so
+LAYER_INSTALLED=/usr/libexec/nativepipe/nativepipe-vulkan-blob-alignment.so
+LAYER_MANIFEST=/etc/vulkan/implicit_layer.d/VkLayer_NATIVEPIPE_blob_alignment.json
 GUEST_PAGE_SIZE=$(getconf PAGESIZE 2>/dev/null || getconf PAGE_SIZE 2>/dev/null || true)
 ALIGN_SO=
 if [ -z "$GUEST_PAGE_SIZE" ] || [ "$GUEST_PAGE_SIZE" -lt 16384 ]; then
@@ -59,13 +61,20 @@ if [ -z "$GUEST_PAGE_SIZE" ] || [ "$GUEST_PAGE_SIZE" -lt 16384 ]; then
         ALIGN_SO=$ALIGN_SRC
     fi
     if [ -r "$ALIGN_SO" ]; then
-        export LD_PRELOAD="$ALIGN_SO${LD_PRELOAD:+:$LD_PRELOAD}"
+        case ":${LD_PRELOAD:-}:" in
+            *:"$ALIGN_SO":*) ;;
+            *) export LD_PRELOAD="$ALIGN_SO${LD_PRELOAD:+:$LD_PRELOAD}" ;;
+        esac
+    fi
+    if [ -r "$LAYER_INSTALLED" ] && [ -r "$LAYER_MANIFEST" ]; then
+        export NATIVEPIPE_BLOB_ALIGNMENT=16384
     fi
 fi
 
 {
 	echo "ICD=$ICD"
 	echo "LD_PRELOAD=${LD_PRELOAD:-}"
+	echo "NATIVEPIPE_BLOB_ALIGNMENT=${NATIVEPIPE_BLOB_ALIGNMENT:-}"
 	echo "align so: $ALIGN_SO"
 	ls -l "$ALIGN_SO" 2>&1 || true
 	echo "--- preload smoke ---"
