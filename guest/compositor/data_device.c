@@ -1,7 +1,10 @@
+#define _GNU_SOURCE
+
 #include "data_device.h"
 
 #include "compositor_internal.h"
 #include "hostlink.h"
+#include "scale.h"
 #include "scene.h"
 #include "window_events.h"
 #include "windowwire.h"
@@ -753,7 +756,7 @@ static void data_device_start_drag(struct wl_client *client, struct wl_resource 
 	if (!entry || !source || !origin) return;
 	struct np_server *server = entry->server;
 	struct np_surface *origin_surface = wl_resource_get_user_data(origin);
-	if (!server->pointer_button_down || serial != server->pointer_grab_serial ||
+	if (server->pointer_buttons == 0 || serial != server->pointer_grab_serial ||
 	    server->pointer_grab_client != client || !origin_surface ||
 	    origin_surface->id != server->pointer_surface)
 		return;
@@ -777,8 +780,13 @@ static void data_device_start_drag(struct wl_client *client, struct wl_resource 
 	 * wl_pointer focus must leave before wl_data_device.enter takes ownership of
 	 * the same physical pointer. GDK relies on this ordering: its DnD enter
 	 * installs the drop focus without first clearing the normal pointer focus. */
-	struct np_surface *surface = np_surface_by_window(server, server->pointer_window);
-	if (!surface) surface = origin_surface;
+	/* The validated origin is the exact surface holding pointer focus.  Looking
+	 * it up by window collapses a subsurface to its xdg root and sends the first
+	 * data-device enter to the wrong wl_surface until another motion arrives. */
+	struct np_surface *surface = origin_surface;
+	struct np_surface *root = np_scene_root(origin_surface);
+	if (icon_surface && root)
+		np_scale_changed(icon_surface, root->preferred_scale);
 	np_input_clear_pointer_focus_for_drag(server);
 	send_drag_icon(server, icon);
 	np_data_drag_enter(server, surface, fixed_from(server->pointer_x), fixed_from(server->pointer_y));

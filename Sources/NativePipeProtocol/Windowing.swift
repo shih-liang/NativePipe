@@ -18,6 +18,35 @@ public enum Windowing {}
 // MARK: - Guest -> host
 
 extension Windowing {
+	public struct Display: Codable, Sendable, Equatable {
+		public var id: UInt32
+		public var name: String
+		public var x: Int
+		public var y: Int
+		public var width: Int
+		public var height: Int
+		public var pixelWidth: Int
+		public var pixelHeight: Int
+		public var physicalWidthMM: Int
+		public var physicalHeightMM: Int
+		public var scale: Int
+		public var refreshMilliHz: Int
+
+		public init(
+			id: UInt32, name: String, x: Int, y: Int,
+			width: Int, height: Int, pixelWidth: Int, pixelHeight: Int,
+			physicalWidthMM: Int, physicalHeightMM: Int,
+			scale: Int, refreshMilliHz: Int
+		) {
+			self.id = id; self.name = name; self.x = x; self.y = y
+			self.width = width; self.height = height
+			self.pixelWidth = pixelWidth; self.pixelHeight = pixelHeight
+			self.physicalWidthMM = physicalWidthMM
+			self.physicalHeightMM = physicalHeightMM
+			self.scale = scale; self.refreshMilliHz = refreshMilliHz
+		}
+	}
+
     /// Things the guest's translator reports upward.
     public enum GuestEvent: Codable, Sendable {
         /// The compositor sends this before replaying its authoritative state
@@ -243,11 +272,14 @@ extension Windowing {
         public var scale: Int
         public var windowGeometry: Rect
         public var layers: [SceneLayer]
+        /// Output-pixel regions whose composited result changed. The host keeps
+        /// a persistent window texture; an empty list means a latch-only scene.
+        public var damage: [Rect]
 
         public init(
             surface: UInt32, presentationID: UInt32,
             width: Int, height: Int, scale: Int,
-            windowGeometry: Rect, layers: [SceneLayer]
+            windowGeometry: Rect, layers: [SceneLayer], damage: [Rect] = []
         ) {
             self.surface = surface
             self.presentationID = presentationID
@@ -256,6 +288,7 @@ extension Windowing {
             self.scale = scale
             self.windowGeometry = windowGeometry
             self.layers = layers
+            self.damage = damage
         }
     }
 
@@ -465,6 +498,12 @@ extension Windowing {
         /// Backing scale of the screen the window is on, which changes when the
         /// user drags it between displays.
         case scaleChanged(window: UInt32, scale: Int)
+		/// Complete current physical-display topology. It changes only when macOS
+		/// screen parameters change, not per frame or per window.
+		case outputsChanged(displays: [Display])
+		/// The wl_output currently containing this xdg window. Nil leaves all
+		/// outputs, for example while AppKit is moving it between screens.
+		case windowOutputChanged(window: UInt32, outputID: UInt32?)
 
         case keyboardFocus(window: UInt32?)
         case key(window: UInt32, keycode: UInt32, pressed: Bool, modifiers: Modifiers)

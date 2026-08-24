@@ -14,8 +14,8 @@ public enum WindowWire {
     public static let popupConfigureMagic: [UInt8] = Array("NPPF".utf8)
     public static let sceneMagic: [UInt8] = Array("NPSN".utf8)
     public static let lifecycleMagic: [UInt8] = Array("NPW2".utf8)
-    public static let sceneVersion: UInt16 = 1
-    public static let sceneHeaderSize = 56
+    public static let sceneVersion: UInt16 = 2
+    public static let sceneHeaderSize = 72
     public static let sceneLayerSize = 88
     public static let maximumSceneLayers = 128
 
@@ -57,11 +57,22 @@ public enum WindowWire {
             width: Int(try reader.integer() as Int32),
             height: Int(try reader.integer() as Int32))
         let layerCount = Int(try reader.integer() as UInt32)
-        _ = try reader.integer() as UInt32 // header flags; none in version 1
+		let flags = try reader.integer() as UInt32
+		let damage = Windowing.Rect(
+			x: Int(try reader.integer() as Int32),
+			y: Int(try reader.integer() as Int32),
+			width: Int(try reader.integer() as Int32),
+			height: Int(try reader.integer() as Int32))
 
         guard surface != 0, presentationID != 0,
               width > 0, height > 0, scale >= 1, scale <= 4,
               geometry.width > 0, geometry.height > 0,
+			  flags & ~1 == 0,
+			  damage.x >= 0, damage.y >= 0,
+			  damage.width >= 0, damage.height >= 0,
+			  (damage.width == 0) == (damage.height == 0),
+			  damage.x <= width - damage.width,
+			  damage.y <= height - damage.height,
               layerCount > 0, layerCount <= maximumSceneLayers,
               layerCount <= (Int.max - sceneHeaderSize) / sceneLayerSize,
               sceneHeaderSize + layerCount * sceneLayerSize == totalSize
@@ -115,7 +126,8 @@ public enum WindowWire {
         return .sceneCommitted(scene: Windowing.SceneSnapshot(
             surface: surface, presentationID: presentationID,
             width: width, height: height, scale: scale,
-            windowGeometry: geometry, layers: layers))
+			windowGeometry: geometry, layers: layers,
+			damage: damage.width > 0 ? [damage] : []))
     }
 
     private static func lifecycleEvent(from payload: Data) throws -> Windowing.GuestEvent {
@@ -197,6 +209,14 @@ public enum WindowWire {
                 throw DecodeError.malformed
             }
             return try finished(.cursorShapeChanged(shape: shape))
+        case 22:
+            let surface: UInt32 = try reader.integer()
+            let presentationID: UInt32 = try reader.integer()
+            guard surface != 0, presentationID != 0 else {
+                throw DecodeError.malformed
+            }
+            return try finished(.frameCallbackRequested(
+                surface: surface, presentationID: presentationID))
         case 35:
             let placement = Windowing.PopupPlacement(
                 window: try reader.integer(), parent: try reader.integer(),

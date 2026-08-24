@@ -14,6 +14,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/dma-buf.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -45,9 +46,11 @@ struct np_dmabuf_format_table_entry {
 struct np_params {
     int drm_fd;
     int fd;
+	uint32_t offset;
     uint32_t stride;
     uint64_t modifier;
     bool has_plane;
+	bool used;
 };
 
 struct np_gpu_buffer_object {
@@ -56,6 +59,8 @@ struct np_gpu_buffer_object {
     uint32_t client_bo_handle;          /* lifetime reference only */
     uint32_t client_resource_id;        /* diagnostic only; never sent to host */
     int drm_fd;                         /* borrowed lookup fd */
+	int dma_buf_fd;                    /* owned, also exports a pollable fence */
+	struct wl_client *client;          /* alive whenever a release is queued */
 	struct wl_resource *resource;
 	uint32_t references;
 	uint32_t current_references;
@@ -117,6 +122,7 @@ static void gpu_buffer_free(struct np_gpu_buffer_object *gpu)
 		struct drm_gem_close closer = { .handle = gpu->client_bo_handle };
 		ioctl(gpu->drm_fd, DRM_IOCTL_GEM_CLOSE, &closer);
 	}
+	if (gpu->dma_buf_fd >= 0) close(gpu->dma_buf_fd);
 	free(gpu);
 }
 
@@ -151,27 +157,42 @@ static void maybe_release_client(struct np_gpu_buffer_object *gpu)
 	}
 }
 
-static bool wait_for_client_render(struct np_gpu_buffer_object *gpu)
+static enum np_gpu_read_result wait_for_client_render(
+	struct np_gpu_buffer_object *gpu, int *wait_fd)
 {
+	if (wait_fd) *wait_fd = -1;
 	uint64_t start = np_perf_now_ns();
-    struct drm_virtgpu_3d_wait wait = {
-        .handle = gpu->client_bo_handle,
-        /* Never stall the Wayland event loop behind application rendering.
-         * scene.c retries from a one-shot loop timer while the dma-resv fence
-         * is still busy. */
-        .flags = VIRTGPU_WAIT_NOWAIT,
-    };
-    if (ioctl(gpu->drm_fd, DRM_IOCTL_VIRTGPU_WAIT, &wait) == 0) {
+	struct drm_virtgpu_3d_wait wait = {
+		.handle = gpu->client_bo_handle,
+		/* Never stall the Wayland event loop behind application rendering.
+		 * The exported dma-resv sync_file wakes the loop when the producer is
+		 * actually ready. */
+		.flags = VIRTGPU_WAIT_NOWAIT,
+	};
+	if (ioctl(gpu->drm_fd, DRM_IOCTL_VIRTGPU_WAIT, &wait) == 0) {
 		np_perf_record(NP_PERF_CLIENT_WAIT, np_perf_now_ns() - start);
-        return true;
+		return NP_GPU_READ_READY;
 	}
 	np_perf_record(NP_PERF_CLIENT_WAIT, np_perf_now_ns() - start);
 
-	if (errno == EBUSY || errno == EAGAIN) return false;
+	if (errno == EBUSY || errno == EAGAIN) {
+		struct dma_buf_export_sync_file export = {
+			.flags = DMA_BUF_SYNC_READ,
+			.fd = -1,
+		};
+		if (gpu->dma_buf_fd >= 0 &&
+		    ioctl(gpu->dma_buf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &export) == 0 &&
+		    export.fd >= 0) {
+			fcntl(export.fd, F_SETFD, FD_CLOEXEC);
+			if (wait_fd) *wait_fd = export.fd;
+			else close(export.fd);
+		}
+		return NP_GPU_READ_WAIT;
+	}
 
-    fprintf(stderr, "[wayland] WAIT client_res=%u: %s\n",
-            gpu->client_resource_id, strerror(errno));
-    return false;
+	fprintf(stderr, "[wayland] WAIT client_res=%u: %s\n",
+	        gpu->client_resource_id, strerror(errno));
+	return NP_GPU_READ_FAILED;
 }
 
 static void gpu_buffer_resource_destroy(struct wl_resource *resource)
@@ -204,7 +225,7 @@ static struct wl_resource *make_gpu_buffer(struct wl_client *client, uint32_t id
                                            uint32_t format)
 {
     if (!params->has_plane || params->fd < 0 || width <= 0 || height <= 0 ||
-        !supported_format(format))
+	    params->offset != 0 || !supported_format(format))
         return NULL;
 
     if (params->modifier != DRM_FORMAT_MOD_LINEAR &&
@@ -215,17 +236,18 @@ static struct wl_resource *make_gpu_buffer(struct wl_client *client, uint32_t id
     }
 
     uint32_t client_bo = 0;
-    uint32_t client_res = resource_from_prime(params->drm_fd, params->fd, &client_bo);
-    if (!client_res)
-        return NULL;
+	uint32_t client_res = resource_from_prime(params->drm_fd, params->fd, &client_bo);
+	if (!client_res) return NULL;
 
-    struct np_gpu_buffer_object *gpu = calloc(1, sizeof(*gpu));
+	struct np_gpu_buffer_object *gpu = calloc(1, sizeof(*gpu));
     if (!gpu) {
         struct drm_gem_close closer = { .handle = client_bo };
         ioctl(params->drm_fd, DRM_IOCTL_GEM_CLOSE, &closer);
         return NULL;
     }
-    gpu->drm_fd = params->drm_fd;
+	gpu->drm_fd = params->drm_fd;
+	gpu->dma_buf_fd = params->fd;
+	gpu->client = client;
     gpu->client_bo_handle = client_bo;
     gpu->client_resource_id = client_res;
 	gpu->references = 1;
@@ -237,8 +259,7 @@ static struct wl_resource *make_gpu_buffer(struct wl_client *client, uint32_t id
     gpu->info.stride = (int32_t)params->stride;
     gpu->info.format = format;
 
-    close(params->fd);
-    params->fd = -1;
+	params->fd = -1;
     params->has_plane = false;
 
     struct wl_resource *buffer = wl_resource_create(client, &wl_buffer_interface, 1, id);
@@ -277,13 +298,24 @@ void np_gpu_buffer_release_current(struct np_gpu_buffer *buffer)
 	gpu_buffer_unref(gpu);
 }
 
-bool np_gpu_buffer_begin_host_read(struct np_gpu_buffer *buffer)
+bool np_gpu_buffer_acquire_host_read(struct np_gpu_buffer *buffer)
 {
 	struct np_gpu_buffer_object *gpu = gpu_object(buffer);
-	if (!gpu || !wait_for_client_render(gpu)) return false;
+	if (!gpu) return false;
 	gpu->host_reads++;
 	gpu_buffer_ref(gpu);
 	return true;
+}
+
+enum np_gpu_read_result np_gpu_buffer_render_status(
+	struct np_gpu_buffer *buffer, int *wait_fd)
+{
+	struct np_gpu_buffer_object *gpu = gpu_object(buffer);
+	if (!gpu) {
+		if (wait_fd) *wait_fd = -1;
+		return NP_GPU_READ_FAILED;
+	}
+	return wait_for_client_render(gpu, wait_fd);
 }
 
 void np_gpu_buffer_end_host_read(struct np_gpu_buffer *buffer)
@@ -312,10 +344,12 @@ void np_gpu_buffer_queue_release(
 	}
 	struct np_gpu_sync_release *release = calloc(1, sizeof(*release));
 	if (!release) {
-		/* Keep correctness under memory pressure: never signal while Metal may
-		 * still be reading. The point intentionally remains unsignalled. */
+		/* Never signal while Metal may still be reading. Disconnecting the
+		 * client releases its syncobj state instead of leaving a live client
+		 * blocked forever on an unsignalled point. */
 		fprintf(stderr, "[wayland] could not retain explicit release point\n");
 		np_sync_point_destroy(point);
+		wl_client_post_no_memory(gpu->client);
 		return;
 	}
 	release->point = point;
@@ -335,6 +369,13 @@ static void params_add(struct wl_client *client, struct wl_resource *resource,
 {
     (void)client;
     struct np_params *params = wl_resource_get_user_data(resource);
+	if (params->used) {
+		close(fd);
+		wl_resource_post_error(resource,
+			ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_ALREADY_USED,
+			"buffer params have already been used");
+		return;
+	}
 
     if (plane_idx != 0) {
         close(fd);
@@ -348,25 +389,75 @@ static void params_add(struct wl_client *client, struct wl_resource *resource,
                                "plane 0 already set");
         return;
     }
-    if (offset != 0) {
-        close(fd);
-        wl_resource_post_error(resource, ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_OUT_OF_BOUNDS,
-                               "non-zero plane offsets are not supported");
-        return;
-    }
-
-    params->fd = fd;
+	params->fd = fd;
+	params->offset = offset;
     params->stride = stride;
     params->modifier = ((uint64_t)modifier_hi << 32) | modifier_lo;
     params->has_plane = true;
 }
 
+static bool params_validate_create(
+	struct wl_resource *resource, struct np_params *params,
+	int32_t width, int32_t height, uint32_t format)
+{
+	if (params->used) {
+		wl_resource_post_error(resource,
+			ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_ALREADY_USED,
+			"buffer params have already been used");
+		return false;
+	}
+	params->used = true;
+	if (!params->has_plane || params->fd < 0) {
+		wl_resource_post_error(resource,
+			ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INCOMPLETE,
+			"ARGB/XRGB buffers require exactly one plane");
+		return false;
+	}
+	if (width <= 0 || height <= 0) {
+		wl_resource_post_error(resource,
+			ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INVALID_DIMENSIONS,
+			"buffer dimensions must be positive");
+		return false;
+	}
+	if (!supported_format(format) ||
+	    (params->modifier != DRM_FORMAT_MOD_LINEAR &&
+	     params->modifier != DRM_FORMAT_MOD_INVALID)) {
+		wl_resource_post_error(resource,
+			ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INVALID_FORMAT,
+			"unsupported format or modifier");
+		return false;
+	}
+	uint64_t row_bytes = (uint64_t)(uint32_t)width * 4u;
+	uint64_t last_row = (uint64_t)(uint32_t)(height - 1) * params->stride;
+	uint64_t required = (uint64_t)params->offset + last_row + row_bytes;
+	if (params->stride < row_bytes || required < last_row || required < row_bytes) {
+		wl_resource_post_error(resource,
+			ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_OUT_OF_BOUNDS,
+			"invalid plane stride or range");
+		return false;
+	}
+	struct stat st;
+	off_t size = fstat(params->fd, &st) == 0 ? st.st_size : -1;
+	if (size == 0) size = lseek(params->fd, 0, SEEK_END);
+	if (size <= 0 || required > (uint64_t)size) {
+		wl_resource_post_error(resource,
+			ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_OUT_OF_BOUNDS,
+			"plane extends outside the dma-buf");
+		return false;
+	}
+	return true;
+}
+
 static void params_create(struct wl_client *client, struct wl_resource *resource,
                           int32_t width, int32_t height, uint32_t format, uint32_t flags)
 {
-    (void)flags;
-    struct np_params *params = wl_resource_get_user_data(resource);
-    struct wl_resource *buffer = make_gpu_buffer(client, 0, params, width, height, format);
+	struct np_params *params = wl_resource_get_user_data(resource);
+	if (!params_validate_create(resource, params, width, height, format)) return;
+	if (flags != 0 || params->offset != 0) {
+		zwp_linux_buffer_params_v1_send_failed(resource);
+		return;
+	}
+	struct wl_resource *buffer = make_gpu_buffer(client, 0, params, width, height, format);
     if (!buffer) {
         zwp_linux_buffer_params_v1_send_failed(resource);
         return;
@@ -378,9 +469,15 @@ static void params_create_immed(struct wl_client *client, struct wl_resource *re
                                 uint32_t buffer_id, int32_t width, int32_t height,
                                 uint32_t format, uint32_t flags)
 {
-    (void)flags;
-    struct np_params *params = wl_resource_get_user_data(resource);
-    if (!make_gpu_buffer(client, buffer_id, params, width, height, format)) {
+	struct np_params *params = wl_resource_get_user_data(resource);
+	if (!params_validate_create(resource, params, width, height, format)) return;
+	if (flags != 0 || params->offset != 0) {
+		wl_resource_post_error(resource,
+			ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INVALID_WL_BUFFER,
+			"unsupported dma-buf flags or non-zero plane offset");
+		return;
+	}
+	if (!make_gpu_buffer(client, buffer_id, params, width, height, format)) {
         wl_resource_post_error(resource,
                                ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INVALID_WL_BUFFER,
                                "could not create NativePipe display mirror");

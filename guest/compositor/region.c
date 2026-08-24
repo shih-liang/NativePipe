@@ -1,6 +1,6 @@
 #include "region.h"
 
-#include <limits.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wayland-server-protocol.h>
@@ -14,6 +14,52 @@ static bool valid_box(int32_t width, int32_t height)
 	return width > 0 && height > 0;
 }
 
+static bool reserve_boxes(struct np_region_state *state, uint32_t needed)
+{
+	if (needed <= state->capacity) return true;
+	uint32_t capacity = state->capacity ? state->capacity : 8u;
+	while (capacity < needed) {
+		if (capacity > UINT32_MAX / 2u) {
+			capacity = needed;
+			break;
+		}
+		capacity *= 2u;
+	}
+	if (sizeof(*state->boxes) > SIZE_MAX / (size_t)capacity) return false;
+	struct np_region_box *boxes = realloc(
+		state->boxes, (size_t)capacity * sizeof(*state->boxes));
+	if (!boxes) return false;
+	state->boxes = boxes;
+	state->capacity = capacity;
+	return true;
+}
+
+static bool append_piece(struct np_region_state *state,
+	                     int64_t x, int64_t y, int64_t width, int64_t height)
+{
+	if (width <= 0 || height <= 0) return true;
+	if (state->count == UINT32_MAX || !reserve_boxes(state, state->count + 1u))
+		return false;
+	state->boxes[state->count++] = (struct np_region_box){ x, y, width, height };
+	return true;
+}
+
+void np_region_fini(struct np_region_state *region)
+{
+	if (!region) return;
+	free(region->boxes);
+	memset(region, 0, sizeof(*region));
+}
+
+void np_region_move(struct np_region_state *destination,
+	                struct np_region_state *source)
+{
+	if (!destination || !source || destination == source) return;
+	np_region_fini(destination);
+	*destination = *source;
+	memset(source, 0, sizeof(*source));
+}
+
 static void region_destroy(struct wl_client *client, struct wl_resource *resource)
 {
 	(void)client;
@@ -22,51 +68,24 @@ static void region_destroy(struct wl_client *client, struct wl_resource *resourc
 
 static void region_resource_destroy(struct wl_resource *resource)
 {
-	free(wl_resource_get_user_data(resource));
+	struct np_region *region = wl_resource_get_user_data(resource);
+	if (!region) return;
+	np_region_fini(&region->state);
+	free(region);
 }
 
 static void region_add(struct wl_client *client, struct wl_resource *resource,
 	                   int32_t x, int32_t y, int32_t width, int32_t height)
 {
-	(void)client;
 	struct np_region *region = wl_resource_get_user_data(resource);
 	if (!region || !valid_box(width, height)) return;
-	if (region->state.count == NP_REGION_MAX_BOXES) {
-		/* Preserve a conservative input superset instead of allocating from an
-		 * untrusted request stream. Merge the new box into the last entry. */
-		struct np_region_box *box = &region->state.boxes[NP_REGION_MAX_BOXES - 1];
-		int64_t left = box->x < x ? box->x : x;
-		int64_t top = box->y < y ? box->y : y;
-		int64_t right0 = (int64_t)box->x + box->width;
-		int64_t right1 = (int64_t)x + width;
-		int64_t bottom0 = (int64_t)box->y + box->height;
-		int64_t bottom1 = (int64_t)y + height;
-		int64_t right = right0 > right1 ? right0 : right1;
-		int64_t bottom = bottom0 > bottom1 ? bottom0 : bottom1;
-		box->x = (int32_t)(left < INT32_MIN ? INT32_MIN : left);
-		box->y = (int32_t)(top < INT32_MIN ? INT32_MIN : top);
-		box->width = (int32_t)(right - box->x > INT32_MAX ? INT32_MAX : right - box->x);
-		box->height = (int32_t)(bottom - box->y > INT32_MAX ? INT32_MAX : bottom - box->y);
-		return;
-	}
-	region->state.boxes[region->state.count++] =
-		(struct np_region_box){ x, y, width, height };
-}
-
-static void append_piece(struct np_region_state *state,
-	                     int64_t x, int64_t y, int64_t width, int64_t height)
-{
-	if (width <= 0 || height <= 0 || state->count == NP_REGION_MAX_BOXES) return;
-	state->boxes[state->count++] = (struct np_region_box){
-		.x = (int32_t)x, .y = (int32_t)y,
-		.width = (int32_t)width, .height = (int32_t)height,
-	};
+	if (!append_piece(&region->state, x, y, width, height))
+		wl_client_post_no_memory(client);
 }
 
 static void region_subtract(struct wl_client *client, struct wl_resource *resource,
 	                        int32_t x, int32_t y, int32_t width, int32_t height)
 {
-	(void)client;
 	struct np_region *region = wl_resource_get_user_data(resource);
 	if (!region || !valid_box(width, height)) return;
 	struct np_region_state result = {0};
@@ -80,15 +99,22 @@ static void region_subtract(struct wl_client *client, struct wl_resource *resour
 		int64_t ix1 = bx1 < sx1 ? bx1 : sx1;
 		int64_t iy1 = by1 < sy1 ? by1 : sy1;
 		if (ix0 >= ix1 || iy0 >= iy1) {
-			append_piece(&result, bx0, by0, bx1 - bx0, by1 - by0);
+			if (!append_piece(&result, bx0, by0, bx1 - bx0, by1 - by0))
+				goto no_memory;
 			continue;
 		}
-		append_piece(&result, bx0, by0, bx1 - bx0, iy0 - by0);
-		append_piece(&result, bx0, iy1, bx1 - bx0, by1 - iy1);
-		append_piece(&result, bx0, iy0, ix0 - bx0, iy1 - iy0);
-		append_piece(&result, ix1, iy0, bx1 - ix1, iy1 - iy0);
+		if (!append_piece(&result, bx0, by0, bx1 - bx0, iy0 - by0) ||
+		    !append_piece(&result, bx0, iy1, bx1 - bx0, by1 - iy1) ||
+		    !append_piece(&result, bx0, iy0, ix0 - bx0, iy1 - iy0) ||
+		    !append_piece(&result, ix1, iy0, bx1 - ix1, iy1 - iy0))
+			goto no_memory;
 	}
-	region->state = result;
+	np_region_move(&region->state, &result);
+	return;
+
+no_memory:
+	np_region_fini(&result);
+	wl_client_post_no_memory(client);
 }
 
 static const struct wl_region_interface region_implementation = {
@@ -123,7 +149,14 @@ bool np_region_copy_resource(struct wl_resource *resource,
 		return false;
 	struct np_region *region = wl_resource_get_user_data(resource);
 	if (!region) return false;
-	*destination = region->state;
+	struct np_region_state copy = {0};
+	if (region->state.count) {
+		if (!reserve_boxes(&copy, region->state.count)) return false;
+		memcpy(copy.boxes, region->state.boxes,
+		       (size_t)region->state.count * sizeof(*copy.boxes));
+		copy.count = region->state.count;
+	}
+	np_region_move(destination, &copy);
 	return true;
 }
 

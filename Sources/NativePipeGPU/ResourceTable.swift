@@ -9,8 +9,8 @@ import os
 /// HOST3D blobs are Venus allocations. CPU-mappable allocations expose vkr's
 /// host pointer through the guest aperture; DEVICE_LOCAL allocations stay in a
 /// Metal heap and are accessed through their renderer resource id. Application
-/// windows never make these resources into IOSurfaces: NativeWindow owns its
-/// display IOSurface and copies the compositor output into it.
+/// windows never make these resources into IOSurfaces: NativeWindow samples the
+/// original Metal texture while composing directly into a CAMetalDrawable.
 public final class GPUResource {
     public let resourceID: UInt32
     /// Set only for the legacy virtio-gpu 2D framebuffer path.
@@ -33,7 +33,7 @@ public final class GPUResource {
     /// asynchronous, however, and the backing must remain alive until VZ has
     /// actually removed the aperture mapping.
     internal var unmapInFlight = false
-    internal var afterUnmap: [() -> Void] = []
+    internal var afterUnmap: [(Bool) -> Void] = []
 
     /// Contexts currently holding a reference, from `CTX_ATTACH_RESOURCE`.
     public internal(set) var attachedContexts: Set<UInt32> = []
@@ -146,6 +146,8 @@ public final class ResourceTable {
     public var count: Int { resources.count }
 
     public var identifiers: [UInt32] { Array(resources.keys) }
+
+    public var all: [GPUResource] { Array(resources.values) }
 
     public subscript(id: UInt32) -> GPUResource? { resources[id] }
 

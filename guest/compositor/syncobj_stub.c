@@ -33,5 +33,6 @@ bool np_sync_point_ready(struct np_sync_point *point)
 	(void)point;
 	return true;
 }
+int np_sync_point_wait_fd(struct np_sync_point *point) { (void)point; return -1; }
 void np_sync_point_destroy(struct np_sync_point *point) { (void)point; }
 void np_sync_point_signal(struct np_sync_point *point) { (void)point; }

@@ -29,5 +29,10 @@ void np_xdg_configure_popup(struct np_surface *surface,
 void np_xdg_apply_popup_geometry(struct np_surface *surface,
                                  int32_t x, int32_t y,
                                  int32_t width, int32_t height);
+void np_xdg_apply_size_constraints(struct np_surface *surface,
+                                   int32_t minimum_width,
+                                   int32_t minimum_height,
+                                   int32_t maximum_width,
+                                   int32_t maximum_height);
 
 #endif

@@ -4,26 +4,28 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define NP_REGION_MAX_BOXES 64u
-
 struct wl_client;
 struct wl_resource;
 
 struct np_region_box {
-	int32_t x, y, width, height;
+	int64_t x, y, width, height;
 };
 
-/* wl_region is mutable, but wl_surface.set_*_region copies its value into
- * double-buffered surface state. A bounded rectangle set keeps request memory
- * under compositor control and is sufficient for toolkit input/opaque regions. */
+/* wl_region has no protocol-defined complexity limit. Keep an exact dynamic
+ * rectangle set: silently merging or dropping fragments changes input hit
+ * testing. A zero-initialized state is valid. */
 struct np_region_state {
 	uint32_t count;
-	struct np_region_box boxes[NP_REGION_MAX_BOXES];
+	uint32_t capacity;
+	struct np_region_box *boxes;
 };
 
 void np_region_create(struct wl_client *client, uint32_t id);
 bool np_region_copy_resource(struct wl_resource *resource,
 	                         struct np_region_state *destination);
+void np_region_fini(struct np_region_state *region);
+void np_region_move(struct np_region_state *destination,
+	                struct np_region_state *source);
 bool np_region_contains(const struct np_region_state *region,
 	                    double x, double y);
 

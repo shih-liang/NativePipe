@@ -4,6 +4,73 @@ import AppKit
 import NativePipeProtocol
 import QuartzCore
 
+/// One refresh source per physical NSScreen, shared by every NativeWindow on
+/// that display. A window moving screens is re-registered atomically; links are
+/// invalidated when their final window leaves.
+@MainActor
+final class DisplayClock: NSObject {
+	private final class WeakWindow {
+		weak var value: NativeWindow?
+		init(_ value: NativeWindow) { self.value = value }
+	}
+	private struct Entry {
+		let link: CADisplayLink
+		var windows: [ObjectIdentifier: WeakWindow]
+	}
+	private var entries: [ObjectIdentifier: Entry] = [:]
+	private var screenByWindow: [ObjectIdentifier: ObjectIdentifier] = [:]
+
+	func register(_ window: NativeWindow, screen: NSScreen?) {
+		guard let screen = screen ?? NSScreen.main else { return }
+		let windowKey = ObjectIdentifier(window)
+		let screenKey = ObjectIdentifier(screen)
+		if screenByWindow[windowKey] == screenKey { return }
+		unregister(window)
+		if entries[screenKey] == nil {
+			let link = screen.displayLink(
+				target: self, selector: #selector(tick(_:)))
+			link.add(to: .main, forMode: .common)
+			link.isPaused = false
+			entries[screenKey] = Entry(link: link, windows: [:])
+		}
+		entries[screenKey]?.windows[windowKey] = WeakWindow(window)
+		screenByWindow[windowKey] = screenKey
+	}
+
+	func unregister(_ window: NativeWindow) {
+		let windowKey = ObjectIdentifier(window)
+		guard let screenKey = screenByWindow.removeValue(forKey: windowKey),
+			var entry = entries[screenKey] else { return }
+		entry.windows.removeValue(forKey: windowKey)
+		if entry.windows.isEmpty {
+			entry.link.invalidate()
+			entries.removeValue(forKey: screenKey)
+		} else {
+			entries[screenKey] = entry
+		}
+	}
+
+	@objc private func tick(_ link: CADisplayLink) {
+		guard let screenKey = entries.first(where: { $0.value.link === link })?.key,
+			var entry = entries[screenKey] else { return }
+		let windows = entry.windows
+		for (key, weakWindow) in windows {
+			if let window = weakWindow.value {
+				window.displayClockFired(link)
+			} else {
+				entry.windows.removeValue(forKey: key)
+				screenByWindow.removeValue(forKey: key)
+			}
+		}
+		if entry.windows.isEmpty {
+			entry.link.invalidate()
+			entries.removeValue(forKey: screenKey)
+		} else {
+			entries[screenKey] = entry
+		}
+	}
+}
+
 /// One `xdg_toplevel`, one `NSWindow`.
 ///
 /// This class is a translator and nothing else. There is no scene graph, no
@@ -74,9 +141,9 @@ final class NativeWindow: NSObject {
         var states: [Windowing.ToplevelState]
     }
     private var pendingConfigure: PendingConfigure?
-    private var configureDisplayLink: CADisplayLink?
-    /// CPU/remote contents installed since the previous display tick. GPU
-    /// frames use the CAMetalDrawable's actual presentation callback instead.
+	private var presenterNeedsDisplayRetry = false
+	/// Commits accepted since the previous display tick. This is the Wayland
+	/// output-latch clock; Metal source release remains tied to command completion.
     private struct Presentation: Hashable {
         let surface: UInt32
         let id: UInt32
@@ -85,12 +152,21 @@ final class NativeWindow: NSObject {
     private let metalDevice = MTLCreateSystemDefaultDevice()
     private lazy var sceneRenderer: HostSceneRenderer? = {
         guard let metalDevice else { return nil }
-        return try? HostSceneRenderer(device: metalDevice)
+		return bridge?.sceneRenderer(for: metalDevice)
     }()
     private lazy var asyncScenePresenter: AsyncMetalScenePresenter? = {
         guard let metalDevice, let renderer = sceneRenderer else { return nil }
         return AsyncMetalScenePresenter(
-            layer: contentView.metalLayer, device: metalDevice, renderer: renderer)
+            layer: contentView.metalLayer, device: metalDevice, renderer: renderer,
+            requestDisplayRetry: { [weak self] in
+                RunLoop.main.perform(
+                    inModes: [.common, RunLoop.Mode("NSEventTrackingRunLoopMode")]
+                ) {
+                    MainActor.assumeIsolated {
+                        self?.presenterNeedsDisplayRetry = true
+                    }
+                }
+            })
     }()
 
     init(windowID: UInt32, surfaceID: UInt32, bridge: WindowBridge, popup: Popup? = nil) {
@@ -166,7 +242,9 @@ final class NativeWindow: NSObject {
             NSSize(width: $0.width, height: $0.height)
         } ?? .zero
         window.contentMaxSize = maximumConstraint.map {
-            NSSize(width: $0.width, height: $0.height)
+            NSSize(
+                width: $0.width == 0 ? 10_000_000 : $0.width,
+                height: $0.height == 0 ? 10_000_000 : $0.height)
         } ?? NSSize(width: 10_000_000, height: 10_000_000)
     }
 
@@ -243,8 +321,18 @@ final class NativeWindow: NSObject {
         awaitPresentation(Presentation(surface: surface, id: presentationID))
     }
 
+	func invalidateSceneHistory() {
+		asyncScenePresenter?.invalidateHistory()
+	}
+
     private func awaitPresentation(_ presentation: Presentation) {
         guard !pendingPresentations.contains(presentation) else { return }
+		guard let window, window.isVisible,
+		      window.occlusionState.contains(.visible) else {
+			bridge?.send(.framePresented(
+				surface: presentation.surface, presentationID: presentation.id))
+			return
+		}
         pendingPresentations.append(presentation)
     }
 
@@ -365,18 +453,8 @@ final class NativeWindow: NSObject {
             if let requestedFullscreen { setFullscreen(requestedFullscreen) }
             Self.note("window \(windowID) key=\(window.isKeyWindow) firstResponder=\(String(describing: window.firstResponder))")
         }
-        let displayLink = contentView.displayLink(
-            target: self, selector: #selector(configureDisplayLinkFired(_:)))
-        // Keep the link active while the window exists. Repeatedly pausing and
-        // restarting it made sparse content updates degrade to a few callbacks
-        // per second and detached frame pacing from the display clock.
-        displayLink.isPaused = false
-        displayLink.add(to: .main, forMode: .common)
-        configureDisplayLink = displayLink
-
-        // The client needs the display's scale before it can pick a buffer size,
-        // and it has only ever been told on change until now.
-        bridge?.send(.scaleChanged(window: windowID, scale: Int(window.backingScaleFactor)))
+		bridge?.registerDisplayClock(self, screen: window.screen)
+		bridge?.windowScreenChanged(windowID, screen: window.screen)
     }
 
     private func styleMaskForToplevel() -> NSWindow.StyleMask {
@@ -443,7 +521,7 @@ final class NativeWindow: NSObject {
         return window.convertToScreen(inWindow)
     }
 
-    func close() {
+	func close() {
         pendingConfigure = nil
         contentView.clearDisplayedSurface()
         let pending = pendingPresentations
@@ -452,9 +530,10 @@ final class NativeWindow: NSObject {
             bridge?.send(.framePresented(
                 surface: presentation.surface, presentationID: presentation.id))
         }
-        configureDisplayLink?.invalidate()
-        configureDisplayLink = nil
+		bridge?.windowScreenChanged(windowID, screen: nil)
+		bridge?.unregisterDisplayClock(self)
         asyncScenePresenter?.cancelPending()
+		asyncScenePresenter?.invalidateHistory()
         // `orderOut` only hides a window; it does not terminate its AppKit
         // lifetime.  In particular a popup remains retained by its parent as a
         // child window, and reconnecting the compositor can then leave an old
@@ -487,10 +566,9 @@ final class NativeWindow: NSObject {
         guard size != lastConfiguredSize || states != lastConfiguredStates else { return }
 
         pendingConfigure = PendingConfigure(size: size, states: states)
-        configureDisplayLink?.isPaused = false
     }
 
-    @objc private func configureDisplayLinkFired(_ displayLink: CADisplayLink) {
+	func displayClockFired(_ displayLink: CADisplayLink) {
         // Deliver the newest resize before waking a frame-throttled client, so
         // the draw started by this tick targets the newest logical size.
         flushConfigure()
@@ -498,6 +576,11 @@ final class NativeWindow: NSObject {
         // Frame callbacks and FIFO latching are paced by the display clock.
         // Source buffers were already released by their Metal completion.
         flushPresentations()
+
+		if presenterNeedsDisplayRetry {
+			presenterNeedsDisplayRetry = false
+			asyncScenePresenter?.resumeAfterDisplayTick()
+		}
     }
 
     private func flushPresentations() {
@@ -588,6 +671,12 @@ extension NativeWindow: NSWindowDelegate {
         bridge?.parentGeometryChanged(windowID)
     }
 
+	func windowDidChangeScreen(_ notification: Notification) {
+		guard let window else { return }
+		bridge?.registerDisplayClock(self, screen: window.screen)
+		bridge?.windowScreenChanged(windowID, screen: window.screen)
+	}
+
     /// The drag is over; the client should land on the exact size immediately.
     func windowDidEndLiveResize(_ notification: Notification) {
         sendConfigure(states: activeStates())
@@ -600,7 +689,7 @@ extension NativeWindow: NSWindowDelegate {
     /// Wayland terms is a different output scale for that surface.
     func windowDidChangeBackingProperties(_ notification: Notification) {
         guard let window else { return }
-        bridge?.send(.scaleChanged(window: windowID, scale: Int(window.backingScaleFactor)))
+		bridge?.windowScreenChanged(windowID, screen: window.screen)
         sendConfigure(states: activeStates())
         bridge?.parentGeometryChanged(windowID)
     }
@@ -655,23 +744,43 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
     }
 
     private let layer: CAMetalLayer
+	private let device: MTLDevice
     private let renderer: HostSceneRenderer
+    private let requestDisplayRetry: (@Sendable () -> Void)?
     private let queue = DispatchQueue(
         label: "com.nativepipe.metal-present", qos: .userInteractive)
     private let lock = NSLock()
     private var pending: Work?
     private var running = false
+	private var historyTexture: MTLTexture?
+	private var historyValid = false
 
     private enum ProcessResult: Equatable {
         case handled
         case retryExactSize
     }
 
-    init(layer: CAMetalLayer, device: MTLDevice, renderer: HostSceneRenderer) {
+    init(
+        layer: CAMetalLayer, device: MTLDevice, renderer: HostSceneRenderer,
+		requestDisplayRetry: (@Sendable () -> Void)? = nil
+	) {
         self.layer = layer
+		self.device = device
         self.renderer = renderer
+		self.requestDisplayRetry = requestDisplayRetry
         layer.device = device
     }
+
+	func resumeAfterDisplayTick() {
+		queue.async { self.drain() }
+	}
+
+	func invalidateHistory() {
+		queue.async {
+			self.historyValid = false
+			self.historyTexture = nil
+		}
+	}
 
     func enqueue(
         scene: Windowing.SceneSnapshot, layers: [ResolvedSceneLayer],
@@ -679,12 +788,15 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         latched: @escaping @MainActor () -> Void,
         presented: (@MainActor () -> Void)? = nil
     ) {
-        let work = Work(
-            scene: scene, layers: layers,
-            readComplete: readComplete, latched: latched,
-            presented: presented)
         lock.lock()
         let superseded = pending
+		let mergedScene = superseded.map {
+			scene.includingUnrenderedDamage(from: $0.scene)
+		} ?? scene
+		let work = Work(
+			scene: mergedScene, layers: layers,
+			readComplete: readComplete, latched: latched,
+			presented: presented)
         pending = work
         let shouldStart = !running
         if shouldStart { running = true }
@@ -747,9 +859,9 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
             height: scene.windowGeometry.height)
         let drawableSize = CGSize(width: scene.width, height: scene.height)
 
-        // These properties all affect how CAMetalLayer creates and displays a
-        // drawable. They are deliberately mutated here, immediately before
-        // nextDrawable(), rather than by the AppKit resize callback.
+        // A drawable and its layer geometry are one committed frame. The
+        // layer's top-left gravity keeps the previous drawable unscaled while
+        // SurfaceView keeps its top-left anchor pinned during live resize.
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         layer.bounds = CGRect(origin: .zero, size: logicalSize)
@@ -777,18 +889,41 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
                 DispatchQueue.main.async { presented() }
             }
         }
+		let needsHistory = historyTexture?.width != scene.width ||
+			historyTexture?.height != scene.height
+		if needsHistory {
+			let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+				pixelFormat: .bgra8Unorm, width: scene.width,
+				height: scene.height, mipmapped: false)
+			descriptor.storageMode = .private
+			descriptor.usage = [.renderTarget]
+			historyTexture = device.makeTexture(descriptor: descriptor)
+			historyValid = false
+		}
+		guard let history = historyTexture else {
+			finish(work, success: false)
+			latch(work)
+			return .handled
+		}
 
         do {
             try renderer.encode(
                 scene: scene, layers: work.layers,
+				history: history, redrawAll: !historyValid,
                 drawable: drawable
             ) { command in
                 if command.status != .completed, let error = command.error {
                     FileHandle.standardError.write(
                         Data("[nsw] Metal scene failed: \(error)\n".utf8))
                 }
+				if command.status != .completed {
+					self.queue.async {
+						if self.historyTexture === history { self.historyValid = false }
+					}
+				}
                 self.finish(work, success: command.status == .completed)
             }
+			historyValid = true
             // A drawable has accepted this scene in FIFO order. Queue its
             // Wayland callback for the next display-link tick. Source-buffer
             // release remains tied to Metal completion above.
@@ -810,9 +945,13 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         if shouldRetry { pending = work }
         lock.unlock()
         guard shouldRetry else { return false }
-        queue.asyncAfter(deadline: .now() + .milliseconds(1)) {
-            self.drain()
-        }
+		if let requestDisplayRetry {
+			requestDisplayRetry()
+		} else {
+			queue.asyncAfter(deadline: .now() + .milliseconds(16)) {
+				self.drain()
+			}
+		}
         return true
     }
 
@@ -887,19 +1026,23 @@ private final class SurfaceView: NSView {
         metalLayer.framebufferOnly = false
         metalLayer.maximumDrawableCount = 3
         metalLayer.allowsNextDrawableTimeout = true
+        // SurfaceView is flipped. AppKit maps its visual `.topLeft` placement
+        // to Core Animation's `.bottomLeft` gravity (verified against the
+        // layerContentsPlacement API), so the standalone Metal child must use
+        // the same gravity instead of the oppositely oriented `.topLeft`.
+        metalLayer.contentsGravity = .bottomLeft
         metalLayer.isOpaque = false
         metalLayer.anchorPoint = .zero
         metalLayer.isGeometryFlipped = true
         metalLayer.isHidden = true
         wantsLayer = true
         layerContentsRedrawPolicy = .never
+        layerContentsPlacement = .topLeft
     }
 
     override func makeBackingLayer() -> CALayer {
         let layer = CALayer()
         layer.isOpaque = false
-        layer.anchorPoint = .zero
-        layer.isGeometryFlipped = true
         layer.masksToBounds = true
         sceneLayer.addSublayer(surfaceLayer)
         sceneLayer.addSublayer(metalLayer)
@@ -980,6 +1123,7 @@ private final class SurfaceView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        input?.pointerMoved(to: location(of: event))
         input?.pointerButton(.left, pressed: false)
     }
 
@@ -989,18 +1133,22 @@ private final class SurfaceView: NSView {
     }
 
     override func rightMouseUp(with event: NSEvent) {
+        input?.pointerMoved(to: location(of: event))
         input?.pointerButton(.right, pressed: false)
     }
 
     override func otherMouseDown(with event: NSEvent) {
+        input?.pointerMoved(to: location(of: event))
         input?.pointerButton(.middle, pressed: true)
     }
 
     override func otherMouseUp(with event: NSEvent) {
+        input?.pointerMoved(to: location(of: event))
         input?.pointerButton(.middle, pressed: false)
     }
 
     override func scrollWheel(with event: NSEvent) {
+        input?.pointerMoved(to: location(of: event))
         // macOS scrolls in points and inverts by default; Wayland's axis is a
         // downward-positive distance, so both are undone here rather than in the
         // guest, which cannot know about "natural" scrolling.

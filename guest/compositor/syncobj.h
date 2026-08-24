@@ -20,6 +20,8 @@ bool np_syncobj_take_commit(
 	struct np_sync_point **acquire, struct np_sync_point **release);
 
 bool np_sync_point_ready(struct np_sync_point *point);
+/* Returns a pollable eventfd which signals when the timeline point is ready. */
+int np_sync_point_wait_fd(struct np_sync_point *point);
 void np_sync_point_destroy(struct np_sync_point *point);
 void np_sync_point_signal(struct np_sync_point *point);
 

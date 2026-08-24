@@ -53,6 +53,14 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
     private var hostVisibleRegion: VZVirtioSharedMemoryRegion?
     private let resources = ResourceTable()
     private var contexts: [UInt32: GuestContext] = [:]
+    /// Removed from the guest-visible table but retained until VZ has really
+    /// unmapped its aperture range and Venus has dropped the import.
+    private var retiringResources: [UInt32: GPUResource] = [:]
+    /// A failed VZ unmap cannot be treated as success: the guest mapping may
+    /// still reference the backing. Keep it quarantined until a later reset can
+    /// retry, or until the VM stops and VZ tears the whole region down.
+    private var quarantinedResourceIDs: Set<UInt32> = []
+    private var deferredBlobCreates: [UInt32: DeferredBlobCreate] = [:]
     /// Owns the import table and, when present, virglrenderer. Created on the
     /// device queue's thread in `init` so every later call stays there.
     private let venus: OpaquePointer
@@ -156,8 +164,8 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
         return (published.pointer!, published.byteCount)
     }
 
-    /// A Venus image exported as an MTLTexture. Application windows use this
-    /// as the source of their private display-IOSurface blit.
+    /// A Venus image exported as an MTLTexture. Application windows sample it
+    /// directly while rendering into their CAMetalDrawable.
     public func gpuMetalTexture(
         forResource resourceID: UInt32,
         width: Int, height: Int, bytesPerRow: Int, format: UInt32
@@ -212,6 +220,12 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
         publishedLock.unlock()
     }
 
+	private func cancelDeferredBlobCreates() {
+		let deferred = deferredBlobCreates.values
+		deferredBlobCreates.removeAll(keepingCapacity: false)
+		for create in deferred { create.element.returnToQueue() }
+	}
+
     private func unpublish(_ resourceID: UInt32) {
         publishedLock.lock()
         published.removeValue(forKey: resourceID)
@@ -257,6 +271,12 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
         var debugName: String
         var resources: Set<UInt32> = []
     }
+
+	private struct DeferredBlobCreate {
+		let request: VirtioGPU.ResourceCreateBlob
+		let header: VirtioGPU.ControlHeader
+		let element: VZVirtioQueueElement
+	}
 
     private struct GuestBackingSegment {
         let logicalOffset: UInt64
@@ -430,6 +450,10 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
 
         case .resourceCreate2D:
             let request = try VirtioGPU.ResourceCreate2D(parsing: &reader)
+            guard retiringResources[request.resourceID] == nil else {
+                respond(element, header.reply(.errInvalidResourceID))
+                return
+            }
             do {
                 let resource = try resources.create2D(
                     id: request.resourceID, format: request.format,
@@ -615,24 +639,22 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
                 respond(element, header.reply(.errInvalidParameter))
                 return
             }
-            // The guest allocates resource ids and reuses them. DRM tears objects
-            // down lazily, so RESOURCE_UNREF for the old resource can arrive after
-            // the CREATE that reuses its id — and refusing the create as a
-            // duplicate strands the surface permanently, which looks like a window
-            // that goes blank after a resize and never comes back. The guest is
-            // authoritative here: a create for a live id replaces it.
-            if let stale = resources[request.resourceID] {
-                Self.note("replace res=\(request.resourceID) (create arrived before unref)")
-                unpublish(request.resourceID)
-                unmapFromGuest(stale, element: nil, header: nil) { [weak self] in
-                    guard let self, !self.rendererTornDown else {
-                        element.returnToQueue()
-                        return
-                    }
-                    np_venus_unimport_blob(self.venus, request.resourceID)
-                    _ = self.resources.remove(request.resourceID)
-                    self.createBlobResource(request, header: header, element: element)
+            if resources[request.resourceID] != nil {
+                Self.log.error("duplicate live resource id \(request.resourceID)")
+                respond(element, header.reply(.errInvalidResourceID))
+                return
+            }
+            if retiringResources[request.resourceID] != nil {
+                guard !quarantinedResourceIDs.contains(request.resourceID) else {
+                    respond(element, header.reply(.errInvalidResourceID))
+                    return
                 }
+                guard deferredBlobCreates[request.resourceID] == nil else {
+                    respond(element, header.reply(.errInvalidResourceID))
+                    return
+                }
+                deferredBlobCreates[request.resourceID] = DeferredBlobCreate(
+                    request: request, header: header, element: element)
                 return
             }
             createBlobResource(request, header: header, element: element)
@@ -655,23 +677,41 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
             unpublish(request.resourceID)
             guestBackings.removeValue(forKey: request.resourceID)
             if scanoutBinding?.resourceID == request.resourceID { setScanout(nil) }
-            guard let resource = resources[request.resourceID] else {
+            guard let resource = resources.remove(request.resourceID) else {
                 respond(element, header.reply(.okNoData))
                 return
             }
             if resource.twoDimensional != nil {
-                _ = resources.remove(request.resourceID)
                 respond(element, header.reply(.okNoData))
                 return
             }
-            unmapFromGuest(resource, element: nil, header: nil) { [weak self] in
+			retiringResources[request.resourceID] = resource
+            unmapFromGuest(resource, element: nil, header: nil) { [weak self] success in
                 guard let self, !self.rendererTornDown else {
                     element.returnToQueue()
                     return
                 }
+                guard success else {
+                    self.quarantinedResourceIDs.insert(request.resourceID)
+                    self.respond(element, header.reply(.errUnspecified))
+                    if let deferred = self.deferredBlobCreates.removeValue(
+                        forKey: request.resourceID) {
+                        self.respond(
+                            deferred.element,
+                            deferred.header.reply(.errInvalidResourceID))
+                    }
+                    return
+                }
                 np_venus_unimport_blob(self.venus, request.resourceID)
-                _ = self.resources.remove(request.resourceID)
+                self.retiringResources.removeValue(forKey: request.resourceID)
+                self.quarantinedResourceIDs.remove(request.resourceID)
                 self.respond(element, header.reply(.okNoData))
+				if let deferred = self.deferredBlobCreates.removeValue(
+					forKey: request.resourceID) {
+					self.createBlobResource(
+						deferred.request, header: deferred.header,
+						element: deferred.element)
+				}
             }
 
         case .submit3D:
@@ -987,17 +1027,19 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
         _ resource: GPUResource,
         element: VZVirtioQueueElement?,
         header: VirtioGPU.ControlHeader?,
-        completion: (() -> Void)? = nil
+        completion: ((Bool) -> Void)? = nil
     ) {
-        let finish = { [weak self] in
+        let finish = { [weak self] (success: Bool) in
             if let element, let header {
                 if let self, !self.rendererTornDown {
-                    self.respond(element, header.reply(.okNoData))
+                    self.respond(
+                        element,
+                        header.reply(success ? .okNoData : .errUnspecified))
                 } else {
                     element.returnToQueue()
                 }
             }
-            completion?()
+            completion?(success)
         }
 
         // UNMAP and UNREF are separate virtio commands and can both be queued
@@ -1009,8 +1051,12 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
             return
         }
 
-        guard let region = hostVisibleRegion, let offset = resource.mappedOffset else {
-            finish()
+        guard let offset = resource.mappedOffset else {
+            finish(true)
+            return
+        }
+        guard let region = hostVisibleRegion else {
+            finish(false)
             return
         }
 
@@ -1030,8 +1076,8 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
                 resource.unmapInFlight = false
                 let waiters = resource.afterUnmap
                 resource.afterUnmap.removeAll(keepingCapacity: false)
-                finish()
-                waiters.forEach { $0() }
+                finish(false)
+                waiters.forEach { $0(false) }
                 done()
                 return
             }
@@ -1039,12 +1085,17 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
                 if let error, !self.rendererTornDown {
                     Self.log.error("unmapping resource \(resource.resourceID) failed: \(error.localizedDescription, privacy: .public)")
                     Self.note("reject  unmap res=\(resource.resourceID) offset=\(offset): \(error.localizedDescription)")
+                    // The API did not confirm that the mapping disappeared.
+                    // Restoring the claimed offset keeps the backing reachable
+                    // and lets a later reset retry instead of freeing live pages.
+                    resource.mappedOffset = offset
                 }
                 resource.unmapInFlight = false
                 let waiters = resource.afterUnmap
                 resource.afterUnmap.removeAll(keepingCapacity: false)
-                finish()
-                waiters.forEach { $0() }
+                let success = error == nil
+                finish(success)
+                waiters.forEach { $0(success) }
                 done()
             }
         }
@@ -1274,17 +1325,37 @@ extension VirtioGPUDevice: VZCustomVirtioDeviceDelegate {
 
     /// Drop mappings and Venus contexts; leave the host renderer running.
     private func clearGuestRendererState(completion: @escaping () -> Void = {}) {
+		cancelDeferredBlobCreates()
         setScanout(nil)
         guestBackings.removeAll(keepingCapacity: true)
-        let resourceIDs = resources.identifiers
+        let activeResources = resources.all
+        let cleanupResources = activeResources + Array(retiringResources.values)
         let contextIDs = Array(contexts.keys)
-        for resource in resources.mapped {
+        for resource in cleanupResources
+        where resource.mappedOffset != nil || resource.unmapInFlight {
             unmapFromGuest(resource, element: nil, header: nil)
         }
         // This operation is queued after every asynchronous aperture unmap.
         // Renderer mappings must remain alive until the guest mapping is gone.
         enqueueRegionOperation { [self] done in
-            for id in resourceIDs { np_venus_unimport_blob(venus, id) }
+            for resource in cleanupResources where resource.twoDimensional == nil {
+                // A RESOURCE_UNREF already in flight may have completed and
+                // unimported this retiring object before the reset barrier ran.
+                // Only the table which still owns the object may retire it.
+                guard resources[resource.resourceID] === resource ||
+                        retiringResources[resource.resourceID] === resource
+                else { continue }
+                if resource.mappedOffset == nil && !resource.unmapInFlight {
+                    np_venus_unimport_blob(venus, resource.resourceID)
+                    retiringResources.removeValue(forKey: resource.resourceID)
+                    quarantinedResourceIDs.remove(resource.resourceID)
+                } else {
+                    retiringResources[resource.resourceID] = resource
+                    quarantinedResourceIDs.insert(resource.resourceID)
+                    Self.log.error(
+                        "resource \(resource.resourceID) remains mapped after reset; quarantined")
+                }
+            }
             for ctxID in contextIDs { np_venus_context_destroy(venus, ctxID) }
             contexts.removeAll()
             resources.removeAll()
@@ -1302,6 +1373,7 @@ extension VirtioGPUDevice: VZCustomVirtioDeviceDelegate {
         guard !rendererTornDown else { return }
         Self.note("tearing down Venus / virglrenderer")
         rendererTornDown = true
+		cancelDeferredBlobCreates()
         setScanout(nil)
         guestBackings.removeAll(keepingCapacity: false)
 
@@ -1312,12 +1384,16 @@ extension VirtioGPUDevice: VZCustomVirtioDeviceDelegate {
         // access the device, and VZ tears down the complete region itself, so
         // release renderer objects synchronously and let any late completion
         // take the guarded path above.
-        let resourceIDs = resources.identifiers
+        let cleanupResources = resources.all + Array(retiringResources.values)
         let contextIDs = Array(contexts.keys)
-        for id in resourceIDs { np_venus_unimport_blob(venus, id) }
+        for resource in cleanupResources where resource.twoDimensional == nil {
+            np_venus_unimport_blob(venus, resource.resourceID)
+        }
         for ctxID in contextIDs { np_venus_context_destroy(venus, ctxID) }
         contexts.removeAll()
         resources.removeAll()
+        retiringResources.removeAll(keepingCapacity: false)
+        quarantinedResourceIDs.removeAll(keepingCapacity: false)
         publishedLock.lock()
         published.removeAll(keepingCapacity: false)
         metalTextures.removeAll(keepingCapacity: false)

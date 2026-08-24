@@ -45,7 +45,9 @@ GENERATED := xdg-shell-server-protocol.h xdg-shell-client-protocol.h xdg-shell-p
              fifo-v1-server-protocol.h fifo-v1-protocol.c \
              linux-drm-syncobj-v1-server-protocol.h linux-drm-syncobj-v1-protocol.c
 
-SHARED_SOURCES := compositor.c decoration.c scale.c scene.c region.c perf.c hostlink.c \
+SHARED_SOURCES := compositor.c surface.c surface_commit.c presentation.c \
+                  subcompositor.c input.c host_session.c \
+                  decoration.c scale.c scene.c region.c perf.c hostlink.c \
                   windowwire.c window_events.c xdg_shell.c text_input.c fifo.c data_device.c \
                   cursor_shape.c cursor-shape-v1-protocol.c \
                   xdg-shell-protocol.c viewporter-protocol.c fractional-scale-v1-protocol.c \

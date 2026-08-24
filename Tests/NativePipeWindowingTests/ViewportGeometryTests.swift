@@ -5,6 +5,32 @@ import XCTest
 
 @MainActor
 final class ViewportGeometryTests: XCTestCase {
+	func testLatestSceneCarriesDamageFromSkippedUnencodedScene() {
+		let layer = Windowing.SceneLayer(
+			surface: 1, resourceID: 10, width: 800, height: 600,
+			bytesPerRow: 3_200, format: .bgra8888,
+			destination: .init(x: 0, y: 0, width: 800, height: 600),
+			sourcePixels: .init(x: 0, y: 0, width: 800, height: 600),
+			clip: .init(x: 0, y: 0, width: 800, height: 600),
+			alpha: 1, opaque: true, transform: .normal)
+		let older = Windowing.SceneSnapshot(
+			surface: 1, presentationID: 1, width: 800, height: 600, scale: 1,
+			windowGeometry: .init(x: 0, y: 0, width: 800, height: 600),
+			layers: [layer], damage: [.init(x: 10, y: 20, width: 30, height: 40)])
+		var newerLayer = layer
+		newerLayer.resourceID = 11
+		let newer = Windowing.SceneSnapshot(
+			surface: 1, presentationID: 2, width: 800, height: 600, scale: 1,
+			windowGeometry: older.windowGeometry, layers: [newerLayer],
+			damage: [.init(x: 100, y: 90, width: 20, height: 10)])
+
+		let merged = newer.includingUnrenderedDamage(from: older)
+		XCTAssertEqual(merged.presentationID, 2)
+		XCTAssertEqual(merged.layers[0].resourceID, 11)
+		XCTAssertEqual(
+			merged.damage, [.init(x: 10, y: 20, width: 110, height: 80)])
+	}
+
     func testPopupConstraintsPreferFlipThenSlideAndResize() {
         let bounds = CGRect(x: 0, y: 0, width: 800, height: 600)
         let flipped = Windowing.PopupPlacement(

@@ -8,6 +8,8 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <wayland-server-protocol.h>
 
 #ifdef NP_REMOTE
 
@@ -23,17 +25,27 @@ struct np_surface *np_scene_hit_test(struct np_surface *root, double x, double y
 	return root;
 }
 
-bool np_scene_build(struct np_surface *root, uint32_t presentation_id,
-	                struct np_scene_packet *packet)
+enum np_scene_build_result np_scene_build(
+	struct np_surface *root, uint32_t presentation_id,
+	struct np_scene_packet *packet, int *wait_fd)
 {
 	(void)root; (void)presentation_id; (void)packet;
-	return false;
+	if (wait_fd) *wait_fd = -1;
+	return NP_SCENE_INVALID;
 }
-bool np_scene_hold_current(struct np_surface *surface, uint32_t presentation_id)
+enum np_scene_build_result np_scene_hold_current(
+	struct np_surface *surface, uint32_t presentation_id, int *wait_fd)
 {
 	(void)surface; (void)presentation_id;
-	return false;
+	if (wait_fd) *wait_fd = -1;
+	return NP_SCENE_INVALID;
 }
+void np_scene_note_damage(struct np_surface *surface,
+	                      const struct np_box *buffer_damage, bool full_scene)
+{
+	(void)surface; (void)buffer_damage; (void)full_scene;
+}
+void np_scene_damage_sent(struct np_surface *root) { (void)root; }
 void np_scene_presented(struct np_surface *root, uint32_t presentation_id)
 {
 	(void)root; (void)presentation_id;
@@ -44,8 +56,8 @@ void np_scene_destroy(struct np_surface *surface) { (void)surface; }
 #else
 
 #define NP_SCENE_MAGIC "NPSN"
-#define NP_SCENE_VERSION 1u
-#define NP_SCENE_HEADER_SIZE 56u
+#define NP_SCENE_VERSION 2u
+#define NP_SCENE_HEADER_SIZE 72u
 #define NP_SCENE_LAYER_SIZE 88u
 #define NP_SCENE_MAX_LAYERS 128u
 
@@ -80,6 +92,28 @@ struct np_surface *np_scene_root(struct np_surface *surface)
 {
 	while (surface && surface->parent) surface = surface->parent;
 	return surface && (surface->toplevel || surface->popup) ? surface : NULL;
+}
+
+void np_scene_note_damage(struct np_surface *surface,
+	                      const struct np_box *buffer_damage, bool full_scene)
+{
+	struct np_surface *root = np_scene_root(surface);
+	if (!surface || !root) return;
+	if (buffer_damage && buffer_damage->width > 0 && buffer_damage->height > 0)
+		np_box_union(&surface->scene_damage,
+		             buffer_damage->x, buffer_damage->y,
+		             buffer_damage->width, buffer_damage->height);
+	if (full_scene) root->scene_full_damage = true;
+}
+
+void np_scene_damage_sent(struct np_surface *root)
+{
+	if (!root) return;
+	root->scene_full_damage = false;
+	struct np_surface *surface;
+	wl_list_for_each(surface, &root->server->surfaces, link) {
+		if (np_scene_root(surface) == root) np_box_clear(&surface->scene_damage);
+	}
 }
 
 static struct np_surface *hit_tree(
@@ -136,21 +170,97 @@ struct np_surface *np_scene_hit_test(struct np_surface *root, double x, double y
 	return hit_tree(root, root_x, root_y, 0, 0, local_x, local_y);
 }
 
-static bool collect_surface(
-	struct np_surface *surface, int32_t origin_x, int32_t origin_y,
+static void source_to_destination(uint32_t transform, double u, double v,
+	                              double *destination_u, double *destination_v)
+{
+	switch (transform) {
+	case WL_OUTPUT_TRANSFORM_90:
+		*destination_u = 1.0 - v; *destination_v = u; break;
+	case WL_OUTPUT_TRANSFORM_180:
+		*destination_u = 1.0 - u; *destination_v = 1.0 - v; break;
+	case WL_OUTPUT_TRANSFORM_270:
+		*destination_u = v; *destination_v = 1.0 - u; break;
+	case WL_OUTPUT_TRANSFORM_FLIPPED:
+		*destination_u = 1.0 - u; *destination_v = v; break;
+	case WL_OUTPUT_TRANSFORM_FLIPPED_90:
+		*destination_u = v; *destination_v = u; break;
+	case WL_OUTPUT_TRANSFORM_FLIPPED_180:
+		*destination_u = u; *destination_v = 1.0 - v; break;
+	case WL_OUTPUT_TRANSFORM_FLIPPED_270:
+		*destination_u = 1.0 - v; *destination_v = 1.0 - u; break;
+	default:
+		*destination_u = u; *destination_v = v; break;
+	}
+}
+
+static void collect_item_damage(const struct np_scene_item *item,
+	                            struct np_box *scene_damage)
+{
+	const struct np_box *damage = &item->surface->scene_damage;
+	if (!scene_damage || damage->width <= 0 || damage->height <= 0 ||
+	    item->source[2] <= 0 || item->source[3] <= 0) return;
+	double sx0 = fmax(item->source[0], (double)damage->x);
+	double sy0 = fmax(item->source[1], (double)damage->y);
+	double sx1 = fmin(item->source[0] + item->source[2],
+	                  (double)damage->x + damage->width);
+	double sy1 = fmin(item->source[1] + item->source[3],
+	                  (double)damage->y + damage->height);
+	if (sx1 <= sx0 || sy1 <= sy0) return;
+	double min_u = 1.0, min_v = 1.0, max_u = 0.0, max_v = 0.0;
+	for (int corner = 0; corner < 4; corner++) {
+		double source_u = (((corner & 1) ? sx1 : sx0) - item->source[0]) /
+		                  item->source[2];
+		double source_v = (((corner & 2) ? sy1 : sy0) - item->source[1]) /
+		                  item->source[3];
+		double u, v;
+		source_to_destination(item->transform, source_u, source_v, &u, &v);
+		if (u < min_u) min_u = u;
+		if (v < min_v) min_v = v;
+		if (u > max_u) max_u = u;
+		if (v > max_v) max_v = v;
+	}
+	double x0 = fmax(item->clip[0], item->destination[0] + min_u * item->destination[2]);
+	double y0 = fmax(item->clip[1], item->destination[1] + min_v * item->destination[3]);
+	double x1 = fmin(item->clip[0] + item->clip[2],
+	                  item->destination[0] + max_u * item->destination[2]);
+	double y1 = fmin(item->clip[1] + item->clip[3],
+	                  item->destination[1] + max_v * item->destination[3]);
+	if (x1 <= x0 || y1 <= y0) return;
+	int64_t left = (int64_t)floor(x0);
+	int64_t top = (int64_t)floor(y0);
+	int64_t right = (int64_t)ceil(x1);
+	int64_t bottom = (int64_t)ceil(y1);
+	np_box_union(scene_damage, left, top, right - left, bottom - top);
+}
+
+static enum np_scene_build_result collect_surface(
+	struct np_surface *surface, int64_t origin_x, int64_t origin_y,
 	int32_t geometry_x, int32_t geometry_y, uint32_t output_scale,
 	uint32_t output_width, uint32_t output_height,
-	struct np_scene_item items[NP_SCENE_MAX_LAYERS], uint32_t *count)
+	struct np_scene_item items[NP_SCENE_MAX_LAYERS], uint32_t *count,
+	struct np_box *scene_damage)
 {
 	if (!surface->has_published ||
 	    (!surface->current_gpu && !surface->current_shm))
-		return true;
-	if (*count >= NP_SCENE_MAX_LAYERS) return false;
+		return NP_SCENE_READY;
+	if (*count >= NP_SCENE_MAX_LAYERS) return NP_SCENE_INVALID;
 
 	struct np_surface_mapping mapping;
 	if (!np_scale_resolve(surface, (uint32_t)surface->last_width,
 	                     (uint32_t)surface->last_height, &mapping))
-		return false;
+		return NP_SCENE_INVALID;
+	double x_value = ((double)origin_x + surface->buffer_offset_x - geometry_x) *
+	                 output_scale;
+	double y_value = ((double)origin_y + surface->buffer_offset_y - geometry_y) *
+	                 output_scale;
+	double width_value = mapping.logical_width * output_scale;
+	double height_value = mapping.logical_height * output_scale;
+	double clip_x0 = fmax(x_value, 0.0);
+	double clip_y0 = fmax(y_value, 0.0);
+	double clip_x1 = fmin(x_value + width_value, output_width);
+	double clip_y1 = fmin(y_value + height_value, output_height);
+	if (clip_x1 <= clip_x0 || clip_y1 <= clip_y0) return NP_SCENE_READY;
+
 	struct np_scene_item *item = &items[(*count)++];
 	memset(item, 0, sizeof(*item));
 	item->surface = surface;
@@ -164,12 +274,10 @@ static bool collect_surface(
 	item->flags = item->format == 2u ? 1u : 0u;
 	item->transform = (uint32_t)surface->transform;
 
-	float x = (float)((origin_x + surface->buffer_offset_x - geometry_x) *
-	                  (int32_t)output_scale);
-	float y = (float)((origin_y + surface->buffer_offset_y - geometry_y) *
-	                  (int32_t)output_scale);
-	float width = (float)(mapping.logical_width * output_scale);
-	float height = (float)(mapping.logical_height * output_scale);
+	float x = (float)x_value;
+	float y = (float)y_value;
+	float width = (float)width_value;
+	float height = (float)height_value;
 	item->destination[0] = x;
 	item->destination[1] = y;
 	item->destination[2] = width;
@@ -178,18 +286,10 @@ static bool collect_surface(
 	item->source[1] = (float)mapping.source_y_pixels;
 	item->source[2] = (float)mapping.source_width_pixels;
 	item->source[3] = (float)mapping.source_height_pixels;
-	float clip_x0 = fmaxf(x, 0);
-	float clip_y0 = fmaxf(y, 0);
-	float clip_x1 = fminf(x + width, (float)output_width);
-	float clip_y1 = fminf(y + height, (float)output_height);
-	if (clip_x1 <= clip_x0 || clip_y1 <= clip_y0) {
-		(*count)--;
-		return true;
-	}
-	item->clip[0] = clip_x0;
-	item->clip[1] = clip_y0;
-	item->clip[2] = clip_x1 - clip_x0;
-	item->clip[3] = clip_y1 - clip_y0;
+	item->clip[0] = (float)clip_x0;
+	item->clip[1] = (float)clip_y0;
+	item->clip[2] = (float)(clip_x1 - clip_x0);
+	item->clip[3] = (float)(clip_y1 - clip_y0);
 
 	if (surface->current_gpu) {
 		item->resource_id = surface->current_gpu->resource_id;
@@ -201,34 +301,42 @@ static bool collect_surface(
 		item->reference.kind = NP_SCENE_SHM;
 		item->reference.shm = surface->current_shm;
 	}
-	return item->resource_id != 0;
+	collect_item_damage(item, scene_damage);
+	return item->resource_id != 0 ? NP_SCENE_READY : NP_SCENE_INVALID;
 }
 
-static bool collect_tree(
-	struct np_surface *surface, int32_t origin_x, int32_t origin_y,
+static enum np_scene_build_result collect_tree(
+	struct np_surface *surface, int64_t origin_x, int64_t origin_y,
 	int32_t geometry_x, int32_t geometry_y, uint32_t output_scale,
 	uint32_t output_width, uint32_t output_height,
-	struct np_scene_item items[NP_SCENE_MAX_LAYERS], uint32_t *count)
+	struct np_scene_item items[NP_SCENE_MAX_LAYERS], uint32_t *count,
+	uint32_t depth, struct np_box *scene_damage)
 {
+	if (depth >= NP_SCENE_MAX_LAYERS) return NP_SCENE_INVALID;
 	struct np_surface *child;
 	wl_list_for_each(child, &surface->children, sibling_link) {
-		if (!child->above_parent &&
-		    !collect_tree(child, origin_x + child->sub_x,
-		                  origin_y + child->sub_y, geometry_x, geometry_y,
-		                  output_scale, output_width, output_height, items, count))
-			return false;
+		if (!child->above_parent) {
+			enum np_scene_build_result result = collect_tree(
+				child, origin_x + child->sub_x, origin_y + child->sub_y,
+					geometry_x, geometry_y, output_scale, output_width, output_height,
+					items, count, depth + 1, scene_damage);
+			if (result != NP_SCENE_READY) return result;
+		}
 	}
-	if (!collect_surface(surface, origin_x, origin_y, geometry_x, geometry_y,
-	                     output_scale, output_width, output_height, items, count))
-		return false;
+	enum np_scene_build_result result = collect_surface(
+		surface, origin_x, origin_y, geometry_x, geometry_y,
+		output_scale, output_width, output_height, items, count, scene_damage);
+	if (result != NP_SCENE_READY) return result;
 	wl_list_for_each(child, &surface->children, sibling_link) {
-		if (child->above_parent &&
-		    !collect_tree(child, origin_x + child->sub_x,
-		                  origin_y + child->sub_y, geometry_x, geometry_y,
-		                  output_scale, output_width, output_height, items, count))
-			return false;
+		if (child->above_parent) {
+			result = collect_tree(
+				child, origin_x + child->sub_x, origin_y + child->sub_y,
+					geometry_x, geometry_y, output_scale, output_width, output_height,
+					items, count, depth + 1, scene_damage);
+			if (result != NP_SCENE_READY) return result;
+		}
 	}
-	return true;
+	return NP_SCENE_READY;
 }
 
 static void put_u16(unsigned char *p, uint16_t value)
@@ -260,86 +368,110 @@ static void release_references(struct np_scene_presentation *presentation)
 		else
 			np_shm_texture_end_host_read(reference->shm);
 	}
+	presentation->reference_count = 0;
 }
 
-bool np_scene_hold_current(struct np_surface *surface, uint32_t presentation_id)
+static bool same_reference(const struct np_scene_reference *a,
+	                       const struct np_scene_reference *b)
 {
+	if (a->kind != b->kind) return false;
+	return a->kind == NP_SCENE_GPU ? a->gpu == b->gpu : a->shm == b->shm;
+}
+
+/* A texture may appear more than once in one subsurface tree. Hold and release
+ * each imported object once per presentation, independent of layer count. */
+static bool retain_reference(struct np_scene_presentation *presentation,
+	                         struct np_scene_reference reference)
+{
+	for (uint32_t i = 0; i < presentation->reference_count; i++) {
+		if (same_reference(&presentation->references[i], &reference)) return true;
+	}
+	if (presentation->reference_count >= NP_SCENE_MAX_LAYERS) return false;
+	if (reference.kind == NP_SCENE_GPU) {
+		if (!np_gpu_buffer_acquire_host_read(reference.gpu)) return false;
+	} else {
+		np_shm_texture_begin_host_read(reference.shm);
+	}
+	presentation->references[presentation->reference_count++] = reference;
+	return true;
+}
+
+enum np_scene_build_result np_scene_hold_current(
+	struct np_surface *surface, uint32_t presentation_id, int *wait_fd)
+{
+	if (wait_fd) *wait_fd = -1;
 	if (!surface || !presentation_id ||
 	    (!surface->current_gpu && !surface->current_shm))
-		return false;
+		return NP_SCENE_INVALID;
 	struct np_scene_presentation *presentation = calloc(1, sizeof(*presentation));
-	if (!presentation) return false;
+	if (!presentation) return NP_SCENE_NO_MEMORY;
 	wl_list_init(&presentation->link);
 	presentation->id = presentation_id;
 	struct np_scene_reference reference;
 	if (surface->current_gpu) {
-		if (!np_gpu_buffer_begin_host_read(surface->current_gpu)) {
-			free(presentation);
-			return false;
-		}
 		reference.kind = NP_SCENE_GPU;
 		reference.gpu = surface->current_gpu;
 	} else {
-		np_shm_texture_begin_host_read(surface->current_shm);
 		reference.kind = NP_SCENE_SHM;
 		reference.shm = surface->current_shm;
 	}
-	presentation->references[0] = reference;
-	presentation->reference_count = 1;
+	if (!retain_reference(presentation, reference)) {
+		free(presentation);
+		return NP_SCENE_INVALID;
+	}
 	wl_list_insert(&surface->scene_presentations, &presentation->link);
-	return true;
+	return NP_SCENE_READY;
 }
 
-bool np_scene_build(struct np_surface *root, uint32_t presentation_id,
-	                struct np_scene_packet *packet)
+enum np_scene_build_result np_scene_build(
+	struct np_surface *root, uint32_t presentation_id,
+	struct np_scene_packet *packet, int *wait_fd)
 {
+	if (wait_fd) *wait_fd = -1;
 	if (!root || !packet || !presentation_id || !root->has_published)
-		return false;
+		return NP_SCENE_INVALID;
 	memset(packet, 0, sizeof(*packet));
 
 	struct np_surface_mapping root_mapping;
 	if (!np_scale_resolve(root, (uint32_t)root->last_width,
 	                     (uint32_t)root->last_height, &root_mapping))
-		return false;
+		return NP_SCENE_INVALID;
 	int32_t gx = root->geometry_set ? root->geometry_x : 0;
 	int32_t gy = root->geometry_set ? root->geometry_y : 0;
 	int32_t gw = root->geometry_set ? root->geometry_width
 	                              : (int32_t)llround(root_mapping.logical_width);
 	int32_t gh = root->geometry_set ? root->geometry_height
 	                              : (int32_t)llround(root_mapping.logical_height);
-	uint32_t scale = root->server->output_scale > 0
-		? (uint32_t)root->server->output_scale : 1u;
+	uint32_t scale = root->preferred_scale > 0
+		? (uint32_t)root->preferred_scale : 1u;
 	if (gw <= 0 || gh <= 0 || scale > 4 ||
-	    (uint64_t)gw * scale > UINT32_MAX ||
-	    (uint64_t)gh * scale > UINT32_MAX)
-		return false;
+	    (uint64_t)gw * scale > INT32_MAX ||
+	    (uint64_t)gh * scale > INT32_MAX)
+		return NP_SCENE_INVALID;
 	uint32_t output_width = (uint32_t)gw * scale;
 	uint32_t output_height = (uint32_t)gh * scale;
 
 	struct np_scene_item items[NP_SCENE_MAX_LAYERS];
 	uint32_t count = 0;
-	if (!collect_tree(root, 0, 0, gx, gy, scale,
-	                  output_width, output_height, items, &count) || !count)
-		return false;
+	struct np_box scene_damage;
+	np_box_clear(&scene_damage);
+	enum np_scene_build_result collected = collect_tree(
+		root, 0, 0, gx, gy, scale, output_width, output_height,
+		items, &count, 0, &scene_damage);
+	if (collected != NP_SCENE_READY || !count) {
+		return collected == NP_SCENE_READY ? NP_SCENE_INVALID : collected;
+	}
 
 	struct np_scene_presentation *presentation = calloc(1, sizeof(*presentation));
-	if (!presentation) return false;
+	if (!presentation) return NP_SCENE_NO_MEMORY;
 	wl_list_init(&presentation->link);
 	presentation->id = presentation_id;
 	for (uint32_t i = 0; i < count; i++) {
-		bool ready;
-		if (items[i].reference.kind == NP_SCENE_GPU)
-			ready = np_gpu_buffer_begin_host_read(items[i].reference.gpu);
-		else {
-			np_shm_texture_begin_host_read(items[i].reference.shm);
-			ready = true;
-		}
-		if (!ready) {
+		if (!retain_reference(presentation, items[i].reference)) {
 			release_references(presentation);
 			free(presentation);
-			return false;
+			return NP_SCENE_INVALID;
 		}
-		presentation->references[presentation->reference_count++] = items[i].reference;
 	}
 
 	size_t size = NP_SCENE_HEADER_SIZE + (size_t)count * NP_SCENE_LAYER_SIZE;
@@ -347,7 +479,7 @@ bool np_scene_build(struct np_surface *root, uint32_t presentation_id,
 	if (!bytes) {
 		release_references(presentation);
 		free(presentation);
-		return false;
+		return NP_SCENE_NO_MEMORY;
 	}
 	memcpy(bytes, NP_SCENE_MAGIC, 4);
 	put_u16(bytes + 4, NP_SCENE_VERSION);
@@ -363,23 +495,31 @@ bool np_scene_build(struct np_surface *root, uint32_t presentation_id,
 	put_i32(bytes + 40, gw);
 	put_i32(bytes + 44, gh);
 	put_u32(bytes + 48, count);
-	put_u32(bytes + 52, 0);
+	put_u32(bytes + 52, root->scene_full_damage ? 1u : 0u);
+	if (root->scene_full_damage) {
+		scene_damage = (struct np_box){0, 0, output_width, output_height};
+	}
+	put_i32(bytes + 56, (int32_t)scene_damage.x);
+	put_i32(bytes + 60, (int32_t)scene_damage.y);
+	put_i32(bytes + 64, (int32_t)scene_damage.width);
+	put_i32(bytes + 68, (int32_t)scene_damage.height);
 
 	for (uint32_t i = 0; i < count; i++) {
 		unsigned char *layer = bytes + NP_SCENE_HEADER_SIZE +
 		                       (size_t)i * NP_SCENE_LAYER_SIZE;
-		put_u32(layer + 0, items[i].surface->id);
-		put_u32(layer + 4, items[i].resource_id);
-		put_u32(layer + 8, items[i].width);
-		put_u32(layer + 12, items[i].height);
-		put_u32(layer + 16, items[i].stride);
-		put_u16(layer + 20, items[i].format);
-		put_u16(layer + 22, items[i].flags);
-		put_u32(layer + 24, items[i].transform);
+		struct np_scene_item *item = &items[i];
+		put_u32(layer + 0, item->surface->id);
+		put_u32(layer + 4, item->resource_id);
+		put_u32(layer + 8, item->width);
+		put_u32(layer + 12, item->height);
+		put_u32(layer + 16, item->stride);
+		put_u16(layer + 20, item->format);
+		put_u16(layer + 22, item->flags);
+		put_u32(layer + 24, item->transform);
 		for (uint32_t j = 0; j < 4; j++) {
-			put_f32(layer + 32 + j * 4, items[i].destination[j]);
-			put_f32(layer + 48 + j * 4, items[i].source[j]);
-			put_f32(layer + 64 + j * 4, items[i].clip[j]);
+			put_f32(layer + 32 + j * 4, item->destination[j]);
+			put_f32(layer + 48 + j * 4, item->source[j]);
+			put_f32(layer + 64 + j * 4, item->clip[j]);
 		}
 		put_f32(layer + 80, 1.0f);
 	}
@@ -387,7 +527,7 @@ bool np_scene_build(struct np_surface *root, uint32_t presentation_id,
 	wl_list_insert(&root->scene_presentations, &presentation->link);
 	packet->data = bytes;
 	packet->size = size;
-	return true;
+	return NP_SCENE_READY;
 }
 
 void np_scene_presented(struct np_surface *root, uint32_t presentation_id)

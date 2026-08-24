@@ -11,6 +11,7 @@
 
 struct np_box;
 struct np_server;
+struct np_surface;
 struct wl_resource;
 
 #ifndef NP_REMOTE
@@ -27,11 +28,15 @@ struct np_shm_texture {
 	uint32_t host_reads;
 };
 
-struct np_shm_texture *np_shm_texture_upload(
-	struct np_server *server, struct wl_resource *buffer,
-	const struct np_box *damage);
-bool np_shm_texture_is_busy(struct np_server *server,
-	                         struct wl_resource *buffer);
+enum np_shm_upload_result {
+	NP_SHM_UPLOAD_OK = 0,
+	NP_SHM_UPLOAD_INVALID,
+	NP_SHM_UPLOAD_NO_MEMORY,
+};
+
+enum np_shm_upload_result np_shm_texture_upload(
+	struct np_surface *surface, struct wl_resource *buffer,
+	const struct np_box *damage, struct np_shm_texture **texture_out);
 void np_shm_texture_ref(struct np_shm_texture *texture);
 void np_shm_texture_unref(struct np_shm_texture *texture);
 void np_shm_texture_begin_host_read(struct np_shm_texture *texture);

@@ -113,6 +113,7 @@ void np_host_accept(struct np_host *host) {
 	set_nonblocking(fd);
 	host->conn_fd = fd;
 	host->buffer_len = 0;
+	host->out_head = 0;
 	host->out_len = 0;
 	fprintf(stderr, "[wayland] host attached on port %u\n", host->port);
 }
@@ -124,31 +125,42 @@ void np_host_disconnect(struct np_host *host) {
 		host->conn_fd = -1;
 	}
 	host->buffer_len = 0;
+	host->out_head = 0;
 	host->out_len = 0;
 	if (was_connected)
 		fprintf(stderr, "[wayland] host detached from port %u\n", host->port);
 }
 
-/// Beyond this the host is not draining and the backlog is stale anyway.
-#define NP_MAX_OUTBOUND (4u * 1024u * 1024u)
+/* One maximum-sized NPIP frame must always fit.  The queue cap is otherwise
+ * smaller than the protocol cap and a valid large scene can never be sent. */
+#define NP_MAX_OUTBOUND (NP_HEADER + NP_MAX_PAYLOAD)
 
 /// Pushes as much of the outbound buffer as the socket will take.
 static void flush_outbound(struct np_host *host) {
-	while (host->out_len > 0) {
-		ssize_t written = send(host->conn_fd, host->out, host->out_len, MSG_NOSIGNAL);
+	while (host->out_head < host->out_len) {
+		ssize_t written = send(
+			host->conn_fd, host->out + host->out_head,
+			host->out_len - host->out_head, MSG_NOSIGNAL);
 		if (written > 0) {
-			memmove(host->out, host->out + written, host->out_len - (size_t)written);
-			host->out_len -= (size_t)written;
+			host->out_head += (size_t)written;
 			continue;
 		}
 		if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
 		np_host_disconnect(host);
 		return;
 	}
+	host->out_head = 0;
+	host->out_len = 0;
 }
 
-static bool queue_outbound(struct np_host *host, const unsigned char *bytes, size_t count) {
-	if (host->out_len + count > NP_MAX_OUTBOUND) return false;
+static bool reserve_outbound(struct np_host *host, size_t count) {
+	size_t pending = host->out_len - host->out_head;
+	if (count > NP_MAX_OUTBOUND - pending) return false;
+	if (host->out_head && host->out_cap - host->out_len < count) {
+		memmove(host->out, host->out + host->out_head, pending);
+		host->out_head = 0;
+		host->out_len = pending;
+	}
 	if (host->out_cap < host->out_len + count) {
 		size_t cap = host->out_cap ? host->out_cap * 2 : 65536;
 		while (cap < host->out_len + count) cap *= 2;
@@ -157,8 +169,6 @@ static bool queue_outbound(struct np_host *host, const unsigned char *bytes, siz
 		host->out = grown;
 		host->out_cap = cap;
 	}
-	memcpy(host->out + host->out_len, bytes, count);
-	host->out_len += count;
 	return true;
 }
 
@@ -166,8 +176,13 @@ bool np_host_send_binary(struct np_host *host, const void *payload, size_t lengt
 	if (!host || !payload || !length || length > NP_MAX_PAYLOAD ||
 	    host->conn_fd < 0)
 		return false;
-	if (host->out_len + NP_HEADER + length > NP_MAX_OUTBOUND) {
-		fprintf(stderr, "[wayland] window channel backlog full; dropping one event\n");
+	size_t frame_size = NP_HEADER + length;
+	if (!reserve_outbound(host, frame_size)) {
+		/* Structural and presentation messages are ordered state.  Dropping one
+		 * would leave the two peers permanently divergent; reconnect instead so
+		 * the compositor's normal replay sends one authoritative snapshot. */
+		fprintf(stderr, "[wayland] window channel backlog full; reconnecting\n");
+		np_host_disconnect(host);
 		return false;
 	}
 	unsigned char header[NP_HEADER] = {
@@ -177,9 +192,9 @@ bool np_host_send_binary(struct np_host *host, const void *payload, size_t lengt
 		(unsigned char)((length >> 16) & 0xff),
 		(unsigned char)((length >> 24) & 0xff),
 	};
-	if (!queue_outbound(host, header, sizeof(header)) ||
-	    !queue_outbound(host, payload, length))
-		return false;
+	memcpy(host->out + host->out_len, header, sizeof(header));
+	memcpy(host->out + host->out_len + sizeof(header), payload, length);
+	host->out_len += frame_size;
 	flush_outbound(host);
 	return true;
 }
@@ -215,16 +230,25 @@ void np_host_pump(struct np_host *host, np_host_handler handler,
 	if (host->conn_fd < 0) return;
 
 	for (;;) {
+		/* Parse at most one protocol-sized frame per pump buffer.  More data can
+		 * remain in the socket for the next level-triggered event; allowing the
+		 * receive buffer to grow before validating its header lets a peer consume
+		 * unbounded guest memory. */
+		if (host->buffer_len >= NP_MAX_OUTBOUND) break;
 		if (host->buffer_cap - host->buffer_len < 4096) {
 			size_t cap = host->buffer_cap ? host->buffer_cap * 2 : 8192;
+			if (cap > NP_MAX_OUTBOUND) cap = NP_MAX_OUTBOUND;
 			unsigned char *grown = realloc(host->buffer, cap);
 			if (!grown) return;
 			host->buffer = grown;
 			host->buffer_cap = cap;
 		}
 
+		size_t available = host->buffer_cap - host->buffer_len;
+		if (available > NP_MAX_OUTBOUND - host->buffer_len)
+			available = NP_MAX_OUTBOUND - host->buffer_len;
 		ssize_t got = recv(host->conn_fd, host->buffer + host->buffer_len,
-		                   host->buffer_cap - host->buffer_len, 0);
+		                   available, 0);
 		if (got == 0) {
 			np_host_disconnect(host);
 			return;
@@ -258,6 +282,7 @@ void np_host_pump(struct np_host *host, np_host_handler handler,
 		    (memcmp(payload, "NPMO", 4) == 0 ||
 		     memcmp(payload, "NPSC", 4) == 0 ||
 		     memcmp(payload, "NPCF", 4) == 0 ||
+		     memcmp(payload, "NPPF", 4) == 0 ||
 		     memcmp(payload, "NPFT", 4) == 0)) {
 			if (binary_handler) binary_handler(payload, length, user_data);
 		} else {

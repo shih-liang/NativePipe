@@ -4,8 +4,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "damage.h"
+
 struct np_server;
 struct np_surface;
+struct np_viewport_state;
 struct wl_client;
 struct wl_display;
 
@@ -19,13 +22,23 @@ struct np_surface_mapping {
 };
 
 bool np_scale_transform_swaps_axes(int32_t transform);
-bool np_scale_damage_to_buffer(int32_t transform,
-	                           uint32_t buffer_width, uint32_t buffer_height,
-	                           int32_t scale, int32_t x, int32_t y,
-	                           int32_t width, int32_t height,
-	                           int32_t *buffer_x, int32_t *buffer_y,
-	                           int32_t *buffer_width_out,
-	                           int32_t *buffer_height_out);
+
+enum np_scale_error {
+	NP_SCALE_OK = 0,
+	NP_SCALE_INVALID_SIZE,
+	NP_SCALE_VIEWPORT_BAD_SIZE,
+	NP_SCALE_VIEWPORT_OUT_OF_BUFFER,
+};
+
+enum np_scale_error np_scale_resolve_state(
+	uint32_t buffer_width, uint32_t buffer_height, int32_t scale,
+	int32_t transform, const struct np_viewport_state *viewport,
+	struct np_surface_mapping *mapping);
+
+bool np_scale_damage_to_buffer(
+	uint32_t buffer_width, uint32_t buffer_height, int32_t scale,
+	int32_t transform, const struct np_viewport_state *viewport,
+	const struct np_box *surface_damage, struct np_box *buffer_damage);
 
 /* Resolve wl_buffer.scale and wp_viewport exactly once, in the compositor.
  * Host code must never reinterpret either protocol. */
@@ -37,6 +50,5 @@ void np_scale_advertise(struct wl_display *display, struct np_server *server);
 void np_scale_surface_enter_outputs(struct np_surface *surface,
 	                                struct wl_client *client);
 void np_scale_changed(struct np_surface *surface, int scale);
-void np_scale_update_output(struct np_server *server, int scale);
 
 #endif

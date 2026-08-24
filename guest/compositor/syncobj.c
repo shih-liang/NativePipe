@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/eventfd.h>
 #include <unistd.h>
 
 struct np_sync_timeline {
@@ -85,6 +86,24 @@ bool np_sync_point_ready(struct np_sync_point *point)
 		return false;
 	fprintf(stderr, "[wayland] SYNCOBJ_TIMELINE_WAIT: %s\n", strerror(errno));
 	return false;
+}
+
+int np_sync_point_wait_fd(struct np_sync_point *point)
+{
+	if (!point) return -1;
+	int fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+	if (fd < 0) return -1;
+	struct drm_syncobj_eventfd event = {
+		.handle = point->timeline->handle,
+		.point = point->value,
+		.fd = fd,
+	};
+	if (ioctl(point->timeline->drm_fd, DRM_IOCTL_SYNCOBJ_EVENTFD, &event) < 0) {
+		fprintf(stderr, "[wayland] SYNCOBJ_EVENTFD: %s\n", strerror(errno));
+		close(fd);
+		return -1;
+	}
+	return fd;
 }
 
 void np_sync_point_signal(struct np_sync_point *point)

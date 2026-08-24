@@ -1,4 +1,5 @@
 import AppKit
+import CoreGraphics
 import CoreImage
 import ImageIO
 import IOSurface
@@ -40,7 +41,7 @@ extension FrameSource {
 /// This bridge resolves every resource id to its existing Metal texture and
 /// asks the NSWindow to composite those textures into a drawable.
 @MainActor
-public final class WindowBridge {
+public final class WindowBridge: NSObject {
     /// Window event tracing, off unless NATIVEPIPE_WINDOW_TRACE is set. Writes to
     /// stderr because in GUI mode the console window is the only other place
     /// diagnostics could go, and it cannot be read from a script.
@@ -51,6 +52,10 @@ public final class WindowBridge {
     private static func note(_ message: @autoclosure () -> String) {
         guard trace else { return }
         FileHandle.standardError.write(Data("[win] \(message())\n".utf8))
+    }
+
+    private static func report(_ message: String) {
+        FileHandle.standardError.write(Data("[win] error: \(message)\n".utf8))
     }
 
     struct CustomCursorGeometry: Equatable {
@@ -102,9 +107,8 @@ public final class WindowBridge {
         private let panel: NSPanel
         private let view = NSView()
         private let metalLayer = CAMetalLayer()
-        private var renderer: HostSceneRenderer?
         private var presenter: AsyncMetalScenePresenter?
-        private weak var rendererDevice: MTLDevice?
+		private var presenterRenderer: HostSceneRenderer?
         private var displayedTexture: MTLTexture?
 
         init() {
@@ -129,6 +133,7 @@ public final class WindowBridge {
 
         func display(
             _ texture: MTLTexture, frame: Windowing.Frame,
+			renderer: HostSceneRenderer,
             readComplete: @escaping (Bool) -> Void,
             presented: @escaping () -> Void
         ) -> Bool {
@@ -138,13 +143,10 @@ public final class WindowBridge {
                 height: CGFloat(frame.height) / scale)
             panel.setContentSize(size)
             metalLayer.frame = view.bounds
-            if renderer == nil || rendererDevice !== texture.device {
-                renderer = try? HostSceneRenderer(device: texture.device)
-                presenter = renderer.map {
-                    AsyncMetalScenePresenter(
-                        layer: metalLayer, device: texture.device, renderer: $0)
-                }
-                rendererDevice = texture.device
+			if presenterRenderer !== renderer {
+				presenter = AsyncMetalScenePresenter(
+					layer: metalLayer, device: texture.device, renderer: renderer)
+				presenterRenderer = renderer
             }
             guard let presenter else { return false }
             displayedTexture = texture
@@ -219,6 +221,9 @@ public final class WindowBridge {
     /// Surfaces that exist but have no role yet, and the toplevel each one backs.
     private var surfaceToWindow: [UInt32: UInt32] = [:]
     private var knownSurfaces: Set<UInt32> = []
+	private var sceneRenderers: [ObjectIdentifier: HostSceneRenderer] = [:]
+	private let displayClock = DisplayClock()
+	private var lastDisplays: [Windowing.Display] = []
 
     /// Strong on purpose. There is no cycle to break — a frame source refers to
     /// the VM controller weakly, if at all — and a weak reference here silently
@@ -237,9 +242,17 @@ public final class WindowBridge {
 
     public init(frameSource: FrameSource?) {
         self.frameSource = frameSource
+		super.init()
         clipboard.output = { [weak self] command in self?.send(command) }
         clipboard.start()
+		NotificationCenter.default.addObserver(
+			self, selector: #selector(screenParametersChanged(_:)),
+			name: NSApplication.didChangeScreenParametersNotification, object: nil)
     }
+
+	deinit {
+		NotificationCenter.default.removeObserver(self)
+	}
 
     public var windowCount: Int { windows.count }
 
@@ -254,6 +267,74 @@ public final class WindowBridge {
     func applicationIcon(for applicationID: String) -> NSImage? {
         applicationIconProvider?(applicationID)
     }
+
+	func sceneRenderer(for device: MTLDevice) -> HostSceneRenderer? {
+		let key = ObjectIdentifier(device as AnyObject)
+		if let renderer = sceneRenderers[key] { return renderer }
+		guard let renderer = try? HostSceneRenderer(device: device) else { return nil }
+		sceneRenderers[key] = renderer
+		return renderer
+	}
+
+	func registerDisplayClock(_ window: NativeWindow, screen: NSScreen?) {
+		displayClock.register(window, screen: screen)
+	}
+
+	func unregisterDisplayClock(_ window: NativeWindow) {
+		displayClock.unregister(window)
+	}
+
+	func windowScreenChanged(_ windowID: UInt32, screen: NSScreen?) {
+		publishDisplayTopology()
+		guard let screen, let outputID = displayID(for: screen) else {
+			send(.windowOutputChanged(window: windowID, outputID: nil))
+			return
+		}
+		send(.windowOutputChanged(window: windowID, outputID: outputID))
+		send(.scaleChanged(
+			window: windowID, scale: max(1, Int(screen.backingScaleFactor.rounded()))))
+	}
+
+	@objc private func screenParametersChanged(_ notification: Notification) {
+		lastDisplays.removeAll(keepingCapacity: true)
+		publishDisplayTopology()
+		for (windowID, native) in windows {
+			registerDisplayClock(native, screen: native.window?.screen)
+			windowScreenChanged(windowID, screen: native.window?.screen)
+		}
+	}
+
+	private func displayID(for screen: NSScreen) -> UInt32? {
+		(screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?
+			.uint32Value
+	}
+
+	private func publishDisplayTopology(force: Bool = false) {
+		let screens = NSScreen.screens
+		let top = screens.map(\.frame.maxY).max() ?? 0
+		let displays = screens.compactMap { screen -> Windowing.Display? in
+			guard let id = displayID(for: screen) else { return nil }
+			let frame = screen.frame
+			let scale = max(1, Int(screen.backingScaleFactor.rounded()))
+			let directID = CGDirectDisplayID(id)
+			let physical = CGDisplayScreenSize(directID)
+			let pixelWidth = CGDisplayPixelsWide(directID)
+			let pixelHeight = CGDisplayPixelsHigh(directID)
+			return Windowing.Display(
+				id: id, name: screen.localizedName,
+				x: Int(frame.minX.rounded()), y: Int((top - frame.maxY).rounded()),
+				width: max(1, Int(frame.width.rounded())),
+				height: max(1, Int(frame.height.rounded())),
+				pixelWidth: max(1, pixelWidth), pixelHeight: max(1, pixelHeight),
+				physicalWidthMM: max(0, Int(physical.width.rounded())),
+				physicalHeightMM: max(0, Int(physical.height.rounded())),
+				scale: scale,
+				refreshMilliHz: max(1, screen.maximumFramesPerSecond) * 1_000)
+		}.sorted { $0.id < $1.id }
+		guard force || displays != lastDisplays else { return }
+		lastDisplays = displays
+		send(.outputsChanged(displays: displays))
+	}
 
     public func send(_ command: Windowing.HostCommand) {
         // Outgoing commands were the one direction with no trace, which made
@@ -299,6 +380,8 @@ public final class WindowBridge {
         switch event {
         case .channelReady:
             // Consumed by WindowChannel as the transport generation boundary.
+			lastDisplays.removeAll(keepingCapacity: true)
+			publishDisplayTopology(force: true)
             break
 
         case .surfaceCreated(let surface):
@@ -556,10 +639,12 @@ public final class WindowBridge {
     }
 
     private func retainDeferred(_ scene: Windowing.SceneSnapshot) {
-        if let previous = pendingScenes.updateValue(scene, forKey: scene.surface),
-           previous.presentationID != scene.presentationID {
-            completeScene(previous)
-        }
+		if let previous = pendingScenes[scene.surface] {
+			pendingScenes[scene.surface] = scene.includingUnrenderedDamage(from: previous)
+			if previous.presentationID != scene.presentationID { completeScene(previous) }
+		} else {
+			pendingScenes[scene.surface] = scene
+		}
     }
 
     private func completeScene(_ scene: Windowing.SceneSnapshot) {
@@ -569,7 +654,12 @@ public final class WindowBridge {
             surface: scene.surface, presentationID: scene.presentationID))
     }
 
-    private func present(scene: Windowing.SceneSnapshot, windowID: UInt32) {
+    private func present(scene incoming: Windowing.SceneSnapshot, windowID: UInt32) {
+		var scene = incoming
+		if let deferred = pendingScenes.removeValue(forKey: scene.surface) {
+			scene = scene.includingUnrenderedDamage(from: deferred)
+			if deferred.presentationID != scene.presentationID { completeScene(deferred) }
+		}
         guard let native = windows[windowID], let frameSource else {
             retainDeferred(scene)
             return
@@ -592,9 +682,12 @@ public final class WindowBridge {
                     // release its host-read references instead of deadlocking
                     // the whole client behind one unpresentable image.
                     pendingScenes.removeValue(forKey: scene.surface)
-                    Self.note(
-                        "scene discarded: published resource " +
-                        "\(layer.resourceID) has no Metal texture")
+					native.invalidateSceneHistory()
+                    Self.report(
+                        "published resource \(layer.resourceID) has no Metal texture " +
+                        "for \(layer.width)x\(layer.height), stride \(layer.bytesPerRow), " +
+                        "format \(layer.format); discarded presentation " +
+                        "\(scene.presentationID)")
                     completeScene(scene)
                     return
                 }
@@ -670,8 +763,13 @@ public final class WindowBridge {
     private func presentDragIcon(
         _ texture: MTLTexture, frame: Windowing.Frame, surface: UInt32
     ) {
+		guard let renderer = sceneRenderer(for: texture.device) else {
+			completeCopiedPresentation(
+				surface: surface, presentationID: frame.presentationID)
+			return
+		}
         let queued = dragIcon.display(
-            texture, frame: frame,
+			texture, frame: frame, renderer: renderer,
             readComplete: { [weak self] success in
                 guard let self else { return }
                 self.send(.frameReleased(
@@ -742,13 +840,8 @@ public final class WindowBridge {
 
     private func schedulePresentation(surface: UInt32, presentationID: UInt32) {
         guard presentationID != 0 else { return }
-        if let native = nativeWindowOwningSurface(surface) ?? windows.values.first(where: { $0.window != nil }) {
-            if nativeWindowOwningSurface(surface) != nil {
-                native.awaitPresentation(surface: surface, presentationID: presentationID)
-            } else {
-                completeCopiedPresentation(
-                    surface: surface, presentationID: presentationID)
-            }
+        if let native = nativeWindowOwningSurface(surface) {
+            native.awaitPresentation(surface: surface, presentationID: presentationID)
         } else {
             // An unroled or occluded surface has no latching deadline. FIFO v1
             // explicitly permits clearing its constraint early for forward

@@ -9,6 +9,32 @@ struct ResolvedSceneLayer {
     let texture: MTLTexture
 }
 
+extension Windowing.SceneSnapshot {
+    /// A latest-value queue may discard an unencoded scene, but its damage is
+    /// still part of the transition from the persistent host image to the
+    /// newest scene. The newest layer list is authoritative; only the damaged
+    /// output area must be carried forward.
+    func includingUnrenderedDamage(from older: Self) -> Self {
+        guard width == older.width, height == older.height else { return self }
+        let rectangles = older.damage + damage
+        guard let first = rectangles.first else { return self }
+        var left = first.x
+        var top = first.y
+        var right = first.x + first.width
+        var bottom = first.y + first.height
+        for rect in rectangles.dropFirst() {
+            left = min(left, rect.x)
+            top = min(top, rect.y)
+            right = max(right, rect.x + rect.width)
+            bottom = max(bottom, rect.y + rect.height)
+        }
+        var result = self
+        result.damage = [Windowing.Rect(
+            x: left, y: top, width: right - left, height: bottom - top)]
+        return result
+    }
+}
+
 /// Composites a guest-resolved Wayland scene straight into one drawable.
 /// Textures are bound conventionally, one draw call per layer; this deliberately
 /// avoids argument-buffer descriptors on the NativePipe boundary.
@@ -39,6 +65,7 @@ final class HostSceneRenderer: @unchecked Sendable {
 
     private let queue: MTLCommandQueue
     private let pipeline: MTLRenderPipelineState
+    private let clearPipeline: MTLRenderPipelineState
     private let sampler: MTLSamplerState
 
     init(device: MTLDevice) throws {
@@ -107,6 +134,10 @@ final class HostSceneRenderer: @unchecked Sendable {
             if (u.opaque != 0) color.a = 1.0;
             return color * u.alpha;
         }
+
+        fragment float4 np_scene_clear() {
+            return float4(0.0);
+        }
         """
         guard let library = try? device.makeLibrary(source: source, options: nil),
               let vertex = library.makeFunction(name: "np_scene_vertex"),
@@ -129,6 +160,16 @@ final class HostSceneRenderer: @unchecked Sendable {
         }
         self.pipeline = pipeline
 
+		let clearDescriptor = MTLRenderPipelineDescriptor()
+		clearDescriptor.vertexFunction = vertex
+		clearDescriptor.fragmentFunction = library.makeFunction(name: "np_scene_clear")
+		clearDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+		guard let clearPipeline = try? device.makeRenderPipelineState(
+			descriptor: clearDescriptor) else {
+			throw RendererError.pipeline
+		}
+		self.clearPipeline = clearPipeline
+
         let samplerDescriptor = MTLSamplerDescriptor()
         samplerDescriptor.minFilter = .linear
         samplerDescriptor.magFilter = .linear
@@ -142,6 +183,7 @@ final class HostSceneRenderer: @unchecked Sendable {
 
     func encode(
         scene: Windowing.SceneSnapshot, layers: [ResolvedSceneLayer],
+        history: MTLTexture, redrawAll: Bool,
         drawable: CAMetalDrawable,
         completion: @escaping (MTLCommandBuffer) -> Void
     ) throws {
@@ -151,40 +193,78 @@ final class HostSceneRenderer: @unchecked Sendable {
         }
         let target = drawable.texture
         guard target.pixelFormat == .bgra8Unorm,
-              target.width >= scene.width, target.height >= scene.height else {
+              target.width >= scene.width, target.height >= scene.height,
+              history.pixelFormat == .bgra8Unorm,
+              history.width == scene.width, history.height == scene.height else {
             throw RendererError.incompatibleTexture
         }
+		let regions: [MTLScissorRect] = redrawAll
+			? [MTLScissorRect(x: 0, y: 0, width: scene.width, height: scene.height)]
+			: scene.damage.compactMap { scissor($0, width: scene.width, height: scene.height) }
 
-        if canBlit(scene: scene, layer: layers.first) {
+		if !regions.isEmpty, canBlit(scene: scene, layer: layers.first) {
             guard let layer = layers.first,
                   let encoder = command.makeBlitCommandEncoder() else {
                 throw RendererError.encoder
             }
-            encoder.copy(
-                from: layer.texture, sourceSlice: 0, sourceLevel: 0,
-                sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-                sourceSize: MTLSize(width: scene.width, height: scene.height, depth: 1),
-                to: target, destinationSlice: 0, destinationLevel: 0,
-                destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+			for region in regions {
+				encoder.copy(
+					from: layer.texture, sourceSlice: 0, sourceLevel: 0,
+					sourceOrigin: MTLOrigin(x: region.x, y: region.y, z: 0),
+					sourceSize: MTLSize(
+						width: region.width, height: region.height, depth: 1),
+					to: history, destinationSlice: 0, destinationLevel: 0,
+					destinationOrigin: MTLOrigin(x: region.x, y: region.y, z: 0))
+			}
+			encoder.copy(
+				from: history, sourceSlice: 0, sourceLevel: 0,
+				sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+				sourceSize: MTLSize(width: scene.width, height: scene.height, depth: 1),
+				to: target, destinationSlice: 0, destinationLevel: 0,
+				destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
             encoder.endEncoding()
-        } else {
+        } else if !regions.isEmpty {
             let pass = MTLRenderPassDescriptor()
-            pass.colorAttachments[0].texture = target
-            pass.colorAttachments[0].loadAction = .clear
+			pass.colorAttachments[0].texture = history
+			pass.colorAttachments[0].loadAction = redrawAll ? .clear : .load
             pass.colorAttachments[0].storeAction = .store
             pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0)
             guard let encoder = command.makeRenderCommandEncoder(descriptor: pass) else {
                 throw RendererError.encoder
             }
-            encoder.setRenderPipelineState(pipeline)
-            encoder.setFragmentSamplerState(sampler, index: 0)
-            for layer in layers {
-                try encode(
-                    layer: layer, scene: scene,
-                    outputWidth: target.width, outputHeight: target.height,
-                    encoder: encoder)
+			for region in regions {
+				if !redrawAll { encodeClear(region: region, scene: scene, encoder: encoder) }
+				encoder.setRenderPipelineState(pipeline)
+				encoder.setFragmentSamplerState(sampler, index: 0)
+				for layer in layers {
+					try encode(
+						layer: layer, scene: scene,
+						outputWidth: history.width, outputHeight: history.height,
+						damage: region, encoder: encoder)
+				}
             }
             encoder.endEncoding()
+			guard let blit = command.makeBlitCommandEncoder() else {
+				throw RendererError.encoder
+			}
+			blit.copy(
+				from: history, sourceSlice: 0, sourceLevel: 0,
+				sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+				sourceSize: MTLSize(width: scene.width, height: scene.height, depth: 1),
+				to: target, destinationSlice: 0, destinationLevel: 0,
+				destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+			blit.endEncoding()
+		} else {
+			guard let blit = command.makeBlitCommandEncoder() else {
+				throw RendererError.encoder
+			}
+			blit.copy(
+				from: history, sourceSlice: 0, sourceLevel: 0,
+				sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+				sourceSize: MTLSize(width: scene.width, height: scene.height, depth: 1),
+				to: target, destinationSlice: 0, destinationLevel: 0,
+				destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+			blit.endEncoding()
         }
 
         command.addCompletedHandler { command in
@@ -196,9 +276,35 @@ final class HostSceneRenderer: @unchecked Sendable {
         command.commit()
     }
 
+	private func scissor(
+		_ rect: Windowing.Rect, width: Int, height: Int
+	) -> MTLScissorRect? {
+		let x0 = max(0, rect.x)
+		let y0 = max(0, rect.y)
+		let x1 = min(width, rect.x + rect.width)
+		let y1 = min(height, rect.y + rect.height)
+		guard x1 > x0, y1 > y0 else { return nil }
+		return MTLScissorRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0)
+	}
+
+	private func encodeClear(
+		region: MTLScissorRect, scene: Windowing.SceneSnapshot,
+		encoder: MTLRenderCommandEncoder
+	) {
+		var vertex = VertexUniforms(
+			destination: SIMD4(0, 0, Float(scene.width), Float(scene.height)),
+			outputSize: SIMD2(Float(scene.width), Float(scene.height)))
+		encoder.setRenderPipelineState(clearPipeline)
+		encoder.setScissorRect(region)
+		encoder.setVertexBytes(
+			&vertex, length: MemoryLayout<VertexUniforms>.stride, index: 0)
+		encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+	}
+
     private func encode(
         layer: ResolvedSceneLayer, scene: Windowing.SceneSnapshot,
         outputWidth: Int, outputHeight: Int,
+		damage: MTLScissorRect,
         encoder: MTLRenderCommandEncoder
     ) throws {
         let texture = layer.texture
@@ -209,10 +315,12 @@ final class HostSceneRenderer: @unchecked Sendable {
         }
         let destination = layer.state.destination
         let clip = layer.state.clip
-        let x0 = max(0, Int(clip.x.rounded(.down)))
-        let y0 = max(0, Int(clip.y.rounded(.down)))
-        let x1 = min(scene.width, Int((clip.x + clip.width).rounded(.up)))
-        let y1 = min(scene.height, Int((clip.y + clip.height).rounded(.up)))
+		let x0 = max(damage.x, max(0, Int(clip.x.rounded(.down))))
+		let y0 = max(damage.y, max(0, Int(clip.y.rounded(.down))))
+		let x1 = min(damage.x + damage.width,
+			min(scene.width, Int((clip.x + clip.width).rounded(.up))))
+		let y1 = min(damage.y + damage.height,
+			min(scene.height, Int((clip.y + clip.height).rounded(.up))))
         guard x1 > x0, y1 > y0 else { return }
 
         var vertex = VertexUniforms(

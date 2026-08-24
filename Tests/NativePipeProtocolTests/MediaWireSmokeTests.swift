@@ -27,7 +27,11 @@ final class MediaWireSmokeTests: XCTestCase {
         append(Int32(400), to: &payload)
         append(Int32(300), to: &payload)
         append(UInt32(1), to: &payload)
-        append(UInt32(0), to: &payload)
+		append(UInt32(0), to: &payload)
+		append(Int32(10), to: &payload)
+		append(Int32(20), to: &payload)
+		append(Int32(30), to: &payload)
+		append(Int32(40), to: &payload)
 
         append(UInt32(9), to: &payload)
         append(UInt32(123), to: &payload)
@@ -52,6 +56,7 @@ final class MediaWireSmokeTests: XCTestCase {
         XCTAssertEqual(scene.layers.count, 1)
         XCTAssertEqual(scene.layers[0].resourceID, 123)
         XCTAssertTrue(scene.layers[0].opaque)
+		XCTAssertEqual(scene.damage, [.init(x: 10, y: 20, width: 30, height: 40)])
     }
 
     func testBinarySceneSnapshotRejectsCountBeyondPayload() {
@@ -74,6 +79,33 @@ final class MediaWireSmokeTests: XCTestCase {
         write(Int32(1), at: 40)
         write(Int32(1), at: 44)
         write(UInt32(128), at: 48)
+        XCTAssertThrowsError(try WindowWire.guestEvent(from: payload))
+    }
+
+    func testBinarySceneSnapshotRejectsMoreThanCompositorLayerLimit() {
+        let count = WindowWire.maximumSceneLayers + 1
+        var payload = Data(
+            repeating: 0,
+            count: WindowWire.sceneHeaderSize + count * WindowWire.sceneLayerSize)
+        payload.replaceSubrange(0..<4, with: WindowWire.sceneMagic)
+        func write<T: FixedWidthInteger>(_ value: T, at offset: Int) {
+            var little = value.littleEndian
+            Swift.withUnsafeBytes(of: &little) {
+                payload.replaceSubrange(offset..<(offset + $0.count), with: $0)
+            }
+        }
+        write(WindowWire.sceneVersion, at: 4)
+        write(UInt16(WindowWire.sceneHeaderSize), at: 6)
+        write(UInt32(payload.count), at: 8)
+        write(UInt32(1), at: 12)
+        write(UInt32(1), at: 16)
+        write(UInt32(1), at: 20)
+        write(UInt32(1), at: 24)
+        write(UInt32(1), at: 28)
+        write(Int32(1), at: 40)
+        write(Int32(1), at: 44)
+        write(UInt32(count), at: 48)
+
         XCTAssertThrowsError(try WindowWire.guestEvent(from: payload))
     }
 
@@ -115,6 +147,16 @@ final class MediaWireSmokeTests: XCTestCase {
             try WindowWire.guestEvent(from: shape)
         else { return XCTFail("not a cursor shape") }
         XCTAssertEqual(cursorShape, .pointer)
+
+        var callback = Data(WindowWire.lifecycleMagic)
+        callback.append(contentsOf: [1, 22, 0, 0])
+        append(UInt32(41), to: &callback)
+        append(UInt32(73), to: &callback)
+        guard case .frameCallbackRequested(let surface, let presentationID) =
+            try WindowWire.guestEvent(from: callback)
+        else { return XCTFail("not a frame callback request") }
+        XCTAssertEqual(surface, 41)
+        XCTAssertEqual(presentationID, 73)
     }
 
     func testPopupPlacementAndConfigureBinaryRoundTrip() throws {

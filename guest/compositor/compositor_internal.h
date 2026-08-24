@@ -1,6 +1,7 @@
 #ifndef NP_COMPOSITOR_INTERNAL_H
 #define NP_COMPOSITOR_INTERNAL_H
 
+#include "damage.h"
 #include "hostlink.h"
 #include "region.h"
 #ifdef NP_REMOTE
@@ -24,10 +25,6 @@ enum np_surface_role {
 	NP_SURFACE_ROLE_SUBSURFACE,
 	NP_SURFACE_ROLE_CURSOR,
 	NP_SURFACE_ROLE_DRAG_ICON,
-};
-
-struct np_box {
-	int32_t x, y, width, height;
 };
 
 struct np_server {
@@ -78,7 +75,7 @@ struct np_server {
 	uint32_t pointer_surface;
 	struct wl_client *pointer_grab_client;
 	uint32_t pointer_grab_serial;
-	bool pointer_button_down;
+	uint32_t pointer_buttons;
 	struct wl_client *last_input_client;
 	uint32_t last_input_serial;
 	struct wl_resource *cursor_surface;
@@ -171,12 +168,17 @@ struct np_surface_update {
 	bool opaque_region_changed;
 	bool opaque_region_set;
 	struct np_region_state opaque_region;
+	bool size_constraints_changed;
+	int32_t minimum_width, minimum_height;
+	int32_t maximum_width, maximum_height;
 	struct np_box damage;
 	bool set_fifo_barrier;
 	bool wait_fifo_barrier;
 	bool subsurface_state_changed;
 	struct np_sync_point *acquire_point;
 	struct np_sync_point *release_point;
+	struct wl_event_source *wait_source;
+	int wait_fd;
 	uint32_t presentation_id;
 };
 
@@ -264,6 +266,7 @@ struct np_surface {
 	struct wl_resource *popup;
 	struct wl_resource *decoration;
 	struct wl_resource *fractional_scale;
+	int preferred_scale;
 	int reported_scale;
 	struct wl_resource *viewport;
 	struct np_viewport_state pending_viewport;
@@ -295,6 +298,12 @@ struct np_surface {
 	struct wl_list scene_presentations;
 	bool scene_dirty;
 	uint32_t scene_presentation_id;
+	struct wl_event_source *scene_wait_source;
+	int scene_wait_fd;
+	/* Buffer-space damage accumulated until the next window scene crosses the
+	 * host channel. Structural changes set scene_full_damage on the xdg root. */
+	struct np_box scene_damage;
+	bool scene_full_damage;
 
 	struct np_fifo *fifo;
 	bool pending_fifo_set_barrier;
@@ -324,12 +333,17 @@ struct np_surface {
 	 * its parent commit, not just the attached buffer. */
 	struct wl_list synchronized_updates;
 
-	struct np_box pending;
-	struct np_box owed[2];
+	/* wl_surface.damage and damage_buffer use different coordinate spaces and
+	 * remain separate until this pending state is captured by commit. */
+	struct np_box pending_surface_damage;
+	struct np_box pending_buffer_damage;
 	char *title;
 	char *app_id;
 	int32_t minimum_width, minimum_height;
 	int32_t maximum_width, maximum_height;
+	int32_t pending_minimum_width, pending_minimum_height;
+	int32_t pending_maximum_width, pending_maximum_height;
+	bool pending_size_constraints_changed;
 	bool has_grab;
 	uint32_t focus_restore_window;
 	bool decoration_negotiated;
@@ -356,6 +370,84 @@ struct np_surface *np_surface_by_window(struct np_server *server,
                                         uint32_t window_id);
 struct np_surface *np_surface_by_id(struct np_server *server,
                                     uint32_t surface_id);
+
+/* Core protocol registration. */
+void np_compositor_bind(struct wl_client *client, void *data,
+                        uint32_t version, uint32_t id);
+void np_subcompositor_bind(struct wl_client *client, void *data,
+                           uint32_t version, uint32_t id);
+void np_seat_bind(struct wl_client *client, void *data,
+                  uint32_t version, uint32_t id);
+bool np_input_create_keymap(struct np_server *server);
+
+/* Surface commit and subsurface state. */
+void np_surface_commit(struct wl_client *client, struct wl_resource *resource);
+void np_surface_apply_update(struct np_surface_update *update);
+void np_surface_apply_unblocked(struct np_surface *surface);
+void np_surface_update_destroy(struct np_surface_update *update,
+                               bool release_buffer);
+void np_surface_drop_queued_references(struct np_server *server,
+                                       struct np_surface *surface);
+bool np_surface_is_synchronized(struct np_surface *surface);
+bool np_surface_watch_wait_fd(struct np_server *server, int fd,
+                              struct wl_event_source **source,
+                              int *stored_fd);
+void np_surface_schedule_retry(struct np_server *server);
+void np_subsurface_detach(struct np_surface *surface);
+void np_subsurface_detach_tree(struct np_surface *surface);
+
+/* Frame ownership, presentation feedback and host publication. */
+void np_surface_frame(struct wl_client *client, struct wl_resource *resource,
+                      uint32_t id);
+uint32_t np_presentation_next_id(struct np_server *server);
+bool np_presentation_bind_callbacks(struct np_surface *surface,
+                                    uint32_t presentation_id);
+bool np_presentation_has_unbound_callbacks(struct np_surface *surface);
+void np_presentation_process_presented(struct np_server *server,
+                                       uint32_t surface_id,
+                                       uint32_t presentation_id);
+void np_presentation_process_released(struct np_server *server,
+                                      uint32_t surface_id,
+                                      uint32_t presentation_id);
+void np_presentation_finish_feedback(struct np_server *server);
+void np_presentation_flush(struct np_server *server);
+void np_presentation_clear_scene_wait(struct np_surface *surface);
+void np_presentation_request_refresh(struct np_surface *surface,
+                                     uint32_t presentation_id);
+void np_presentation_add_viewport(struct np_surface *surface, cJSON *frame);
+bool np_presentation_queue_last(struct np_surface *surface,
+                                uint32_t presentation_id);
+bool np_presentation_refresh_current_shm(struct np_surface *surface,
+                                         uint32_t presentation_id,
+                                         const struct np_box *damage);
+void np_presentation_queue_scene(struct np_surface *surface,
+                                 uint32_t presentation_id);
+void np_presentation_publish_buffer(struct np_surface *surface,
+                                    struct wl_resource *buffer,
+                                    struct np_gpu_buffer *gpu_buffer,
+                                    enum np_buffer_commit_kind buffer_commit,
+                                    uint32_t presentation_id,
+                                    struct np_sync_point *release_point,
+                                    const struct np_box *damage);
+void np_presentation_set_current_buffer(struct np_surface *surface,
+                                        struct wl_resource *buffer,
+                                        struct np_gpu_buffer *gpu_buffer,
+                                        struct np_sync_point *release_point);
+
+/* Host transport and command dispatch. */
+void np_input_handle_host_binary(const unsigned char *payload, size_t length,
+                                 void *user_data);
+void np_input_handle_host_command(const char *name, cJSON *body,
+                                  void *user_data);
+void np_host_session_reset_readiness(void);
+bool np_host_session_listen(struct np_server *server);
+bool np_host_session_set_socket(struct np_server *server, const char *socket);
+void np_host_session_attach(struct np_server *server,
+                            struct wl_event_loop *loop);
+void np_host_session_sync(struct np_server *server);
+void np_host_session_pump(struct np_server *server);
+void np_host_session_finish(struct np_server *server);
+
 void np_set_keyboard_focus(struct np_server *server, uint32_t window_id);
 void np_input_clear_pointer_focus_for_drag(struct np_server *server);
 void np_input_restore_pointer_focus_after_drag(struct np_server *server,

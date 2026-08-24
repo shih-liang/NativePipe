@@ -23,7 +23,7 @@ static void schedule_pending_host_toplevel_configure(struct np_surface *surface)
 
 static bool valid_pointer_grab(struct np_surface *surface,
 	                           struct wl_client *client, uint32_t serial) {
-	return surface && surface->server->pointer_button_down &&
+	return surface && surface->server->pointer_buttons != 0 &&
 	       surface->server->pointer_grab_client == client &&
 	       surface->server->pointer_grab_serial == serial;
 }
@@ -148,7 +148,7 @@ static void toplevel_resize(struct wl_client *client, struct wl_resource *resour
 
 static void add_size_constraint(cJSON *body, const char *key,
                                 int32_t width, int32_t height) {
-	if (width > 0 && height > 0) {
+	if (width > 0 || height > 0) {
 		cJSON *size = cJSON_CreateObject();
 		cJSON_AddNumberToObject(size, "width", width);
 		cJSON_AddNumberToObject(size, "height", height);
@@ -172,20 +172,43 @@ static void send_size_constraints(struct np_surface *surface) {
 	np_host_send(&surface->server->host, "sizeConstraintsChanged", body);
 }
 
+void np_xdg_apply_size_constraints(struct np_surface *surface,
+                                   int32_t minimum_width,
+                                   int32_t minimum_height,
+                                   int32_t maximum_width,
+                                   int32_t maximum_height) {
+	if (!surface) return;
+	surface->minimum_width = minimum_width;
+	surface->minimum_height = minimum_height;
+	surface->maximum_width = maximum_width;
+	surface->maximum_height = maximum_height;
+	send_size_constraints(surface);
+}
+
 static void toplevel_set_max_size(struct wl_client *client, struct wl_resource *resource,
                                   int32_t width, int32_t height) {
+	if (width < 0 || height < 0) {
+		wl_resource_post_error(resource, XDG_TOPLEVEL_ERROR_INVALID_SIZE,
+		                       "maximum size must not be negative");
+		return;
+	}
 	struct np_surface *surface = wl_resource_get_user_data(resource);
-	surface->maximum_width = width;
-	surface->maximum_height = height;
-	send_size_constraints(surface);
+	surface->pending_maximum_width = width;
+	surface->pending_maximum_height = height;
+	surface->pending_size_constraints_changed = true;
 }
 
 static void toplevel_set_min_size(struct wl_client *client, struct wl_resource *resource,
                                   int32_t width, int32_t height) {
+	if (width < 0 || height < 0) {
+		wl_resource_post_error(resource, XDG_TOPLEVEL_ERROR_INVALID_SIZE,
+		                       "minimum size must not be negative");
+		return;
+	}
 	struct np_surface *surface = wl_resource_get_user_data(resource);
-	surface->minimum_width = width;
-	surface->minimum_height = height;
-	send_size_constraints(surface);
+	surface->pending_minimum_width = width;
+	surface->pending_minimum_height = height;
+	surface->pending_size_constraints_changed = true;
 }
 
 static void toplevel_request_flag(struct np_surface *surface, const char *name, bool enabled) {

@@ -45,6 +45,7 @@ struct np_host {
 	/// take part of a frame, and writing the rest later is the only way to keep
 	/// the framing intact.
 	unsigned char *out;
+	size_t out_head;
 	size_t out_len;
 	size_t out_cap;
 };
@@ -75,7 +76,7 @@ void np_host_pump(struct np_host *host, np_host_handler handler,
 /// to watch for writability while this holds, or the backlog waits for an
 /// unrelated wakeup that may never come.
 static inline bool np_host_has_backlog(const struct np_host *host) {
-	return host->out_len > 0;
+	return host->out_len > host->out_head;
 }
 
 /// Pushes as much of the backlog as the socket will take. Safe to call at any time.
