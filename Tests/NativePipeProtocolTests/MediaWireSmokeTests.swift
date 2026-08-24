@@ -77,6 +77,85 @@ final class MediaWireSmokeTests: XCTestCase {
         XCTAssertThrowsError(try WindowWire.guestEvent(from: payload))
     }
 
+    func testBinaryLifecycleEventsDecodeWithoutJSON() throws {
+        var created = Data(WindowWire.lifecycleMagic)
+        created.append(contentsOf: [1, 5, 0, 0])
+        append(UInt32(23), to: &created)
+        append(UInt32(17), to: &created)
+        guard case .toplevelCreated(let window, let surface) =
+            try WindowWire.guestEvent(from: created)
+        else { return XCTFail("not a toplevel creation") }
+        XCTAssertEqual(window, 23)
+        XCTAssertEqual(surface, 17)
+
+        var unmapped = Data(WindowWire.lifecycleMagic)
+        unmapped.append(contentsOf: [1, 4, 0, 0])
+        append(UInt32(17), to: &unmapped)
+        guard case .surfaceUnmapped(let unmappedSurface) =
+            try WindowWire.guestEvent(from: unmapped)
+        else { return XCTFail("not a surface unmap") }
+        XCTAssertEqual(unmappedSurface, 17)
+
+        var cursor = Data(WindowWire.lifecycleMagic)
+        cursor.append(contentsOf: [1, 14, 0, 0])
+        append(UInt32(41), to: &cursor)
+        append(Int32(-3), to: &cursor)
+        append(Int32(7), to: &cursor)
+        guard case .cursorChanged(let cursorSurface, let hotspotX, let hotspotY) =
+            try WindowWire.guestEvent(from: cursor)
+        else { return XCTFail("not a cursor change") }
+        XCTAssertEqual(cursorSurface, 41)
+        XCTAssertEqual(hotspotX, -3)
+        XCTAssertEqual(hotspotY, 7)
+
+        var shape = Data(WindowWire.lifecycleMagic)
+        shape.append(contentsOf: [1, 15, 0, 0])
+        append(Windowing.CursorShape.pointer.rawValue, to: &shape)
+        guard case .cursorShapeChanged(let cursorShape) =
+            try WindowWire.guestEvent(from: shape)
+        else { return XCTFail("not a cursor shape") }
+        XCTAssertEqual(cursorShape, .pointer)
+    }
+
+    func testPopupPlacementAndConfigureBinaryRoundTrip() throws {
+        var placement = Data(WindowWire.lifecycleMagic)
+        placement.append(contentsOf: [1, 35, 0, 0])
+        append(UInt32(9), to: &placement)
+        append(UInt32(3), to: &placement)
+        append(Int32(700), to: &placement)
+        append(Int32(20), to: &placement)
+        append(Int32(520), to: &placement)
+        append(Int32(20), to: &placement)
+        append(Int32(240), to: &placement)
+        append(Int32(180), to: &placement)
+        append(UInt32(5), to: &placement)
+        append(UInt32(77), to: &placement)
+        placement.append(1)
+
+        guard case .popupPlacementRequested(let decoded) =
+            try WindowWire.guestEvent(from: placement)
+        else { return XCTFail("not a popup placement") }
+        XCTAssertEqual(decoded.window, 9)
+        XCTAssertEqual(decoded.flippedX, 520)
+        XCTAssertEqual(decoded.adjustment, 5)
+        XCTAssertEqual(decoded.token, 77)
+        XCTAssertTrue(decoded.reactive)
+
+        let command = Windowing.HostCommand.configurePopup(
+            window: 9, x: 520, y: 20, width: 240, height: 180, token: 77)
+        let payload = try XCTUnwrap(WindowWire.fastPayload(for: command))
+        XCTAssertEqual(Array(payload.prefix(4)), WindowWire.popupConfigureMagic)
+        XCTAssertEqual(payload.count, 28)
+    }
+
+    func testBinaryLifecycleRejectsTrailingFields() {
+        var payload = Data(WindowWire.lifecycleMagic)
+        payload.append(contentsOf: [1, 6, 0, 0])
+        append(UInt32(23), to: &payload)
+        append(UInt32(99), to: &payload)
+        XCTAssertThrowsError(try WindowWire.guestEvent(from: payload))
+    }
+
     func testNPENRoundTrip() {
         let header = MediaWire.Header(
             surfaceID: 17, width: 320, height: 200,

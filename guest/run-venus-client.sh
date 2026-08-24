@@ -42,25 +42,30 @@ if [ -n "$ICD" ]; then
 	export VK_ICD_FILENAMES="$ICD"
 fi
 
-# Round Mesa Venus blob sizes to the host page. See align-host-blob.c.
+# A 4 KiB guest needs blob sizes rounded to the 16 KiB host page. A native
+# 16 KiB LightHouse kernel already provides that invariant and needs no shim.
 # Copy off the virtiofs share: some guests refuse PROT_EXEC mmap there.
 ALIGN_SRC=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/align-host-blob.so
 ALIGN_INSTALLED=/usr/libexec/nativepipe/nativepipe-align-host-blob.so
-if [ -r "$ALIGN_INSTALLED" ]; then
-	ALIGN_SO=$ALIGN_INSTALLED
-elif [ -f "$ALIGN_SRC" ]; then
-	ALIGN_SO=$XDG_RUNTIME_DIR/nativepipe-align-host-blob.so
-	cp "$ALIGN_SRC" "$ALIGN_SO"
-else
-	ALIGN_SO=$ALIGN_SRC
-fi
-if [ -r "$ALIGN_SO" ]; then
-	export LD_PRELOAD="$ALIGN_SO${LD_PRELOAD:+:$LD_PRELOAD}"
+GUEST_PAGE_SIZE=$(getconf PAGESIZE 2>/dev/null || getconf PAGE_SIZE 2>/dev/null || true)
+ALIGN_SO=
+if [ -z "$GUEST_PAGE_SIZE" ] || [ "$GUEST_PAGE_SIZE" -lt 16384 ]; then
+    if [ -r "$ALIGN_INSTALLED" ]; then
+        ALIGN_SO=$ALIGN_INSTALLED
+    elif [ -f "$ALIGN_SRC" ]; then
+        ALIGN_SO=$XDG_RUNTIME_DIR/nativepipe-align-host-blob.so
+        cp "$ALIGN_SRC" "$ALIGN_SO"
+    else
+        ALIGN_SO=$ALIGN_SRC
+    fi
+    if [ -r "$ALIGN_SO" ]; then
+        export LD_PRELOAD="$ALIGN_SO${LD_PRELOAD:+:$LD_PRELOAD}"
+    fi
 fi
 
 {
 	echo "ICD=$ICD"
-	echo "LD_PRELOAD=$LD_PRELOAD"
+	echo "LD_PRELOAD=${LD_PRELOAD:-}"
 	echo "align so: $ALIGN_SO"
 	ls -l "$ALIGN_SO" 2>&1 || true
 	echo "--- preload smoke ---"

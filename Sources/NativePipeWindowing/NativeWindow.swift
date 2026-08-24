@@ -412,6 +412,28 @@ final class NativeWindow: NSObject {
                     y: content.maxY - popup.origin.y - size.height))
     }
 
+    func applyPopupGeometry(origin: CGPoint, size: NSSize) {
+        guard var popup else { return }
+        popup.origin = origin
+        self.popup = popup
+        guard let window else { return }
+        window.setContentSize(size)
+        position(window, forPopup: popup, size: size)
+    }
+
+    /// Visible screen bounds expressed in the parent's top-down surface-local
+    /// coordinate space, which is exactly the space xdg_positioner uses.
+    var popupConstraintBounds: CGRect? {
+        guard let window, let screen = window.screen else { return nil }
+        let parent = surfaceRectInScreen
+        let visible = screen.visibleFrame
+        return CGRect(
+            x: visible.minX - parent.minX,
+            y: parent.maxY - visible.maxY,
+            width: visible.width,
+            height: visible.height)
+    }
+
     /// The Wayland surface is the content view, not AppKit's contentLayoutRect.
     /// They are identical for a normal titled window, but fullSizeContentView
     /// deliberately leaves contentLayoutRect inset by the hidden title bar.
@@ -559,6 +581,11 @@ extension NativeWindow: NSWindowDelegate {
     func windowDidResize(_ notification: Notification) {
         guard !isPopup else { return }
         sendConfigure(states: activeStates())
+        bridge?.parentGeometryChanged(windowID)
+    }
+
+    func windowDidMove(_ notification: Notification) {
+        bridge?.parentGeometryChanged(windowID)
     }
 
     /// The drag is over; the client should land on the exact size immediately.
@@ -575,6 +602,7 @@ extension NativeWindow: NSWindowDelegate {
         guard let window else { return }
         bridge?.send(.scaleChanged(window: windowID, scale: Int(window.backingScaleFactor)))
         sendConfigure(states: activeStates())
+        bridge?.parentGeometryChanged(windowID)
     }
 
     func windowDidBecomeKey(_ notification: Notification) {

@@ -126,6 +126,16 @@ static void gpu_buffer_unref(struct np_gpu_buffer_object *gpu)
 	gpu_buffer_free(gpu);
 }
 
+void np_gpu_buffer_retain(struct np_gpu_buffer *buffer)
+{
+	gpu_buffer_ref(gpu_object(buffer));
+}
+
+void np_gpu_buffer_drop(struct np_gpu_buffer *buffer)
+{
+	gpu_buffer_unref(gpu_object(buffer));
+}
+
 static void maybe_release_client(struct np_gpu_buffer_object *gpu)
 {
 	if (!gpu || gpu->current_references || gpu->host_reads) return;

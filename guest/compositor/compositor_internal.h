@@ -17,6 +17,15 @@ struct np_shm_texture;
 struct np_sync_surface;
 struct np_sync_point;
 
+enum np_surface_role {
+	NP_SURFACE_ROLE_NONE = 0,
+	NP_SURFACE_ROLE_XDG_TOPLEVEL,
+	NP_SURFACE_ROLE_XDG_POPUP,
+	NP_SURFACE_ROLE_SUBSURFACE,
+	NP_SURFACE_ROLE_CURSOR,
+	NP_SURFACE_ROLE_DRAG_ICON,
+};
+
 struct np_box {
 	int32_t x, y, width, height;
 };
@@ -67,6 +76,13 @@ struct np_server {
 	uint32_t focused_window;
 	uint32_t pointer_window;
 	uint32_t pointer_surface;
+	struct wl_client *pointer_grab_client;
+	uint32_t pointer_grab_serial;
+	bool pointer_button_down;
+	struct wl_client *last_input_client;
+	uint32_t last_input_serial;
+	struct wl_resource *cursor_surface;
+	int32_t cursor_hotspot_x, cursor_hotspot_y;
 	uint32_t drag_focus_surface;
 	struct wl_event_source *host_connection_source;
 	struct wl_event_source *scene_retry_timer;
@@ -90,6 +106,7 @@ struct np_input {
 	struct wl_list link;
 	struct wl_resource *resource;
 	struct np_server *server;
+	uint32_t last_enter_serial;
 };
 
 struct np_output {
@@ -115,6 +132,12 @@ struct np_fifo {
 	struct np_surface *surface;
 };
 
+enum np_buffer_commit_kind {
+	NP_BUFFER_UNCHANGED,
+	NP_BUFFER_ATTACH,
+	NP_BUFFER_DETACH,
+};
+
 struct np_surface_update {
 	struct wl_list link;
 	/* A commit captures the synchronized child CUs that existed at that exact
@@ -126,15 +149,22 @@ struct np_surface_update {
 	struct wl_list stack_ops;
 	struct np_surface *surface;
 	struct wl_resource *buffer;
+	/* A wl_buffer resource may be destroyed while this commit waits. Preserve
+	 * the submitted operation and imported object independently. */
+	struct np_gpu_buffer *gpu_buffer;
 	struct wl_listener buffer_destroy;
-	bool buffer_set;
+	enum np_buffer_commit_kind buffer_commit;
 	int scale;
 	bool geometry_set;
 	int32_t geometry_x, geometry_y, geometry_width, geometry_height;
+	bool popup_geometry_changed;
+	int32_t popup_x, popup_y, popup_width, popup_height;
 	bool viewport_changed;
 	struct np_viewport_state viewport;
 	bool transform_changed;
 	int32_t transform;
+	bool offset_changed;
+	int32_t offset_x, offset_y;
 	bool input_region_changed;
 	bool input_region_set;
 	struct np_region_state input_region;
@@ -166,6 +196,23 @@ struct np_subsurface_stack_op {
 	bool above;
 };
 
+/* xdg_surface.configure serials remain valid until ack_configure consumes the
+ * named serial and every older one.  Keep the exact outstanding set instead of
+ * comparing integers: serials are display-global and may wrap. */
+struct np_xdg_configure {
+	struct wl_list link;
+	uint32_t serial;
+	bool popup_geometry;
+	int32_t popup_x, popup_y, popup_width, popup_height;
+};
+
+enum np_xdg_configure_phase {
+	NP_XDG_NO_ROLE,
+	NP_XDG_AWAITING_INITIAL_COMMIT,
+	NP_XDG_AWAITING_INITIAL_ACK,
+	NP_XDG_CONFIGURED,
+};
+
 struct np_surface {
 	struct wl_list link;
 	/* Active children are stored bottom-to-top. The below-parent group always
@@ -180,6 +227,9 @@ struct np_surface {
 	struct wl_list blocked_updates;
 	struct wl_resource *pending_buffer;
 	bool pending_buffer_set;
+	/* Protocol state at the last wl_surface.commit boundary. This is separate
+	 * from current_buffer, whose GPU lifetime may extend past a null commit. */
+	bool committed_buffer_attached;
 	/* Current Wayland source for a window scene. It remains busy while it is
 	 * part of the scene and is replaced atomically by the next buffer commit. */
 	struct wl_resource *current_buffer;
@@ -193,6 +243,9 @@ struct np_surface {
 	int32_t pending_transform;
 	int32_t transform;
 	bool pending_transform_changed;
+	bool pending_offset_changed;
+	int32_t pending_offset_x, pending_offset_y;
+	int32_t buffer_offset_x, buffer_offset_y;
 	bool pending_input_region_changed;
 	bool pending_input_region_set;
 	struct np_region_state pending_input_region;
@@ -205,6 +258,8 @@ struct np_surface {
 	struct np_region_state opaque_region;
 
 	struct wl_resource *xdg_surface;
+	struct wl_resource *xdg_wm_base;
+	enum np_surface_role role;
 	struct wl_resource *toplevel;
 	struct wl_resource *popup;
 	struct wl_resource *decoration;
@@ -215,17 +270,19 @@ struct np_surface {
 	struct np_viewport_state viewport_state;
 	bool pending_viewport_changed;
 	uint32_t window_id;
-	uint32_t configure_serial;
-	bool host_configure_in_flight;
-	uint32_t host_configure_serial;
+	struct wl_list xdg_configures;
+	uint32_t latest_configure_serial;
+	enum np_xdg_configure_phase xdg_configure_phase;
+	bool mapped;
 	bool host_configure_pending;
 	int32_t host_configure_pending_width;
 	int32_t host_configure_pending_height;
 	uint32_t host_configure_pending_state_bits;
 	uint32_t host_configure_acked_serial;
 	bool host_configure_acked;
-	/* One-shot idle used to collapse host resize events that were already
-	 * queued when the client became ready for its next configure. */
+	/* One-shot idle collapses all host resize records read in one event-loop
+	 * dispatch. xdg-shell permits several outstanding configure events; it is
+	 * the client, not the compositor, that chooses which serial to answer. */
 	struct wl_event_source *host_configure_idle;
 	bool pending_geometry_set;
 	int32_t pending_geometry_x, pending_geometry_y;
@@ -247,6 +304,16 @@ struct np_surface {
 
 	struct wl_resource *subsurface;
 	struct np_surface *parent;
+	uint32_t popup_parent_window;
+	int32_t popup_x, popup_y;
+	int32_t popup_width, popup_height;
+	int32_t popup_flip_x, popup_flip_y;
+	uint32_t popup_constraint_adjustment;
+	uint32_t popup_requested_token;
+	bool popup_reactive;
+	bool popup_geometry_acked;
+	int32_t popup_acked_x, popup_acked_y;
+	int32_t popup_acked_width, popup_acked_height;
 	bool above_parent;
 	int32_t sub_x, sub_y;
 	bool pending_sub_position_set;
@@ -279,5 +346,19 @@ struct np_surface {
 	uint16_t last_epoch;
 #endif
 };
+
+bool np_surface_assign_role(struct np_surface *surface,
+                            enum np_surface_role role);
+
+/* Narrow services shared by protocol modules. */
+bool np_trace_enabled(void);
+struct np_surface *np_surface_by_window(struct np_server *server,
+                                        uint32_t window_id);
+struct np_surface *np_surface_by_id(struct np_server *server,
+                                    uint32_t surface_id);
+void np_set_keyboard_focus(struct np_server *server, uint32_t window_id);
+void np_input_clear_pointer_focus_for_drag(struct np_server *server);
+void np_input_restore_pointer_focus_after_drag(struct np_server *server,
+                                               struct np_surface *surface);
 
 #endif

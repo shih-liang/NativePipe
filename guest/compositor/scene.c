@@ -102,8 +102,10 @@ static struct np_surface *hit_tree(
 		                     (uint32_t)surface->last_height, &mapping)) {
 			double sx = root_x - origin_x;
 			double sy = root_y - origin_y;
-			bool inside = sx >= 0 && sy >= 0 &&
-			              sx < mapping.logical_width && sy < mapping.logical_height;
+			bool inside = sx >= surface->buffer_offset_x &&
+			              sy >= surface->buffer_offset_y &&
+			              sx < surface->buffer_offset_x + mapping.logical_width &&
+			              sy < surface->buffer_offset_y + mapping.logical_height;
 			if (inside && (!surface->input_region_set ||
 			               np_region_contains(&surface->input_region, sx, sy))) {
 				if (local_x) *local_x = sx;
@@ -162,8 +164,10 @@ static bool collect_surface(
 	item->flags = item->format == 2u ? 1u : 0u;
 	item->transform = (uint32_t)surface->transform;
 
-	float x = (float)((origin_x - geometry_x) * (int32_t)output_scale);
-	float y = (float)((origin_y - geometry_y) * (int32_t)output_scale);
+	float x = (float)((origin_x + surface->buffer_offset_x - geometry_x) *
+	                  (int32_t)output_scale);
+	float y = (float)((origin_y + surface->buffer_offset_y - geometry_y) *
+	                  (int32_t)output_scale);
 	float width = (float)(mapping.logical_width * output_scale);
 	float height = (float)(mapping.logical_height * output_scale);
 	item->destination[0] = x;

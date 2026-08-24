@@ -11,7 +11,9 @@ public enum WindowWire {
     public static let scrollMagic: [UInt8] = Array("NPSC".utf8)
     public static let configureMagic: [UInt8] = Array("NPCF".utf8)
     public static let frameTimingMagic: [UInt8] = Array("NPFT".utf8)
+    public static let popupConfigureMagic: [UInt8] = Array("NPPF".utf8)
     public static let sceneMagic: [UInt8] = Array("NPSN".utf8)
+    public static let lifecycleMagic: [UInt8] = Array("NPW2".utf8)
     public static let sceneVersion: UInt16 = 1
     public static let sceneHeaderSize = 56
     public static let sceneLayerSize = 88
@@ -28,6 +30,9 @@ public enum WindowWire {
     /// validated before a value is read; callers can safely reject malformed or
     /// newer messages without losing NPIP stream framing.
     public static func guestEvent(from payload: Data) throws -> Windowing.GuestEvent {
+        if payload.count >= 4, Array(payload.prefix(4)) == lifecycleMagic {
+            return try lifecycleEvent(from: payload)
+        }
         guard payload.count >= 4,
               Array(payload.prefix(4)) == sceneMagic else {
             throw DecodeError.notBinaryScene
@@ -113,6 +118,105 @@ public enum WindowWire {
             windowGeometry: geometry, layers: layers))
     }
 
+    private static func lifecycleEvent(from payload: Data) throws -> Windowing.GuestEvent {
+        var reader = Reader(payload)
+        try reader.skip(4)
+        let direction: UInt8 = try reader.integer()
+        let opcode: UInt8 = try reader.integer()
+        let reserved: UInt16 = try reader.integer()
+        guard direction == 1, reserved == 0 else { throw DecodeError.malformed }
+
+        func finished(_ event: Windowing.GuestEvent) throws -> Windowing.GuestEvent {
+            guard reader.isAtEnd else { throw DecodeError.malformed }
+            return event
+        }
+        switch opcode {
+        case 2:
+            return try finished(.surfaceCreated(surface: reader.integer()))
+        case 3:
+            return try finished(.surfaceDestroyed(surface: reader.integer()))
+        case 4:
+            return try finished(.surfaceUnmapped(surface: reader.integer()))
+        case 5:
+            return try finished(.toplevelCreated(
+                window: reader.integer(), surface: reader.integer()))
+        case 6:
+            return try finished(.toplevelDestroyed(window: reader.integer()))
+        case 7:
+            let window: UInt32 = try reader.integer()
+            let surface: UInt32 = try reader.integer()
+            let parent: UInt32 = try reader.integer()
+            let x = Int(try reader.integer() as Int32)
+            let y = Int(try reader.integer() as Int32)
+            let width = Int(try reader.integer() as Int32)
+            let height = Int(try reader.integer() as Int32)
+            guard width > 0, height > 0 else { throw DecodeError.malformed }
+            return try finished(.popupCreated(
+                window: window, surface: surface, parent: parent,
+                x: x, y: y, width: width, height: height))
+        case 8:
+            let window: UInt32 = try reader.integer()
+            let x = Int(try reader.integer() as Int32)
+            let y = Int(try reader.integer() as Int32)
+            let width = Int(try reader.integer() as Int32)
+            let height = Int(try reader.integer() as Int32)
+            guard width > 0, height > 0 else { throw DecodeError.malformed }
+            return try finished(.popupRepositioned(
+                window: window, x: x, y: y, width: width, height: height))
+        case 9:
+            return try finished(.popupDestroyed(window: reader.integer()))
+        case 10:
+            let surface: UInt32 = try reader.integer()
+            let parent: UInt32 = try reader.integer()
+            let x = Int(try reader.integer() as Int32)
+            let y = Int(try reader.integer() as Int32)
+            guard surface != 0, parent != 0 else { throw DecodeError.malformed }
+            return try finished(.subsurfaceCreated(
+                surface: surface, parent: parent, x: x, y: y))
+        case 11:
+            let surface: UInt32 = try reader.integer()
+            let x = Int(try reader.integer() as Int32)
+            let y = Int(try reader.integer() as Int32)
+            guard surface != 0 else { throw DecodeError.malformed }
+            return try finished(.subsurfaceMoved(surface: surface, x: x, y: y))
+        case 12:
+            return try finished(.subsurfaceDestroyed(surface: reader.integer()))
+        case 13:
+            let surface: UInt32 = try reader.integer()
+            return try finished(.dragIconChanged(surface: surface == 0 ? nil : surface))
+        case 14:
+            let surface: UInt32 = try reader.integer()
+            let hotspotX = Int(try reader.integer() as Int32)
+            let hotspotY = Int(try reader.integer() as Int32)
+            return try finished(.cursorChanged(
+                surface: surface == 0 ? nil : surface,
+                hotspotX: hotspotX, hotspotY: hotspotY))
+        case 15:
+            let raw: UInt32 = try reader.integer()
+            guard let shape = Windowing.CursorShape(rawValue: raw) else {
+                throw DecodeError.malformed
+            }
+            return try finished(.cursorShapeChanged(shape: shape))
+        case 35:
+            let placement = Windowing.PopupPlacement(
+                window: try reader.integer(), parent: try reader.integer(),
+                x: Int(try reader.integer() as Int32),
+                y: Int(try reader.integer() as Int32),
+                flippedX: Int(try reader.integer() as Int32),
+                flippedY: Int(try reader.integer() as Int32),
+                width: Int(try reader.integer() as Int32),
+                height: Int(try reader.integer() as Int32),
+                adjustment: try reader.integer(), token: try reader.integer(),
+                reactive: try reader.boolean())
+            guard placement.window != 0, placement.width > 0,
+                  placement.height > 0, placement.adjustment & ~0x3f == 0
+            else { throw DecodeError.malformed }
+            return try finished(.popupPlacementRequested(placement))
+        default:
+            throw DecodeError.malformed
+        }
+    }
+
     /// Encodes high-rate host state without allocating a JSON object.
     public static func fastPayload(for command: Windowing.HostCommand) -> Data? {
         switch command {
@@ -149,6 +253,21 @@ public enum WindowWire {
             append(height, to: &payload)
             append(stateBits, to: &payload)
             append(serial, to: &payload)
+            return payload
+        case .configurePopup(
+            let window, let x, let y, let width, let height, let token):
+            guard let x = Int32(exactly: x), let y = Int32(exactly: y),
+                  let width = Int32(exactly: width),
+                  let height = Int32(exactly: height),
+                  width > 0, height > 0
+            else { return nil }
+            var payload = Data(popupConfigureMagic)
+            append(window, to: &payload)
+            append(x, to: &payload)
+            append(y, to: &payload)
+            append(width, to: &payload)
+            append(height, to: &payload)
+            append(token, to: &payload)
             return payload
         default:
             return nil
@@ -219,6 +338,12 @@ public enum WindowWire {
             }
             offset += size
             return T(littleEndian: value)
+        }
+
+        mutating func boolean() throws -> Bool {
+            let value: UInt8 = try integer()
+            guard value <= 1 else { throw DecodeError.malformed }
+            return value == 1
         }
 
         mutating func float() throws -> Float {

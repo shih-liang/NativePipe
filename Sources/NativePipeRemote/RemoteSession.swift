@@ -205,7 +205,13 @@ public final class RemoteSession: @unchecked Sendable {
         do {
             while let payload = try surfaceDecoder.next() {
                 do {
-                    events.append(try JSONDecoder().decode(Windowing.GuestEvent.self, from: payload))
+                    if payload.starts(with: WindowWire.sceneMagic) ||
+                        payload.starts(with: WindowWire.lifecycleMagic) {
+                        events.append(try WindowWire.guestEvent(from: payload))
+                    } else {
+                        events.append(try JSONDecoder().decode(
+                            Windowing.GuestEvent.self, from: payload))
+                    }
                 } catch {
                     fputs(
                         "nativepipe-remote: skip event: \(String(decoding: payload, as: UTF8.self))\n",

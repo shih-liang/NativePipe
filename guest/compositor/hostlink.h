@@ -1,9 +1,8 @@
 // The window channel to the host, over vsock or TCP.
 //
 // NPIP provides versioned length framing around either JSON metadata or the
-// high-rate binary messages. Local VM events use 1025; host control, input and
-// frame feedback each use their own unidirectional port below. RemotePipe keeps
-// its legacy bidirectional TCP stream on 1025.
+// high-rate binary messages. Local VM traffic owns a dedicated vsock range;
+// RemotePipe keeps its legacy bidirectional TCP stream on 1025.
 //
 // This carries metadata only. Local VM pixels never travel here — a frame
 // message names a virtio-gpu resource that is already host memory. Remote
@@ -16,11 +15,13 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/// NativePipePort.surface
+/// RemotePipe TCP surface port.
 #define NP_SURFACE_PORT 1025
-#define NP_WINDOW_CONTROL_PORT 1286
-#define NP_WINDOW_INPUT_PORT 1287
-#define NP_WINDOW_FEEDBACK_PORT 1288
+/// Local VM compositor vsock ports.
+#define NP_WINDOW_EVENT_PORT 4096
+#define NP_WINDOW_CONTROL_PORT 4097
+#define NP_WINDOW_INPUT_PORT 4098
+#define NP_WINDOW_FEEDBACK_PORT 4099
 
 enum np_host_transport {
 	NP_HOST_VSOCK = 0,

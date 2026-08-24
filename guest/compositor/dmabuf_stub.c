@@ -8,6 +8,8 @@ struct np_gpu_buffer *np_gpu_buffer_get(struct wl_resource *buffer) {
 	return NULL;
 }
 
+void np_gpu_buffer_retain(struct np_gpu_buffer *buffer) { (void)buffer; }
+void np_gpu_buffer_drop(struct np_gpu_buffer *buffer) { (void)buffer; }
 void np_gpu_buffer_acquire_current(struct np_gpu_buffer *buffer) { (void)buffer; }
 void np_gpu_buffer_release_current(struct np_gpu_buffer *buffer) { (void)buffer; }
 bool np_gpu_buffer_begin_host_read(struct np_gpu_buffer *buffer) { (void)buffer; return false; }

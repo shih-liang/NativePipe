@@ -66,6 +66,14 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
     /// `ResourceTable` itself stays queue confined; this is a published mirror.
     private let publishedLock = NSLock()
     private var published: [UInt32: PublishedBuffer] = [:]
+    private struct CachedMetalTexture {
+        let width: Int
+        let height: Int
+        let bytesPerRow: Int
+        let format: UInt32
+        let texture: AnyObject
+    }
+    private var metalTextures: [UInt32: CachedMetalTexture] = [:]
     private var latestScanout: ScanoutFrame?
     private var scanoutObservers: [UUID: (ScanoutFrame?) -> Void] = [:]
     private var scanoutDeliveryScheduled = false
@@ -154,6 +162,18 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
         forResource resourceID: UInt32,
         width: Int, height: Int, bytesPerRow: Int, format: UInt32
     ) -> AnyObject? {
+        publishedLock.lock()
+        if let cached = metalTextures[resourceID],
+           cached.width == width, cached.height == height,
+           cached.bytesPerRow == bytesPerRow, cached.format == format,
+           published[resourceID] != nil {
+            publishedLock.unlock()
+            return cached.texture
+        }
+        let isPublished = published[resourceID] != nil
+        publishedLock.unlock()
+        guard isPublished else { return nil }
+
         let lookup: () -> AnyObject? = { [self] in
             guard !rendererTornDown,
                   let raw = np_venus_metal_texture(
@@ -162,8 +182,17 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
             else { return nil }
             return Unmanaged<AnyObject>.fromOpaque(raw).takeUnretainedValue()
         }
-        if DispatchQueue.getSpecific(key: Self.deviceQueueKey) != nil { return lookup() }
-        return deviceQueue.sync(execute: lookup)
+        let texture = DispatchQueue.getSpecific(key: Self.deviceQueueKey) != nil
+            ? lookup() : deviceQueue.sync(execute: lookup)
+        guard let texture else { return nil }
+        publishedLock.lock()
+        if published[resourceID] != nil {
+            metalTextures[resourceID] = CachedMetalTexture(
+                width: width, height: height, bytesPerRow: bytesPerRow,
+                format: format, texture: texture)
+        }
+        publishedLock.unlock()
+        return texture
     }
 
     private func buffer(forResource resourceID: UInt32) -> PublishedBuffer? {
@@ -178,6 +207,7 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
             pointer: resource.baseAddress,
             byteCount: resource.byteCount)
         publishedLock.lock()
+        metalTextures.removeValue(forKey: resource.resourceID)
         published[resource.resourceID] = entry
         publishedLock.unlock()
     }
@@ -185,6 +215,7 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
     private func unpublish(_ resourceID: UInt32) {
         publishedLock.lock()
         published.removeValue(forKey: resourceID)
+        metalTextures.removeValue(forKey: resourceID)
         publishedLock.unlock()
     }
 
@@ -1259,6 +1290,7 @@ extension VirtioGPUDevice: VZCustomVirtioDeviceDelegate {
             resources.removeAll()
             publishedLock.lock()
             published.removeAll(keepingCapacity: true)
+            metalTextures.removeAll(keepingCapacity: true)
             publishedLock.unlock()
             completion()
             done()
@@ -1288,6 +1320,7 @@ extension VirtioGPUDevice: VZCustomVirtioDeviceDelegate {
         resources.removeAll()
         publishedLock.lock()
         published.removeAll(keepingCapacity: false)
+        metalTextures.removeAll(keepingCapacity: false)
         publishedLock.unlock()
         np_venus_destroy(venus)
         rendererDestroyed = true

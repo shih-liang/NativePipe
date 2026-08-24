@@ -1,4 +1,5 @@
 import AppKit
+import CoreImage
 import ImageIO
 import IOSurface
 @preconcurrency import Metal
@@ -208,8 +209,12 @@ public final class WindowBridge {
     /// resource is resolvable; superseded ids are completed explicitly.
     private var pendingScenes: [UInt32: Windowing.SceneSnapshot] = [:]
     private var pointerCursor = NSCursor.arrow
+    private var cursorSurface: UInt32?
+    private var cursorHotSpot = CGPoint.zero
+    private var cursorContext: CIContext?
 
     private var windows: [UInt32: NativeWindow] = [:]
+    private var popupPlacements: [UInt32: Windowing.PopupPlacement] = [:]
     private var mappedApplicationWindows: Set<UInt32> = []
     /// Surfaces that exist but have no role yet, and the toplevel each one backs.
     private var surfaceToWindow: [UInt32: UInt32] = [:]
@@ -316,10 +321,35 @@ public final class WindowBridge {
                 dragIconSurface = nil
                 dragIcon.hide()
             }
+            if cursorSurface == surface {
+                cursorSurface = nil
+                pointerCursor = .arrow
+                pointerCursor.set()
+            }
             if let windowID = surfaceToWindow.removeValue(forKey: surface) {
                 mappedApplicationWindows.remove(windowID)
                 windows.removeValue(forKey: windowID)?.close()
             }
+
+        case .surfaceUnmapped(let surface):
+            if let frame = pendingSurfaceFrames.removeValue(forKey: surface) {
+                completeCopiedPresentation(
+                    surface: surface, presentationID: frame.presentationID)
+            }
+            if let frame = pendingFrames.removeValue(forKey: surface) {
+                completeCopiedPresentation(
+                    surface: surface, presentationID: frame.presentationID)
+            }
+            if let scene = pendingScenes.removeValue(forKey: surface) {
+                completeScene(scene)
+            }
+            guard let windowID = surfaceToWindow[surface],
+                  let native = windows[windowID] else { break }
+            mappedApplicationWindows.remove(windowID)
+            // xdg-shell keeps the role alive across an unmap. Closing only the
+            // AppKit object lets the next mapped scene recreate it with the
+            // retained title, app id, decoration mode and constraints.
+            native.close()
 
         case .toplevelCreated(let window, let surface):
             // NSWindow waits for the first committed frame. Creating it here
@@ -348,7 +378,18 @@ public final class WindowBridge {
                 present(scene: scene, windowID: window)
             }
 
+        case .popupPlacementRequested(let placement):
+            popupPlacements[placement.window] = placement
+            configurePopup(placement)
+
+        case .popupRepositioned(let window, let x, let y, let width, let height):
+            windows[window]?.applyPopupGeometry(
+                origin: CGPoint(x: x, y: y),
+                size: NSSize(width: width, height: height))
+            parentGeometryChanged(window)
+
         case .popupDestroyed(let window):
+            popupPlacements.removeValue(forKey: window)
             if let native = windows.removeValue(forKey: window) {
                 mappedApplicationWindows.remove(window)
                 surfaceToWindow.removeValue(forKey: native.surfaceID)
@@ -381,12 +422,20 @@ public final class WindowBridge {
                 presentDragIcon(texture, frame: frame, surface: surface)
             }
 
-        case .cursorChanged(let surface, _, _):
-            // A custom surface is installed when its committed pixels arrive.
-            // Until then retain the current AppKit cursor; nil restores arrow.
-            if surface == nil { pointerCursor = .arrow }
+        case .cursorChanged(let surface, let hotspotX, let hotspotY):
+            cursorSurface = surface
+            cursorHotSpot = CGPoint(x: hotspotX, y: hotspotY)
+            guard let surface else {
+                pointerCursor = .arrow
+                pointerCursor.set()
+                break
+            }
+            if let frame = pendingSurfaceFrames.removeValue(forKey: surface) {
+                installCustomCursor(frame, surface: surface)
+            }
 
         case .cursorShapeChanged(let shape):
+            cursorSurface = nil
             pointerCursor = NativeCursorResolver.cursor(for: shape)
             pointerCursor.set()
 
@@ -407,6 +456,10 @@ public final class WindowBridge {
             windows[window]?.setConstraints(minimum: minimum, maximum: maximum)
 
         case .committed(let surface, let frame):
+            if surface == cursorSurface {
+                installCustomCursor(frame, surface: surface)
+                return
+            }
             if surface == dragIconSurface {
                 guard let texture = texture(for: frame) else {
                     retainDeferred(frame, for: surface)
@@ -487,6 +540,14 @@ public final class WindowBridge {
             guard let windowID = surfaceToWindow[surface] else { continue }
             present(scene: scene, windowID: windowID)
         }
+        if let surface = cursorSurface,
+           let frame = pendingSurfaceFrames.removeValue(forKey: surface) {
+            installCustomCursor(frame, surface: surface)
+        }
+        if let surface = dragIconSurface,
+           let frame = pendingSurfaceFrames.removeValue(forKey: surface) {
+            apply(.committed(surface: surface, frame: frame))
+        }
         guard !pendingFrames.isEmpty else { return }
         let snapshot = pendingFrames
         for (surface, frame) in snapshot {
@@ -565,6 +626,45 @@ public final class WindowBridge {
             forResource: frame.resourceID,
             width: frame.width, height: frame.height,
             bytesPerRow: frame.bytesPerRow, format: format) as? MTLTexture
+    }
+
+    private func installCustomCursor(_ frame: Windowing.Frame, surface: UInt32) {
+        guard let texture = texture(for: frame) else {
+            retainUnroled(frame, for: surface)
+            return
+        }
+        let geometry = Self.customCursorGeometry(
+            frame: frame, hotSpot: cursorHotSpot)
+        let source = geometry.sourcePixels.intersection(
+            CGRect(x: 0, y: 0, width: texture.width, height: texture.height))
+        guard !source.isEmpty,
+              let image = CIImage(mtlTexture: texture, options: [
+                .colorSpace: CGColorSpaceCreateDeviceRGB()
+              ])
+        else {
+            completeCopiedPresentation(
+                surface: surface, presentationID: frame.presentationID)
+            return
+        }
+        if cursorContext == nil { cursorContext = CIContext(mtlDevice: texture.device) }
+        // Core Image's Metal texture origin is bottom-left; Wayland viewport
+        // coordinates are top-left.
+        let ciSource = CGRect(
+            x: source.minX,
+            y: CGFloat(texture.height) - source.maxY,
+            width: source.width,
+            height: source.height)
+        guard let cgImage = cursorContext?.createCGImage(image, from: ciSource) else {
+            completeCopiedPresentation(
+                surface: surface, presentationID: frame.presentationID)
+            return
+        }
+        let nsImage = NSImage(cgImage: cgImage, size: geometry.imageSize)
+        pointerCursor = NSCursor(image: nsImage, hotSpot: geometry.hotSpot)
+        pointerCursor.set()
+        pendingSurfaceFrames.removeValue(forKey: surface)
+        completeCopiedPresentation(
+            surface: surface, presentationID: frame.presentationID)
     }
 
     private func presentDragIcon(
@@ -759,6 +859,67 @@ public final class WindowBridge {
         }
     }
 
+    func parentGeometryChanged(_ parent: UInt32) {
+        for placement in popupPlacements.values
+        where placement.parent == parent && placement.reactive {
+            configurePopup(placement)
+        }
+    }
+
+    private func configurePopup(_ placement: Windowing.PopupPlacement) {
+        let bounds = windows[placement.parent]?.popupConstraintBounds
+            ?? NSScreen.main.map {
+                CGRect(origin: .zero, size: $0.visibleFrame.size)
+            }
+        guard let bounds else { return }
+        let rect = Self.constrainPopup(placement, to: bounds)
+        send(.configurePopup(
+            window: placement.window,
+            x: Int(rect.minX.rounded()), y: Int(rect.minY.rounded()),
+            width: max(1, Int(rect.width.rounded())),
+            height: max(1, Int(rect.height.rounded())),
+            token: placement.token))
+    }
+
+    static func constrainPopup(
+        _ placement: Windowing.PopupPlacement, to bounds: CGRect
+    ) -> CGRect {
+        func axis(
+            origin: CGFloat, flipped: CGFloat, size: CGFloat,
+            minimum: CGFloat, maximum: CGFloat,
+            flip: Bool, slide: Bool, resize: Bool
+        ) -> (CGFloat, CGFloat) {
+            func fits(_ value: CGFloat, _ length: CGFloat) -> Bool {
+                value >= minimum && value + length <= maximum
+            }
+            var value = origin
+            var length = size
+            if !fits(value, length), flip, fits(flipped, length) { value = flipped }
+            if !fits(value, length), slide, length <= maximum - minimum {
+                value = min(max(value, minimum), maximum - length)
+            }
+            if !fits(value, length), resize {
+                let end = min(value + length, maximum)
+                value = max(value, minimum)
+                length = max(1, end - value)
+            }
+            return (value, length)
+        }
+
+        let bits = placement.adjustment
+        let horizontal = axis(
+            origin: CGFloat(placement.x), flipped: CGFloat(placement.flippedX),
+            size: CGFloat(placement.width), minimum: bounds.minX, maximum: bounds.maxX,
+            flip: bits & 4 != 0, slide: bits & 1 != 0, resize: bits & 16 != 0)
+        let vertical = axis(
+            origin: CGFloat(placement.y), flipped: CGFloat(placement.flippedY),
+            size: CGFloat(placement.height), minimum: bounds.minY, maximum: bounds.maxY,
+            flip: bits & 8 != 0, slide: bits & 2 != 0, resize: bits & 32 != 0)
+        return CGRect(
+            x: horizontal.0, y: vertical.0,
+            width: horizontal.1, height: vertical.1)
+    }
+
     /// Injects a canned input sequence once the first frame lands, when
     /// NATIVEPIPE_INPUT_TEST is set.
     ///
@@ -830,8 +991,12 @@ public final class WindowBridge {
         pendingFrames.removeAll()
         for (_, scene) in pendingScenes { completeScene(scene) }
         pendingScenes.removeAll()
+        cursorSurface = nil
+        cursorContext = nil
+        pointerCursor = .arrow
         for (_, window) in windows { window.close() }
         windows.removeAll()
+        popupPlacements.removeAll()
         mappedApplicationWindows.removeAll()
         surfaceToWindow.removeAll()
         knownSurfaces.removeAll()

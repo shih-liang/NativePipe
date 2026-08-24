@@ -5,6 +5,32 @@ import XCTest
 
 @MainActor
 final class ViewportGeometryTests: XCTestCase {
+    func testPopupConstraintsPreferFlipThenSlideAndResize() {
+        let bounds = CGRect(x: 0, y: 0, width: 800, height: 600)
+        let flipped = Windowing.PopupPlacement(
+            window: 2, parent: 1,
+            x: 740, y: 20, flippedX: 500, flippedY: 20,
+            width: 240, height: 180, adjustment: 4,
+            token: 1, reactive: false)
+        XCTAssertEqual(
+            WindowBridge.constrainPopup(flipped, to: bounds),
+            CGRect(x: 500, y: 20, width: 240, height: 180))
+
+        var slide = flipped
+        slide.adjustment = 1
+        XCTAssertEqual(
+            WindowBridge.constrainPopup(slide, to: bounds),
+            CGRect(x: 560, y: 20, width: 240, height: 180))
+
+        var resize = flipped
+        resize.x = -20
+        resize.width = 900
+        resize.adjustment = 16
+        XCTAssertEqual(
+            WindowBridge.constrainPopup(resize, to: bounds),
+            CGRect(x: 0, y: 20, width: 800, height: 180))
+    }
+
     func testFirefoxBufferMapsToViewportDestinationWithoutChangingBufferScale() {
         let frame = Windowing.Frame(
             resourceID: 47, width: 1_600, height: 1_200,
@@ -155,6 +181,21 @@ final class ViewportGeometryTests: XCTestCase {
             if case .framePresented(surface: 8, presentationID: 17) = $0 { return true }
             return false
         })
+        bridge.closeAll()
+    }
+
+    func testUnmapClosesOnlyThePhysicalWindowAndRetainsRole() {
+        let bridge = WindowBridge(frameSource: nil)
+        bridge.apply(.surfaceCreated(surface: 8))
+        bridge.apply(.toplevelCreated(window: 3, surface: 8))
+        let role = bridge.window(3)
+
+        bridge.apply(.surfaceUnmapped(surface: 8))
+
+        XCTAssertNotNil(role)
+        XCTAssertTrue(bridge.window(3) === role)
+        bridge.apply(.toplevelDestroyed(window: 3))
+        XCTAssertNil(bridge.window(3))
         bridge.closeAll()
     }
 

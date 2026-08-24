@@ -22,6 +22,10 @@ struct np_gpu_buffer {
 
 struct np_gpu_buffer *np_gpu_buffer_get(struct wl_resource *buffer);
 
+/* Queued commits retain the imported object independently of wl_resource. */
+void np_gpu_buffer_retain(struct np_gpu_buffer *buffer);
+void np_gpu_buffer_drop(struct np_gpu_buffer *buffer);
+
 /// Current-surface and host-read ownership are independent of wl_resource
 /// lifetime. A client may destroy the protocol object immediately after attach;
 /// the imported resource remains alive until both counters reach zero.

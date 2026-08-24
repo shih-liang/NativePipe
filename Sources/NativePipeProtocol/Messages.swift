@@ -28,7 +28,7 @@ public struct Request: Sendable {
         case run(spec: LaunchSpec)
 
         /// Interactive PTY exec. Guest allocates a PTY, starts the process, and
-        /// accepts one vsock connection on `NativePipePort.exec` for the session.
+        /// accepts one vsock connection from the dedicated session port range.
         case exec(spec: LaunchSpec, cols: Int, rows: Int)
 
         /// Read a guest file (raw bytes) or list one directory level.

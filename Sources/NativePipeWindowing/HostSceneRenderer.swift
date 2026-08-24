@@ -151,7 +151,7 @@ final class HostSceneRenderer: @unchecked Sendable {
         }
         let target = drawable.texture
         guard target.pixelFormat == .bgra8Unorm,
-              target.width == scene.width, target.height == scene.height else {
+              target.width >= scene.width, target.height >= scene.height else {
             throw RendererError.incompatibleTexture
         }
 
@@ -179,7 +179,10 @@ final class HostSceneRenderer: @unchecked Sendable {
             encoder.setRenderPipelineState(pipeline)
             encoder.setFragmentSamplerState(sampler, index: 0)
             for layer in layers {
-                try encode(layer: layer, scene: scene, encoder: encoder)
+                try encode(
+                    layer: layer, scene: scene,
+                    outputWidth: target.width, outputHeight: target.height,
+                    encoder: encoder)
             }
             encoder.endEncoding()
         }
@@ -195,6 +198,7 @@ final class HostSceneRenderer: @unchecked Sendable {
 
     private func encode(
         layer: ResolvedSceneLayer, scene: Windowing.SceneSnapshot,
+        outputWidth: Int, outputHeight: Int,
         encoder: MTLRenderCommandEncoder
     ) throws {
         let texture = layer.texture
@@ -215,7 +219,7 @@ final class HostSceneRenderer: @unchecked Sendable {
             destination: SIMD4(
                 Float(destination.x), Float(destination.y),
                 Float(destination.width), Float(destination.height)),
-            outputSize: SIMD2(Float(scene.width), Float(scene.height)))
+            outputSize: SIMD2(Float(outputWidth), Float(outputHeight)))
         let source = layer.state.sourcePixels
         var fragment = FragmentUniforms(
             sourcePixels: SIMD4(

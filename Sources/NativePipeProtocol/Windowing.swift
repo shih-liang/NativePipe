@@ -27,6 +27,10 @@ extension Windowing {
 
         case surfaceCreated(surface: UInt32)
         case surfaceDestroyed(surface: UInt32)
+        /// A null-buffer commit unmaps the role without destroying it. The host
+        /// closes only the physical NSWindow and keeps the role for a later
+        /// initial-configure/remap sequence.
+        case surfaceUnmapped(surface: UInt32)
 
         /// A surface took the toplevel role. No `NSWindow` is created yet: one
         /// appears on the first commit that carries a frame, because a window
@@ -40,6 +44,9 @@ extension Windowing {
         case popupCreated(
             window: UInt32, surface: UInt32, parent: UInt32,
             x: Int, y: Int, width: Int, height: Int)
+        case popupPlacementRequested(PopupPlacement)
+        case popupRepositioned(
+            window: UInt32, x: Int, y: Int, width: Int, height: Int)
         case popupDestroyed(window: UInt32)
 
         /// Legacy compatibility events. Current guests composite subsurfaces
@@ -138,6 +145,39 @@ extension Windowing {
             self.y = y
             self.width = width
             self.height = height
+        }
+    }
+
+    public struct PopupPlacement: Codable, Sendable, Equatable {
+        public var window: UInt32
+        public var parent: UInt32
+        public var x: Int
+        public var y: Int
+        public var flippedX: Int
+        public var flippedY: Int
+        public var width: Int
+        public var height: Int
+        public var adjustment: UInt32
+        public var token: UInt32
+        public var reactive: Bool
+
+        public init(
+            window: UInt32, parent: UInt32,
+            x: Int, y: Int, flippedX: Int, flippedY: Int,
+            width: Int, height: Int, adjustment: UInt32,
+            token: UInt32, reactive: Bool
+        ) {
+            self.window = window
+            self.parent = parent
+            self.x = x
+            self.y = y
+            self.flippedX = flippedX
+            self.flippedY = flippedY
+            self.width = width
+            self.height = height
+            self.adjustment = adjustment
+            self.token = token
+            self.reactive = reactive
         }
     }
 
@@ -416,6 +456,12 @@ extension Windowing {
         /// Dismiss a popup: the click went elsewhere, or the parent lost focus.
         /// Like close, this is a request; the client tears the popup down.
         case dismissPopup(window: UInt32)
+        /// Host-resolved popup geometry in parent-local logical coordinates.
+        /// The guest turns this into xdg_popup.configure; AppKit moves only
+        /// after the client acknowledges and commits that configure.
+        case configurePopup(
+            window: UInt32, x: Int, y: Int, width: Int, height: Int,
+            token: UInt32)
         /// Backing scale of the screen the window is on, which changes when the
         /// user drags it between displays.
         case scaleChanged(window: UInt32, scale: Int)
