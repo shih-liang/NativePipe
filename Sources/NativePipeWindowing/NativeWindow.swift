@@ -293,27 +293,29 @@ final class NativeWindow: NSObject {
     /// Draw a complete guest-resolved scene directly from the client's existing
     /// Metal textures. `readComplete` is distinct from display presentation:
     /// the former releases Wayland buffers, the latter completes frame/FIFO.
+    @discardableResult
     func present(
         scene: Windowing.SceneSnapshot, layers: [ResolvedSceneLayer],
+        latchIDs: [UInt32],
         readComplete: @escaping @MainActor (Bool) -> Void
-    ) {
+    ) -> Bool {
         prepareWindow(for: scene)
         guard let presenter = asyncScenePresenter,
-              contentView.configureMetalLayer(scene: scene)
+              let drawableSize = contentView.configureMetalLayer(scene: scene)
         else {
             Self.note("could not configure Metal scene window=\(windowID)")
-            readComplete(false)
-            awaitPresentation(
-                surface: scene.surface, presentationID: scene.presentationID)
-            return
+            return false
         }
         presenter.enqueue(
-            scene: scene, layers: layers, readComplete: readComplete,
+            scene: scene, layers: layers, drawableSize: drawableSize,
+            readComplete: readComplete,
             latched: { [weak self] in
-                self?.awaitPresentation(
-                    surface: scene.surface,
-                    presentationID: scene.presentationID)
+                for presentationID in latchIDs {
+                    self?.awaitPresentation(
+                        surface: scene.surface, presentationID: presentationID)
+                }
             })
+        return true
     }
 
     func awaitPresentation(surface: UInt32, presentationID: UInt32) {
@@ -731,15 +733,18 @@ extension NativeWindow: NSWindowDelegate {
 
 /// Owns every `CAMetalLayer` drawable-pool operation on one serial queue.
 /// `nextDrawable()` may wait tens of milliseconds for WindowServer, so it must
-/// not run on AppKit's main thread. Keeping `drawableSize` on this same queue
-/// also prevents a resize from rebuilding the pool while a drawable is being
-/// acquired. One latest-value pending slot drops stale resize frames.
+/// not run on AppKit's main thread. AppKit geometry remains on the main actor,
+/// while both `drawableSize` and `nextDrawable()` stay on this queue so a live
+/// resize cannot mutate the pool concurrently. One latest-value pending slot
+/// drops stale resize frames.
 final class AsyncMetalScenePresenter: @unchecked Sendable {
     private struct Work: @unchecked Sendable {
+        let epoch: UInt64
         let scene: Windowing.SceneSnapshot
         let layers: [ResolvedSceneLayer]
+        let drawableSize: CGSize
         let readComplete: @MainActor (Bool) -> Void
-        let latched: @MainActor () -> Void
+        let latches: [@MainActor () -> Void]
         let presented: (@MainActor () -> Void)?
     }
 
@@ -749,15 +754,22 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
     private let requestDisplayRetry: (@Sendable () -> Void)?
     private let queue = DispatchQueue(
         label: "com.nativepipe.metal-present", qos: .userInteractive)
-    private let lock = NSLock()
+	private let lock = NSLock()
     private var pending: Work?
-    private var running = false
+	private var epoch: UInt64 = 0
+	private var drainScheduled = false
 	private var historyTexture: MTLTexture?
 	private var historyValid = false
 
     private enum ProcessResult: Equatable {
         case handled
-        case retryExactSize
+        case retryAfterDisplay
+    }
+
+    private enum RetryDisposition {
+        case scheduled
+        case superseded
+        case cancelled
     }
 
     init(
@@ -772,7 +784,11 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
     }
 
 	func resumeAfterDisplayTick() {
-		queue.async { self.drain() }
+		lock.lock()
+		let shouldSchedule = pending != nil && !drainScheduled
+		if shouldSchedule { drainScheduled = true }
+		lock.unlock()
+		if shouldSchedule { queue.async { self.drain() } }
 	}
 
 	func invalidateHistory() {
@@ -784,22 +800,27 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
 
     func enqueue(
         scene: Windowing.SceneSnapshot, layers: [ResolvedSceneLayer],
+        drawableSize: CGSize,
         readComplete: @escaping @MainActor (Bool) -> Void,
         latched: @escaping @MainActor () -> Void,
         presented: (@MainActor () -> Void)? = nil
     ) {
         lock.lock()
         let superseded = pending
-		let mergedScene = superseded.map {
-			scene.includingUnrenderedDamage(from: $0.scene)
-		} ?? scene
-		let work = Work(
-			scene: mergedScene, layers: layers,
-			readComplete: readComplete, latched: latched,
-			presented: presented)
+		let work = superseded.map {
+			Work(
+				epoch: epoch,
+				scene: scene.includingUnrenderedDamage(from: $0.scene),
+				layers: layers, drawableSize: drawableSize,
+				readComplete: readComplete,
+				latches: $0.latches + [latched], presented: presented)
+		} ?? Work(
+			epoch: epoch, scene: scene, layers: layers,
+			drawableSize: drawableSize, readComplete: readComplete,
+			latches: [latched], presented: presented)
         pending = work
-        let shouldStart = !running
-        if shouldStart { running = true }
+        let shouldSchedule = !drainScheduled
+        if shouldSchedule { drainScheduled = true }
         lock.unlock()
 
         // This work never reached Metal. Releasing it immediately is what
@@ -807,15 +828,13 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         // would pin the client's whole swapchain until drawableSize settles.
         if let superseded {
             finish(superseded, success: false)
-            latch(superseded)
         }
-        if shouldStart {
-            queue.async { self.drain() }
-        }
+        if shouldSchedule { queue.async { self.drain() } }
     }
 
     func cancelPending() {
         lock.lock()
+        epoch &+= 1
         let cancelled = pending
         pending = nil
         lock.unlock()
@@ -829,9 +848,9 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard let work = pending else {
-            running = false
-            return nil
-        }
+			drainScheduled = false
+			return nil
+		}
         pending = nil
         return work
     }
@@ -839,50 +858,42 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
     private func drain() {
         while let work = takeNext() {
             let result = autoreleasepool { process(work) }
-            guard result == .retryExactSize else { continue }
-            if scheduleRetry(work) {
+            guard result == .retryAfterDisplay else { continue }
+            switch scheduleRetry(work) {
+            case .scheduled:
                 // Do not spin through stale drawables from the old pool. A
                 // later queue turn gives CoreAnimation time to retire them.
                 return
+            case .superseded:
+                // A newer scene owns the slot and inherited the output latch.
+                finish(work, success: false)
+            case .cancelled:
+                // The window generation disappeared while nextDrawable was
+                // waiting. Complete its callbacks so a remap starts cleanly.
+                finish(work, success: false)
+                latch(work)
             }
-            // A newer scene already owns the pending slot. This frame was
-            // never read and can be released without delaying that scene.
-            finish(work, success: false)
-            latch(work)
         }
     }
 
     private func process(_ work: Work) -> ProcessResult {
-        let scene = work.scene
-        let logicalSize = CGSize(
-            width: scene.windowGeometry.width,
-            height: scene.windowGeometry.height)
-        let drawableSize = CGSize(width: scene.width, height: scene.height)
-
-        // A drawable and its layer geometry are one committed frame. The
-        // layer's top-left gravity keeps the previous drawable unscaled while
-        // SurfaceView keeps its top-left anchor pinned during live resize.
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        layer.bounds = CGRect(origin: .zero, size: logicalSize)
-        layer.position = .zero
-        layer.contentsScale = CGFloat(scene.scale)
-        layer.drawableSize = drawableSize
-        CATransaction.commit()
-
-        guard let drawable = layer.nextDrawable() else {
+        guard isCurrent(work) else {
             finish(work, success: false)
             latch(work)
             return .handled
         }
-        guard drawable.texture.width == scene.width,
-              drawable.texture.height == scene.height else {
-            let message =
-                "[nsw] retired mismatched drawable " +
-                "\(drawable.texture.width)x\(drawable.texture.height), " +
-                "need \(scene.width)x\(scene.height)\n"
-            FileHandle.standardError.write(Data(message.utf8))
-            return .retryExactSize
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.drawableSize = work.drawableSize
+        CATransaction.commit()
+        let scene = work.scene
+        guard let drawable = layer.nextDrawable() else {
+            return .retryAfterDisplay
+        }
+        guard isCurrent(work) else {
+            finish(work, success: false)
+            latch(work)
+            return .handled
         }
         if let presented = work.presented {
             drawable.addPresentedHandler { _ in
@@ -901,6 +912,9 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
 			historyValid = false
 		}
 		guard let history = historyTexture else {
+			historyValid = false
+			FileHandle.standardError.write(
+				Data("[nsw] could not allocate Metal scene history\n".utf8))
 			finish(work, success: false)
 			latch(work)
 			return .handled
@@ -929,22 +943,45 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
             // release remains tied to Metal completion above.
             latch(work)
         } catch {
+			historyValid = false
             FileHandle.standardError.write(
                 Data("[nsw] could not encode Metal scene: \(error)\n".utf8))
-            finish(work, success: false)
-            latch(work)
+			finish(work, success: false)
+			latch(work)
+			return .handled
         }
         return .handled
     }
 
-    /// Retry only when no newer scene is already waiting. `running` remains
-    /// true while delayed, so enqueue cannot start a second drain concurrently.
-    private func scheduleRetry(_ work: Work) -> Bool {
+    private func isCurrent(_ work: Work) -> Bool {
         lock.lock()
-        let shouldRetry = pending == nil
-        if shouldRetry { pending = work }
+        defer { lock.unlock() }
+        return work.epoch == epoch
+    }
+
+    /// Retry only when no newer scene is already waiting. A drawable-pool miss
+    /// sleeps until the shared display clock; a new scene wakes it immediately.
+    private func scheduleRetry(_ work: Work) -> RetryDisposition {
+        lock.lock()
+        let disposition: RetryDisposition
+        if work.epoch != epoch {
+            disposition = .cancelled
+        } else if let newer = pending {
+            pending = Work(
+                epoch: newer.epoch,
+                scene: newer.scene.includingUnrenderedDamage(from: work.scene),
+                layers: newer.layers, drawableSize: newer.drawableSize,
+                readComplete: newer.readComplete,
+                latches: work.latches + newer.latches,
+                presented: newer.presented)
+            disposition = .superseded
+        } else {
+            pending = work
+			drainScheduled = false
+            disposition = .scheduled
+        }
         lock.unlock()
-        guard shouldRetry else { return false }
+        guard case .scheduled = disposition else { return disposition }
 		if let requestDisplayRetry {
 			requestDisplayRetry()
 		} else {
@@ -952,7 +989,7 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
 				self.drain()
 			}
 		}
-        return true
+		return disposition
     }
 
     private func finish(_ work: Work, success: Bool) {
@@ -967,7 +1004,9 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         RunLoop.main.perform(
             inModes: [.common, RunLoop.Mode("NSEventTrackingRunLoopMode")]
         ) {
-            MainActor.assumeIsolated { work.latched() }
+            MainActor.assumeIsolated {
+                for latch in work.latches { latch() }
+            }
         }
     }
 }
@@ -1002,6 +1041,10 @@ private final class SurfaceView: NSView {
     /// The legacy CPU/remote surface currently on screen, held for exactly as
     /// long as it is installed in the layer. GPU windows use `metalLayer`.
     private var displayed: IOSurfaceRef?
+	/// Pixel density of the most recently committed Wayland scene. The drawable
+	/// follows the live AppKit bounds at this density even while client content
+	/// is still at an older configured size.
+	private var metalScale: CGFloat = 1
     /// Holds client content in AppKit point space without rubber-band scaling.
     /// If AppKit is ahead of the client during resize, the old scene remains at
     /// its committed size and is clipped (or leaves an unpainted edge) until an
@@ -1201,19 +1244,21 @@ private final class SurfaceView: NSView {
         input?.key(event.keyCode, pressed: nowDown, flags: event.modifierFlags)
     }
 
-    func configureMetalLayer(scene: Windowing.SceneSnapshot) -> Bool {
+    func configureMetalLayer(scene: Windowing.SceneSnapshot) -> CGSize? {
         displayed = nil
-        guard layer != nil, scene.width > 0, scene.height > 0 else { return false }
+        guard layer != nil, scene.width > 0, scene.height > 0 else { return nil }
+		metalScale = CGFloat(max(scene.scale, 1))
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         sceneLayer.bounds = CGRect(origin: .zero, size: bounds.size)
         sceneLayer.position = .zero
         sceneLayer.setAffineTransform(.identity)
+		let drawableSize = layoutMetalLayer()
         surfaceLayer.isHidden = true
         metalLayer.isHidden = false
         CATransaction.commit()
-        return true
+        return drawableSize
     }
 
     /// Remote decoders may allocate surfaces larger than the active frame.
@@ -1262,11 +1307,15 @@ private final class SurfaceView: NSView {
         guard let backing = layer else { return }
         let scenePresentation = sceneLayer.presentation() ?? sceneLayer
         let surfacePresentation = surfaceLayer.presentation() ?? surfaceLayer
+        let metalPresentation = metalLayer.presentation() ?? metalLayer
         var message = "[nsw] layers window=\(windowID) view=\(bounds) backing=\(backing.bounds) "
         message += "sceneBounds=\(sceneLayer.bounds) sceneFrame=\(sceneLayer.frame) "
         message += "scenePresented=\(scenePresentation.frame) surfaceBounds=\(surfaceLayer.bounds) "
         message += "surfaceFrame=\(surfaceLayer.frame) "
-        message += "surfacePresented=\(surfacePresentation.frame)\n"
+        message += "surfacePresented=\(surfacePresentation.frame) "
+        message += "metalBounds=\(metalLayer.bounds) metalFrame=\(metalLayer.frame) "
+        message += "metalPosition=\(metalLayer.position) drawable=\(metalLayer.drawableSize) "
+        message += "metalPresented=\(metalPresentation.frame)\n"
         FileHandle.standardError.write(Data(message.utf8))
     }
 
@@ -1279,8 +1328,21 @@ private final class SurfaceView: NSView {
         sceneLayer.bounds = CGRect(origin: .zero, size: bounds.size)
         sceneLayer.position = .zero
         sceneLayer.setAffineTransform(.identity)
+		_ = layoutMetalLayer()
         CATransaction.commit()
     }
+
+	/// Keep drawable allocation coupled to the physical NSWindow, never to an
+	/// older Wayland buffer. The renderer clips that older buffer at the drawable
+	/// origin, so live resize can always latch it and release FIFO/buffer waits.
+	private func layoutMetalLayer() -> CGSize {
+		metalLayer.bounds = CGRect(origin: .zero, size: bounds.size)
+		metalLayer.position = .zero
+		metalLayer.contentsScale = metalScale
+		return CGSize(
+			width: max(1, (bounds.width * metalScale).rounded()),
+			height: max(1, (bounds.height * metalScale).rounded()))
+	}
 }
 
 // MARK: - Text input

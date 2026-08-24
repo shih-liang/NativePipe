@@ -15,7 +15,12 @@ extension Windowing.SceneSnapshot {
     /// newest scene. The newest layer list is authoritative; only the damaged
     /// output area must be carried forward.
     func includingUnrenderedDamage(from older: Self) -> Self {
-        guard width == older.width, height == older.height else { return self }
+		guard width == older.width, height == older.height,
+              scale == older.scale, windowGeometry == older.windowGeometry else {
+            var result = self
+            result.damage = [Windowing.Rect(x: 0, y: 0, width: width, height: height)]
+            return result
+        }
         let rectangles = older.damage + damage
         guard let first = rectangles.first else { return self }
         var left = first.x
@@ -193,7 +198,7 @@ final class HostSceneRenderer: @unchecked Sendable {
         }
         let target = drawable.texture
         guard target.pixelFormat == .bgra8Unorm,
-              target.width >= scene.width, target.height >= scene.height,
+              target.width > 0, target.height > 0,
               history.pixelFormat == .bgra8Unorm,
               history.width == scene.width, history.height == scene.height else {
             throw RendererError.incompatibleTexture
@@ -216,12 +221,6 @@ final class HostSceneRenderer: @unchecked Sendable {
 					to: history, destinationSlice: 0, destinationLevel: 0,
 					destinationOrigin: MTLOrigin(x: region.x, y: region.y, z: 0))
 			}
-			encoder.copy(
-				from: history, sourceSlice: 0, sourceLevel: 0,
-				sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-				sourceSize: MTLSize(width: scene.width, height: scene.height, depth: 1),
-				to: target, destinationSlice: 0, destinationLevel: 0,
-				destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
             encoder.endEncoding()
         } else if !regions.isEmpty {
             let pass = MTLRenderPassDescriptor()
@@ -244,28 +243,9 @@ final class HostSceneRenderer: @unchecked Sendable {
 				}
             }
             encoder.endEncoding()
-			guard let blit = command.makeBlitCommandEncoder() else {
-				throw RendererError.encoder
-			}
-			blit.copy(
-				from: history, sourceSlice: 0, sourceLevel: 0,
-				sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-				sourceSize: MTLSize(width: scene.width, height: scene.height, depth: 1),
-				to: target, destinationSlice: 0, destinationLevel: 0,
-				destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
-			blit.endEncoding()
-		} else {
-			guard let blit = command.makeBlitCommandEncoder() else {
-				throw RendererError.encoder
-			}
-			blit.copy(
-				from: history, sourceSlice: 0, sourceLevel: 0,
-				sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-				sourceSize: MTLSize(width: scene.width, height: scene.height, depth: 1),
-				to: target, destinationSlice: 0, destinationLevel: 0,
-				destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
-			blit.endEncoding()
         }
+
+		try encodeOutput(history: history, target: target, command: command)
 
         command.addCompletedHandler { command in
             // Retain every source wrapper until Metal has completed its reads.
@@ -275,6 +255,41 @@ final class HostSceneRenderer: @unchecked Sendable {
         command.present(drawable)
         command.commit()
     }
+
+	/// xdg_toplevel.configure is a size hint, not a requirement that the current
+	/// committed buffer already have that extent. During an interactive resize
+	/// AppKit's drawable follows the window while Wayland may still show the
+	/// previous content update. Copy their intersection at (0, 0), preserving
+	/// top-left alignment, and clear only the newly exposed right/bottom area.
+	private func encodeOutput(
+		history: MTLTexture, target: MTLTexture, command: MTLCommandBuffer
+	) throws {
+		if target.width != history.width || target.height != history.height {
+			let pass = MTLRenderPassDescriptor()
+			pass.colorAttachments[0].texture = target
+			pass.colorAttachments[0].loadAction = .clear
+			pass.colorAttachments[0].storeAction = .store
+			pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0)
+			guard let clear = command.makeRenderCommandEncoder(descriptor: pass) else {
+				throw RendererError.encoder
+			}
+			clear.endEncoding()
+		}
+
+		let width = min(history.width, target.width)
+		let height = min(history.height, target.height)
+		guard width > 0, height > 0,
+		      let blit = command.makeBlitCommandEncoder() else {
+			throw RendererError.encoder
+		}
+		blit.copy(
+			from: history, sourceSlice: 0, sourceLevel: 0,
+			sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+			sourceSize: MTLSize(width: width, height: height, depth: 1),
+			to: target, destinationSlice: 0, destinationLevel: 0,
+			destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+		blit.endEncoding()
+	}
 
 	private func scissor(
 		_ rect: Windowing.Rect, width: Int, height: Int

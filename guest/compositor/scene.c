@@ -6,6 +6,7 @@
 #include "shm_texture.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -536,6 +537,10 @@ void np_scene_presented(struct np_surface *root, uint32_t presentation_id)
 	struct np_scene_presentation *presentation, *tmp;
 	wl_list_for_each_safe(presentation, tmp, &root->scene_presentations, link) {
 		if (presentation->id != presentation_id) continue;
+		if (np_trace_enabled())
+			fprintf(stderr,
+			        "[scene] release surface=%u present=%u references=%u\n",
+			        root->id, presentation_id, presentation->reference_count);
 		wl_list_remove(&presentation->link);
 		release_references(presentation);
 		free(presentation);

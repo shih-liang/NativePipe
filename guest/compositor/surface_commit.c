@@ -675,6 +675,15 @@ void np_surface_apply_update(struct np_surface_update *update) {
 	}
 	if (!wl_list_empty(&update->surface->blocked_updates) ||
 	    !surface_update_can_apply(update, update)) {
+		if (np_trace_enabled())
+			fprintf(stderr,
+			        "[wayland] queue blocked surface=%u present=%u fifo=%d gpu_busy=%d acquire=%d\n",
+			        update->surface->id, update->presentation_id,
+			        update->wait_fifo_barrier &&
+			        update->surface->fifo_barrier_active,
+			        update->gpu_buffer && np_gpu_buffer_is_busy(update->gpu_buffer),
+			        update->acquire_point &&
+			        !np_sync_point_ready(update->acquire_point));
 		wl_list_insert(update->surface->blocked_updates.prev, &update->link);
 		return;
 	}
@@ -735,18 +744,16 @@ void np_surface_commit(struct wl_client *client, struct wl_resource *resource) {
 	bool unmapping = xdg_role && surface->committed_buffer_attached &&
 	                 surface->pending_buffer_set && !surface->pending_buffer;
 	/* Capture this before snapshot_surface_update() consumes the pending ack.
-	 * The xdg-shell configure is complete at this wl_surface.commit boundary,
-	 * even when the resulting buffer update must wait for an acquire fence or
-	 * a FIFO barrier.  Waiting for snapshot_surface_update() to return an
-	 * immediately applicable update accidentally coupled resize flow control
-	 * back to GPU/output availability. */
+	 * The acked state belongs to this commit, but resize flow control does not
+	 * reopen until the commit's presentation id reaches the output latch. */
 	uint32_t configure_serial = surface->host_configure_acked
 		? surface->host_configure_acked_serial : 0;
 	if (surface->pending_buffer_set)
 		surface->committed_buffer_attached = surface->pending_buffer != NULL;
 	struct np_surface_update *update = snapshot_surface_update(surface);
 	if (configure_serial)
-		np_xdg_finish_toplevel_configure(surface, configure_serial);
+		np_xdg_finish_toplevel_configure(
+			surface, configure_serial, update ? update->presentation_id : 0);
 	if (update) np_surface_apply_update(update);
 	if (unmapping) {
 		surface->xdg_configure_phase = NP_XDG_AWAITING_INITIAL_COMMIT;

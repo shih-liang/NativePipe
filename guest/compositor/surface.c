@@ -233,10 +233,6 @@ static void surface_resource_destroy(struct wl_resource *resource) {
 		cJSON_Delete(surface->pending_frame);
 		surface->pending_frame = NULL;
 	}
-	if (surface->host_configure_idle) {
-		wl_event_source_remove(surface->host_configure_idle);
-		surface->host_configure_idle = NULL;
-	}
 	np_presentation_clear_scene_wait(surface);
 	np_xdg_clear_configures(surface);
 	struct np_frame_callback *callback, *callback_tmp;

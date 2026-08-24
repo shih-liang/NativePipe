@@ -7,6 +7,24 @@ import IOSurface
 import NativePipeProtocol
 import UniformTypeIdentifiers
 
+public enum FrameTextureStatus: Sendable {
+    case ready
+    case unpublished
+    case unavailable
+}
+
+/// Result of resolving one exact scene layer. Only `unpublished` is retryable:
+/// the CREATE_BLOB command has not crossed the virtio queue yet.
+public struct FrameTextureResolution: @unchecked Sendable {
+    public let status: FrameTextureStatus
+    public let texture: AnyObject?
+
+    public init(status: FrameTextureStatus, texture: AnyObject? = nil) {
+        self.status = status
+        self.texture = texture
+    }
+}
+
 /// Where a committed frame's pixels come from.
 ///
 /// Local scene layers name existing client or wl_shm-upload Venus textures. The
@@ -16,14 +34,17 @@ import UniformTypeIdentifiers
 @MainActor
 public protocol FrameSource: AnyObject {
     func surface(forResource resourceID: UInt32) -> IOSurfaceRef?
-    /// True while this id names a live host resource. A published resource
-    /// that still cannot produce the requested texture is not a publication
-    /// race and must not hold a Wayland buffer forever.
+    /// True while this id names a live host resource. This distinguishes a
+    /// CREATE_BLOB ordering race from a renderer import failure in diagnostics;
+    /// neither case is allowed to fabricate an output latch.
     func isResourcePublished(_ resourceID: UInt32) -> Bool
     func metalTexture(
         forResource resourceID: UInt32,
         width: Int, height: Int, bytesPerRow: Int, format: UInt32
     ) -> AnyObject?
+    func metalTextures(
+        for layers: [Windowing.SceneLayer],
+        completion: @escaping @MainActor ([FrameTextureResolution]) -> Void)
 }
 
 extension FrameSource {
@@ -33,6 +54,25 @@ extension FrameSource {
         forResource resourceID: UInt32,
         width: Int, height: Int, bytesPerRow: Int, format: UInt32
     ) -> AnyObject? { nil }
+
+    public func metalTextures(
+        for layers: [Windowing.SceneLayer],
+        completion: @escaping @MainActor ([FrameTextureResolution]) -> Void
+    ) {
+        completion(layers.map {
+            let texture = metalTexture(
+                forResource: $0.resourceID,
+                width: $0.width, height: $0.height,
+                bytesPerRow: $0.bytesPerRow,
+                format: $0.format == .rgba8888 ? 67 : 1)
+            if let texture {
+                return FrameTextureResolution(status: .ready, texture: texture)
+            }
+            return FrameTextureResolution(
+                status: isResourcePublished($0.resourceID)
+                    ? .unavailable : .unpublished)
+        })
+    }
 }
 
 /// Applies guest window events to `NSWindow`s, and sends host decisions back.
@@ -175,6 +215,7 @@ public final class WindowBridge: NSObject {
             presenter.enqueue(
                 scene: scene,
                 layers: [ResolvedSceneLayer(state: layer, texture: texture)],
+                drawableSize: CGSize(width: frame.width, height: frame.height),
                 readComplete: readComplete,
                 latched: {},
                 presented: presented)
@@ -206,10 +247,37 @@ public final class WindowBridge: NSObject {
     /// A commit can beat virtio CREATE_BLOB publication on the host. Resource
     /// publication is an event on the main actor, so no polling timer is needed.
     private var pendingFrames: [UInt32: Windowing.Frame] = [:]
-    /// A binary scene can race CREATE_BLOB publication for any of its layers.
-    /// Keep only the newest complete snapshot for each window until every
-    /// resource is resolvable; superseded ids are completed explicitly.
-    private var pendingScenes: [UInt32: Windowing.SceneSnapshot] = [:]
+    /// Work that has not entered Metal yet. A superseded scene can release its
+    /// source buffers immediately, but its frame callbacks/FIFO barrier must be
+    /// inherited by the scene that really reaches the output latch.
+    private struct SceneWork {
+        var scene: Windowing.SceneSnapshot
+        var latchIDs: [UInt32]
+
+        init(scene: Windowing.SceneSnapshot) {
+            self.scene = scene
+            latchIDs = scene.presentationID == 0 ? [] : [scene.presentationID]
+        }
+
+        func superseding(_ older: SceneWork) -> SceneWork {
+            var result = self
+            result.scene = scene.includingUnrenderedDamage(from: older.scene)
+            result.latchIDs = older.latchIDs + latchIDs.filter {
+                !older.latchIDs.contains($0)
+            }
+            return result
+        }
+    }
+
+    /// One latest-value waiting slot and at most one asynchronous resource
+    /// lookup per surface. Resource lookup never blocks AppKit's main actor.
+    private struct ResolvingScene {
+        let token: UInt64
+        let work: SceneWork
+    }
+    private var pendingScenes: [UInt32: SceneWork] = [:]
+    private var resolvingScenes: [UInt32: ResolvingScene] = [:]
+    private var nextSceneLookupToken: UInt64 = 0
     private var pointerCursor = NSCursor.arrow
     private var cursorSurface: UInt32?
     private var cursorHotSpot = CGPoint.zero
@@ -397,9 +465,7 @@ public final class WindowBridge: NSObject {
                 completeCopiedPresentation(
                     surface: surface, presentationID: frame.presentationID)
             }
-            if let scene = pendingScenes.removeValue(forKey: surface) {
-                completeScene(scene)
-            }
+            cancelSceneWork(for: surface)
             if dragIconSurface == surface {
                 dragIconSurface = nil
                 dragIcon.hide()
@@ -423,9 +489,7 @@ public final class WindowBridge: NSObject {
                 completeCopiedPresentation(
                     surface: surface, presentationID: frame.presentationID)
             }
-            if let scene = pendingScenes.removeValue(forKey: surface) {
-                completeScene(scene)
-            }
+            cancelSceneWork(for: surface)
             guard let windowID = surfaceToWindow[surface],
                   let native = windows[windowID] else { break }
             mappedApplicationWindows.remove(windowID)
@@ -444,9 +508,7 @@ public final class WindowBridge: NSObject {
             if let frame = pendingSurfaceFrames.removeValue(forKey: surface) {
                 presentCommitted(surface: surface, windowID: window, frame: frame)
             }
-            if let scene = pendingScenes.removeValue(forKey: surface) {
-                present(scene: scene, windowID: window)
-            }
+            startPendingScene(for: surface)
 
         case .popupCreated(let window, let surface, let parent, let x, let y, _, _):
             // Like a toplevel, the NSWindow waits for the first frame; a menu
@@ -457,9 +519,7 @@ public final class WindowBridge: NSObject {
                 popup: NativeWindow.Popup(parent: parent, origin: CGPoint(x: x, y: y)))
             windows[window] = native
             surfaceToWindow[surface] = window
-            if let scene = pendingScenes.removeValue(forKey: surface) {
-                present(scene: scene, windowID: window)
-            }
+            startPendingScene(for: surface)
 
         case .popupPlacementRequested(let placement):
             popupPlacements[placement.window] = placement
@@ -561,12 +621,12 @@ public final class WindowBridge: NSObject {
             presentCommitted(surface: surface, windowID: windowID, frame: frame)
 
         case .sceneCommitted(let scene):
-            guard let windowID = surfaceToWindow[scene.surface] else {
-                retainDeferred(scene)
+            enqueue(scene)
+            guard surfaceToWindow[scene.surface] != nil else {
                 Self.note("scene retained: surface \(scene.surface) has no role yet")
                 return
             }
-            present(scene: scene, windowID: windowID)
+            startPendingScene(for: scene.surface)
 
         case .frameCallbackRequested(let surface, let presentationID):
             schedulePresentation(surface: surface, presentationID: presentationID)
@@ -618,11 +678,7 @@ public final class WindowBridge: NSObject {
 
     /// Called when a virtio-gpu resource becomes presentable after CREATE_BLOB.
     public func retryPendingFrames() {
-        let scenes = pendingScenes
-        for (surface, scene) in scenes {
-            guard let windowID = surfaceToWindow[surface] else { continue }
-            present(scene: scene, windowID: windowID)
-        }
+        for surface in Array(pendingScenes.keys) { startPendingScene(for: surface) }
         if let surface = cursorSurface,
            let frame = pendingSurfaceFrames.removeValue(forKey: surface) {
             installCustomCursor(frame, surface: surface)
@@ -638,79 +694,145 @@ public final class WindowBridge: NSObject {
         }
     }
 
-    private func retainDeferred(_ scene: Windowing.SceneSnapshot) {
-		if let previous = pendingScenes[scene.surface] {
-			pendingScenes[scene.surface] = scene.includingUnrenderedDamage(from: previous)
-			if previous.presentationID != scene.presentationID { completeScene(previous) }
-		} else {
-			pendingScenes[scene.surface] = scene
-		}
+    private func enqueue(_ scene: Windowing.SceneSnapshot) {
+        var work = SceneWork(scene: scene)
+        if let older = pendingScenes[scene.surface] {
+            work = work.superseding(older)
+            releaseScene(older.scene)
+        }
+        pendingScenes[scene.surface] = work
     }
 
-    private func completeScene(_ scene: Windowing.SceneSnapshot) {
-        send(.framePresented(
-            surface: scene.surface, presentationID: scene.presentationID))
-        send(.frameReleased(
-            surface: scene.surface, presentationID: scene.presentationID))
+    private func startPendingScene(for surface: UInt32) {
+        guard resolvingScenes[surface] == nil,
+              let work = pendingScenes[surface],
+              let windowID = surfaceToWindow[surface],
+              windows[windowID] != nil,
+              let frameSource
+        else { return }
+
+        pendingScenes.removeValue(forKey: surface)
+        nextSceneLookupToken &+= 1
+        let token = nextSceneLookupToken
+        resolvingScenes[surface] = ResolvingScene(token: token, work: work)
+        frameSource.metalTextures(for: work.scene.layers) { [weak self] results in
+            self?.resolvedScene(surface: surface, token: token, results: results)
+        }
     }
 
-    private func present(scene incoming: Windowing.SceneSnapshot, windowID: UInt32) {
-		var scene = incoming
-		if let deferred = pendingScenes.removeValue(forKey: scene.surface) {
-			scene = scene.includingUnrenderedDamage(from: deferred)
-			if deferred.presentationID != scene.presentationID { completeScene(deferred) }
-		}
-        guard let native = windows[windowID], let frameSource else {
-            retainDeferred(scene)
+    private func resolvedScene(
+        surface: UInt32, token: UInt64,
+        results: [FrameTextureResolution]
+    ) {
+        guard let resolving = resolvingScenes[surface], resolving.token == token else { return }
+        resolvingScenes.removeValue(forKey: surface)
+        let work = resolving.work
+
+        // A scene committed while this lookup was in flight is authoritative.
+        // The older source was never read by Metal, so release it and carry its
+        // output-latch obligations into the newer work.
+        if var newer = pendingScenes.removeValue(forKey: surface) {
+            newer = newer.superseding(work)
+            releaseScene(work.scene)
+            pendingScenes[surface] = newer
+            startPendingScene(for: surface)
             return
         }
-        var resolved: [ResolvedSceneLayer] = []
-        resolved.reserveCapacity(scene.layers.count)
-        for layer in scene.layers {
-            let virglFormat: UInt32 = layer.format == .rgba8888 ? 67 : 1
-            guard let object = frameSource.metalTexture(
-                forResource: layer.resourceID,
-                width: layer.width, height: layer.height,
-                bytesPerRow: layer.bytesPerRow, format: virglFormat),
-                let texture = object as? MTLTexture
-            else {
-                if frameSource.isResourcePublished(layer.resourceID) {
-                    // The guest waits for every scene's frame/FIFO completion
-                    // before it can submit the next swapchain image. Once the
-                    // named resource exists, an export failure cannot be fixed
-                    // by another CREATE_BLOB notification. Drop this frame and
-                    // release its host-read references instead of deadlocking
-                    // the whole client behind one unpresentable image.
-                    pendingScenes.removeValue(forKey: scene.surface)
-					native.invalidateSceneHistory()
-                    Self.report(
-                        "published resource \(layer.resourceID) has no Metal texture " +
-                        "for \(layer.width)x\(layer.height), stride \(layer.bytesPerRow), " +
-                        "format \(layer.format); discarded presentation " +
-                        "\(scene.presentationID)")
-                    completeScene(scene)
-                    return
-                }
-                retainDeferred(scene)
-                Self.note(
-                    "scene deferred: no Metal texture for resource \(layer.resourceID)")
-                return
-            }
-            resolved.append(ResolvedSceneLayer(state: layer, texture: texture))
+
+        guard results.count == work.scene.layers.count else {
+            discardScene(
+                work,
+                reason: "resolved \(results.count) textures for " +
+                    "\(work.scene.layers.count) layers")
+            return
         }
-        pendingScenes.removeValue(forKey: scene.surface)
-        native.present(
-            scene: scene, layers: resolved,
-            readComplete: { [weak self] success in
-                guard let self else { return }
-                self.send(.frameReleased(
-                    surface: scene.surface,
-                    presentationID: scene.presentationID))
-            })
+
+        var layers: [ResolvedSceneLayer] = []
+        layers.reserveCapacity(work.scene.layers.count)
+        var unpublished: [UInt32] = []
+        var unavailable: [UInt32] = []
+        for (state, result) in zip(work.scene.layers, results) {
+            switch result.status {
+            case .ready:
+                guard let texture = result.texture as? MTLTexture else {
+                    unavailable.append(state.resourceID)
+                    continue
+                }
+                layers.append(ResolvedSceneLayer(state: state, texture: texture))
+            case .unpublished:
+                unpublished.append(state.resourceID)
+            case .unavailable:
+                unavailable.append(state.resourceID)
+            }
+        }
+        if !unavailable.isEmpty {
+            discardScene(
+                work,
+                reason: "resources \(unavailable) cannot export their committed Metal textures")
+            return
+        }
+        guard unpublished.isEmpty else {
+            pendingScenes[surface] = work
+            Self.note("scene deferred: waiting for resources \(unpublished)")
+            return
+        }
+
+        guard let windowID = surfaceToWindow[surface],
+              let native = windows[windowID],
+              native.present(
+                scene: work.scene, layers: layers, latchIDs: work.latchIDs,
+                readComplete: { [weak self] _ in
+                    self?.releaseScene(work.scene)
+                })
+        else {
+            discardScene(work, reason: "window presenter rejected the scene")
+            return
+        }
+
         notifyApplicationWindowMapped(windowID)
         native.traceLayerGeometry()
         injectTestInput(windowID)
         scheduleResizeProbe(native)
+    }
+
+    private func releaseScene(_ scene: Windowing.SceneSnapshot) {
+        guard scene.presentationID != 0 else { return }
+        send(.frameReleased(
+            surface: scene.surface, presentationID: scene.presentationID))
+    }
+
+    private func complete(_ work: SceneWork) {
+        releaseScene(work.scene)
+        for presentationID in work.latchIDs where presentationID != 0 {
+            send(.framePresented(
+                surface: work.scene.surface, presentationID: presentationID))
+        }
+    }
+
+    private func cancelSceneWork(for surface: UInt32) {
+        if let work = pendingScenes.removeValue(forKey: surface) { complete(work) }
+        if let resolving = resolvingScenes.removeValue(forKey: surface) {
+            complete(resolving.work)
+        }
+    }
+
+    /// Keep the last good image when one accepted guest resource cannot be
+    /// exported. Its source is no longer read, while callbacks and FIFO retire
+    /// on the next output latch instead of being fabricated immediately.
+    private func discardScene(_ work: SceneWork, reason: String) {
+        nativeWindowOwningSurface(work.scene.surface)?.invalidateSceneHistory()
+        releaseScene(work.scene)
+        for presentationID in work.latchIDs where presentationID != 0 {
+            if let native = nativeWindowOwningSurface(work.scene.surface) {
+                native.awaitPresentation(
+                    surface: work.scene.surface, presentationID: presentationID)
+            } else {
+                send(.framePresented(
+                    surface: work.scene.surface, presentationID: presentationID))
+            }
+        }
+        Self.report(
+            "discarded presentation \(work.scene.presentationID): \(reason)")
     }
 
     private func texture(for frame: Windowing.Frame) -> MTLTexture? {
@@ -1082,8 +1204,10 @@ public final class WindowBridge: NSObject {
                 surface: surface, presentationID: frame.presentationID)
         }
         pendingFrames.removeAll()
-        for (_, scene) in pendingScenes { completeScene(scene) }
+        for work in pendingScenes.values { complete(work) }
         pendingScenes.removeAll()
+        for resolving in resolvingScenes.values { complete(resolving.work) }
+        resolvingScenes.removeAll()
         cursorSurface = nil
         cursorContext = nil
         pointerCursor = .arrow

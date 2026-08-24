@@ -289,6 +289,13 @@ public enum WindowWire {
             append(height, to: &payload)
             append(token, to: &payload)
             return payload
+        case .framePresented(let surface, let presentationID):
+            var payload = Data(frameTimingMagic)
+            append(UInt32(1), to: &payload)
+            append(UInt32(1), to: &payload)
+            append(surface, to: &payload)
+            append(presentationID, to: &payload)
+            return payload
         default:
             return nil
         }

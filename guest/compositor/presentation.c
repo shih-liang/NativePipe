@@ -10,6 +10,7 @@
 #include "shm_texture.h"
 #include "syncobj.h"
 #include "window_events.h"
+#include "xdg_shell.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -98,6 +99,8 @@ static void rebind_frame_callbacks(struct np_surface *surface,
 		if (callback->presentation_id == from)
 			callback->presentation_id = to;
 	}
+	if (surface->host_configure_latch_presentation_id == from)
+		surface->host_configure_latch_presentation_id = to;
 }
 
 static void complete_presentation(struct np_surface *surface, uint32_t presentation_id) {
@@ -132,6 +135,9 @@ void np_presentation_process_presented(struct np_server *server,
 	 * synchronized surfaces. They all become visible at this one latch. */
 	struct np_surface *surface;
 	wl_list_for_each(surface, &server->surfaces, link) {
+		/* A queued resize configure must be visible before a frame callback
+		 * wakes the client for the same latch. */
+		np_xdg_toplevel_configure_latched(surface, presentation_id);
 		complete_presentation(surface, presentation_id);
 		if (surface->fifo_barrier_active &&
 		    surface->fifo_barrier_presentation_id == presentation_id) {

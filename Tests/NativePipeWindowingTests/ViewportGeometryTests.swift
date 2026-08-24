@@ -31,6 +31,17 @@ final class ViewportGeometryTests: XCTestCase {
 			merged.damage, [.init(x: 10, y: 20, width: 110, height: 80)])
 	}
 
+    func testSkippedSceneWithDifferentGeometryForcesFullRedraw() {
+        let old = scene(presentationID: 1)
+        var new = scene(presentationID: 2)
+        new.windowGeometry.width -= 1
+        new.damage = []
+
+        XCTAssertEqual(
+            new.includingUnrenderedDamage(from: old).damage,
+            [.init(x: 0, y: 0, width: new.width, height: new.height)])
+    }
+
     func testPopupConstraintsPreferFlipThenSlideAndResize() {
         let bounds = CGRect(x: 0, y: 0, width: 800, height: 600)
         let flipped = Windowing.PopupPlacement(
@@ -225,7 +236,7 @@ final class ViewportGeometryTests: XCTestCase {
         bridge.closeAll()
     }
 
-    func testSupersededDeferredSceneCompletesAndReleasesItsSources() {
+    func testSupersededDeferredSceneReleasesSourceButDefersItsLatch() {
         let bridge = WindowBridge(frameSource: nil)
         var commands: [Windowing.HostCommand] = []
         bridge.output = { commands.append($0) }
@@ -236,7 +247,7 @@ final class ViewportGeometryTests: XCTestCase {
             bridge.apply(.sceneCommitted(scene: scene(presentationID: presentationID)))
         }
 
-        XCTAssertTrue(commands.contains {
+        XCTAssertFalse(commands.contains {
             if case .framePresented(surface: 8, presentationID: 17) = $0 { return true }
             return false
         })
@@ -249,9 +260,17 @@ final class ViewportGeometryTests: XCTestCase {
             return false
         })
         bridge.closeAll()
+        XCTAssertTrue(commands.contains {
+            if case .framePresented(surface: 8, presentationID: 17) = $0 { return true }
+            return false
+        })
+        XCTAssertTrue(commands.contains {
+            if case .framePresented(surface: 8, presentationID: 18) = $0 { return true }
+            return false
+        })
     }
 
-    func testPublishedButUnpresentableSceneIsDiscardedAndReleased() {
+    func testPublishedButUnpresentableSceneIsRetiredWithoutDeadlockingFIFO() {
         final class PublishedFrameSource: FrameSource {
             func surface(forResource resourceID: UInt32) -> IOSurfaceRef? { nil }
             func isResourcePublished(_ resourceID: UInt32) -> Bool { resourceID == 99 }
@@ -270,6 +289,58 @@ final class ViewportGeometryTests: XCTestCase {
         })
         XCTAssertTrue(commands.contains {
             if case .frameReleased(surface: 8, presentationID: 17) = $0 { return true }
+            return false
+        })
+        bridge.closeAll()
+    }
+
+    func testOldTextureLookupCannotConsumeNewSurfaceGeneration() {
+        final class DeferredFrameSource: FrameSource {
+            typealias Completion = @MainActor ([FrameTextureResolution]) -> Void
+            var completions: [Completion] = []
+
+            func surface(forResource resourceID: UInt32) -> IOSurfaceRef? { nil }
+            func metalTextures(
+                for layers: [Windowing.SceneLayer],
+                completion: @escaping Completion
+            ) {
+                completions.append(completion)
+            }
+        }
+
+        let source = DeferredFrameSource()
+        let bridge = WindowBridge(frameSource: source)
+        var commands: [Windowing.HostCommand] = []
+        bridge.output = { commands.append($0) }
+
+        bridge.apply(.surfaceCreated(surface: 8))
+        bridge.apply(.toplevelCreated(window: 3, surface: 8))
+        bridge.apply(.sceneCommitted(scene: scene(presentationID: 17)))
+        XCTAssertEqual(source.completions.count, 1)
+
+        bridge.apply(.surfaceDestroyed(surface: 8))
+        bridge.apply(.surfaceCreated(surface: 8))
+        bridge.apply(.toplevelCreated(window: 4, surface: 8))
+        bridge.apply(.sceneCommitted(scene: scene(presentationID: 18)))
+        XCTAssertEqual(source.completions.count, 2)
+
+        source.completions[0]([
+            FrameTextureResolution(status: .unavailable)
+        ])
+        XCTAssertFalse(commands.contains {
+            if case .frameReleased(surface: 8, presentationID: 18) = $0 { return true }
+            return false
+        })
+
+        source.completions[1]([
+            FrameTextureResolution(status: .unavailable)
+        ])
+        XCTAssertTrue(commands.contains {
+            if case .frameReleased(surface: 8, presentationID: 18) = $0 { return true }
+            return false
+        })
+        XCTAssertTrue(commands.contains {
+            if case .framePresented(surface: 8, presentationID: 18) = $0 { return true }
             return false
         })
         bridge.closeAll()

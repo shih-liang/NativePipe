@@ -119,6 +119,46 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
         public var byteCount: Int
     }
 
+    public struct MetalTextureRequest: Sendable {
+        public let resourceID: UInt32
+        public let width: Int
+        public let height: Int
+        public let bytesPerRow: Int
+        public let format: UInt32
+
+        public init(
+            resourceID: UInt32, width: Int, height: Int,
+            bytesPerRow: Int, format: UInt32
+        ) {
+            self.resourceID = resourceID
+            self.width = width
+            self.height = height
+            self.bytesPerRow = bytesPerRow
+            self.format = format
+        }
+    }
+
+    public enum MetalTextureStatus: Sendable {
+        case ready
+        case unpublished
+        case unavailable
+    }
+
+    /// Result for one exact committed Vulkan image. `unpublished` is the only
+    /// retryable state: its CREATE_BLOB has not reached the host yet. Once the
+    /// resource is published, failure to export its real Metal texture is
+    /// terminal for that commit; treating the blob's raw storage as a linear
+    /// image would ignore the renderer's image layout and aliasing rules.
+    public struct MetalTextureResolution: @unchecked Sendable {
+        public let status: MetalTextureStatus
+        public let texture: AnyObject?
+
+        public init(status: MetalTextureStatus, texture: AnyObject? = nil) {
+            self.status = status
+            self.texture = texture
+        }
+    }
+
     /// Additive observer used by the inline preview and the detached display
     /// window. Callbacks are always delivered on the main queue and immediately
     /// replay the current frame (including nil before the first scanout).
@@ -170,29 +210,75 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
         forResource resourceID: UInt32,
         width: Int, height: Int, bytesPerRow: Int, format: UInt32
     ) -> AnyObject? {
+        let lookup = { [self] in
+            metalTextureResolutionOnDeviceQueue(
+                forResource: resourceID, width: width, height: height,
+                bytesPerRow: bytesPerRow, format: format).texture
+        }
+        return DispatchQueue.getSpecific(key: Self.deviceQueueKey) != nil
+            ? lookup() : deviceQueue.sync(execute: lookup)
+    }
+
+    /// Resolves one atomic window scene without blocking AppKit's main actor.
+    /// The completion is delivered on the main queue in request order.
+    public func gpuMetalTextures(
+        for requests: [MetalTextureRequest],
+        completion: @escaping @MainActor ([MetalTextureResolution]) -> Void
+    ) {
+        deviceQueue.async { [weak self] in
+            guard let self, !self.rendererTornDown else {
+                DispatchQueue.main.async {
+                    completion(requests.map { _ in
+                        MetalTextureResolution(status: .unavailable)
+                    })
+                }
+                return
+            }
+            let textures = requests.map {
+                self.metalTextureResolutionOnDeviceQueue(
+                    forResource: $0.resourceID,
+                    width: $0.width, height: $0.height,
+                    bytesPerRow: $0.bytesPerRow, format: $0.format)
+            }
+            DispatchQueue.main.async { completion(textures) }
+        }
+    }
+
+    private func metalTextureResolutionOnDeviceQueue(
+        forResource resourceID: UInt32,
+        width: Int, height: Int, bytesPerRow: Int, format: UInt32
+    ) -> MetalTextureResolution {
         publishedLock.lock()
         if let cached = metalTextures[resourceID],
            cached.width == width, cached.height == height,
            cached.bytesPerRow == bytesPerRow, cached.format == format,
            published[resourceID] != nil {
             publishedLock.unlock()
-            return cached.texture
+            return MetalTextureResolution(status: .ready, texture: cached.texture)
         }
-        let isPublished = published[resourceID] != nil
+        let entry = published[resourceID]
         publishedLock.unlock()
-        guard isPublished else { return nil }
-
-        let lookup: () -> AnyObject? = { [self] in
-            guard !rendererTornDown,
-                  let raw = np_venus_metal_texture(
-                    venus, resourceID, UInt32(width), UInt32(height),
-                    UInt32(bytesPerRow), format)
-            else { return nil }
-            return Unmanaged<AnyObject>.fromOpaque(raw).takeUnretainedValue()
+        guard let entry else {
+            return MetalTextureResolution(status: .unpublished)
         }
-        let texture = DispatchQueue.getSpecific(key: Self.deviceQueueKey) != nil
-            ? lookup() : deviceQueue.sync(execute: lookup)
-        guard let texture else { return nil }
+        let (minimumBytesPerRow, rowOverflow) = width.multipliedReportingOverflow(by: 4)
+        let (requiredBytes, imageOverflow) = bytesPerRow.multipliedReportingOverflow(by: height)
+        guard !rendererTornDown, width > 0, height > 0,
+              !rowOverflow, !imageOverflow,
+              bytesPerRow >= minimumBytesPerRow,
+              entry.byteCount >= requiredBytes,
+              format == 1 || format == 67
+        else {
+            return MetalTextureResolution(status: .unavailable)
+        }
+
+        guard let raw = np_venus_metal_texture(
+            venus, resourceID, UInt32(width), UInt32(height),
+            UInt32(bytesPerRow), format)
+        else {
+            return MetalTextureResolution(status: .unavailable)
+        }
+        let texture = Unmanaged<AnyObject>.fromOpaque(raw).takeUnretainedValue()
         publishedLock.lock()
         if published[resourceID] != nil {
             metalTextures[resourceID] = CachedMetalTexture(
@@ -200,7 +286,7 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
                 format: format, texture: texture)
         }
         publishedLock.unlock()
-        return texture
+        return MetalTextureResolution(status: .ready, texture: texture)
     }
 
     private func buffer(forResource resourceID: UInt32) -> PublishedBuffer? {
