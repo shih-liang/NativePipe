@@ -11,20 +11,44 @@ extern "C" {
 
 /// Host half of the virtual GPU's 3D path.
 ///
-/// Guest: Linux virtio_gpu.ko + Mesa Venus (capset 4). We do not implement
-/// or patch Venus. Mesa serializes Vulkan as SUBMIT_3D.
+/// Guest: Linux virtio_gpu.ko + Mesa VirGL (capsets 1/2) or Venus (capset 4).
+/// Mesa serializes both Gallium and Vulkan work as SUBMIT_3D.
 ///
-/// Host: this file + virglrenderer (vkr) + MoltenVK. We advertise capset 4,
-/// create vkr contexts, and hand SUBMIT_3D to virglrenderer. MoltenVK is
-/// the ICD. Window scenes keep their original MoltenVK textures and are
-/// composed directly into CAMetalDrawables; device-local Vulkan memory stays
-/// inside MoltenVK.
+/// Host: this file + one virglrenderer instance. VirGL capsets use ANGLE's
+/// OpenGL ES implementation on Metal; Venus uses MoltenVK. Both paths retain
+/// their native Metal textures for direct host composition.
 
 typedef struct np_venus np_venus;
 
 enum {
 	NP_VENUS_CAPSET_VENUS = 4,
+	NP_VENUS_CAPSET_VIRGL = 1,
+	NP_VENUS_CAPSET_VIRGL2 = 2,
 };
+
+typedef struct np_renderer_resource_3d {
+	uint32_t resource_id;
+	uint32_t target;
+	uint32_t format;
+	uint32_t bind;
+	uint32_t width;
+	uint32_t height;
+	uint32_t depth;
+	uint32_t array_size;
+	uint32_t last_level;
+	uint32_t nr_samples;
+	uint32_t flags;
+} np_renderer_resource_3d;
+
+typedef struct np_renderer_iovec {
+	void *base;
+	size_t length;
+} np_renderer_iovec;
+
+typedef struct np_renderer_box {
+	uint32_t x, y, z;
+	uint32_t width, height, depth;
+} np_renderer_box;
 
 /// Result of a fence wait. `user` is whatever was passed to `np_venus_submit`.
 typedef void (*np_venus_fence_fn)(void *user, uint64_t fence_id, bool ok);
@@ -38,30 +62,43 @@ typedef struct np_venus_blob {
 } np_venus_blob;
 
 /// Opens the renderer. Always returns an object: without virglrenderer the
-/// device still maps blobs for the compositor, it just does not advertise a
-/// Venus capset, so Mesa will not try to start one.
+/// device still maps blobs for the compositor, it just does not advertise 3D
+/// capsets, so Mesa will not try to start VirGL or Venus.
 np_venus *np_venus_create(void);
 
-/// Releases this VM's exclusive renderer lease. The successful renderer is a
-/// process singleton: it is reset between sequential VMs instead of unloaded,
-/// because the macOS vkr/MoltenVK stack does not survive full reinitialization.
+/// Releases this VM's resources, contexts, and fence callbacks. ANGLE and
+/// virglrenderer are process singletons shared by all VM clients and are not
+/// reset or unloaded when one VM stops.
 void np_venus_destroy(np_venus *venus);
 
-/// True when virglrenderer initialised and reported a Venus capset. That is
-/// what GET_CAPSET_INFO advertises, and what makes guest Mesa pick Venus.
+/// True when virglrenderer initialized and reported at least one 3D capset.
 bool np_venus_is_live(const np_venus *venus);
 
-/// Fills GET_CAPSET_INFO from virglrenderer. Zeros if the library is absent,
-/// so Mesa sees no Venus and stays on software.
+/// Fills the Venus GET_CAPSET_INFO entry. Zeros if the renderer is absent.
 void np_venus_capset_info(np_venus *venus, uint32_t *max_version, uint32_t *max_size);
 
 /// Writes the capset blob. `buffer` must be at least `max_size` bytes.
 /// Returns the number of bytes written, or 0 if Venus is not live.
 uint32_t np_venus_fill_caps(np_venus *venus, uint32_t version, void *buffer, uint32_t buffer_size);
 
+void np_renderer_capset_info(np_venus *venus, uint32_t capset_id,
+                             uint32_t *max_version, uint32_t *max_size);
+uint32_t np_renderer_fill_caps(np_venus *venus, uint32_t capset_id,
+                              uint32_t version, void *buffer, uint32_t buffer_size);
+
 int np_venus_context_create(np_venus *venus, uint32_t ctx_id, uint32_t capset_id,
                             const char *name);
 void np_venus_context_destroy(np_venus *venus, uint32_t ctx_id);
+
+int np_renderer_resource_create_3d(np_venus *venus,
+                                   const np_renderer_resource_3d *resource);
+int np_renderer_resource_attach_iov(np_venus *venus, uint32_t resource_id,
+                                    const np_renderer_iovec *entries, uint32_t count);
+void np_renderer_resource_detach_iov(np_venus *venus, uint32_t resource_id);
+int np_renderer_transfer_3d(np_venus *venus, uint32_t resource_id, uint32_t ctx_id,
+                            uint32_t level, uint32_t stride, uint32_t layer_stride,
+                            const np_renderer_box *box, uint64_t offset,
+                            bool from_host);
 
 /// Registers a HOST3D blob with virglrenderer.
 ///

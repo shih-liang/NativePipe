@@ -5,9 +5,9 @@ import NativePipeVenus
 import Virtualization
 import os
 
-/// Host virtio-gpu. Guest: stock `virtio_gpu.ko` + Mesa Venus + the
-/// NativePipe compositor. One instance can expose both a Venus render node and
-/// an optional KMS scanout; no Apple graphics device is required in that mode.
+/// Host virtio-gpu. Guest: stock `virtio_gpu.ko` + Mesa VirGL/Venus + the
+/// NativePipe compositor. One instance exposes VirGL for OpenGL/GLES, Venus
+/// for Vulkan, and an optional KMS scanout; no Apple graphics device is needed.
 ///
 ///   * CREATE_BLOB from Mesa Venus → ordinary renderer allocations. Wayland
 ///     linux-dmabuf commits continue naming those original client textures.
@@ -15,7 +15,9 @@ import os
 ///     into a CAMetalDrawable, then releases the source on GPU completion.
 ///   * IOSurface-backed resources remain only for the optional legacy 2D
 ///     framebuffer path.
-///   * SUBMIT_3D → virglrenderer (vkr) → MoltenVK. Venus is not here.
+///   * VirGL SUBMIT_3D → vrend → ANGLE/EGL → Metal.
+///   * Venus SUBMIT_3D → vkr → MoltenVK → Metal. Guest Venus remains
+///     inside Mesa and is not implemented here.
 ///
 /// All delegate callbacks arrive on `deviceQueue`, so the state below is queue
 /// confined and deliberately unsynchronised.
@@ -52,7 +54,7 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
     private var device: VZCustomVirtioDevice?
     private var hostVisibleRegion: VZVirtioSharedMemoryRegion?
     private let resources = ResourceTable()
-    private var contexts: [UInt32: GuestContext] = [:]
+    private var contexts: Set<UInt32> = []
     /// Removed from the guest-visible table but retained until VZ has really
     /// unmapped its aperture range and Venus has dropped the import.
     private var retiringResources: [UInt32: GPUResource] = [:]
@@ -64,6 +66,9 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
     /// Owns the import table and, when present, virglrenderer. Created on the
     /// device queue's thread in `init` so every later call stays there.
     private let venus: OpaquePointer
+    /// Stable virtual-hardware ABI. A missing backend fails device creation;
+    /// it never changes the capset list seen by an existing VM definition.
+    private static let advertisedCapsets: [VirtioGPU.Capset] = [.virgl, .virgl2, .venus]
     /// Set once Venus/virglrenderer has been cleaned up. Further virtio
     /// commands are dropped; `deinit` must not call cleanup again.
     private var rendererTornDown = false
@@ -117,6 +122,9 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
         public var surface: IOSurfaceRef?
         public var pointer: UnsafeMutableRawPointer?
         public var byteCount: Int
+        /// The renderer owns the allocation and validates its exact texture
+        /// geometry when exporting a native handle; it has no CPU byte range.
+        public var isRendererNative: Bool
     }
 
     public struct MetalTextureRequest: Sendable {
@@ -266,7 +274,7 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
         guard !rendererTornDown, width > 0, height > 0,
               !rowOverflow, !imageOverflow,
               bytesPerRow >= minimumBytesPerRow,
-              entry.byteCount >= requiredBytes,
+              (entry.isRendererNative || entry.byteCount >= requiredBytes),
               format == 1 || format == 67
         else {
             return MetalTextureResolution(status: .unavailable)
@@ -299,7 +307,8 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
         let entry = PublishedBuffer(
             surface: resource.surface,
             pointer: resource.baseAddress,
-            byteCount: resource.byteCount)
+            byteCount: resource.byteCount,
+            isRendererNative: resource.isVirglResource)
         publishedLock.lock()
         metalTextures.removeValue(forKey: resource.resourceID)
         published[resource.resourceID] = entry
@@ -352,12 +361,6 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
     /// Fired on the main queue after a Venus blob is adopted and published.
     public var onResourcePublished: ((UInt32) -> Void)?
 
-    private struct GuestContext {
-        var capsetID: UInt32
-        var debugName: String
-        var resources: Set<UInt32> = []
-    }
-
 	private struct DeferredBlobCreate {
 		let request: VirtioGPU.ResourceCreateBlob
 		let header: VirtioGPU.ControlHeader
@@ -387,6 +390,7 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
     private enum ScanoutFailure: LocalizedError {
         case missingDevice
         case emptyBacking
+        case backingAlreadyAttached
         case invalidBackingRange
         case guestMappingFailed(address: UInt64, length: UInt32)
         case invalidTransfer
@@ -395,6 +399,7 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
             switch self {
             case .missingDevice: return "custom virtio device is not ready"
             case .emptyBacking: return "resource backing is empty"
+            case .backingAlreadyAttached: return "resource backing is already attached"
             case .invalidBackingRange: return "resource backing range overflow"
             case .guestMappingFailed(let address, let length):
                 return "could not map guest range 0x\(String(address, radix: 16))+\(length)"
@@ -414,10 +419,22 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
     public let apertureSize: UInt64
     public let scanoutConfiguration: ScanoutConfiguration?
 
+    public enum InitializationError: LocalizedError {
+        case rendererUnavailable([VirtioGPU.Capset])
+
+        public var errorDescription: String? {
+            switch self {
+            case .rendererUnavailable(let capsets):
+                let names = capsets.map(String.init(describing:)).joined(separator: ", ")
+                return "NativePipe GPU backends are unavailable: \(names)"
+            }
+        }
+    }
+
     public init(
         hostVisibleApertureSize: UInt64 = VirtioGPUDevice.defaultApertureSize,
         scanout: ScanoutConfiguration? = nil
-    ) {
+    ) throws {
         apertureSize = hostVisibleApertureSize
         scanoutConfiguration = scanout
         deviceQueue = DispatchQueue(label: "com.nativepipe.gpu.device", qos: .userInteractive)
@@ -428,23 +445,37 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
         configuration.pciSubclassID = VirtioGPU.pciSubclassOther
         configuration.virtioQueueCount = VirtioGPU.queueCount
 
+        guard let created = np_venus_create() else {
+            throw InitializationError.rendererUnavailable(Self.advertisedCapsets)
+        }
+        let missingCapsets = Self.advertisedCapsets.filter { capset in
+            var version: UInt32 = 0
+            var size: UInt32 = 0
+            np_renderer_capset_info(created, capset.rawValue, &version, &size)
+            return size == 0
+        }
+        guard missingCapsets.isEmpty else {
+            np_venus_destroy(created)
+            throw InitializationError.rendererUnavailable(missingCapsets)
+        }
+
         // Offered but not demanded. Making these mandatory would refuse to start
         // the device against a guest kernel too old to accept them; offering them
         // instead lets any virtio_gpu driver bind, and the negotiated set tells
         // us afterwards what we actually got.
-        configuration.optionalFeatures.subset0 = VirtioGPU.Feature.mask([
-            // Required for the 3D ioctls even though venus, not virgl, is the
-            // renderer; see the note on Feature.virgl.
+        let features: [UInt32] = [
             VirtioGPU.Feature.virgl,
             VirtioGPU.Feature.resourceBlob,
             VirtioGPU.Feature.contextInit,
-        ])
+        ]
+        configuration.optionalFeatures.subset0 = VirtioGPU.Feature.mask(features)
 
         // Render-only VMs keep zero scanouts. Framebuffer-enabled VMs expose a
         // single KMS head from this same device rather than attaching Apple's
         // second, unrelated virtio-gpu device.
         let deviceConfig = VirtioGPU.DeviceConfig(
-            numScanouts: scanout == nil ? 0 : 1, numCapsets: 1)
+            numScanouts: scanout == nil ? 0 : 1,
+            numCapsets: UInt32(Self.advertisedCapsets.count))
         configuration.deviceSpecificConfiguration =
             VZVirtioDeviceSpecificConfiguration(configurationData: deviceConfig.encoded())
 
@@ -454,9 +485,6 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
         ]
 
         self.configuration = configuration
-        guard let created = np_venus_create() else {
-            fatalError("Venus host failed to allocate")
-        }
         self.venus = created
         super.init()
         deviceQueue.setSpecific(key: Self.deviceQueueKey, value: ())
@@ -557,13 +585,32 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
 
         case .resourceAttachBacking:
             let request = try VirtioGPU.ResourceAttachBacking(parsing: &reader)
-            _ = try resources.require(request.resourceID)
-            try attachGuestBacking(request.entries, to: request.resourceID)
+            let resource = try resources.require(request.resourceID)
+            let backing = try makeGuestBacking(request.entries, for: request.resourceID)
+            if resource.isVirglResource {
+                let entries = backing.segments.map {
+                    np_renderer_iovec(base: $0.mapping.mutableBytes, length: $0.mapping.length)
+                }
+                let rc = entries.withUnsafeBufferPointer {
+                    np_renderer_resource_attach_iov(
+                        venus, request.resourceID, $0.baseAddress, UInt32($0.count))
+                }
+                guard rc == 0 else {
+                    throw ScanoutFailure.invalidBackingRange
+                }
+            }
+            guestBackings[request.resourceID] = backing
+            Self.note(
+                "backing res=\(request.resourceID) entries=\(request.entries.count) " +
+                "bytes=\(backing.byteCount)")
             respond(element, header.reply(.okNoData))
 
         case .resourceDetachBacking:
             let request = try VirtioGPU.ResourceDetachBacking(parsing: &reader)
-            _ = try resources.require(request.resourceID)
+            let resource = try resources.require(request.resourceID)
+            if resource.isVirglResource {
+                np_renderer_resource_detach_iov(venus, request.resourceID)
+            }
             guestBackings.removeValue(forKey: request.resourceID)
             respond(element, header.reply(.okNoData))
 
@@ -652,69 +699,85 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
 
         case .getCapsetInfo:
             let request = try VirtioGPU.GetCapsetInfo(parsing: &reader)
-            // Only one capset is advertised, at index 0.
-            guard request.capsetIndex == 0 else {
+            guard request.capsetIndex < UInt32(Self.advertisedCapsets.count) else {
                 respond(element, header.reply(.errInvalidParameter))
                 return
             }
+            let capset = Self.advertisedCapsets[Int(request.capsetIndex)]
             var maxVersion: UInt32 = 0
             var maxSize: UInt32 = 0
-            np_venus_capset_info(venus, &maxVersion, &maxSize)
+            np_renderer_capset_info(venus, capset.rawValue, &maxVersion, &maxSize)
             let info = VirtioGPU.CapsetInfoResponse(
-                capsetID: VirtioGPU.Capset.venus.rawValue,
+                capsetID: capset.rawValue,
                 capsetMaxVersion: maxVersion,
                 capsetMaxSize: maxSize)
             respond(element, header.reply(.okCapsetInfo), body: info.encoded())
 
         case .getCapset:
             let request = try VirtioGPU.GetCapset(parsing: &reader)
+            guard Self.advertisedCapsets.contains(where: { $0.rawValue == request.capsetID }) else {
+                respond(element, header.reply(.errInvalidParameter))
+                return
+            }
             var maxVersion: UInt32 = 0
             var maxSize: UInt32 = 0
-            np_venus_capset_info(venus, &maxVersion, &maxSize)
-            guard request.capsetID == VirtioGPU.Capset.venus.rawValue, maxSize > 0 else {
+            np_renderer_capset_info(venus, request.capsetID, &maxVersion, &maxSize)
+            guard maxSize > 0 else {
                 respond(element, header.reply(.okCapset))
                 return
             }
             var blob = Data(count: Int(maxSize))
             let written = blob.withUnsafeMutableBytes { raw -> UInt32 in
-                np_venus_fill_caps(venus, request.capsetVersion, raw.baseAddress, maxSize)
+                np_renderer_fill_caps(
+                    venus, request.capsetID, request.capsetVersion,
+                    raw.baseAddress, maxSize)
             }
             respond(element, header.reply(.okCapset), body: blob.prefix(Int(written)))
 
         case .ctxCreate:
             let request = try VirtioGPU.ContextCreate(parsing: &reader)
-            contexts[header.contextID] = GuestContext(
-                capsetID: request.capsetID, debugName: request.debugName)
+            guard !contexts.contains(header.contextID) else {
+                respond(element, header.reply(.errInvalidContextID))
+                return
+            }
             let rc = np_venus_context_create(
                 venus, header.contextID, request.capsetID, request.debugName)
             guard rc == 0 else {
-                contexts.removeValue(forKey: header.contextID)
                 respond(element, header.reply(.errInvalidParameter))
                 return
             }
+            contexts.insert(header.contextID)
             Self.log.info(
                 "context \(header.contextID) created for capset \(request.capsetID) (\(request.debugName, privacy: .public))")
             respond(element, header.reply(.okNoData))
 
         case .ctxDestroy:
+            guard contexts.remove(header.contextID) != nil else {
+                respond(element, header.reply(.errInvalidContextID))
+                return
+            }
             np_venus_context_destroy(venus, header.contextID)
-            contexts.removeValue(forKey: header.contextID)
             respond(element, header.reply(.okNoData))
 
         case .ctxAttachResource:
             let request = try VirtioGPU.ContextResource(parsing: &reader)
-            let resource = try resources.require(request.resourceID)
-            resource.attachedContexts.insert(header.contextID)
-            contexts[header.contextID]?.resources.insert(request.resourceID)
-            _ = np_venus_attach(venus, header.contextID, request.resourceID)
-            respond(element, header.reply(.okNoData))
+            guard contexts.contains(header.contextID) else {
+                respond(element, header.reply(.errInvalidContextID))
+                return
+            }
+            _ = try resources.require(request.resourceID)
+            let rc = np_venus_attach(venus, header.contextID, request.resourceID)
+            respond(element, header.reply(rc == 0 ? .okNoData : .errInvalidParameter))
 
         case .ctxDetachResource:
             let request = try VirtioGPU.ContextResource(parsing: &reader)
-            resources[request.resourceID]?.attachedContexts.remove(header.contextID)
-            contexts[header.contextID]?.resources.remove(request.resourceID)
-            _ = np_venus_detach(venus, header.contextID, request.resourceID)
-            respond(element, header.reply(.okNoData))
+            guard contexts.contains(header.contextID) else {
+                respond(element, header.reply(.errInvalidContextID))
+                return
+            }
+            _ = try resources.require(request.resourceID)
+            let rc = np_venus_detach(venus, header.contextID, request.resourceID)
+            respond(element, header.reply(rc == 0 ? .okNoData : .errInvalidParameter))
 
         case .resourceCreateBlob:
             let request = try VirtioGPU.ResourceCreateBlob(parsing: &reader)
@@ -761,16 +824,23 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
                 Self.note("unref   res=\(resource.resourceID) final \(Self.peek(resource))")
             }
             unpublish(request.resourceID)
-            guestBackings.removeValue(forKey: request.resourceID)
             if scanoutBinding?.resourceID == request.resourceID { setScanout(nil) }
             guard let resource = resources.remove(request.resourceID) else {
                 respond(element, header.reply(.okNoData))
                 return
             }
             if resource.twoDimensional != nil {
+                guestBackings.removeValue(forKey: request.resourceID)
                 respond(element, header.reply(.okNoData))
                 return
             }
+            if resource.isVirglResource {
+                np_venus_unimport_blob(venus, request.resourceID)
+                guestBackings.removeValue(forKey: request.resourceID)
+                respond(element, header.reply(.okNoData))
+                return
+            }
+			guestBackings.removeValue(forKey: request.resourceID)
 			retiringResources[request.resourceID] = resource
             unmapFromGuest(resource, element: nil, header: nil) { [weak self] success in
                 guard let self, !self.rendererTornDown else {
@@ -814,8 +884,66 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
             // Cursor lives on the macOS side; nothing to draw here.
             respond(element, header.reply(.okNoData))
 
-        case .resourceCreate3D, .transferToHost3D, .transferFromHost3D,
-             .resourceAssignUUID:
+        case .resourceCreate3D:
+            let request = try VirtioGPU.ResourceCreate3D(parsing: &reader)
+            Self.note(
+                "create3d res=\(request.resourceID) target=\(request.target) " +
+                "fmt=\(request.format) bind=0x\(String(request.bind, radix: 16)) " +
+                "\(request.width)x\(request.height)x\(request.depth) " +
+                "array=\(request.arraySize) levels=\(request.lastLevel + 1) " +
+                "samples=\(request.sampleCount) flags=0x\(String(request.flags, radix: 16))")
+            var create = np_renderer_resource_3d(
+                resource_id: request.resourceID,
+                target: request.target,
+                format: request.format,
+                bind: request.bind,
+                width: request.width,
+                height: request.height,
+                depth: request.depth,
+                array_size: request.arraySize,
+                last_level: request.lastLevel,
+                nr_samples: request.sampleCount,
+                flags: request.flags)
+            guard np_renderer_resource_create_3d(venus, &create) == 0 else {
+                respond(element, header.reply(.errOutOfMemory))
+                return
+            }
+            do {
+                let resource = try resources.adoptVirglResource(id: request.resourceID)
+                publish(resource)
+                notifyResourcePublished(request.resourceID)
+            } catch {
+                np_venus_unimport_blob(venus, request.resourceID)
+                throw error
+            }
+            respond(element, header.reply(.okNoData))
+
+        case .transferToHost3D, .transferFromHost3D:
+            let request = try VirtioGPU.Transfer3D(parsing: &reader)
+            let resource = try resources.require(request.resourceID)
+            guard resource.isVirglResource else {
+                respond(element, header.reply(.errInvalidResourceID))
+                return
+            }
+            var box = np_renderer_box(
+                x: request.box.x, y: request.box.y, z: request.box.z,
+                width: request.box.width, height: request.box.height,
+                depth: request.box.depth)
+            let rc = np_renderer_transfer_3d(
+                venus, request.resourceID, header.contextID, request.level,
+                request.stride, request.layerStride, &box, request.offset,
+                command == .transferFromHost3D)
+            let direction = command == .transferFromHost3D ? "read" : "write"
+            Self.note(
+                "transfer3d \(direction) " +
+                "res=\(request.resourceID) level=\(request.level) " +
+                "box=\(request.box.x),\(request.box.y),\(request.box.z) " +
+                "\(request.box.width)x\(request.box.height)x\(request.box.depth) " +
+                "stride=\(request.stride) layer=\(request.layerStride) " +
+                "offset=\(request.offset) rc=\(rc)")
+            respond(element, header.reply(rc == 0 ? .okNoData : .errUnspecified))
+
+        case .resourceAssignUUID:
             Self.log.error("unimplemented command \(String(describing: command), privacy: .public)")
             respond(element, header.reply(.errUnspecified))
         }
@@ -823,11 +951,14 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
 
     // MARK: - 2D scanout
 
-    private func attachGuestBacking(
-        _ entries: [VirtioGPU.MemoryEntry], to resourceID: UInt32
-    ) throws {
+    private func makeGuestBacking(
+        _ entries: [VirtioGPU.MemoryEntry], for resourceID: UInt32
+    ) throws -> GuestBacking {
         guard let device else { throw ScanoutFailure.missingDevice }
         guard !entries.isEmpty else { throw ScanoutFailure.emptyBacking }
+        guard guestBackings[resourceID] == nil else {
+            throw ScanoutFailure.backingAlreadyAttached
+        }
 
         var logicalOffset: UInt64 = 0
         var segments: [GuestBackingSegment] = []
@@ -848,9 +979,7 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
             guard !countOverflow else { throw ScanoutFailure.invalidBackingRange }
             logicalOffset = next
         }
-        guestBackings[resourceID] = GuestBacking(
-            segments: segments, byteCount: logicalOffset)
-        Self.note("backing res=\(resourceID) entries=\(entries.count) bytes=\(logicalOffset)")
+        return GuestBacking(segments: segments, byteCount: logicalOffset)
     }
 
     private func transferToHost2D(_ request: VirtioGPU.TransferToHost2D) throws {
@@ -1234,6 +1363,7 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
                 }
                 finishCreateBlob(resource, header: header, element: element)
             } catch {
+                np_venus_unimport_blob(venus, request.resourceID)
                 Self.note(
                     "reject  create res=\(request.resourceID) blob_id=\(request.blobID): \(error.localizedDescription)")
                 Self.log.error(
@@ -1244,8 +1374,9 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
         }
         Self.note(
             "reject  create res=\(request.resourceID) blob_id=\(request.blobID) rc=\(createResult) — renderer rejected ordered blob creation")
+        let blobFlags = String(request.blobFlags, radix: 16)
         Self.log.error(
-            "vkr rejected ordered blob creation for res \(request.resourceID), blob_id \(request.blobID), rc \(createResult)")
+            "vkr rejected ordered blob creation for res \(request.resourceID), ctx \(header.contextID), blob_id \(request.blobID), flags 0x\(blobFlags, privacy: .public), size \(request.size), rc \(createResult)")
         respond(
             element,
             header.reply(createResult == -ENOMEM ? .errOutOfMemory : .errInvalidParameter))
@@ -1401,10 +1532,9 @@ extension VirtioGPUDevice: VZCustomVirtioDeviceDelegate {
     private func clearGuestRendererState(completion: @escaping () -> Void = {}) {
 		cancelDeferredBlobCreates()
         setScanout(nil)
-        guestBackings.removeAll(keepingCapacity: true)
         let activeResources = resources.all
         let cleanupResources = activeResources + Array(retiringResources.values)
-        let contextIDs = Array(contexts.keys)
+        let contextIDs = Array(contexts)
         for resource in cleanupResources
         where resource.mappedOffset != nil || resource.unmapInFlight {
             unmapFromGuest(resource, element: nil, header: nil)
@@ -1431,7 +1561,10 @@ extension VirtioGPUDevice: VZCustomVirtioDeviceDelegate {
                 }
             }
             for ctxID in contextIDs { np_venus_context_destroy(venus, ctxID) }
-            contexts.removeAll()
+            // virglrenderer has now detached every iovec, so its guest-memory
+            // mappings can finally be released.
+            guestBackings.removeAll(keepingCapacity: true)
+            contexts.removeAll(keepingCapacity: true)
             resources.removeAll()
             publishedLock.lock()
             published.removeAll(keepingCapacity: true)
@@ -1449,7 +1582,6 @@ extension VirtioGPUDevice: VZCustomVirtioDeviceDelegate {
         rendererTornDown = true
 		cancelDeferredBlobCreates()
         setScanout(nil)
-        guestBackings.removeAll(keepingCapacity: false)
 
         // `willStop` is the ownership boundary for the whole custom device.
         // Waiting for individual VZ shared-region unmaps here can deadlock:
@@ -1459,10 +1591,11 @@ extension VirtioGPUDevice: VZCustomVirtioDeviceDelegate {
         // release renderer objects synchronously and let any late completion
         // take the guarded path above.
         let cleanupResources = resources.all + Array(retiringResources.values)
-        let contextIDs = Array(contexts.keys)
+        let contextIDs = Array(contexts)
         for resource in cleanupResources where resource.twoDimensional == nil {
             np_venus_unimport_blob(venus, resource.resourceID)
         }
+        guestBackings.removeAll(keepingCapacity: false)
         for ctxID in contextIDs { np_venus_context_destroy(venus, ctxID) }
         contexts.removeAll()
         resources.removeAll()

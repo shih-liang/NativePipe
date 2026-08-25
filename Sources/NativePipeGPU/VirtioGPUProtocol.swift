@@ -2,10 +2,10 @@ import Foundation
 
 /// The virtio-gpu wire protocol, as much of it as NativePipe speaks.
 ///
-/// NativePipe implements one optional scanout as well as the Venus render node.
+/// NativePipe implements one optional scanout plus VirGL and Venus render nodes.
 /// The 2D path is deliberately small but complete: Linux can allocate a dumb
 /// framebuffer in guest RAM, transfer damaged rectangles into an IOSurface and
-/// flush that surface to the host. `SUBMIT_3D` remains an opaque Venus payload.
+/// flush that surface to the host. `SUBMIT_3D` remains opaque renderer payload.
 public enum VirtioGPU {
 
     // MARK: - Device identity
@@ -49,7 +49,8 @@ public enum VirtioGPU {
 
     // MARK: - Capability sets
 
-    /// Capset IDs as understood by Mesa and crosvm. NativePipe offers venus only.
+    /// Capset IDs as understood by Mesa and crosvm. NativePipe offers VirGL,
+    /// VirGL2, and Venus from the same renderer instance.
     public enum Capset: UInt32 {
         case virgl = 1
         case virgl2 = 2
@@ -412,6 +413,73 @@ extension VirtioGPU {
         public init(parsing reader: inout LittleEndianReader) throws {
             resourceID = try reader.readUInt32()
             try reader.skip(4)
+        }
+    }
+
+    /// `struct virtio_gpu_resource_create_3d`.
+    public struct ResourceCreate3D {
+        public var resourceID: UInt32
+        public var target: UInt32
+        public var format: UInt32
+        public var bind: UInt32
+        public var width: UInt32
+        public var height: UInt32
+        public var depth: UInt32
+        public var arraySize: UInt32
+        public var lastLevel: UInt32
+        public var sampleCount: UInt32
+        public var flags: UInt32
+
+        public init(parsing reader: inout LittleEndianReader) throws {
+            resourceID = try reader.readUInt32()
+            target = try reader.readUInt32()
+            format = try reader.readUInt32()
+            bind = try reader.readUInt32()
+            width = try reader.readUInt32()
+            height = try reader.readUInt32()
+            depth = try reader.readUInt32()
+            arraySize = try reader.readUInt32()
+            lastLevel = try reader.readUInt32()
+            sampleCount = try reader.readUInt32()
+            flags = try reader.readUInt32()
+            try reader.skip(4)
+        }
+    }
+
+    public struct Box3D {
+        public var x: UInt32
+        public var y: UInt32
+        public var z: UInt32
+        public var width: UInt32
+        public var height: UInt32
+        public var depth: UInt32
+
+        public init(parsing reader: inout LittleEndianReader) throws {
+            x = try reader.readUInt32()
+            y = try reader.readUInt32()
+            z = try reader.readUInt32()
+            width = try reader.readUInt32()
+            height = try reader.readUInt32()
+            depth = try reader.readUInt32()
+        }
+    }
+
+    /// Shared body of TRANSFER_TO_HOST_3D and TRANSFER_FROM_HOST_3D.
+    public struct Transfer3D {
+        public var box: Box3D
+        public var offset: UInt64
+        public var resourceID: UInt32
+        public var level: UInt32
+        public var stride: UInt32
+        public var layerStride: UInt32
+
+        public init(parsing reader: inout LittleEndianReader) throws {
+            box = try Box3D(parsing: &reader)
+            offset = try reader.readUInt64()
+            resourceID = try reader.readUInt32()
+            level = try reader.readUInt32()
+            stride = try reader.readUInt32()
+            layerStride = try reader.readUInt32()
         }
     }
 

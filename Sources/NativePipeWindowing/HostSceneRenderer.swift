@@ -11,9 +11,9 @@ struct ResolvedSceneLayer {
 
 extension Windowing.SceneSnapshot {
     /// A latest-value queue may discard an unencoded scene, but its damage is
-    /// still part of the transition from the persistent host image to the
-    /// newest scene. The newest layer list is authoritative; only the damaged
-    /// output area must be carried forward.
+    /// still part of the transition recorded for the drawable pool. The newest
+    /// layer list is authoritative; only the damaged output area is carried
+    /// forward.
     func includingUnrenderedDamage(from older: Self) -> Self {
 		guard width == older.width, height == older.height,
               scale == older.scale, windowGeometry == older.windowGeometry else {
@@ -37,6 +37,132 @@ extension Windowing.SceneSnapshot {
         result.damage = [Windowing.Rect(
             x: left, y: top, width: right - left, height: bottom - top)]
         return result
+    }
+}
+
+/// Tracks only the recent damage needed to restore each CAMetalLayer drawable.
+/// No extra texture is retained: the layer's own drawable pool is the backing
+/// store, identified by Metal's stable GPU resource id.
+struct DrawableAgeTracker {
+    struct Geometry: Equatable {
+        let drawableWidth: Int
+        let drawableHeight: Int
+        let sceneWidth: Int
+        let sceneHeight: Int
+        let scale: Int
+        let windowGeometry: Windowing.Rect
+    }
+
+    struct Plan {
+        let serial: UInt64
+        let drawableID: UInt64
+        let geometry: Geometry
+        let redrawAll: Bool
+        let damage: [Windowing.Rect]
+        fileprivate let transitionDamage: [Windowing.Rect]
+    }
+
+    private struct Slot {
+        let serial: UInt64
+        let geometry: Geometry
+    }
+
+    private struct Record {
+        let serial: UInt64
+        let damage: [Windowing.Rect]
+    }
+
+    private let capacity: Int
+    private var serial: UInt64 = 0
+    private var lastGeometry: Geometry?
+    private var slots: [UInt64: Slot] = [:]
+    private var history: [Record] = []
+
+    init(capacity: Int) {
+        self.capacity = max(1, capacity)
+    }
+
+    mutating func plan(
+        drawableID: UInt64, scene: Windowing.SceneSnapshot,
+        drawableWidth: Int, drawableHeight: Int
+    ) -> Plan {
+        let geometry = Geometry(
+            drawableWidth: drawableWidth, drawableHeight: drawableHeight,
+            sceneWidth: scene.width, sceneHeight: scene.height,
+            scale: scene.scale, windowGeometry: scene.windowGeometry)
+        let full = [Windowing.Rect(
+            x: 0, y: 0, width: drawableWidth, height: drawableHeight)]
+        let transition = lastGeometry == geometry
+            ? Self.coalesced(scene.damage, width: drawableWidth, height: drawableHeight)
+            : full
+        let nextSerial = serial &+ 1
+
+        var redrawAll = true
+        var damage = full
+        if let slot = slots[drawableID], slot.geometry == geometry {
+            let firstRequired = slot.serial &+ 1
+            let historyStartsInTime = slot.serial == serial ||
+                (history.first.map { $0.serial <= firstRequired } ?? false)
+            if historyStartsInTime {
+                redrawAll = false
+                let accumulated = history.filter { $0.serial > slot.serial }
+                    .flatMap(\.damage) + transition
+                damage = Self.coalesced(
+                    accumulated,
+                    width: drawableWidth, height: drawableHeight)
+            }
+        }
+
+        return Plan(
+            serial: nextSerial, drawableID: drawableID, geometry: geometry,
+            redrawAll: redrawAll, damage: damage,
+            transitionDamage: transition)
+    }
+
+    mutating func commit(_ plan: Plan) {
+        precondition(plan.serial == serial &+ 1)
+        serial = plan.serial
+        lastGeometry = plan.geometry
+        slots[plan.drawableID] = Slot(serial: serial, geometry: plan.geometry)
+        history.append(Record(serial: serial, damage: plan.transitionDamage))
+        if history.count > capacity {
+            history.removeFirst(history.count - capacity)
+        }
+        if slots.count > capacity {
+            let keep = slots.sorted { $0.value.serial > $1.value.serial }.prefix(capacity)
+            slots = Dictionary(uniqueKeysWithValues: keep.map { ($0.key, $0.value) })
+        }
+    }
+
+    mutating func invalidate() {
+        serial = 0
+        lastGeometry = nil
+        slots.removeAll(keepingCapacity: true)
+        history.removeAll(keepingCapacity: true)
+    }
+
+    private static func coalesced<S: Sequence>(
+        _ rectangles: S, width: Int, height: Int
+    ) -> [Windowing.Rect] where S.Element == Windowing.Rect {
+        var bounds: Windowing.Rect?
+        for rect in rectangles {
+            let x0 = max(0, rect.x)
+            let y0 = max(0, rect.y)
+            let x1 = min(width, rect.x + rect.width)
+            let y1 = min(height, rect.y + rect.height)
+            guard x1 > x0, y1 > y0 else { continue }
+            if let old = bounds {
+                let right = max(old.x + old.width, x1)
+                let bottom = max(old.y + old.height, y1)
+                let left = min(old.x, x0)
+                let top = min(old.y, y0)
+                bounds = Windowing.Rect(
+                    x: left, y: top, width: right - left, height: bottom - top)
+            } else {
+                bounds = Windowing.Rect(x: x0, y: y0, width: x1 - x0, height: y1 - y0)
+            }
+        }
+        return bounds.map { [$0] } ?? []
     }
 }
 
@@ -188,7 +314,7 @@ final class HostSceneRenderer: @unchecked Sendable {
 
     func encode(
         scene: Windowing.SceneSnapshot, layers: [ResolvedSceneLayer],
-        history: MTLTexture, redrawAll: Bool,
+        damage: [Windowing.Rect], redrawAll: Bool,
         drawable: CAMetalDrawable,
         completion: @escaping (MTLCommandBuffer) -> Void
     ) throws {
@@ -198,33 +324,23 @@ final class HostSceneRenderer: @unchecked Sendable {
         }
         let target = drawable.texture
         guard target.pixelFormat == .bgra8Unorm,
-              target.width > 0, target.height > 0,
-              history.pixelFormat == .bgra8Unorm,
-              history.width == scene.width, history.height == scene.height else {
+              target.width > 0, target.height > 0 else {
             throw RendererError.incompatibleTexture
         }
-		let regions: [MTLScissorRect] = redrawAll
-			? [MTLScissorRect(x: 0, y: 0, width: scene.width, height: scene.height)]
-			: scene.damage.compactMap { scissor($0, width: scene.width, height: scene.height) }
 
-		if !regions.isEmpty, canBlit(scene: scene, layer: layers.first) {
-            guard let layer = layers.first,
-                  let encoder = command.makeBlitCommandEncoder() else {
-                throw RendererError.encoder
-            }
-			for region in regions {
-				encoder.copy(
-					from: layer.texture, sourceSlice: 0, sourceLevel: 0,
-					sourceOrigin: MTLOrigin(x: region.x, y: region.y, z: 0),
-					sourceSize: MTLSize(
-						width: region.width, height: region.height, depth: 1),
-					to: history, destinationSlice: 0, destinationLevel: 0,
-					destinationOrigin: MTLOrigin(x: region.x, y: region.y, z: 0))
-			}
-            encoder.endEncoding()
-        } else if !regions.isEmpty {
+		let limitWidth = min(scene.width, target.width)
+		let limitHeight = min(scene.height, target.height)
+		let regions = redrawAll
+			? [MTLScissorRect(x: 0, y: 0, width: limitWidth, height: limitHeight)]
+			: damage.compactMap { scissor($0, width: limitWidth, height: limitHeight) }
+
+		if canBlit(scene: scene, layer: layers.first), let layer = layers.first {
+			try encodeBlit(
+				layer.texture, regions: regions, redrawAll: redrawAll,
+				target: target, command: command)
+        } else if redrawAll || !regions.isEmpty {
             let pass = MTLRenderPassDescriptor()
-			pass.colorAttachments[0].texture = history
+			pass.colorAttachments[0].texture = target
 			pass.colorAttachments[0].loadAction = redrawAll ? .clear : .load
             pass.colorAttachments[0].storeAction = .store
             pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0)
@@ -232,20 +348,21 @@ final class HostSceneRenderer: @unchecked Sendable {
                 throw RendererError.encoder
             }
 			for region in regions {
-				if !redrawAll { encodeClear(region: region, scene: scene, encoder: encoder) }
+				if !redrawAll {
+					encodeClear(region: region, outputWidth: target.width,
+						outputHeight: target.height, encoder: encoder)
+				}
 				encoder.setRenderPipelineState(pipeline)
 				encoder.setFragmentSamplerState(sampler, index: 0)
 				for layer in layers {
 					try encode(
 						layer: layer, scene: scene,
-						outputWidth: history.width, outputHeight: history.height,
+						outputWidth: target.width, outputHeight: target.height,
 						damage: region, encoder: encoder)
 				}
             }
             encoder.endEncoding()
         }
-
-		try encodeOutput(history: history, target: target, command: command)
 
         command.addCompletedHandler { command in
             // Retain every source wrapper until Metal has completed its reads.
@@ -256,15 +373,12 @@ final class HostSceneRenderer: @unchecked Sendable {
         command.commit()
     }
 
-	/// xdg_toplevel.configure is a size hint, not a requirement that the current
-	/// committed buffer already have that extent. During an interactive resize
-	/// AppKit's drawable follows the window while Wayland may still show the
-	/// previous content update. Copy their intersection at (0, 0), preserving
-	/// top-left alignment, and clear only the newly exposed right/bottom area.
-	private func encodeOutput(
-		history: MTLTexture, target: MTLTexture, command: MTLCommandBuffer
+	private func encodeBlit(
+		_ source: MTLTexture, regions: [MTLScissorRect], redrawAll: Bool,
+		target: MTLTexture, command: MTLCommandBuffer
 	) throws {
-		if target.width != history.width || target.height != history.height {
+		if redrawAll && (regions.first?.width != target.width ||
+			regions.first?.height != target.height) {
 			let pass = MTLRenderPassDescriptor()
 			pass.colorAttachments[0].texture = target
 			pass.colorAttachments[0].loadAction = .clear
@@ -276,18 +390,19 @@ final class HostSceneRenderer: @unchecked Sendable {
 			clear.endEncoding()
 		}
 
-		let width = min(history.width, target.width)
-		let height = min(history.height, target.height)
-		guard width > 0, height > 0,
-		      let blit = command.makeBlitCommandEncoder() else {
+		guard !regions.isEmpty else { return }
+		guard let blit = command.makeBlitCommandEncoder() else {
 			throw RendererError.encoder
 		}
-		blit.copy(
-			from: history, sourceSlice: 0, sourceLevel: 0,
-			sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-			sourceSize: MTLSize(width: width, height: height, depth: 1),
-			to: target, destinationSlice: 0, destinationLevel: 0,
-			destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+		for region in regions {
+			blit.copy(
+				from: source, sourceSlice: 0, sourceLevel: 0,
+				sourceOrigin: MTLOrigin(x: region.x, y: region.y, z: 0),
+				sourceSize: MTLSize(
+					width: region.width, height: region.height, depth: 1),
+				to: target, destinationSlice: 0, destinationLevel: 0,
+				destinationOrigin: MTLOrigin(x: region.x, y: region.y, z: 0))
+		}
 		blit.endEncoding()
 	}
 
@@ -303,12 +418,12 @@ final class HostSceneRenderer: @unchecked Sendable {
 	}
 
 	private func encodeClear(
-		region: MTLScissorRect, scene: Windowing.SceneSnapshot,
+		region: MTLScissorRect, outputWidth: Int, outputHeight: Int,
 		encoder: MTLRenderCommandEncoder
 	) {
 		var vertex = VertexUniforms(
-			destination: SIMD4(0, 0, Float(scene.width), Float(scene.height)),
-			outputSize: SIMD2(Float(scene.width), Float(scene.height)))
+			destination: SIMD4(0, 0, Float(outputWidth), Float(outputHeight)),
+			outputSize: SIMD2(Float(outputWidth), Float(outputHeight)))
 		encoder.setRenderPipelineState(clearPipeline)
 		encoder.setScissorRect(region)
 		encoder.setVertexBytes(
@@ -332,10 +447,10 @@ final class HostSceneRenderer: @unchecked Sendable {
         let clip = layer.state.clip
 		let x0 = max(damage.x, max(0, Int(clip.x.rounded(.down))))
 		let y0 = max(damage.y, max(0, Int(clip.y.rounded(.down))))
-		let x1 = min(damage.x + damage.width,
-			min(scene.width, Int((clip.x + clip.width).rounded(.up))))
-		let y1 = min(damage.y + damage.height,
-			min(scene.height, Int((clip.y + clip.height).rounded(.up))))
+		let x1 = min(damage.x + damage.width, min(outputWidth,
+			min(scene.width, Int((clip.x + clip.width).rounded(.up)))))
+		let y1 = min(damage.y + damage.height, min(outputHeight,
+			min(scene.height, Int((clip.y + clip.height).rounded(.up)))))
         guard x1 > x0, y1 > y0 else { return }
 
         var vertex = VertexUniforms(

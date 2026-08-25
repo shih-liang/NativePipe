@@ -13,7 +13,7 @@ written **once**. VM and Remote only swap transport (vsock/virtio vs TCP/H.264).
 | `Sources/NativePipeProtocol` | NPIP framing, window events/commands, ports, NPEN |
 | `Sources/NativePipeWindowing` | `WindowBridge` / `NativeWindow` → `NSWindow` |
 | `Sources/NativePipeGPU` | Host virtio-gpu (`VZCustomVirtioDevice`) — **VM** |
-| `Sources/NativePipeVenus` | C bridge: dlopen virglrenderer / Venus host — **VM** |
+| `Sources/NativePipeVenus` | C bridge: VirGL→ANGLE/Metal and Venus→MoltenVK/Metal — **VM** |
 | `Sources/NativePipeRemote` | TCP client, VideoToolbox decode, `DisplaySession` — **Remote** |
 | `Sources/NativePipeRemoteApp` | `remotepipe` CLI (SSH only; display via NativePipeRemote) |
 | `guest/compositor` | Shared compositor core + thin VM/Remote mains |
@@ -30,7 +30,7 @@ swift build -c release --product remotepipe
 
 | Target | Binary | Role |
 |---|---|---|
-| `make` | **`vmpipe-wayland`** | LightHouse **VM**: vsock + virtio blobs / Venus |
+| `make` | **`vmpipe-wayland`** | LightHouse **VM**: vsock + virtio blobs / VirGL + Venus |
 | `make remote` | **`remotepipe-wayland`** | **Bare metal**: TCP `1025`/`1026` + H.264 |
 
 Shared code: `compositor.c`, `hostlink`, Wayland protocols.  

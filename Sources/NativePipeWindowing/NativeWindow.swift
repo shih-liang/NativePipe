@@ -324,7 +324,7 @@ final class NativeWindow: NSObject {
     }
 
 	func invalidateSceneHistory() {
-		asyncScenePresenter?.invalidateHistory()
+		asyncScenePresenter?.invalidateDrawableAges()
 	}
 
     private func awaitPresentation(_ presentation: Presentation) {
@@ -544,7 +544,7 @@ final class NativeWindow: NSObject {
 		bridge?.windowScreenChanged(windowID, screen: nil)
 		bridge?.unregisterDisplayClock(self)
         asyncScenePresenter?.cancelPending()
-		asyncScenePresenter?.invalidateHistory()
+		asyncScenePresenter?.invalidateDrawableAges()
         // `orderOut` only hides a window; it does not terminate its AppKit
         // lifetime.  In particular a popup remains retained by its parent as a
         // child window, and reconnecting the compositor can then leave an old
@@ -757,8 +757,7 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         let presented: (@MainActor () -> Void)?
     }
 
-    private let layer: CAMetalLayer
-	private let device: MTLDevice
+	private let layer: CAMetalLayer
     private let renderer: HostSceneRenderer
     private let requestDisplayRetry: (@Sendable () -> Void)?
     private let queue = DispatchQueue(
@@ -767,8 +766,7 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
     private var pending: Work?
 	private var epoch: UInt64 = 0
 	private var drainScheduled = false
-	private var historyTexture: MTLTexture?
-	private var historyValid = false
+	private var drawableAges: DrawableAgeTracker
 
     private enum ProcessResult: Equatable {
         case handled
@@ -786,10 +784,11 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
 		requestDisplayRetry: (@Sendable () -> Void)? = nil
 	) {
         self.layer = layer
-		self.device = device
         self.renderer = renderer
 		self.requestDisplayRetry = requestDisplayRetry
+		self.drawableAges = DrawableAgeTracker(capacity: layer.maximumDrawableCount)
         layer.device = device
+		layer.framebufferOnly = false
     }
 
 	func resumeAfterDisplayTick() {
@@ -800,11 +799,8 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
 		if shouldSchedule { queue.async { self.drain() } }
 	}
 
-	func invalidateHistory() {
-		queue.async {
-			self.historyValid = false
-			self.historyTexture = nil
-		}
+	func invalidateDrawableAges() {
+		queue.async { self.drawableAges.invalidate() }
 	}
 
     func enqueue(
@@ -909,30 +905,14 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
                 DispatchQueue.main.async { presented() }
             }
         }
-		let needsHistory = historyTexture?.width != scene.width ||
-			historyTexture?.height != scene.height
-		if needsHistory {
-			let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-				pixelFormat: .bgra8Unorm, width: scene.width,
-				height: scene.height, mipmapped: false)
-			descriptor.storageMode = .private
-			descriptor.usage = [.renderTarget]
-			historyTexture = device.makeTexture(descriptor: descriptor)
-			historyValid = false
-		}
-		guard let history = historyTexture else {
-			historyValid = false
-			FileHandle.standardError.write(
-				Data("[nsw] could not allocate Metal scene history\n".utf8))
-			finish(work, success: false)
-			latch(work)
-			return .handled
-		}
-
+		let plan = drawableAges.plan(
+			drawableID: drawable.texture.gpuResourceID._impl,
+			scene: scene, drawableWidth: drawable.texture.width,
+			drawableHeight: drawable.texture.height)
         do {
             try renderer.encode(
                 scene: scene, layers: work.layers,
-				history: history, redrawAll: !historyValid,
+				damage: plan.damage, redrawAll: plan.redrawAll,
                 drawable: drawable
             ) { command in
                 if command.status != .completed, let error = command.error {
@@ -940,19 +920,16 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
                         Data("[nsw] Metal scene failed: \(error)\n".utf8))
                 }
 				if command.status != .completed {
-					self.queue.async {
-						if self.historyTexture === history { self.historyValid = false }
-					}
+					self.queue.async { self.drawableAges.invalidate() }
 				}
                 self.finish(work, success: command.status == .completed)
             }
-			historyValid = true
+			drawableAges.commit(plan)
             // A drawable has accepted this scene in FIFO order. Queue its
             // Wayland callback for the next display-link tick. Source-buffer
             // release remains tied to Metal completion above.
             latch(work)
         } catch {
-			historyValid = false
             FileHandle.standardError.write(
                 Data("[nsw] could not encode Metal scene: \(error)\n".utf8))
 			finish(work, success: false)

@@ -551,9 +551,19 @@ static const uint32_t k_formats[] = {
     DRM_FORMAT_XRGB8888,
 };
 static const uint64_t k_modifiers[] = {
-    /* Mesa's standard Apple modifier maps to optimal tiling in VGL. */
+    /* NativePipe's private Apple-family token maps to optimal tiling in VGL. */
     DRM_FORMAT_MOD_APPLE_GPU_TILED,
     DRM_FORMAT_MOD_LINEAR,
+};
+
+/* Classic VirGL does not implement pipe_screen::resource_create_with_modifiers.
+ * Mesa therefore requires INVALID in dmabuf feedback before it will allocate
+ * an implicit-modifier window buffer.  Keep INVALID out of the legacy
+ * `modifier` events: the legacy `format` event already advertises that path. */
+static const uint64_t k_feedback_modifiers[] = {
+    DRM_FORMAT_MOD_APPLE_GPU_TILED,
+    DRM_FORMAT_MOD_LINEAR,
+    DRM_FORMAT_MOD_INVALID,
 };
 
 static void feedback_destroy(struct wl_client *client, struct wl_resource *resource)
@@ -586,13 +596,15 @@ static int create_format_table(void)
 {
     struct np_dmabuf_format_table_entry entries[
         sizeof(k_formats) / sizeof(k_formats[0]) *
-        sizeof(k_modifiers) / sizeof(k_modifiers[0])];
+        sizeof(k_feedback_modifiers) / sizeof(k_feedback_modifiers[0])];
     size_t entry = 0;
     for (size_t f = 0; f < sizeof(k_formats) / sizeof(k_formats[0]); f++) {
-        for (size_t m = 0; m < sizeof(k_modifiers) / sizeof(k_modifiers[0]); m++) {
+        for (size_t m = 0;
+             m < sizeof(k_feedback_modifiers) / sizeof(k_feedback_modifiers[0]);
+             m++) {
             entries[entry++] = (struct np_dmabuf_format_table_entry) {
                 .format = k_formats[f],
-                .modifier = k_modifiers[m],
+                .modifier = k_feedback_modifiers[m],
             };
         }
     }
@@ -619,17 +631,23 @@ static void send_feedback(struct wl_resource *feedback, struct np_dmabuf *dmabuf
     }
 
     struct wl_array device;
-    struct wl_array indices;
+    struct wl_array explicit_indices;
+    struct wl_array implicit_indices;
     wl_array_init(&device);
-    wl_array_init(&indices);
+    wl_array_init(&explicit_indices);
+    wl_array_init(&implicit_indices);
 
     dev_t *device_value = wl_array_add(&device, sizeof(*device_value));
-    uint16_t *format_indices = wl_array_add(
-        &indices,
-        sizeof(uint16_t) * sizeof(k_formats) / sizeof(k_formats[0]) *
-            sizeof(k_modifiers) / sizeof(k_modifiers[0]));
-    if (!device_value || !format_indices) {
-        wl_array_release(&indices);
+    const size_t format_count = sizeof(k_formats) / sizeof(k_formats[0]);
+    const size_t modifier_count =
+        sizeof(k_feedback_modifiers) / sizeof(k_feedback_modifiers[0]);
+    uint16_t *explicit_values = wl_array_add(
+        &explicit_indices, sizeof(uint16_t) * format_count * 2);
+    uint16_t *implicit_values = wl_array_add(
+        &implicit_indices, sizeof(uint16_t) * format_count);
+    if (!device_value || !explicit_values || !implicit_values) {
+        wl_array_release(&implicit_indices);
+        wl_array_release(&explicit_indices);
         wl_array_release(&device);
         close(table_fd);
         wl_resource_post_no_memory(feedback);
@@ -637,21 +655,40 @@ static void send_feedback(struct wl_resource *feedback, struct np_dmabuf *dmabuf
     }
 
     *device_value = dmabuf->device;
-    for (size_t i = 0; i < indices.size / sizeof(*format_indices); i++)
-        format_indices[i] = (uint16_t)i;
+    for (size_t f = 0; f < format_count; f++) {
+        explicit_values[f * 2] = (uint16_t)(f * modifier_count);
+        explicit_values[f * 2 + 1] = (uint16_t)(f * modifier_count + 1);
+        implicit_values[f] = (uint16_t)(f * modifier_count + 2);
+    }
 
     zwp_linux_dmabuf_feedback_v1_send_format_table(
-        feedback, table_fd,
-        (uint32_t)(sizeof(struct np_dmabuf_format_table_entry) *
-                   indices.size / sizeof(*format_indices)));
+        feedback, table_fd, (uint32_t)(
+            sizeof(struct np_dmabuf_format_table_entry) *
+            format_count * modifier_count));
     zwp_linux_dmabuf_feedback_v1_send_main_device(feedback, &device);
+
+    /* Every buffer selected from this feedback is a compositor presentation
+     * candidate. SCANOUT is NativePipe's allocation marker for a native Metal
+     * backing; it does not change the later host composition step. */
     zwp_linux_dmabuf_feedback_v1_send_tranche_target_device(feedback, &device);
-    zwp_linux_dmabuf_feedback_v1_send_tranche_flags(feedback, 0);
-    zwp_linux_dmabuf_feedback_v1_send_tranche_formats(feedback, &indices);
+    zwp_linux_dmabuf_feedback_v1_send_tranche_flags(
+        feedback, ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_SCANOUT);
+    zwp_linux_dmabuf_feedback_v1_send_tranche_formats(
+        feedback, &explicit_indices);
+    zwp_linux_dmabuf_feedback_v1_send_tranche_done(feedback);
+
+    /* Classic VirGL has no resource_create_with_modifiers callback, so its
+     * second-choice implicit tranche carries the same native-backing marker. */
+    zwp_linux_dmabuf_feedback_v1_send_tranche_target_device(feedback, &device);
+    zwp_linux_dmabuf_feedback_v1_send_tranche_flags(
+        feedback, ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_SCANOUT);
+    zwp_linux_dmabuf_feedback_v1_send_tranche_formats(
+        feedback, &implicit_indices);
     zwp_linux_dmabuf_feedback_v1_send_tranche_done(feedback);
     zwp_linux_dmabuf_feedback_v1_send_done(feedback);
 
-    wl_array_release(&indices);
+    wl_array_release(&implicit_indices);
+    wl_array_release(&explicit_indices);
     wl_array_release(&device);
     close(table_fd);
 }

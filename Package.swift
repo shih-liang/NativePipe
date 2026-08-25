@@ -23,8 +23,8 @@ let package = Package(
             name: "NativePipeProtocol",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
-        // Host side of the virtual GPU: dlopen virglrenderer, advertise the
-        // Venus capset, forward SUBMIT_3D. Venus itself is guest Mesa.
+        // Host side of the virtual GPU: one virglrenderer instance advertises
+        // VirGL/VirGL2 for guest OpenGL and Venus for guest Vulkan.
         .target(
             name: "NativePipeVenus",
             publicHeadersPath: "include",

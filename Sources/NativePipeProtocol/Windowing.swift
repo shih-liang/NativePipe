@@ -273,7 +273,8 @@ extension Windowing {
         public var windowGeometry: Rect
         public var layers: [SceneLayer]
         /// Output-pixel regions whose composited result changed. The host keeps
-        /// a persistent window texture; an empty list means a latch-only scene.
+        /// a short damage history for each drawable slot; an empty list means a
+        /// latch-only scene.
         public var damage: [Rect]
 
         public init(

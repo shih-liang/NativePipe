@@ -23,6 +23,8 @@ public final class GPUResource {
     public let twoDimensional: Resource2DMetadata?
     /// Mesa's Venus object id, or the packed geometry word for a window.
     public let blobID: UInt64
+    /// Standard VirGL RESOURCE_CREATE_3D resource owned by virglrenderer.
+    public let isVirglResource: Bool
 
     /// Offset inside the host-visible shared memory region, once the guest has
     /// asked for it with `RESOURCE_MAP_BLOB`. Nil while unmapped.
@@ -34,9 +36,6 @@ public final class GPUResource {
     /// actually removed the aperture mapping.
     internal var unmapInFlight = false
     internal var afterUnmap: [(Bool) -> Void] = []
-
-    /// Contexts currently holding a reference, from `CTX_ATTACH_RESOURCE`.
-    public internal(set) var attachedContexts: Set<UInt32> = []
 
     private let pointer: UnsafeMutableRawPointer?
 
@@ -53,7 +52,8 @@ public final class GPUResource {
         byteCount: Int,
         geometry: VirtioGPU.BlobGeometry?,
         twoDimensional: Resource2DMetadata? = nil,
-        blobID: UInt64
+        blobID: UInt64,
+        isVirglResource: Bool = false
     ) {
         self.resourceID = resourceID
         self.pointer = pointer
@@ -62,6 +62,7 @@ public final class GPUResource {
         self.geometry = geometry
         self.twoDimensional = twoDimensional
         self.blobID = blobID
+        self.isVirglResource = isVirglResource
     }
 
     /// A Metal buffer over the exact pages mapped into the guest aperture.
@@ -248,6 +249,17 @@ public final class ResourceTable {
         let resource = GPUResource(
             resourceID: id, pointer: nil, surface: nil, byteCount: byteCount,
             geometry: nil, blobID: blobID)
+        resources[id] = resource
+        return resource
+    }
+
+    @discardableResult
+    public func adoptVirglResource(id: UInt32) throws -> GPUResource {
+        guard resources[id] == nil else { throw ResourceAllocationError.duplicateID(id) }
+        guard id != 0 else { throw ResourceAllocationError.unknownID(id) }
+        let resource = GPUResource(
+            resourceID: id, pointer: nil, surface: nil, byteCount: 0,
+            geometry: nil, blobID: 0, isVirglResource: true)
         resources[id] = resource
         return resource
     }

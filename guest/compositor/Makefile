@@ -8,7 +8,7 @@
 PKGS          := wayland-server libcjson xkbcommon
 CLIENT_PKGS   := wayland-client
 CFLAGS        += -O2 -Wall -Wextra -Wno-unused-parameter -std=gnu11 $(shell pkg-config --cflags $(PKGS))
-LDLIBS        += $(shell pkg-config --libs $(PKGS))
+LDLIBS        += $(shell pkg-config --libs $(PKGS)) -lm
 PROJECT_ROOT  := $(abspath ../../../..)
 ifeq ($(shell pkg-config --exists vulkan 2>/dev/null && echo yes),yes)
 VULKAN_CFLAGS := $(shell pkg-config --cflags vulkan)

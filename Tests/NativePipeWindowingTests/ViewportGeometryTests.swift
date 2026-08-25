@@ -42,6 +42,65 @@ final class ViewportGeometryTests: XCTestCase {
             [.init(x: 0, y: 0, width: new.width, height: new.height)])
     }
 
+	func testDrawableAgeAccumulatesDamageForThreeDrawableRotation() {
+		var tracker = DrawableAgeTracker(capacity: 3)
+		var frame = scene(presentationID: 1)
+		frame.damage = [.init(x: 1, y: 1, width: 2, height: 2)]
+		let first = tracker.plan(
+			drawableID: 10, scene: frame, drawableWidth: 64, drawableHeight: 48)
+		XCTAssertTrue(first.redrawAll)
+		tracker.commit(first)
+
+		frame.presentationID = 2
+		frame.damage = [.init(x: 10, y: 10, width: 2, height: 2)]
+		let second = tracker.plan(
+			drawableID: 11, scene: frame, drawableWidth: 64, drawableHeight: 48)
+		tracker.commit(second)
+
+		frame.presentationID = 3
+		frame.damage = [.init(x: 20, y: 5, width: 3, height: 3)]
+		let third = tracker.plan(
+			drawableID: 12, scene: frame, drawableWidth: 64, drawableHeight: 48)
+		tracker.commit(third)
+
+		frame.presentationID = 4
+		frame.damage = [.init(x: 4, y: 30, width: 2, height: 2)]
+		let reused = tracker.plan(
+			drawableID: 10, scene: frame, drawableWidth: 64, drawableHeight: 48)
+		XCTAssertFalse(reused.redrawAll)
+		XCTAssertEqual(
+			reused.damage, [.init(x: 4, y: 5, width: 19, height: 27)])
+	}
+
+	func testDrawableAgeFallsBackToFullAfterHistoryExpires() {
+		var tracker = DrawableAgeTracker(capacity: 2)
+		var frame = scene(presentationID: 1)
+		for id: UInt64 in 1...3 {
+			frame.presentationID = UInt32(id)
+			frame.damage = [.init(x: Int(id), y: 0, width: 1, height: 1)]
+			let plan = tracker.plan(
+				drawableID: id, scene: frame, drawableWidth: 64, drawableHeight: 48)
+			tracker.commit(plan)
+		}
+		let expired = tracker.plan(
+			drawableID: 1, scene: frame, drawableWidth: 64, drawableHeight: 48)
+		XCTAssertTrue(expired.redrawAll)
+		XCTAssertEqual(expired.damage, [.init(x: 0, y: 0, width: 64, height: 48)])
+	}
+
+	func testDrawableAgeResizeForcesFullRedraw() {
+		var tracker = DrawableAgeTracker(capacity: 3)
+		let frame = scene(presentationID: 1)
+		let first = tracker.plan(
+			drawableID: 7, scene: frame, drawableWidth: 64, drawableHeight: 48)
+		tracker.commit(first)
+
+		let resized = tracker.plan(
+			drawableID: 7, scene: frame, drawableWidth: 80, drawableHeight: 48)
+		XCTAssertTrue(resized.redrawAll)
+		XCTAssertEqual(resized.damage, [.init(x: 0, y: 0, width: 80, height: 48)])
+	}
+
     func testPopupConstraintsPreferFlipThenSlideAndResize() {
         let bounds = CGRect(x: 0, y: 0, width: 800, height: 600)
         let flipped = Windowing.PopupPlacement(
