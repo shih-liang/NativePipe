@@ -358,7 +358,16 @@ final class NativeWindow: NSObject {
         let pointSize = NSSize(
             width: CGFloat(scene.windowGeometry.width),
             height: CGFloat(scene.windowGeometry.height))
-        if window == nil { makeWindow(contentSize: pointSize) }
+        if window == nil {
+            makeWindow(contentSize: pointSize)
+        } else if let window, let popup, window.contentView?.bounds.size != pointSize {
+            // xdg_surface.window_geometry is double-buffered state. Firefox can
+            // commit its final menu geometry after the first popup frame; keep
+            // the native panel on that committed visible bound. Toplevel size
+            // remains AppKit/configure-owned and must not follow stale frames.
+            window.setContentSize(pointSize)
+            position(window, forPopup: popup, size: pointSize)
+        }
     }
 
     private func effectiveGeometry(for frame: Windowing.Frame) -> Windowing.Rect {

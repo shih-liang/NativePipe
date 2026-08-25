@@ -68,6 +68,79 @@ final class ViewportGeometryTests: XCTestCase {
             CGRect(x: 0, y: 20, width: 800, height: 180))
     }
 
+    func testPopupTracksCommittedWindowGeometryAfterFirstScene() throws {
+        final class TextureSource: FrameSource {
+            let device: MTLDevice
+
+            init(device: MTLDevice) { self.device = device }
+
+            func surface(forResource resourceID: UInt32) -> IOSurfaceRef? { nil }
+
+            func metalTextures(
+                for layers: [Windowing.SceneLayer],
+                completion: @escaping @MainActor ([FrameTextureResolution]) -> Void
+            ) {
+                completion(layers.map { layer in
+                    let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+                        pixelFormat: .bgra8Unorm, width: layer.width,
+                        height: layer.height, mipmapped: false)
+                    descriptor.usage = [.shaderRead]
+                    guard let texture = device.makeTexture(descriptor: descriptor) else {
+                        return FrameTextureResolution(status: .unavailable)
+                    }
+                    return FrameTextureResolution(status: .ready, texture: texture)
+                })
+            }
+        }
+
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("Metal is unavailable")
+        }
+        let bridge = WindowBridge(frameSource: TextureSource(device: device))
+        bridge.apply(.surfaceCreated(surface: 1))
+        bridge.apply(.toplevelCreated(window: 8, surface: 1))
+        bridge.apply(.surfaceCreated(surface: 12))
+        bridge.apply(.popupCreated(
+            window: 14, surface: 12, parent: 8,
+            x: 373, y: 182, width: 152, height: 218))
+
+        func popupScene(
+            presentationID: UInt32, width: Int, height: Int
+        ) -> Windowing.SceneSnapshot {
+            Windowing.SceneSnapshot(
+                surface: 12, presentationID: presentationID,
+                width: width * 2, height: height * 2, scale: 2,
+                windowGeometry: .init(x: 0, y: 0, width: width, height: height),
+                layers: [.init(
+                    surface: 12, resourceID: presentationID,
+                    width: width * 2, height: height * 2,
+                    bytesPerRow: width * 8, format: .bgra8888,
+                    destination: .init(
+                        x: 0, y: 0, width: Double(width * 2),
+                        height: Double(height * 2)),
+                    sourcePixels: .init(
+                        x: 0, y: 0, width: Double(width * 2),
+                        height: Double(height * 2)),
+                    clip: .init(
+                        x: 0, y: 0, width: Double(width * 2),
+                        height: Double(height * 2)))],
+                damage: [.init(x: 0, y: 0, width: width * 2, height: height * 2)])
+        }
+
+        bridge.apply(.sceneCommitted(
+            scene: popupScene(presentationID: 1, width: 152, height: 218)))
+        XCTAssertEqual(
+            bridge.window(14)?.window?.contentView?.bounds.size,
+            NSSize(width: 152, height: 218))
+
+        bridge.apply(.sceneCommitted(
+            scene: popupScene(presentationID: 2, width: 197, height: 220)))
+        XCTAssertEqual(
+            bridge.window(14)?.window?.contentView?.bounds.size,
+            NSSize(width: 197, height: 220))
+        bridge.closeAll()
+    }
+
     func testFirefoxBufferMapsToViewportDestinationWithoutChangingBufferScale() {
         let frame = Windowing.Frame(
             resourceID: 47, width: 1_600, height: 1_200,
