@@ -67,16 +67,22 @@ BINARY        := vmpipe-wayland
 REMOTE_BINARY := remotepipe-wayland
 CLIENT        := shmclient
 VKPRESENT     := vkpresent
+ARCH          := $(shell uname -m | sed 's/^arm64$$/aarch64/')
+LIBC          := $(shell ldd --version 2>&1 | grep -qi musl && echo musl || echo gnu)
+DIST_BINARY   := dist/$(BINARY)-$(ARCH)-$(LIBC)
+DIST_REMOTE   := dist/$(REMOTE_BINARY)-$(ARCH)
 ALIGN_BLOB    := ../align-host-blob.so
 ALIGN_LAYER   := ../vulkan-blob-alignment-layer.so
 ALIGN_TEST    := ../align-host-blob-test
 LAYER_TEST    := ../vulkan-blob-alignment-layer-test
 DISCONNECT_TRACE := ../tools/wayland-disconnect-trace.so
 
-.PHONY: all remote clean install install-remote align-blob alignment-self-test disconnect-trace static static-clean
+.PHONY: all remote dist dist-remote dist-clean clean install install-remote align-blob alignment-self-test disconnect-trace static static-clean
 
 all: $(BINARY) $(CLIENT)
 remote: $(REMOTE_BINARY)
+dist: $(DIST_BINARY)
+dist-remote: $(DIST_REMOTE)
 align-blob: $(ALIGN_BLOB) $(ALIGN_LAYER)
 alignment-self-test: $(ALIGN_TEST) $(LAYER_TEST)
 	$(ALIGN_TEST)
@@ -146,6 +152,16 @@ $(REMOTE_BINARY): $(GENERATED) $(SHARED_SOURCES) $(REMOTE_SOURCES)
 	$(CC) $(CFLAGS) $(FFMPEG_CFLAGS) -DNP_REMOTE -o $@ \
 		$(SHARED_SOURCES) $(REMOTE_SOURCES) $(LDLIBS) $(FFMPEG_LIBS)
 
+$(DIST_BINARY): $(BINARY)
+	mkdir -p dist
+	install -m0755 $(BINARY) $@
+	strip $@
+
+$(DIST_REMOTE): $(REMOTE_BINARY)
+	mkdir -p dist
+	install -m0755 $(REMOTE_BINARY) $@
+	strip $@
+
 $(CLIENT): xdg-shell-client-protocol.h xdg-shell-protocol.c \
            text-input-v3-client-protocol.h text-input-v3-protocol.c shmclient.c
 	$(CC) -O2 -Wall -std=gnu11 $(shell pkg-config --cflags $(CLIENT_PKGS)) \
@@ -176,3 +192,6 @@ static:
 
 static-clean:
 	rm -rf dist .deps
+
+dist-clean:
+	rm -rf dist
