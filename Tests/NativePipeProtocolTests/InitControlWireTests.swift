@@ -48,4 +48,28 @@ final class InitControlWireTests: XCTestCase {
         XCTAssertEqual(devices[0].identifier, "nativepipe-root")
         XCTAssertFalse(devices[0].readOnly)
     }
+
+    func testRecoveryReadyHandshakeUsesExistingRuntimeEvent() {
+        var payload = Data(ControlWire.runtimeReadyMagic)
+        for value in [
+            "initramfs-1", "6.18.46", "LightHouse Recovery", "1", "nativepipe-init",
+        ] {
+            appendString(value, to: &payload)
+        }
+        let capabilities = [
+            "init.control", "init.mount", "init.execute", "fs.read", "fs.stat", "fs.write",
+        ]
+        append(UInt16(capabilities.count), to: &payload)
+        for capability in capabilities {
+            appendString(capability, to: &payload)
+        }
+
+        guard case .event(.runtimeReady(let info)) = ControlWire.decode(payload) else {
+            return XCTFail("recovery ready handshake did not decode")
+        }
+        XCTAssertEqual(info.agentVersion, "initramfs-1")
+        XCTAssertEqual(info.initSystem, "nativepipe-init")
+        XCTAssertEqual(info.capabilities, capabilities)
+        XCTAssertTrue(info.isRecoveryEnvironment)
+    }
 }

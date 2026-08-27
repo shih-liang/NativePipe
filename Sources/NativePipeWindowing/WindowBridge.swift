@@ -25,6 +25,18 @@ public struct FrameTextureResolution: @unchecked Sendable {
     }
 }
 
+public struct DockWindow: Sendable, Identifiable, Equatable {
+    public let id: UInt32
+    public let title: String
+    public let applicationID: String?
+
+    public init(id: UInt32, title: String, applicationID: String?) {
+        self.id = id
+        self.title = title
+        self.applicationID = applicationID
+    }
+}
+
 /// Where a committed frame's pixels come from.
 ///
 /// Local scene layers name existing client or wl_shm-upload Venus textures. The
@@ -139,6 +151,12 @@ public final class WindowBridge: NSObject {
                 y: min(max(requestedHotSpot.y, 0), max(0, height - 1))))
     }
 
+    static func topDownCursorImage(_ image: CIImage, source: CGRect) -> CIImage {
+        image.cropped(to: source).transformed(by: CGAffineTransform(
+            a: 1, b: 0, c: 0, d: -1,
+            tx: 0, ty: source.minY + source.maxY))
+    }
+
     /// A Wayland drag icon is neither a window nor part of the target surface.
     /// A non-activating, click-through panel gives it the same global, transient
     /// lifetime while AppKit continues to own window movement and hit testing.
@@ -163,6 +181,7 @@ public final class WindowBridge: NSObject {
             metalLayer.isOpaque = false
             metalLayer.framebufferOnly = true
             panel.contentView = view
+            panel.isExcludedFromWindowsMenu = true
             panel.backgroundColor = .clear
             panel.isOpaque = false
             panel.hasShadow = false
@@ -292,6 +311,11 @@ public final class WindowBridge: NSObject {
 	private var sceneRenderers: [ObjectIdentifier: HostSceneRenderer] = [:]
 	private let displayClock = DisplayClock()
 	private var lastDisplays: [Windowing.Display] = []
+	private struct WindowDisplayState: Equatable {
+		let outputID: UInt32?
+		let scale: Int
+	}
+	private var windowDisplayStates: [UInt32: WindowDisplayState] = [:]
 
     /// Strong on purpose. There is no cycle to break — a frame source refers to
     /// the VM controller weakly, if at all — and a weak reference here silently
@@ -324,6 +348,29 @@ public final class WindowBridge: NSObject {
 
     public var windowCount: Int { windows.count }
 
+    /// Authoritative mapped xdg_toplevels for the VM host's window switcher.
+    /// Popups, cursor surfaces and drag icons never become application windows.
+    public var dockWindows: [DockWindow] {
+        windows.values.compactMap { native in
+            guard !native.isPopup, native.window != nil else { return nil }
+            return DockWindow(
+                id: native.windowID,
+                title: native.title.isEmpty ? "Untitled Window" : native.title,
+                applicationID: native.applicationID)
+        }.sorted {
+            $0.title.localizedStandardCompare($1.title) == .orderedAscending
+        }
+    }
+
+    @discardableResult
+    public func activateDockWindow(_ id: UInt32) -> Bool {
+        guard let native = windows[id], !native.isPopup, native.window != nil else {
+            return false
+        }
+        native.activateFromDock()
+        return true
+    }
+
     public func refreshApplicationIcons() {
         for window in windows.values { window.refreshApplicationIcon() }
     }
@@ -331,6 +378,10 @@ public final class WindowBridge: NSObject {
     func window(_ id: UInt32) -> NativeWindow? { windows[id] }
 
     func currentPointerCursor() -> NSCursor { pointerCursor }
+
+    private func refreshPointerCursor() {
+        for window in windows.values { window.refreshPointerCursor() }
+    }
 
     func applicationIcon(for applicationID: String) -> NSImage? {
         applicationIconProvider?(applicationID)
@@ -354,17 +405,25 @@ public final class WindowBridge: NSObject {
 
 	func windowScreenChanged(_ windowID: UInt32, screen: NSScreen?) {
 		publishDisplayTopology()
-		guard let screen, let outputID = displayID(for: screen) else {
-			send(.windowOutputChanged(window: windowID, outputID: nil))
+		let state = WindowDisplayState(
+			outputID: screen.flatMap { displayID(for: $0) },
+			scale: screen.map { max(1, Int($0.backingScaleFactor.rounded())) } ?? 1)
+		guard windowDisplayStates[windowID] != state else { return }
+		windowDisplayStates[windowID] = state
+		send(.windowOutputChanged(window: windowID, outputID: state.outputID))
+		if state.outputID != nil {
+			send(.scaleChanged(window: windowID, scale: state.scale))
+		}
+	}
+
+	func windowClosed(_ windowID: UInt32) {
+		guard windowDisplayStates.removeValue(forKey: windowID)?.outputID != nil else {
 			return
 		}
-		send(.windowOutputChanged(window: windowID, outputID: outputID))
-		send(.scaleChanged(
-			window: windowID, scale: max(1, Int(screen.backingScaleFactor.rounded()))))
+		send(.windowOutputChanged(window: windowID, outputID: nil))
 	}
 
 	@objc private func screenParametersChanged(_ notification: Notification) {
-		lastDisplays.removeAll(keepingCapacity: true)
 		publishDisplayTopology()
 		for (windowID, native) in windows {
 			registerDisplayClock(native, screen: native.window?.screen)
@@ -473,7 +532,7 @@ public final class WindowBridge: NSObject {
             if cursorSurface == surface {
                 cursorSurface = nil
                 pointerCursor = .arrow
-                pointerCursor.set()
+                refreshPointerCursor()
             }
             if let windowID = surfaceToWindow.removeValue(forKey: surface) {
                 mappedApplicationWindows.remove(windowID)
@@ -570,7 +629,7 @@ public final class WindowBridge: NSObject {
             cursorHotSpot = CGPoint(x: hotspotX, y: hotspotY)
             guard let surface else {
                 pointerCursor = .arrow
-                pointerCursor.set()
+                refreshPointerCursor()
                 break
             }
             if let frame = pendingSurfaceFrames.removeValue(forKey: surface) {
@@ -580,7 +639,7 @@ public final class WindowBridge: NSObject {
         case .cursorShapeChanged(let shape):
             cursorSurface = nil
             pointerCursor = NativeCursorResolver.cursor(for: shape)
-            pointerCursor.set()
+            refreshPointerCursor()
 
         case .titleChanged(let window, let title):
             windows[window]?.title = title
@@ -869,14 +928,15 @@ public final class WindowBridge: NSObject {
             y: CGFloat(texture.height) - source.maxY,
             width: source.width,
             height: source.height)
-        guard let cgImage = cursorContext?.createCGImage(image, from: ciSource) else {
+        let cursorImage = Self.topDownCursorImage(image, source: ciSource)
+        guard let cgImage = cursorContext?.createCGImage(cursorImage, from: ciSource) else {
             completeCopiedPresentation(
                 surface: surface, presentationID: frame.presentationID)
             return
         }
         let nsImage = NSImage(cgImage: cgImage, size: geometry.imageSize)
         pointerCursor = NSCursor(image: nsImage, hotSpot: geometry.hotSpot)
-        pointerCursor.set()
+        refreshPointerCursor()
         pendingSurfaceFrames.removeValue(forKey: surface)
         completeCopiedPresentation(
             surface: surface, presentationID: frame.presentationID)
@@ -1213,6 +1273,7 @@ public final class WindowBridge: NSObject {
         pointerCursor = .arrow
         for (_, window) in windows { window.close() }
         windows.removeAll()
+		windowDisplayStates.removeAll(keepingCapacity: true)
         popupPlacements.removeAll()
         mappedApplicationWindows.removeAll()
         surfaceToWindow.removeAll()

@@ -1,7 +1,4 @@
-import CoreVideo
 import Foundation
-import IOSurface
-import Metal
 import os
 
 /// One guest `resource_id` on the host virtio-gpu.
@@ -13,14 +10,7 @@ import os
 /// original Metal texture while composing directly into a CAMetalDrawable.
 public final class GPUResource {
     public let resourceID: UInt32
-    /// Set only for the legacy virtio-gpu 2D framebuffer path.
-    public let surface: IOSurfaceRef?
     public let byteCount: Int
-    public let geometry: VirtioGPU.BlobGeometry?
-    /// Present only for RESOURCE_CREATE_2D resources. `sourceBytesPerRow` is
-    /// the guest-visible tight stride; `geometry.bytesPerRow` is the IOSurface
-    /// stride and may be larger because Apple aligns scanout rows.
-    public let twoDimensional: Resource2DMetadata?
     /// Mesa's Venus object id, or the packed geometry word for a window.
     public let blobID: UInt64
     /// Standard VirGL RESOURCE_CREATE_3D resource owned by virglrenderer.
@@ -48,88 +38,32 @@ public final class GPUResource {
     init(
         resourceID: UInt32,
         pointer: UnsafeMutableRawPointer?,
-        surface: IOSurfaceRef?,
         byteCount: Int,
-        geometry: VirtioGPU.BlobGeometry?,
-        twoDimensional: Resource2DMetadata? = nil,
         blobID: UInt64,
         isVirglResource: Bool = false
     ) {
         self.resourceID = resourceID
         self.pointer = pointer
-        self.surface = surface
         self.byteCount = byteCount
-        self.geometry = geometry
-        self.twoDimensional = twoDimensional
         self.blobID = blobID
         self.isVirglResource = isVirglResource
-    }
-
-    /// A Metal buffer over the exact pages mapped into the guest aperture.
-    /// Used by the renderer/device implementation, never by application-window
-    /// presentation.
-    public func makeMetalBuffer(using device: MTLDevice) -> MTLBuffer? {
-        guard let pointer else { return nil }
-        return device.makeBuffer(
-            bytesNoCopy: pointer,
-            length: byteCount,
-            options: .storageModeShared,
-            deallocator: nil)
-    }
-
-    /// A BGRA texture view over a legacy 2D IOSurface resource.
-    public func makeMetalTexture(using device: MTLDevice) -> MTLTexture? {
-        guard let geometry, let surface else { return nil }
-        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .bgra8Unorm,
-            width: geometry.width,
-            height: geometry.height,
-            mipmapped: false)
-        descriptor.storageMode = .shared
-        descriptor.usage = [.shaderRead, .shaderWrite, .renderTarget]
-        return device.makeTexture(descriptor: descriptor, iosurface: surface, plane: 0)
-    }
-}
-
-public struct Resource2DMetadata: Equatable, Sendable {
-    public let format: UInt32
-    public let width: Int
-    public let height: Int
-    public let sourceBytesPerRow: Int
-
-    public init(format: UInt32, width: Int, height: Int, sourceBytesPerRow: Int) {
-        self.format = format
-        self.width = width
-        self.height = height
-        self.sourceBytesPerRow = sourceBytesPerRow
     }
 }
 
 public enum ResourceAllocationError: LocalizedError {
     case duplicateID(UInt32)
     case unknownID(UInt32)
-    case allocationFailed(bytes: Int)
     case emptyBlob
     case blobTooLarge(UInt64)
-    case tooSmall(allocated: Int, requested: Int)
     case unalignedPointer
-    case invalidDimensions(width: UInt32, height: UInt32)
-    case unsupportedFormat(UInt32)
 
     public var errorDescription: String? {
         switch self {
         case .duplicateID(let id): return "resource \(id) already exists"
         case .unknownID(let id): return "no such resource \(id)"
-        case .allocationFailed(let bytes): return "could not allocate \(bytes) bytes"
         case .emptyBlob: return "blob size must be greater than zero"
         case .blobTooLarge(let bytes): return "blob size \(bytes) exceeds host address space"
-        case .tooSmall(let allocated, let requested):
-            return "allocated \(allocated) bytes for a blob the guest will map \(requested) of"
         case .unalignedPointer: return "host mapping is not a multiple of the host page"
-        case .invalidDimensions(let width, let height):
-            return "invalid 2D resource dimensions \(width)x\(height)"
-        case .unsupportedFormat(let format):
-            return "unsupported 2D resource format \(format)"
         }
     }
 }
@@ -160,66 +94,6 @@ public final class ResourceTable {
         return (Int(size) + pageSize - 1) / pageSize * pageSize
     }
 
-    /// Linux KMS dumb framebuffer. Guest pages remain the authoritative
-    /// backing; TRANSFER_TO_HOST_2D copies only the requested rectangle into
-    /// this IOSurface, which is then presented without another CPU copy.
-    @discardableResult
-    public func create2D(
-        id: UInt32, format: UInt32, width: UInt32, height: UInt32
-    ) throws -> GPUResource {
-        guard resources[id] == nil else { throw ResourceAllocationError.duplicateID(id) }
-        guard id != 0, width > 0, height > 0 else {
-            throw ResourceAllocationError.invalidDimensions(width: width, height: height)
-        }
-        guard let wireFormat = VirtioGPU.Format(rawValue: format),
-              wireFormat.isSupportedScanout32Bit
-        else { throw ResourceAllocationError.unsupportedFormat(format) }
-
-        let widthInt = Int(width)
-        let heightInt = Int(height)
-        let (tightStride, strideOverflow) = widthInt.multipliedReportingOverflow(by: 4)
-        guard !strideOverflow else {
-            throw ResourceAllocationError.invalidDimensions(width: width, height: height)
-        }
-        let hostStride = IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, tightStride)
-        let (minimumBytes, sizeOverflow) = hostStride.multipliedReportingOverflow(by: heightInt)
-        guard !sizeOverflow, minimumBytes > 0 else {
-            throw ResourceAllocationError.invalidDimensions(width: width, height: height)
-        }
-
-        guard let surface = IOSurface(properties: [
-            .width: widthInt,
-            .height: heightInt,
-            .bytesPerElement: 4,
-            .bytesPerRow: hostStride,
-            .allocSize: minimumBytes,
-            .pixelFormat: kCVPixelFormatType_32BGRA,
-        ]) else {
-            throw ResourceAllocationError.allocationFailed(bytes: minimumBytes)
-        }
-        let ref = surface as IOSurfaceRef
-        let byteCount = IOSurfaceGetAllocSize(ref)
-        guard byteCount >= minimumBytes else {
-            throw ResourceAllocationError.tooSmall(
-                allocated: byteCount, requested: minimumBytes)
-        }
-        let geometry = VirtioGPU.BlobGeometry(
-            width: widthInt, height: heightInt, bytesPerRow: hostStride)
-        let metadata = Resource2DMetadata(
-            format: format, width: widthInt, height: heightInt,
-            sourceBytesPerRow: tightStride)
-        let resource = GPUResource(
-            resourceID: id,
-            pointer: IOSurfaceGetBaseAddress(ref),
-            surface: ref,
-            byteCount: byteCount,
-            geometry: geometry,
-            twoDimensional: metadata,
-            blobID: 0)
-        resources[id] = resource
-        return resource
-    }
-
     /// Mesa Venus blob: adopt the host pointer virglrenderer already mapped.
     /// The guest will see these pages through the aperture. We do not own them.
     @discardableResult
@@ -233,8 +107,7 @@ public final class ResourceTable {
             throw ResourceAllocationError.unalignedPointer
         }
         let resource = GPUResource(
-            resourceID: id, pointer: pointer, surface: nil, byteCount: byteCount,
-            geometry: nil, blobID: blobID)
+            resourceID: id, pointer: pointer, byteCount: byteCount, blobID: blobID)
         resources[id] = resource
         return resource
     }
@@ -247,8 +120,7 @@ public final class ResourceTable {
         guard resources[id] == nil else { throw ResourceAllocationError.duplicateID(id) }
         let byteCount = try alignedByteCount(for: size)
         let resource = GPUResource(
-            resourceID: id, pointer: nil, surface: nil, byteCount: byteCount,
-            geometry: nil, blobID: blobID)
+            resourceID: id, pointer: nil, byteCount: byteCount, blobID: blobID)
         resources[id] = resource
         return resource
     }
@@ -258,8 +130,8 @@ public final class ResourceTable {
         guard resources[id] == nil else { throw ResourceAllocationError.duplicateID(id) }
         guard id != 0 else { throw ResourceAllocationError.unknownID(id) }
         let resource = GPUResource(
-            resourceID: id, pointer: nil, surface: nil, byteCount: 0,
-            geometry: nil, blobID: 0, isVirglResource: true)
+            resourceID: id, pointer: nil, byteCount: 0,
+            blobID: 0, isVirglResource: true)
         resources[id] = resource
         return resource
     }

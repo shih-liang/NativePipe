@@ -338,6 +338,32 @@ final class ViewportGeometryTests: XCTestCase {
         XCTAssertEqual(geometry.hotSpot, CGPoint(x: 19, y: 0))
     }
 
+    func testCustomCursorImageIsFlippedWithinItsSourceRect() {
+        let source = CGRect(x: 0, y: 0, width: 1, height: 2)
+        let lower = CIImage(color: .red).cropped(
+            to: CGRect(x: 0, y: 0, width: 1, height: 1))
+        let upper = CIImage(color: .blue).cropped(
+            to: CGRect(x: 0, y: 1, width: 1, height: 1))
+        let image = upper.composited(over: lower)
+
+        let flipped = WindowBridge.topDownCursorImage(image, source: source)
+
+        XCTAssertEqual(flipped.extent, source)
+        let context = CIContext(options: [.useSoftwareRenderer: true])
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        func pixels(_ input: CIImage) -> [UInt8] {
+            var result = [UInt8](repeating: 0, count: 8)
+            context.render(
+                input, toBitmap: &result, rowBytes: 4, bounds: source,
+                format: .RGBA8, colorSpace: colorSpace)
+            return result
+        }
+        let before = pixels(image)
+        let after = pixels(flipped)
+        XCTAssertEqual(Array(after[0..<4]), Array(before[4..<8]))
+        XCTAssertEqual(Array(after[4..<8]), Array(before[0..<4]))
+    }
+
     func testMissingSceneTextureIsDeferredRatherThanReleased() {
         let bridge = WindowBridge(frameSource: nil)
         var commands: [Windowing.HostCommand] = []

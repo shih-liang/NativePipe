@@ -11,7 +11,6 @@ let package = Package(
     products: [
         .library(name: "NativePipeProtocol", targets: ["NativePipeProtocol"]),
         .library(name: "NativePipeWindowing", targets: ["NativePipeWindowing"]),
-        .library(name: "NativePipeGPU", targets: ["NativePipeGPU"]),
         .library(name: "NativePipeRemote", targets: ["NativePipeRemote"]),
         .executable(name: "remotepipe", targets: ["NativePipeRemoteApp"]),
     ],
@@ -21,23 +20,6 @@ let package = Package(
     targets: [
         .target(
             name: "NativePipeProtocol",
-            swiftSettings: [.swiftLanguageMode(.v5)]
-        ),
-        // Host side of the virtual GPU: one virglrenderer instance advertises
-        // VirGL/VirGL2 for guest OpenGL and Venus for guest Vulkan.
-        .target(
-            name: "NativePipeVenus",
-            publicHeadersPath: "include",
-            linkerSettings: [
-                .linkedFramework("CoreFoundation"),
-                .linkedFramework("IOSurface"),
-            ]
-        ),
-        // Standalone on purpose: the GPU device talks to Virtualization, Metal
-        // and IOSurface, and knows nothing about VM bundles or the guest agent.
-        .target(
-            name: "NativePipeGPU",
-            dependencies: ["NativePipeVenus", "NativePipeProtocol"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         // Wayland guest events ↔ NSWindow / clipboard / key codes.
@@ -75,12 +57,6 @@ let package = Package(
         .testTarget(
             name: "NativePipeWindowingTests",
             dependencies: ["NativePipeWindowing", "NativePipeProtocol"],
-            swiftSettings: [.swiftLanguageMode(.v5)]
-        ),
-        .testTarget(
-            name: "NativePipeGPUTests",
-            dependencies: ["NativePipeGPU", "NativePipeProtocol"],
-            path: "Tests/NativePipeGPUTests",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]

@@ -61,20 +61,19 @@ typedef struct np_venus_blob {
 	uint64_t size;
 } np_venus_blob;
 
-/// Opens the renderer. Always returns an object: without virglrenderer the
-/// device still maps blobs for the compositor, it just does not advertise 3D
-/// capsets, so Mesa will not try to start VirGL or Venus.
+/// Initializes the virglrenderer code linked into LightHouseVMHost.
+/// Always returns an object; `np_venus_is_live` reports initialization failure
+/// (for example, when the bundled ANGLE runtime cannot create a Metal display).
 np_venus *np_venus_create(void);
 
-/// Releases this VM's resources, contexts, and fence callbacks. ANGLE and
-/// virglrenderer are process singletons shared by all VM clients and are not
-/// reset or unloaded when one VM stops.
+/// Releases this VM's resources, contexts, renderer, and fence callbacks.
+/// A VMHost owns exactly one renderer and exits with that VM.
 void np_venus_destroy(np_venus *venus);
 
 /// True when virglrenderer initialized and reported at least one 3D capset.
 bool np_venus_is_live(const np_venus *venus);
 
-/// Fills the Venus GET_CAPSET_INFO entry. Zeros if the renderer is absent.
+/// Fills the Venus GET_CAPSET_INFO entry. Zeros if initialization failed.
 void np_venus_capset_info(np_venus *venus, uint32_t *max_version, uint32_t *max_size);
 
 /// Writes the capset blob. `buffer` must be at least `max_size` bytes.

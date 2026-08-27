@@ -3,7 +3,9 @@ import Foundation
 /// Port assignments for NativePipe's independent services.
 public enum NativePipePort {
     // guestd: low, fixed control-plane ports.
-    /// guestd's main RPC endpoint. The host connects; the guest listens.
+    /// Main RPC endpoint. Installed guestd listens and the host connects.
+    /// Recovery init reverses the direction: the host listens on the same
+    /// destination port and init connects only after normal boot fails.
     public static let control: UInt32 = 1024
 
     /// Agent file pull. The host listens; guestd/bootstrap connects.

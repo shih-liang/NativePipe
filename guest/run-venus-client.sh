@@ -45,7 +45,8 @@ fi
 # A 4 KiB guest needs blob sizes rounded to the 16 KiB host page. A native
 # 16 KiB LightHouse kernel already provides that invariant and needs no shim.
 # Copy off the virtiofs share: some guests refuse PROT_EXEC mmap there.
-ALIGN_SRC=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/align-host-blob.so
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/compositor
+ALIGN_SRC=$(make -s -C "$HERE" print-align)
 ALIGN_INSTALLED=/usr/libexec/nativepipe/nativepipe-align-host-blob.so
 LAYER_INSTALLED=/usr/libexec/nativepipe/nativepipe-vulkan-blob-alignment.so
 LAYER_MANIFEST=/etc/vulkan/implicit_layer.d/VkLayer_NATIVEPIPE_blob_alignment.json
@@ -102,7 +103,6 @@ export MESA_DEBUG="${MESA_DEBUG:-1}"
 export MESA_VK_WSI_DEBUG="${MESA_VK_WSI_DEBUG:-binds}"
 unset WAYLAND_DEBUG
 CLIENT="${NATIVEPIPE_VENUS_CLIENT:-vkcube}"
-HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/compositor
 
 if [ "$CLIENT" = vkpresent ]; then
 	if ! pkg-config --exists vulkan 2>/dev/null; then
@@ -120,7 +120,8 @@ if [ "$CLIENT" = vkpresent ]; then
 		cat "$LOG_DIR/vkpresent-build.log" >> "$LOG_DIR/vkcube.log"
 		exit 1
 	fi
-	nohup "$HERE/vkpresent" > "$LOG_DIR/vkcube.log" 2>&1 &
+	VKPRESENT=$(make -s -C "$HERE" print-vkpresent)
+	nohup "$VKPRESENT" > "$LOG_DIR/vkcube.log" 2>&1 &
 	echo "vkpresent pid $!" >> "$LOG_DIR/vulkaninfo.log"
 else
 	if ! command -v vkcube >/dev/null 2>&1; then

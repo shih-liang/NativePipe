@@ -42,7 +42,7 @@ import Foundation
 ///     NPER  error         id(u64) code(u32) msg_len(u16) msg
 ///
 /// Guest → host events (no request id):
-///     NPRT  runtimeReady  GuestInfo
+///     NPRT  runtimeReady  GuestInfo (also recovery init's outbound handshake)
 ///     NPEX  processExited pid(i32) status(i32)
 ///     NPLG  log           level_len(u16) level msg_len(u16) msg
 ///

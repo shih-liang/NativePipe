@@ -2,10 +2,9 @@ import Foundation
 
 /// The virtio-gpu wire protocol, as much of it as NativePipe speaks.
 ///
-/// NativePipe implements one optional scanout plus VirGL and Venus render nodes.
-/// The 2D path is deliberately small but complete: Linux can allocate a dumb
-/// framebuffer in guest RAM, transfer damaged rectangles into an IOSurface and
-/// flush that surface to the host. `SUBMIT_3D` remains opaque renderer payload.
+/// NativePipe implements VirGL and Venus render nodes and advertises zero
+/// scanouts. Application windows use renderer resources; Apple's separate
+/// Virtio graphics device owns the optional full-VM framebuffer.
 public enum VirtioGPU {
 
     // MARK: - Device identity
@@ -585,20 +584,6 @@ extension VirtioGPU {
             size = try reader.readUInt64()
             entries = try (0..<entryCount).map { _ in try MemoryEntry(parsing: &reader) }
         }
-    }
-
-    /// Host-visible geometry used by the legacy 2D framebuffer resource.
-    public struct BlobGeometry: Equatable {
-        public var width: Int
-        public var height: Int
-        public var bytesPerRow: Int
-
-        public init(width: Int, height: Int, bytesPerRow: Int) {
-            self.width = width
-            self.height = height
-            self.bytesPerRow = bytesPerRow
-        }
-        public var byteCount: Int { bytesPerRow * height }
     }
 
     /// `struct virtio_gpu_mem_entry` — a guest physical range. The host reaches

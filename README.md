@@ -12,8 +12,8 @@ written **once**. VM and Remote only swap transport (vsock/virtio vs TCP/H.264).
 |---|---|
 | `Sources/NativePipeProtocol` | NPIP framing, window events/commands, ports, NPEN |
 | `Sources/NativePipeWindowing` | `WindowBridge` / `NativeWindow` → `NSWindow` |
-| `Sources/NativePipeGPU` | Host virtio-gpu (`VZCustomVirtioDevice`) — **VM** |
-| `Sources/NativePipeVenus` | C bridge: VirGL→ANGLE/Metal and Venus→MoltenVK/Metal — **VM** |
+| `Sources/NativePipeGPU` | Host virtio-gpu (`VZCustomVirtioDevice`) — built only by the root LightHouse package |
+| `Sources/NativePipeVenus` | VMHost-only C bridge — built only by the root LightHouse package |
 | `Sources/NativePipeRemote` | TCP client, VideoToolbox decode, `DisplaySession` — **Remote** |
 | `Sources/NativePipeRemoteApp` | `remotepipe` CLI (SSH only; display via NativePipeRemote) |
 | `guest/compositor` | Shared compositor core + thin VM/Remote mains |
@@ -30,12 +30,17 @@ swift build -c release --product remotepipe
 
 | Target | Binary | Role |
 |---|---|---|
-| `make` | **`vmpipe-wayland`** | LightHouse **VM**: vsock + virtio blobs / VirGL + Venus |
-| `make remote` | **`remotepipe-wayland`** | **Bare metal**: TCP `1025`/`1026` + H.264 |
+| `make` | **`.build/<arch>-<libc>/vmpipe-wayland`** | LightHouse **VM**: vsock + virtio blobs / VirGL + Venus |
+| `make remote` | **`.build/<arch>-<libc>/remotepipe-wayland`** | **Bare metal**: TCP `1025`/`1026` + H.264 |
 
 Shared code: `compositor.c`, `hostlink`, Wayland protocols.  
 VM-only objects: `blob.c`, `dmabuf.c`, `vmpipe_main.c`.  
 Remote-only objects: `medialink.c`, `encoder`, `remotepipe_main.c` (no virtio).
+
+The standalone package intentionally exposes only protocol, windowing, and
+remote targets so it keeps its macOS 14 deployment contract. VM GPU targets use
+macOS 27 Virtualization APIs and external renderer SDKs, and are owned by the
+root LightHouse build.
 
 ### VM guest
 
@@ -44,7 +49,8 @@ cd guest/compositor
 apk add build-base linux-headers wayland-dev wayland-protocols cjson-dev \
         libxkbcommon-dev
 make
-# → vmpipe-wayland
+make -s print-binary
+# → .../guest/compositor/.build/aarch64-musl/vmpipe-wayland
 ```
 
 ### Remote bare-metal host
@@ -54,7 +60,7 @@ cd guest/compositor
 apk add build-base linux-headers wayland-dev wayland-protocols cjson-dev \
         libxkbcommon-dev ffmpeg-dev
 make remote
-# → remotepipe-wayland
+# → .build/aarch64-musl/remotepipe-wayland
 ```
 
 | Port | Content |
@@ -68,7 +74,7 @@ With `remotepipe-wayland` installed on the Linux host:
 
 ```bash
 remotepipe user@host
-remotepipe user@host --compositor ~/nativepipe-guest/compositor/remotepipe-wayland
+remotepipe user@host --compositor ~/nativepipe-guest/compositor/.build/aarch64-gnu/remotepipe-wayland
 remotepipe user@host -i ~/.ssh/id_ed25519 -p 2222
 ```
 
@@ -89,7 +95,7 @@ What it does (SSH in the CLI; display via `NativePipeRemote.DisplaySession`):
 ssh -N -L 1025:127.0.0.1:1025 -L 1026:127.0.0.1:1026 user@linux
 
 # Terminal B — Linux
-./remotepipe-wayland
+./.build/aarch64-gnu/remotepipe-wayland
 
 # Terminal C — Mac
 remotepipe --host 127.0.0.1

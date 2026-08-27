@@ -338,6 +338,12 @@ public struct GuestInfo: Sendable {
         self.environmentIDLike = environmentIDLike
         self.architecture = architecture
     }
+
+    /// `nativepipe-init` shares the NPIP transport with guestd but is an early
+    /// recovery environment, not a process-launch service.
+    public var isRecoveryEnvironment: Bool {
+        capabilities.contains(GuestCapability.initControl)
+    }
 }
 
 /// Unsolicited guest → host notifications (binary events on the control channel).

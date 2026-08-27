@@ -179,6 +179,18 @@ final class NativeWindow: NSObject {
 
     var isPopup: Bool { popup != nil }
     var applicationID: String? { appID }
+    var pointerCursor: NSCursor { bridge?.currentPointerCursor() ?? .arrow }
+
+    func refreshPointerCursor() {
+        window?.invalidateCursorRects(for: contentView)
+    }
+
+    func activateFromDock() {
+        guard let window, !isPopup else { return }
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(contentView)
+    }
 
     /// The guest compositor sends one already-composited scene per window.
     /// This is the only content layer at the host boundary.
@@ -213,7 +225,9 @@ final class NativeWindow: NSObject {
         window.styleMask = styleMaskForToplevel()
         applyToplevelAppearance(to: window)
         window.setFrame(window.frameRect(forContentRect: contentRect), display: true)
-        window.title = enabled ? title : ""
+        // CSD hides the title visually, but NSWindow.title remains the semantic
+        // xdg_toplevel title used by Dock menus, Window menu and accessibility.
+        window.title = title
     }
 
     func setConstraints(minimum: Windowing.Size?, maximum: Windowing.Size?) {
@@ -401,6 +415,7 @@ final class NativeWindow: NSObject {
             panel.isFloatingPanel = true
             panel.becomesKeyOnlyIfNeeded = true
             panel.collectionBehavior = [.transient, .fullScreenAuxiliary]
+            panel.isExcludedFromWindowsMenu = true
             // GTK supplies alpha for rounded corners and the menu outline. If
             // AppKit composites that over NSWindow's default background, the
             // transparent top edge becomes a conspicuous white strip.
@@ -446,7 +461,7 @@ final class NativeWindow: NSObject {
             window.orderFront(nil)
         } else {
             applyToplevelAppearance(to: window)
-            window.title = serverDecorated ? title : ""
+            window.title = title
             window.center()
             // Ordering front is not enough. If NativePipe is not the frontmost
             // application — and four minutes after launch it usually is not — the
@@ -541,7 +556,7 @@ final class NativeWindow: NSObject {
             bridge?.send(.framePresented(
                 surface: presentation.surface, presentationID: presentation.id))
         }
-		bridge?.windowScreenChanged(windowID, screen: nil)
+		bridge?.windowClosed(windowID)
 		bridge?.unregisterDisplayClock(self)
         asyncScenePresenter?.cancelPending()
 		asyncScenePresenter?.invalidateDrawableAges()
@@ -1085,6 +1100,11 @@ private final class SurfaceView: NSView {
     override var isFlipped: Bool { true }
 
     override var acceptsFirstResponder: Bool { true }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: input?.pointerCursor ?? .arrow)
+    }
 
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
