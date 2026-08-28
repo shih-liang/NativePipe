@@ -11,7 +11,9 @@
 #include "xdg_shell.h"
 #include "xdg-shell-server-protocol.h"
 
+#include <errno.h>
 #include <stdint.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -669,6 +671,23 @@ void np_input_handle_host_command(const char *name, cJSON *body, void *user_data
 			// A request, not an order: the client decides whether to exit.
 			xdg_toplevel_send_close(surface->toplevel);
 			wl_display_flush_clients(server->display);
+		}
+		return;
+	}
+
+	if (strcmp(name, "forceQuit") == 0) {
+		struct np_surface *surface = np_surface_by_window(
+			server, (uint32_t)json_int(body, "window", 0));
+		if (!surface || !surface->resource) return;
+
+		struct wl_client *client = wl_resource_get_client(surface->resource);
+		pid_t pid = -1;
+		uid_t uid = 0;
+		gid_t gid = 0;
+		wl_client_get_credentials(client, &pid, &uid, &gid);
+		if (pid > 1 && pid != getpid() && kill(pid, SIGKILL) < 0) {
+			fprintf(stderr, "[wayland] force quit pid %ld failed: %s\n",
+			        (long)pid, strerror(errno));
 		}
 		return;
 	}

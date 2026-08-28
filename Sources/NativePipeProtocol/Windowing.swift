@@ -486,6 +486,9 @@ extension Windowing {
         case configure(window: UInt32, size: Size, states: [ToplevelState], serial: UInt32)
         /// User clicked the close button. This is a request — the client decides.
         case close(window: UInt32)
+        /// The user explicitly confirmed Force Quit. The guest compositor kills
+        /// only the process that owns this Wayland connection.
+        case forceQuit(window: UInt32)
 
         /// Dismiss a popup: the click went elsewhere, or the parent lost focus.
         /// Like close, this is a request; the client tears the popup down.

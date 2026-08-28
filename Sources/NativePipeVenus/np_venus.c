@@ -916,6 +916,14 @@ int np_venus_create_blob(np_venus *venus, uint32_t ctx_id, np_venus_blob *blob) 
 	if (args.blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_MAPPABLE) {
 		void *map = NULL;
 		uint64_t map_size = 0;
+		if (virgl_renderer_resource_get_map_info(blob->resource_id,
+		                                         &blob->map_info) != 0) {
+			note("blob res=%u has no renderer map info", blob->resource_id);
+			virgl_renderer_resource_unref(blob->resource_id);
+			end_renderer_call(venus, entry->virgl_3d);
+			free(entry);
+			return -EINVAL;
+		}
 		if (virgl_renderer_resource_map(blob->resource_id, &map, &map_size) == 0 && map) {
 			blob->pointer = map;
 			if (map_size > 0) blob->size = map_size;

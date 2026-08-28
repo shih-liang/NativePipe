@@ -619,6 +619,10 @@ extension VirtioGPU {
             self.mapInfo = mapInfo.rawValue
         }
 
+        public init(mapInfo: UInt32) {
+            self.mapInfo = mapInfo
+        }
+
         public func encoded() -> Data {
             var writer = LittleEndianWriter()
             writer.write(mapInfo)

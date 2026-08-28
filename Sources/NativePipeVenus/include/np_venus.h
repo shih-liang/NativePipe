@@ -57,6 +57,7 @@ typedef struct np_venus_blob {
 	uint32_t resource_id;
 	uint64_t blob_id;
 	uint32_t blob_flags;
+	uint32_t map_info;
 	void *pointer;
 	uint64_t size;
 } np_venus_blob;

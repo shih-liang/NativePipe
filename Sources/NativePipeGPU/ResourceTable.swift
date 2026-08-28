@@ -15,6 +15,8 @@ public final class GPUResource {
     public let blobID: UInt64
     /// Standard VirGL RESOURCE_CREATE_3D resource owned by virglrenderer.
     public let isVirglResource: Bool
+    /// Renderer-provided `VIRTIO_GPU_MAP_CACHE_*` value for mappable blobs.
+    public let mapInfo: UInt32
 
     /// Offset inside the host-visible shared memory region, once the guest has
     /// asked for it with `RESOURCE_MAP_BLOB`. Nil while unmapped.
@@ -40,12 +42,14 @@ public final class GPUResource {
         pointer: UnsafeMutableRawPointer?,
         byteCount: Int,
         blobID: UInt64,
+        mapInfo: UInt32 = 0,
         isVirglResource: Bool = false
     ) {
         self.resourceID = resourceID
         self.pointer = pointer
         self.byteCount = byteCount
         self.blobID = blobID
+        self.mapInfo = mapInfo
         self.isVirglResource = isVirglResource
     }
 }
@@ -98,7 +102,8 @@ public final class ResourceTable {
     /// The guest will see these pages through the aperture. We do not own them.
     @discardableResult
     public func adoptHostMapping(
-        id: UInt32, pointer: UnsafeMutableRawPointer, size: UInt64, blobID: UInt64
+        id: UInt32, pointer: UnsafeMutableRawPointer, size: UInt64, blobID: UInt64,
+        mapInfo: UInt32
     ) throws -> GPUResource {
         guard resources[id] == nil else { throw ResourceAllocationError.duplicateID(id) }
         let byteCount = try alignedByteCount(for: size)
@@ -107,7 +112,8 @@ public final class ResourceTable {
             throw ResourceAllocationError.unalignedPointer
         }
         let resource = GPUResource(
-            resourceID: id, pointer: pointer, byteCount: byteCount, blobID: blobID)
+            resourceID: id, pointer: pointer, byteCount: byteCount, blobID: blobID,
+            mapInfo: mapInfo)
         resources[id] = resource
         return resource
     }

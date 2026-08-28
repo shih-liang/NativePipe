@@ -871,7 +871,7 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
                 Self.log.info("resource \(resource.resourceID) mapped at region offset \(offset)")
                 Self.note("map     res=\(resource.resourceID) offset=\(offset) size=\(resource.byteCount)")
 
-                let info = VirtioGPU.MapInfoResponse(mapInfo: .cached)
+                let info = VirtioGPU.MapInfoResponse(mapInfo: resource.mapInfo)
                 self.respond(element, header.reply(.okMapInfo), body: info.encoded())
                 done()
             }
@@ -984,6 +984,7 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
             resource_id: request.resourceID,
             blob_id: request.blobID,
             blob_flags: request.blobFlags,
+            map_info: 0,
             pointer: nil,
             size: request.size)
         let createResult = np_venus_create_blob(venus, header.contextID, &blob)
@@ -993,7 +994,8 @@ public final class VirtioGPUDevice: NSObject, @unchecked Sendable {
                 if let pointer = blob.pointer {
                     resource = try resources.adoptHostMapping(
                         id: request.resourceID, pointer: pointer,
-                        size: blob.size, blobID: request.blobID)
+                        size: blob.size, blobID: request.blobID,
+                        mapInfo: blob.map_info)
                 } else {
                     // DEVICE_LOCAL / MTLHeap: pixels stay in Metal; the guest
                     // only needs the resource id for linux-dmabuf present.

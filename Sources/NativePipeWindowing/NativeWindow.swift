@@ -111,6 +111,7 @@ final class NativeWindow: NSObject {
     private(set) var window: NSWindow?
     private let contentView = SurfaceView()
     private weak var bridge: WindowBridge?
+    private weak var transientParent: NativeWindow?
 
     private var appID: String?
     private var applicationIcon: NSImage?
@@ -179,6 +180,10 @@ final class NativeWindow: NSObject {
 
     var isPopup: Bool { popup != nil }
     var applicationID: String? { appID }
+    var dockIcon: NSImage? { applicationIcon }
+    var isMiniaturized: Bool { window?.isMiniaturized == true }
+    var isZoomed: Bool { window?.isZoomed == true }
+    var isFullscreen: Bool { window?.styleMask.contains(.fullScreen) == true }
     var pointerCursor: NSCursor { bridge?.currentPointerCursor() ?? .arrow }
 
     func refreshPointerCursor() {
@@ -190,6 +195,23 @@ final class NativeWindow: NSObject {
         if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(contentView)
+    }
+
+    func minimizeFromDock() {
+        guard let window, !isPopup else { return }
+        window.performMiniaturize(nil)
+    }
+
+    func toggleZoomFromDock() {
+        guard let window, !isPopup else { return }
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.zoom(nil)
+    }
+
+    func toggleFullscreenFromDock() {
+        guard let window, !isPopup else { return }
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.toggleFullScreen(nil)
     }
 
     /// The guest compositor sends one already-composited scene per window.
@@ -263,11 +285,16 @@ final class NativeWindow: NSObject {
     }
 
     func setParent(_ parent: NativeWindow?) {
+        transientParent = parent
+        applyParent()
+    }
+
+    private func applyParent() {
         guard let window else { return }
         if let existing = window.parent {
             existing.removeChildWindow(window)
         }
-        parent?.window?.addChildWindow(window, ordered: .above)
+        transientParent?.window?.addChildWindow(window, ordered: .above)
     }
 
     // MARK: - Content
@@ -449,6 +476,7 @@ final class NativeWindow: NSObject {
         // before the user can begin an interactive resize.
         self.window = window
         applyConstraints()
+        applyParent()
 
         if let popup {
             window.hasShadow = true

@@ -29,11 +29,21 @@ public struct DockWindow: Sendable, Identifiable, Equatable {
     public let id: UInt32
     public let title: String
     public let applicationID: String?
+    public let isMiniaturized: Bool
+    public let isZoomed: Bool
+    public let isFullscreen: Bool
 
-    public init(id: UInt32, title: String, applicationID: String?) {
+    public init(
+        id: UInt32, title: String, applicationID: String?,
+        isMiniaturized: Bool = false, isZoomed: Bool = false,
+        isFullscreen: Bool = false
+    ) {
         self.id = id
         self.title = title
         self.applicationID = applicationID
+        self.isMiniaturized = isMiniaturized
+        self.isZoomed = isZoomed
+        self.isFullscreen = isFullscreen
     }
 }
 
@@ -356,7 +366,10 @@ public final class WindowBridge: NSObject {
             return DockWindow(
                 id: native.windowID,
                 title: native.title.isEmpty ? "Untitled Window" : native.title,
-                applicationID: native.applicationID)
+                applicationID: native.applicationID,
+                isMiniaturized: native.isMiniaturized,
+                isZoomed: native.isZoomed,
+                isFullscreen: native.isFullscreen)
         }.sorted {
             $0.title.localizedStandardCompare($1.title) == .orderedAscending
         }
@@ -369,6 +382,52 @@ public final class WindowBridge: NSObject {
         }
         native.activateFromDock()
         return true
+    }
+
+    public func iconForDockWindow(_ id: UInt32) -> NSImage? {
+        windows[id]?.dockIcon
+    }
+
+    @discardableResult
+    public func minimizeDockWindow(_ id: UInt32) -> Bool {
+        guard let native = dockWindow(id) else { return false }
+        native.minimizeFromDock()
+        return true
+    }
+
+    @discardableResult
+    public func toggleZoomDockWindow(_ id: UInt32) -> Bool {
+        guard let native = dockWindow(id) else { return false }
+        native.toggleZoomFromDock()
+        return true
+    }
+
+    @discardableResult
+    public func toggleFullscreenDockWindow(_ id: UInt32) -> Bool {
+        guard let native = dockWindow(id) else { return false }
+        native.toggleFullscreenFromDock()
+        return true
+    }
+
+    @discardableResult
+    public func requestCloseDockWindow(_ id: UInt32) -> Bool {
+        guard dockWindow(id) != nil else { return false }
+        send(.close(window: id))
+        return true
+    }
+
+    @discardableResult
+    public func forceQuitDockWindow(_ id: UInt32) -> Bool {
+        guard dockWindow(id) != nil else { return false }
+        send(.forceQuit(window: id))
+        return true
+    }
+
+    private func dockWindow(_ id: UInt32) -> NativeWindow? {
+        guard let native = windows[id], !native.isPopup, native.window != nil else {
+            return nil
+        }
+        return native
     }
 
     public func refreshApplicationIcons() {
