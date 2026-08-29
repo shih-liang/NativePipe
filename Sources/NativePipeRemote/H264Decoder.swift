@@ -5,6 +5,11 @@ import VideoToolbox
 
 /// Incremental H.264 Annex-B → CVPixelBuffer decoder (VideoToolbox).
 final class H264Decoder {
+    private final class FrameToken {
+        let resourceID: UInt32
+        init(_ resourceID: UInt32) { self.resourceID = resourceID }
+    }
+
     private var session: VTDecompressionSession?
     private var formatDescription: CMVideoFormatDescription?
     private var sps: Data?
@@ -13,7 +18,7 @@ final class H264Decoder {
     private var height: Int = 0
     private var epoch: UInt16 = 0
 
-    var onFrame: ((CVPixelBuffer) -> Void)?
+    var onFrame: ((UInt32, CVPixelBuffer) -> Void)?
 
     func reset() {
         if let session {
@@ -29,7 +34,10 @@ final class H264Decoder {
 
     deinit { reset() }
 
-    func decode(annexB: Data, width: Int, height: Int, bitstreamEpoch: UInt16) {
+    func decode(
+        annexB: Data, width: Int, height: Int,
+        bitstreamEpoch: UInt16, resourceID: UInt32
+    ) {
         if bitstreamEpoch != 0, bitstreamEpoch != epoch {
             reset()
             epoch = bitstreamEpoch
@@ -68,7 +76,7 @@ final class H264Decoder {
             fflush(stderr)
             return
         }
-        decodeAccessUnit(vcl)
+        decodeAccessUnit(vcl, resourceID: resourceID)
     }
 
     private func rebuildFormatIfPossible() {
@@ -110,11 +118,14 @@ final class H264Decoder {
             self.session = nil
         }
         var callback = VTDecompressionOutputCallbackRecord(
-            decompressionOutputCallback: { refcon, _, status, _, imageBuffer, _, _ in
+            decompressionOutputCallback: { refcon, sourceFrameRefCon, status, _, imageBuffer, _, _ in
                 guard let refcon else { return }
                 let decoder = Unmanaged<H264Decoder>.fromOpaque(refcon).takeUnretainedValue()
+                let resourceID = sourceFrameRefCon.map {
+                    Unmanaged<FrameToken>.fromOpaque($0).takeRetainedValue().resourceID
+                }
                 if status == noErr, let imageBuffer {
-                    decoder.onFrame?(imageBuffer)
+                    if let resourceID { decoder.onFrame?(resourceID, imageBuffer) }
                 } else if status != noErr {
                     fputs("nativepipe-remote: VT callback status=\(status)\n", stderr)
                 }
@@ -144,7 +155,7 @@ final class H264Decoder {
     }
 
     /// One access unit: all VCL NALs length-prefixed (AVCC) in a single sample.
-    private func decodeAccessUnit(_ nals: [Data]) {
+    private func decodeAccessUnit(_ nals: [Data], resourceID: UInt32) {
         guard let session, let formatDescription else { return }
         var packet = Data()
         for nal in nals {
@@ -194,10 +205,12 @@ final class H264Decoder {
 
         var flagsOut: VTDecodeInfoFlags = []
         let asynchronous = VTDecodeFrameFlags(rawValue: 1 << 0)
+        let token = Unmanaged.passRetained(FrameToken(resourceID)).toOpaque()
         let decodeStatus = VTDecompressionSessionDecodeFrame(
             session, sampleBuffer: sampleBuffer, flags: asynchronous,
-            frameRefcon: nil, infoFlagsOut: &flagsOut)
+            frameRefcon: token, infoFlagsOut: &flagsOut)
         if decodeStatus != noErr {
+            Unmanaged<FrameToken>.fromOpaque(token).release()
             fputs("nativepipe-remote: VTDecode status=\(decodeStatus)\n", stderr)
             fflush(stderr)
         }

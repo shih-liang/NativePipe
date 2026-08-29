@@ -5,7 +5,6 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <linux/vm_sockets.h>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -22,41 +21,8 @@
 static void set_nonblocking(int fd) {
 	int flags = fcntl(fd, F_GETFL, 0);
 	if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
-
-bool np_host_listen(struct np_host *host, uint32_t port) {
-	memset(host, 0, sizeof(*host));
-	host->listen_fd = -1;
-	host->conn_fd = -1;
-	host->port = port;
-	host->transport = NP_HOST_VSOCK;
-
-	int fd = socket(AF_VSOCK, SOCK_STREAM, 0);
-	if (fd < 0) {
-		fprintf(stderr, "[wayland] vsock socket: %s\n", strerror(errno));
-		return false;
-	}
-
-	struct sockaddr_vm addr;
-	memset(&addr, 0, sizeof(addr));
-	addr.svm_family = AF_VSOCK;
-	addr.svm_cid = VMADDR_CID_ANY;
-	addr.svm_port = port;
-	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		fprintf(stderr, "[wayland] vsock bind %u: %s\n", port, strerror(errno));
-		close(fd);
-		return false;
-	}
-	if (listen(fd, 1) < 0) {
-		fprintf(stderr, "[wayland] vsock listen: %s\n", strerror(errno));
-		close(fd);
-		return false;
-	}
-
-	set_nonblocking(fd);
-	host->listen_fd = fd;
-	fprintf(stderr, "[wayland] window channel listening on vsock port %u\n", port);
-	return true;
+	flags = fcntl(fd, F_GETFD, 0);
+	if (flags >= 0) fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
 }
 
 bool np_host_listen_tcp(struct np_host *host, uint32_t port) {
@@ -64,7 +30,6 @@ bool np_host_listen_tcp(struct np_host *host, uint32_t port) {
 	host->listen_fd = -1;
 	host->conn_fd = -1;
 	host->port = port;
-	host->transport = NP_HOST_TCP;
 
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (fd < 0) {

@@ -1,4 +1,4 @@
-// Shared Wayland compositor assembly (vmpipe-wayland / remotepipe-wayland).
+// RemotePipe Wayland compositor assembly.
 //
 // Protocol state, input, presentation and host transport live in focused
 // translation units. This file owns only process setup and the event loop.
@@ -17,9 +17,6 @@
 #include "text_input.h"
 #include "xdg_shell.h"
 #include "xwayland.h"
-#ifndef NP_REMOTE
-#include "virtio_resource.h"
-#endif
 #include "fifo-v1-server-protocol.h"
 #include "text-input-v3-server-protocol.h"
 #include "xdg-shell-server-protocol.h"
@@ -66,11 +63,7 @@ int np_compositor_run(int argc, char **argv)
 	server.keymap_fd = -1;
 	server.drm_fd = -1;
 	server.watched_host_fd = -1;
-#ifndef NP_REMOTE
-	server.watched_host_control_fd = -1;
-	server.watched_host_input_fd = -1;
-	server.watched_host_feedback_fd = -1;
-#endif
+	server.watched_media_fd = -1;
 	wl_list_init(&server.surfaces);
 	wl_list_init(&server.shm_textures);
 	wl_list_init(&server.outputs);
@@ -86,17 +79,8 @@ int np_compositor_run(int argc, char **argv)
 	signal(SIGPIPE, SIG_IGN);
 	np_host_session_reset_readiness();
 
-#ifdef NP_REMOTE
 	fprintf(stderr,
 	        "[wayland] remote build: TCP 1025/1026, H.264 encode, no virtio blobs\n");
-#else
-	server.drm_fd = np_virtio_open_lookup_node();
-	if (server.drm_fd < 0) {
-		fprintf(stderr,
-		        "[wayland] no virtio-gpu render node; cannot allocate host buffers\n");
-		return 1;
-	}
-#endif
 
 	server.display = wl_display_create();
 	if (!server.display) {
@@ -125,10 +109,7 @@ int np_compositor_run(int argc, char **argv)
 	wl_global_create(server.display, &zwp_text_input_manager_v3_interface,
 	                 1, &server, np_text_input_manager_bind);
 	np_decoration_advertise(server.display, &server);
-#ifndef NP_REMOTE
-	np_dmabuf_advertise(server.display, server.drm_fd);
-	np_syncobj_advertise(server.display, &server);
-#endif
+		 np_dmabuf_advertise(server.display, server.drm_fd);
 
 	/* Host endpoints exist before the Wayland socket becomes launchable. */
 	if (!np_host_session_listen(&server)) return 1;
@@ -165,8 +146,5 @@ int np_compositor_run(int argc, char **argv)
 	np_host_session_finish(&server);
 	np_xwayland_finish(&server);
 	wl_display_destroy(server.display);
-#ifndef NP_REMOTE
-	if (server.drm_fd >= 0) close(server.drm_fd);
-#endif
 	return 0;
 }

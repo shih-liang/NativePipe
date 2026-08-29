@@ -2,22 +2,58 @@ import Foundation
 
 /// Encoded media frame on the NativePipe media port (`NativePipePort.media`).
 ///
-/// Layout is little-endian, fixed 32-byte header, then `payloadLength` bytes
+/// Layout is little-endian, fixed 36-byte header, then `payloadLength` bytes
 /// of codec bitstream (H.264 Annex-B for codec == h264).
 public enum MediaWire {
-    public static let headerSize = 32
+    public static let version: UInt8 = 2
+    public static let headerSize = 36
     public static let maximumPayloadSize = 32 * 1024 * 1024
     public static let magic = Data("NPEN".utf8)
+    public static let flagHasAlpha: UInt8 = 1 << 0
 
     public enum Codec: UInt8, Sendable {
         case h264 = 1
+        case alphaRLE = 2
+    }
+
+    /// Decodes the PackBits alpha sidecar used for translucent Wayland
+    /// surfaces. The exact output size is part of validation, so malformed
+    /// network data cannot overrun the destination or silently truncate.
+    public static func decodeAlphaRLE(_ payload: Data, pixelCount: Int) -> Data? {
+        guard pixelCount > 0, pixelCount <= maximumPayloadSize else { return nil }
+        var output = Data(capacity: pixelCount)
+        var input = payload.startIndex
+        while input < payload.endIndex, output.count < pixelCount {
+            let tag = payload[input]
+            input += 1
+            if tag <= 127 {
+                let count = Int(tag) + 1
+                guard input + count <= payload.endIndex,
+                      output.count + count <= pixelCount else { return nil }
+                output.append(payload[input..<(input + count)])
+                input += count
+            } else if tag >= 129 {
+                let count = 257 - Int(tag)
+                guard input < payload.endIndex,
+                      output.count + count <= pixelCount else { return nil }
+                output.append(contentsOf: repeatElement(payload[input], count: count))
+                input += 1
+            } else {
+                return nil
+            }
+        }
+        guard input == payload.endIndex, output.count == pixelCount else { return nil }
+        return output
     }
 
     public struct Header: Sendable {
         public var version: UInt8
         public var codec: Codec
         public var flags: UInt8
+        /// H.264 decoder stream. One stream exists per Wayland surface.
         public var surfaceID: UInt32
+        /// Immutable decoded frame named by a committed scene layer.
+        public var resourceID: UInt32
         public var width: UInt16
         public var height: UInt16
         public var ptsNanos: UInt64
@@ -25,10 +61,11 @@ public enum MediaWire {
         public var bitstreamEpoch: UInt16
 
         public init(
-            version: UInt8 = 1,
+            version: UInt8 = MediaWire.version,
             codec: Codec = .h264,
             flags: UInt8 = 0,
             surfaceID: UInt32,
+            resourceID: UInt32,
             width: UInt16,
             height: UInt16,
             ptsNanos: UInt64,
@@ -39,6 +76,7 @@ public enum MediaWire {
             self.codec = codec
             self.flags = flags
             self.surfaceID = surfaceID
+            self.resourceID = resourceID
             self.width = width
             self.height = height
             self.ptsNanos = ptsNanos
@@ -54,6 +92,7 @@ public enum MediaWire {
             data.append(flags)
             data.append(0) // pad to align surfaceID
             appendUInt32(&data, surfaceID)
+            appendUInt32(&data, resourceID)
             appendUInt16(&data, width)
             appendUInt16(&data, height)
             appendUInt64(&data, ptsNanos)
@@ -67,18 +106,23 @@ public enum MediaWire {
             guard data.count >= MediaWire.headerSize else { return nil }
             guard data.prefix(4).elementsEqual(MediaWire.magic) else { return nil }
             let version = data[4]
-            guard version == 1 else { return nil }
+            guard version == MediaWire.version else { return nil }
             guard let codec = Codec(rawValue: data[5]) else { return nil }
             let flags = data[6]
             let surfaceID = readUInt32(data, 8)
-            let width = readUInt16(data, 12)
-            let height = readUInt16(data, 14)
-            let pts = readUInt64(data, 16)
-            let length = readUInt32(data, 24)
-            let epoch = readUInt16(data, 28)
+            let resourceID = readUInt32(data, 12)
+            let width = readUInt16(data, 16)
+            let height = readUInt16(data, 18)
+            let pts = readUInt64(data, 20)
+            let length = readUInt32(data, 28)
+            let epoch = readUInt16(data, 32)
+            guard surfaceID != 0, resourceID != 0, width != 0, height != 0 else {
+                return nil
+            }
             return Header(
                 version: version, codec: codec, flags: flags,
-                surfaceID: surfaceID, width: width, height: height,
+                surfaceID: surfaceID, resourceID: resourceID,
+                width: width, height: height,
                 ptsNanos: pts, payloadLength: length, bitstreamEpoch: epoch)
         }
     }

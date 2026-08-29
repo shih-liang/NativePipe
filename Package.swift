@@ -1,12 +1,9 @@
 // swift-tools-version: 6.0
 import PackageDescription
 
-/// NativePipe — Wayland↔macOS display bridge.
-///
-/// Reusable without Virtualization: remote real-machine hosts depend only on
-/// this package. LightHouse (VM management) depends on it from the repo root.
+/// RemotePipe — remote Linux Wayland applications as native macOS windows.
 let package = Package(
-    name: "NativePipe",
+    name: "RemotePipe",
     platforms: [.macOS(.v14)],
     products: [
         .library(name: "NativePipeProtocol", targets: ["NativePipeProtocol"]),
@@ -14,9 +11,7 @@ let package = Package(
         .library(name: "NativePipeRemote", targets: ["NativePipeRemote"]),
         .executable(name: "remotepipe", targets: ["NativePipeRemoteApp"]),
     ],
-    dependencies: [
-        .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
-    ],
+    dependencies: [],
     targets: [
         .target(
             name: "NativePipeProtocol",
@@ -57,6 +52,16 @@ let package = Package(
         .testTarget(
             name: "NativePipeWindowingTests",
             dependencies: ["NativePipeWindowing", "NativePipeProtocol"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .testTarget(
+            name: "NativePipeRemoteTests",
+            dependencies: ["NativePipeRemote", "NativePipeProtocol"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .testTarget(
+            name: "NativePipeRemoteAppTests",
+            dependencies: ["NativePipeRemoteApp"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]

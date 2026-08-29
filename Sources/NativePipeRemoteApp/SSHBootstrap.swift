@@ -108,16 +108,21 @@ enum SSHBootstrap {
         sshArguments: [String]
     ) throws -> Process {
         let remote = """
-            if [ ! -f /tmp/remotepipe-wayland.env ]; then \
-              echo 'remotepipe: missing /tmp/remotepipe-wayland.env (is the compositor running?)' >&2; \
+            RUNTIME="/tmp/remotepipe-xdg-$(id -u)"; \
+            ENV="$RUNTIME/remotepipe-wayland.env"; \
+            if [ ! -f "$ENV" ]; then \
+              echo "remotepipe: missing $ENV (is the compositor running?)" >&2; \
               exit 1; \
             fi; \
-            . /tmp/remotepipe-wayland.env; \
+            . "$ENV"; \
             if [ -z "${WAYLAND_DISPLAY:-}" ] || [ -z "${XDG_RUNTIME_DIR:-}" ]; then \
-              echo 'remotepipe: /tmp/remotepipe-wayland.env incomplete' >&2; \
+              echo "remotepipe: $ENV incomplete" >&2; \
               exit 1; \
             fi; \
             export WAYLAND_DISPLAY XDG_RUNTIME_DIR; \
+            [ -z "${DISPLAY:-}" ] || export DISPLAY; \
+            [ -z "${XAUTHORITY:-}" ] || export XAUTHORITY; \
+            [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] || export DBUS_SESSION_BUS_ADDRESS; \
             printf 'WAYLAND_DISPLAY=%s XDG_RUNTIME_DIR=%s\\n' "$WAYLAND_DISPLAY" "$XDG_RUNTIME_DIR" \
               > /tmp/remotepipe-shell-started; \
             printf 'remotepipe: remote shell WAYLAND_DISPLAY=%s (runtime %s)\\n' \
@@ -152,19 +157,18 @@ enum SSHBootstrap {
 
     // MARK: - helpers
 
-    private static func ensureScript(compositor: String) -> String {
+    static func ensureScript(compositor: String) -> String {
         let path = shellEscape(compositor)
-        let log = "/tmp/remotepipe-wayland.log"
-        let envFile = "/tmp/remotepipe-wayland.env"
         // Dedicated XDG_RUNTIME_DIR so a session compositor that already owns
         // $XDG_RUNTIME_DIR/wayland-0 cannot collide with ours. Clients in the
-        // nativepipe ssh shell inherit the same runtime + WAYLAND_DISPLAY.
+        // RemotePipe ssh shell inherit the same runtime + display variables.
         return """
             set -e
             COMPOSITOR=\(path)
-            LOG=\(log)
-            ENV=\(envFile)
             RUNTIME="/tmp/remotepipe-xdg-$(id -u)"
+            LOG="$RUNTIME/remotepipe-wayland.log"
+            ENV="$RUNTIME/remotepipe-wayland.env"
+            PID="$RUNTIME/remotepipe-wayland.pid"
             mkdir -p "$RUNTIME"
             chmod 700 "$RUNTIME"
             if ! command -v "$COMPOSITOR" >/dev/null 2>&1 && [ ! -x "$COMPOSITOR" ]; then
@@ -173,34 +177,56 @@ enum SSHBootstrap {
             fi
             listening() {
               if command -v ss >/dev/null 2>&1; then
-                ss -ltn 2>/dev/null | grep -q ':1025'
+                sockets=$(ss -ltn 2>/dev/null)
               else
-                netstat -ltn 2>/dev/null | grep -q ':1025'
+                sockets=$(netstat -ltn 2>/dev/null)
               fi
+              printf '%s\\n' "$sockets" | grep -Eq '[:.]1025[[:space:]]' &&
+                printf '%s\\n' "$sockets" | grep -Eq '[:.]1026[[:space:]]'
             }
-            if ! listening; then
-              rm -f "$ENV"
+            owned_compositor() {
+              tracked_alive || return 1
+              listening
+            }
+            tracked_alive() {
+              [ -s "$PID" ] || return 1
+              pid=$(cat "$PID" 2>/dev/null) || return 1
+              case "$pid" in *[!0-9]*|'') return 1 ;; esac
+              kill -0 "$pid" 2>/dev/null
+            }
+            if ! owned_compositor; then
+              if tracked_alive; then
+                echo "remotepipe: tracked compositor is alive but both ports are not ready" >&2
+                echo "remotepipe: inspect $LOG or stop PID $(cat "$PID") before retrying" >&2
+                exit 1
+              fi
+              if listening; then
+                echo 'remotepipe: ports 1025/1026 belong to an untracked process' >&2
+                echo "remotepipe: stop it or remove stale $PID after verifying ownership" >&2
+                exit 1
+              fi
+              rm -f "$ENV" "$PID"
               env XDG_RUNTIME_DIR="$RUNTIME" nohup "$COMPOSITOR" >"$LOG" 2>&1 &
-              for _ in $(seq 1 25); do
-                listening && break
+              compositor_pid=$!
+              printf '%s\\n' "$compositor_pid" >"$PID.tmp"
+              mv "$PID.tmp" "$PID"
+              attempts=0
+              while [ "$attempts" -lt 25 ]; do
+                owned_compositor && [ -f "$ENV" ] && break
+                kill -0 "$compositor_pid" 2>/dev/null || break
+                attempts=$((attempts + 1))
                 sleep 0.2
               done
             fi
-            if ! listening; then
-              echo "remotepipe: compositor failed to listen on 127.0.0.1:1025" >&2
+            if ! owned_compositor; then
+              echo "remotepipe: compositor failed to listen on 127.0.0.1:1025/1026" >&2
               tail -n 40 "$LOG" 2>/dev/null >&2 || true
+              rm -f "$PID"
               exit 1
-            fi
-            # Prefer the env file the compositor writes; fall back to its log.
-            if [ ! -f "$ENV" ] && [ -f "$LOG" ]; then
-              parsed=$(grep -E 'WAYLAND_DISPLAY=' "$LOG" | tail -n 1 | sed -E 's/.*WAYLAND_DISPLAY=//' | tr -d '[:space:]' || true)
-              if [ -n "$parsed" ]; then
-                printf 'WAYLAND_DISPLAY=%s\\nXDG_RUNTIME_DIR=%s\\n' "$parsed" "$RUNTIME" >"$ENV"
-              fi
             fi
             if [ ! -f "$ENV" ]; then
               echo "remotepipe: compositor is up but WAYLAND_DISPLAY is unknown" >&2
-              echo "remotepipe: restart it under XDG_RUNTIME_DIR=$RUNTIME or check $LOG" >&2
+              tail -n 40 "$LOG" 2>/dev/null >&2 || true
               exit 1
             fi
             . "$ENV"

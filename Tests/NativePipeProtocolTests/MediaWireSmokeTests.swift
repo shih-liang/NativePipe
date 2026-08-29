@@ -200,7 +200,7 @@ final class MediaWireSmokeTests: XCTestCase {
 
     func testNPENRoundTrip() {
         let header = MediaWire.Header(
-            surfaceID: 17, width: 320, height: 200,
+            surfaceID: 17, resourceID: 23, width: 320, height: 200,
             ptsNanos: 123, payloadLength: 4, bitstreamEpoch: 2)
         var frame = header.encoded()
         XCTAssertEqual(frame.count, MediaWire.headerSize)
@@ -209,9 +209,22 @@ final class MediaWireSmokeTests: XCTestCase {
         let out = demux.push(frame)
         XCTAssertEqual(out.count, 1)
         XCTAssertEqual(out[0].0.surfaceID, 17)
+        XCTAssertEqual(out[0].0.resourceID, 23)
         XCTAssertEqual(out[0].0.width, 320)
         XCTAssertEqual(out[0].0.bitstreamEpoch, 2)
         XCTAssertEqual(out[0].1, Data([0, 0, 0, 1]))
+    }
+
+    func testAlphaPackBitsDecodesLiteralsAndRuns() throws {
+        let payload = Data([
+            2, 0, 1, 2,       // three literals
+            253, 7,           // four 7s
+            0, 9,             // one literal
+        ])
+        let alpha = try XCTUnwrap(MediaWire.decodeAlphaRLE(payload, pixelCount: 8))
+        XCTAssertEqual(alpha, Data([0, 1, 2, 7, 7, 7, 7, 9]))
+        XCTAssertNil(MediaWire.decodeAlphaRLE(payload, pixelCount: 7))
+        XCTAssertNil(MediaWire.decodeAlphaRLE(Data([128]), pixelCount: 1))
     }
 
     func testEncodedFrameSourceKind() throws {
@@ -236,36 +249,19 @@ final class MediaWireSmokeTests: XCTestCase {
         XCTAssertEqual(protocolVersion, 1)
     }
 
-    func testExecWireSurvivesFragmentationAndMagicInPTYData() throws {
-        let bytes = Data("before-NPXT-after".utf8)
-        let dataFrame = try ExecWire.data(bytes)
-        let resizeFrame = try ExecWire.resize(cols: 132, rows: 44)
-        let stream = dataFrame + resizeFrame
-        var decoder = ExecWire.Decoder()
-        for byte in stream {
-            decoder.append(Data([byte]))
-        }
-        let first = try XCTUnwrap(decoder.next())
-        XCTAssertEqual(first.kind, .data)
-        XCTAssertEqual(first.payload, bytes)
-        let second = try XCTUnwrap(decoder.next())
-        XCTAssertEqual(second.kind, .resize)
-        XCTAssertEqual(second.payload.count, 8)
-        XCTAssertNil(try decoder.next())
-    }
-
     func testMediaDemuxerRejectsOversizedFrameAndResynchronizes() {
         var invalid = MediaWire.Header(
-            surfaceID: 1, width: 1, height: 1, ptsNanos: 0,
+            surfaceID: 1, resourceID: 1, width: 1, height: 1, ptsNanos: 0,
             payloadLength: UInt32(MediaWire.maximumPayloadSize + 1)).encoded()
         let validHeader = MediaWire.Header(
-            surfaceID: 99, width: 2, height: 3, ptsNanos: 4,
+            surfaceID: 99, resourceID: 100, width: 2, height: 3, ptsNanos: 4,
             payloadLength: 1).encoded()
         invalid.append(validHeader)
         invalid.append(0x7f)
         let output = MediaWire.Demuxer().push(invalid)
         XCTAssertEqual(output.count, 1)
         XCTAssertEqual(output[0].0.surfaceID, 99)
+        XCTAssertEqual(output[0].0.resourceID, 100)
         XCTAssertEqual(output[0].1, Data([0x7f]))
     }
 }

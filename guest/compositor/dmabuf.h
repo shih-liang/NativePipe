@@ -7,8 +7,7 @@
 
 struct np_sync_point;
 
-/// Guest-side linux-dmabuf. Mesa Venus exports a virtio-gpu resource as a
-/// dma-buf; its resource id maps directly to the existing host MTLTexture.
+/// Imports a single-plane linear dma-buf for CPU-side video encoding.
 void np_dmabuf_advertise(struct wl_display *display, int drm_fd);
 
 /// A buffer created from linux-dmabuf, or NULL if this wl_buffer is wl_shm.
@@ -17,6 +16,7 @@ struct np_gpu_buffer {
 	int32_t width;
 	int32_t height;
 	int32_t stride;
+	/* Normalized WL_SHM_FORMAT_ARGB8888 or WL_SHM_FORMAT_XRGB8888. */
 	uint32_t format;
 };
 
@@ -45,6 +45,10 @@ enum np_gpu_read_result np_gpu_buffer_render_status(
  * VIRTGPU_WAIT/export-sync-file per layer would duplicate that synchronization. */
 bool np_gpu_buffer_acquire_host_read(struct np_gpu_buffer *buffer);
 void np_gpu_buffer_end_host_read(struct np_gpu_buffer *buffer);
+/* RemotePipe maps linear dma-buf pixels only for the short encoder copy. */
+bool np_gpu_buffer_begin_cpu_read(
+	struct np_gpu_buffer *buffer, const unsigned char **pixels);
+void np_gpu_buffer_end_cpu_read(struct np_gpu_buffer *buffer);
 bool np_gpu_buffer_is_busy(struct np_gpu_buffer *buffer);
 /* Signal an explicit-sync release point once this buffer has no current
  * surface owners and no host Metal reads. Takes ownership of point. */

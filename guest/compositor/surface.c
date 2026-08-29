@@ -261,12 +261,10 @@ static void surface_resource_destroy(struct wl_resource *resource) {
 	}
 	np_presentation_set_current_buffer(surface, NULL, NULL, NULL);
 	np_syncobj_surface_destroyed(surface);
-#ifdef NP_REMOTE
 	if (surface->encoder) {
 		np_encoder_destroy(surface->encoder);
 		surface->encoder = NULL;
 	}
-#endif
 	free(surface->title);
 	free(surface->app_id);
 	surface->title = surface->app_id = NULL;
@@ -274,9 +272,6 @@ static void surface_resource_destroy(struct wl_resource *resource) {
 	np_region_fini(&surface->input_region);
 	np_region_fini(&surface->pending_opaque_region);
 	np_region_fini(&surface->opaque_region);
-#ifndef NP_REMOTE
-	np_scene_destroy(surface);
-#endif
 	wl_list_remove(&surface->link);
 	free(surface);
 }

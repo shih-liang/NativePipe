@@ -166,7 +166,6 @@ void np_presentation_finish_feedback(struct np_server *server)
 }
 
 
-#ifdef NP_REMOTE
 static uint64_t monotonic_ns(void) {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -174,23 +173,32 @@ static uint64_t monotonic_ns(void) {
 }
 
 static void encoder_emit(void *user, const uint8_t *data, size_t size, uint64_t pts_ns,
-                         uint16_t bitstream_epoch, uint16_t width, uint16_t height) {
+	                         uint32_t resource_id, uint8_t flags,
+	                         const uint8_t *alpha, uint32_t alpha_size,
+	                         uint16_t bitstream_epoch,
+	                         uint16_t width, uint16_t height) {
 	struct np_surface *surface = user;
 	if (!surface || !surface->server) return;
-	np_media_send(&surface->server->media, surface->id, width, height, pts_ns, bitstream_epoch,
-	              data, (uint32_t)size);
+	if (alpha && alpha_size)
+		(void)np_media_send(
+			&surface->server->media, NP_MEDIA_CODEC_ALPHA_RLE, 0,
+			surface->id, resource_id, width, height, pts_ns,
+			bitstream_epoch, alpha, alpha_size);
+	np_media_send(&surface->server->media, NP_MEDIA_CODEC_H264, flags,
+	              surface->id, resource_id,
+	              width, height, pts_ns, bitstream_epoch, data, (uint32_t)size);
 }
 
-static void queue_encoded_committed(struct np_surface *surface, int32_t width, int32_t height,
-                                    const char *format_name, uint32_t presentation_id) {
+static void queue_encoded_committed(struct np_surface *surface,
+                                    uint32_t presentation_id) {
 	uint16_t epoch = surface->encoder ? np_encoder_epoch(surface->encoder) : surface->last_epoch;
 	surface->last_epoch = epoch;
 	cJSON *frame = cJSON_CreateObject();
-	cJSON_AddNumberToObject(frame, "resourceID", surface->id);
-	cJSON_AddNumberToObject(frame, "width", width);
-	cJSON_AddNumberToObject(frame, "height", height);
-	cJSON_AddNumberToObject(frame, "bytesPerRow", width * 4);
-	cJSON_AddStringToObject(frame, "format", format_name);
+	cJSON_AddNumberToObject(frame, "resourceID", surface->last_resource_id);
+	cJSON_AddNumberToObject(frame, "width", surface->last_width);
+	cJSON_AddNumberToObject(frame, "height", surface->last_height);
+	cJSON_AddNumberToObject(frame, "bytesPerRow", surface->last_stride);
+	cJSON_AddStringToObject(frame, "format", surface->last_format);
 	cJSON_AddStringToObject(frame, "source", "encoded");
 	cJSON_AddStringToObject(frame, "codec", "h264");
 	cJSON_AddNumberToObject(frame, "bitstreamEpoch", epoch);
@@ -207,14 +215,6 @@ static void queue_encoded_committed(struct np_surface *surface, int32_t width, i
 	np_presentation_add_viewport(surface, frame);
 	cJSON_AddItemToObject(frame, "damage", cJSON_CreateArray());
 
-	surface->last_format = format_name;
-	surface->last_width = width;
-	surface->last_height = height;
-	surface->last_resource_id = surface->id;
-	surface->last_stride = (uint32_t)(width * 4);
-	surface->last_source = "encoded";
-	surface->has_published = true;
-
 	cJSON *body = cJSON_CreateObject();
 	cJSON_AddNumberToObject(body, "surface", surface->id);
 	cJSON_AddItemToObject(body, "frame", frame);
@@ -223,46 +223,101 @@ static void queue_encoded_committed(struct np_surface *surface, int32_t width, i
 	surface->pending_presentation_id = presentation_id;
 }
 
-/// Remote path: encode wl_shm pixels to H.264 and ship NPEN on the media port.
-static void publish_frame_remote(struct np_surface *surface, struct wl_shm_buffer *shm,
-                                 uint32_t presentation_id) {
+static uint32_t next_media_resource_id(struct np_server *server)
+{
+	uint32_t id = ++server->next_media_resource_id;
+	if (!id) id = ++server->next_media_resource_id;
+	return id;
+}
+
+static bool source_has_transparency(
+	const unsigned char *source, int32_t width, int32_t height, int32_t stride)
+{
+	for (int32_t row = 0; row < height; row++) {
+		const unsigned char *pixel = source + (size_t)row * (size_t)stride + 3;
+		for (int32_t column = 0; column < width; column++, pixel += 4) {
+			if (*pixel != 255) return true;
+		}
+	}
+	return false;
+}
+
+static bool encode_remote_pixels(
+	struct np_surface *surface, const unsigned char *source,
+	int32_t width, int32_t height, int32_t stride, uint32_t format)
+{
+	if (!source || width < 2 || height < 2 || width >= UINT16_MAX ||
+	    height >= UINT16_MAX || width > INT32_MAX / 4 || stride < width * 4)
+		return false;
+	if (format != WL_SHM_FORMAT_ARGB8888 && format != WL_SHM_FORMAT_XRGB8888)
+		return false;
+	const char *format_name = format == WL_SHM_FORMAT_ARGB8888 ? "bgra8888"
+		: "bgrx8888";
+
+	if (!surface->encoder) {
+		surface->encoder = np_encoder_create(
+			(width + 1) & ~1, (height + 1) & ~1, encoder_emit, surface);
+		if (!surface->encoder) {
+			fprintf(stderr, "[wayland] encoder create failed surface=%u\n", surface->id);
+			return false;
+		}
+	}
+
+	uint32_t resource_id = next_media_resource_id(surface->server);
+	uint64_t pts = monotonic_ns();
+	uint8_t flags = format == WL_SHM_FORMAT_ARGB8888 &&
+	                source_has_transparency(source, width, height, stride)
+		? NP_MEDIA_FLAG_HAS_ALPHA : 0;
+	if (!np_encoder_push_bgra(
+			surface->encoder, source, width, height, stride, pts, resource_id,
+			flags)) {
+		fprintf(stderr, "[wayland] encode failed surface=%u\n", surface->id);
+		return false;
+	}
+	surface->last_width = width;
+	surface->last_height = height;
+	surface->last_stride = (uint32_t)(width * 4);
+	surface->last_format = format_name;
+	surface->last_source = "encoded";
+	surface->last_resource_id = resource_id;
+	surface->has_published = true;
+	return true;
+}
+
+/// Copy a wl_shm commit into the asynchronous H.264 encoder before releasing it.
+static bool publish_frame_remote(struct np_surface *surface, struct wl_shm_buffer *shm) {
 	wl_shm_buffer_begin_access(shm);
 	const unsigned char *source = wl_shm_buffer_get_data(shm);
 	int32_t width = wl_shm_buffer_get_width(shm);
 	int32_t height = wl_shm_buffer_get_height(shm);
 	int32_t stride = wl_shm_buffer_get_stride(shm);
 	uint32_t format = wl_shm_buffer_get_format(shm);
-	if (!source || width < 2 || height < 2) {
-		wl_shm_buffer_end_access(shm);
-		return;
-	}
-
-	const char *format_name = format == WL_SHM_FORMAT_ARGB8888 ? "bgra8888"
-		: format == WL_SHM_FORMAT_XRGB8888 ? "bgrx8888"
-		: "rgba8888";
-
-	if (!surface->encoder) {
-		surface->encoder = np_encoder_create(width, height, encoder_emit, surface);
-		if (!surface->encoder) {
-			fprintf(stderr, "[wayland] encoder create failed surface=%u\n", surface->id);
-			wl_shm_buffer_end_access(shm);
-			return;
-		}
-	}
-
-	surface->last_width = width;
-	surface->last_height = height;
-	uint64_t pts = monotonic_ns();
-	if (!np_encoder_push_bgra(surface->encoder, source, width, height, stride, pts)) {
-		fprintf(stderr, "[wayland] encode failed surface=%u\n", surface->id);
-		wl_shm_buffer_end_access(shm);
-		return;
-	}
+	bool encoded = encode_remote_pixels(
+		surface, source, width, height, stride, format);
 	wl_shm_buffer_end_access(shm);
-	queue_encoded_committed(surface, width, height, format_name, presentation_id);
+	return encoded;
 }
 
-#endif
+bool np_presentation_republish_remote(struct np_surface *surface)
+{
+	if (!surface || !surface->encoder || !surface->has_published ||
+	    !surface->last_resource_id)
+		return false;
+	uint32_t replacement = next_media_resource_id(surface->server);
+	uint32_t active = 0;
+	if (np_encoder_replay_last(
+			surface->encoder, monotonic_ns(), replacement, &active) && active)
+		surface->last_resource_id = active;
+	else
+		np_encoder_force_keyframe(surface->encoder);
+	uint32_t presentation_id = np_presentation_next_id(surface->server);
+	if (np_scene_root(surface))
+		np_presentation_queue_scene(surface, presentation_id);
+	else
+		queue_encoded_committed(surface, presentation_id);
+	return true;
+}
+
 
 
 /// Publish one atomic layer snapshot per xdg window. Guest Wayland state is
@@ -272,7 +327,6 @@ void np_presentation_flush(struct np_server *server) {
 	 * partial multi-port session that cannot return both latch and release. */
 	if (!server->host_session_ready) return;
 	struct np_surface *surface;
-#ifndef NP_REMOTE
 	wl_list_for_each(surface, &server->surfaces, link) {
 		if (!surface->scene_dirty || np_scene_root(surface) != surface)
 			continue;
@@ -321,15 +375,11 @@ void np_presentation_flush(struct np_server *server) {
 		surface->scene_dirty = false;
 		surface->scene_presentation_id = 0;
 	}
-#endif
 
-	/* Unroled surfaces (cursor and drag icon) and the remote encoder retain the
-	 * ordinary one-surface frame path. */
+	/* Cursor and drag-icon surfaces are not part of an xdg window scene. */
 	wl_list_for_each(surface, &server->surfaces, link) {
 		if (!surface->pending_frame) continue;
-#ifndef NP_REMOTE
 		if (np_scene_root(surface)) continue;
-#endif
 		cJSON *body = surface->pending_frame;
 		surface->pending_frame = NULL;
 		surface->pending_presentation_id = 0;
@@ -408,122 +458,10 @@ void np_presentation_set_current_buffer(struct np_surface *surface,
 	}
 }
 
-#ifndef NP_REMOTE
-static void set_current_shm(struct np_surface *surface,
-	                        struct np_shm_texture *texture)
-{
-	if (surface->current_shm == texture) return;
-	if (surface->current_shm) np_shm_texture_unref(surface->current_shm);
-	surface->current_shm = texture;
-	if (texture) np_shm_texture_ref(texture);
-}
-#endif
 
 /* Cursor and drag-icon surfaces have no xdg root, so they use the low-rate
  * committed control message. Their pixels still follow the same direct source
  * lifetime as a scene layer; this is not a second window rendering path. */
-#ifndef NP_REMOTE
-static bool queue_unroled_frame(struct np_surface *surface,
-	                           struct wl_resource *buffer,
-	                           uint32_t presentation_id,
-	                           struct np_sync_point *release_point,
-	                           const struct np_box *damage)
-{
-	struct wl_shm_buffer *shm = wl_shm_buffer_get(buffer);
-	struct np_gpu_buffer *gpu = np_gpu_buffer_get(buffer);
-	uint32_t resource_id = 0, stride = 0, format = 0;
-	int32_t width = 0, height = 0;
-	const char *source = NULL;
-	if (shm) {
-		struct np_shm_texture *texture = NULL;
-		enum np_shm_upload_result result = np_shm_texture_upload(
-			surface, buffer, damage, &texture);
-		if (result != NP_SHM_UPLOAD_OK) {
-			np_sync_point_signal(release_point);
-			wl_buffer_send_release(buffer);
-			if (result == NP_SHM_UPLOAD_NO_MEMORY)
-				wl_client_post_no_memory(wl_resource_get_client(surface->resource));
-			else
-				wl_client_post_implementation_error(
-					wl_resource_get_client(surface->resource),
-					"could not import committed cursor or drag wl_shm buffer");
-			return false;
-		}
-		np_presentation_set_current_buffer(surface, buffer, NULL, release_point);
-		set_current_shm(surface, texture);
-		resource_id = texture->image.resource_id;
-		stride = texture->stride;
-		width = wl_shm_buffer_get_width(shm);
-		height = wl_shm_buffer_get_height(shm);
-		format = wl_shm_buffer_get_format(shm);
-		source = "cpu";
-		/* The guest copy is complete; subsequent host access targets texture. */
-		wl_buffer_send_release(buffer);
-	} else if (gpu) {
-		np_presentation_set_current_buffer(surface, buffer, gpu, release_point);
-		resource_id = gpu->resource_id;
-		stride = (uint32_t)gpu->stride;
-		width = gpu->width;
-		height = gpu->height;
-		format = gpu->format;
-		source = "gpu";
-	} else {
-		np_sync_point_signal(release_point);
-		wl_client_post_implementation_error(
-			wl_resource_get_client(surface->resource),
-			"cursor or drag surface buffer is neither wl_shm nor linux-dmabuf");
-		return false;
-	}
-	int wait_fd = -1;
-	enum np_scene_build_result hold =
-		np_scene_hold_current(surface, presentation_id, &wait_fd);
-	if (hold != NP_SCENE_READY) {
-		if (wait_fd >= 0) close(wait_fd);
-		if (hold == NP_SCENE_NO_MEMORY)
-			wl_client_post_no_memory(wl_resource_get_client(surface->resource));
-		else
-			wl_client_post_implementation_error(
-				wl_resource_get_client(surface->resource),
-				"could not retain committed cursor or drag buffer");
-		return false;
-	}
-
-	const char *format_name = format == WL_SHM_FORMAT_XRGB8888 ||
-	                          format == 0x34325258u ? "bgrx8888" :
-	                          format == 0x34324241u ||
-	                          format == 0x34324258u ? "rgba8888" : "bgra8888";
-	cJSON *frame = cJSON_CreateObject();
-	cJSON_AddNumberToObject(frame, "resourceID", resource_id);
-	cJSON_AddNumberToObject(frame, "width", width);
-	cJSON_AddNumberToObject(frame, "height", height);
-	cJSON_AddNumberToObject(frame, "bytesPerRow", stride);
-	cJSON_AddStringToObject(frame, "format", format_name);
-	cJSON_AddStringToObject(frame, "source", source);
-	cJSON_AddNumberToObject(frame, "scale", surface->scale);
-	cJSON_AddNumberToObject(frame, "presentationID", presentation_id);
-	np_presentation_add_viewport(surface, frame);
-	cJSON_AddItemToObject(frame, "damage", cJSON_CreateArray());
-	cJSON *body = cJSON_CreateObject();
-	cJSON_AddNumberToObject(body, "surface", surface->id);
-	cJSON_AddItemToObject(body, "frame", frame);
-	if (surface->pending_frame) {
-		uint32_t old = surface->pending_presentation_id;
-		rebind_frame_callbacks(surface, old, presentation_id);
-		np_scene_presented(surface, old);
-		cJSON_Delete(surface->pending_frame);
-	}
-	surface->last_resource_id = resource_id;
-	surface->last_width = width;
-	surface->last_height = height;
-	surface->last_stride = stride;
-	surface->last_format = format_name;
-	surface->last_source = source;
-	surface->has_published = true;
-	surface->pending_frame = body;
-	surface->pending_presentation_id = presentation_id;
-	return true;
-}
-#endif
 
 /* A scene update is a latest-value marker, not a host frame. np_presentation_flush
  * consumes it after all synchronized child commits have become current and
@@ -583,31 +521,11 @@ void np_presentation_add_viewport(struct np_surface *surface, cJSON *frame) {
 bool np_presentation_queue_last(struct np_surface *surface,
 	                                  uint32_t presentation_id) {
 	if (!surface->has_published) return false;
-	if (np_scene_root(surface) &&
-	    (surface->current_gpu || surface->current_shm)) {
+	if (np_scene_root(surface) && surface->has_published) {
 		np_presentation_queue_scene(surface, presentation_id);
 		return true;
 	}
 	if (!surface->last_resource_id) return false;
-#ifndef NP_REMOTE
-	/* Cursor and drag-icon commits reuse the ordinary metadata envelope, but
-	 * the named texture has exactly the same host-read lifetime as a scene
-	 * layer. Viewport-only commits and reconnect replay must establish a fresh
-	 * hold before the metadata crosses the channel. */
-	int wait_fd = -1;
-	enum np_scene_build_result hold =
-		np_scene_hold_current(surface, presentation_id, &wait_fd);
-	if (hold != NP_SCENE_READY) {
-		if (wait_fd >= 0) close(wait_fd);
-		if (hold == NP_SCENE_NO_MEMORY)
-			wl_client_post_no_memory(wl_resource_get_client(surface->resource));
-		else
-			wl_client_post_implementation_error(
-				wl_resource_get_client(surface->resource),
-				"could not retain current cursor or drag buffer");
-		return false;
-	}
-#endif
 	cJSON *frame = cJSON_CreateObject();
 	cJSON_AddNumberToObject(frame, "resourceID", surface->last_resource_id);
 	cJSON_AddNumberToObject(frame, "width", surface->last_width);
@@ -635,9 +553,6 @@ bool np_presentation_queue_last(struct np_surface *surface,
 	if (surface->pending_frame) {
 		rebind_frame_callbacks(surface, surface->pending_presentation_id,
 		                       presentation_id);
-#ifndef NP_REMOTE
-		np_scene_presented(surface, surface->pending_presentation_id);
-#endif
 		cJSON_Delete(surface->pending_frame);
 	}
 	surface->pending_frame = body;
@@ -649,29 +564,14 @@ bool np_presentation_refresh_current_shm(struct np_surface *surface,
 	                                     uint32_t presentation_id,
 	                                     const struct np_box *damage)
 {
-#ifdef NP_REMOTE
 	struct wl_shm_buffer *shm = wl_shm_buffer_get(surface->current_buffer);
 	if (!shm) return false;
-	publish_frame_remote(surface, shm, presentation_id);
-	return surface->pending_presentation_id == presentation_id;
-#else
-	struct np_shm_texture *texture = NULL;
-	enum np_shm_upload_result result = np_shm_texture_upload(
-		surface, surface->current_buffer, damage, &texture);
-	if (result == NP_SHM_UPLOAD_OK) {
-		set_current_shm(surface, texture);
-		if (!np_presentation_queue_last(surface, presentation_id))
-			np_presentation_request_refresh(surface, presentation_id);
-		return true;
-	}
-	if (result == NP_SHM_UPLOAD_NO_MEMORY)
-		wl_client_post_no_memory(wl_resource_get_client(surface->resource));
+	if (!publish_frame_remote(surface, shm)) return false;
+	if (np_scene_root(surface))
+		np_presentation_queue_scene(surface, presentation_id);
 	else
-		wl_client_post_implementation_error(
-			wl_resource_get_client(surface->resource),
-			"could not update current wl_shm buffer");
-	return false;
-#endif
+		queue_encoded_committed(surface, presentation_id);
+	return true;
 }
 
 
@@ -681,157 +581,51 @@ void np_presentation_publish_buffer(struct np_surface *surface, struct wl_resour
                                    uint32_t presentation_id,
                                    struct np_sync_point *release_point,
                                    const struct np_box *damage) {
-#ifdef NP_REMOTE
-	(void)gpu_buffer;
-	(void)damage;
+	struct np_surface *root = np_scene_root(surface);
 	if (buffer_commit == NP_BUFFER_DETACH) {
-		if (surface->mapped) {
+		if (surface == root && surface->mapped) {
 			uint32_t fields[] = {surface->id};
 			np_window_event_send(surface->server, NP_GUEST_SURFACE_UNMAPPED,
 			                     fields, 1);
 			surface->mapped = false;
 		}
-		surface->has_published = false;
-		np_sync_point_signal(release_point);
-		np_presentation_request_refresh(surface, presentation_id);
-		return;
-	}
-	if (!buffer) {
-		np_sync_point_signal(release_point);
-		np_presentation_request_refresh(surface, presentation_id);
-		return;
-	}
-	struct wl_shm_buffer *remote_shm = wl_shm_buffer_get(buffer);
-	if (remote_shm) {
-		publish_frame_remote(surface, remote_shm, presentation_id);
-		surface->mapped = true;
-		wl_buffer_send_release(buffer);
-	} else {
-		np_sync_point_signal(release_point);
-		np_presentation_request_refresh(surface, presentation_id);
-	}
-	return;
-#else
-	struct np_surface *root = np_scene_root(surface);
-	if (np_trace_enabled())
-		fprintf(stderr,
-		        "[wayland] publish surface=%u root=%u top=%d popup=%d sub=%d buffer=%s\n",
-		        surface->id, root ? root->id : 0, surface->toplevel != NULL,
-		        surface->popup != NULL, surface->subsurface != NULL,
-		        buffer_commit == NP_BUFFER_DETACH ? "gone" :
-		        buffer ? "set" : "retained");
-	if (root) {
-		if (buffer_commit == NP_BUFFER_DETACH) {
-			if (surface == root && surface->mapped) {
-				uint32_t fields[] = {surface->id};
-				np_window_event_send(surface->server,
-				                     NP_GUEST_SURFACE_UNMAPPED, fields, 1);
-				surface->mapped = false;
-			}
-			np_presentation_set_current_buffer(surface, NULL, NULL, release_point);
-			surface->has_published = false;
-			/* A detached child changes its containing window, so the root scene
-			 * must be recomposed without that child. A detached root has no scene
-			 * to compose. Queueing one left scene_dirty set forever because
-			 * np_scene_compose correctly rejects a root with no published buffer;
-			 * every unrelated presentation then retried the impossible frame. */
-			if (surface == root)
-				np_presentation_request_refresh(surface, presentation_id);
-			else
-				np_presentation_queue_scene(surface, presentation_id);
-			return;
-		}
-
-		struct wl_shm_buffer *shm = buffer ? wl_shm_buffer_get(buffer) : NULL;
-		struct np_gpu_buffer *gpu = gpu_buffer ? gpu_buffer : np_gpu_buffer_get(buffer);
-		if (shm) {
-			struct np_shm_texture *texture = NULL;
-			enum np_shm_upload_result result = np_shm_texture_upload(
-				surface, buffer, damage, &texture);
-			if (result != NP_SHM_UPLOAD_OK) {
-				np_sync_point_signal(release_point);
-				wl_buffer_send_release(buffer);
-				if (result == NP_SHM_UPLOAD_NO_MEMORY)
-					wl_client_post_no_memory(wl_resource_get_client(surface->resource));
-				else
-					wl_client_post_implementation_error(
-						wl_resource_get_client(surface->resource),
-						"could not import committed wl_shm buffer");
-				return;
-			}
-			np_presentation_set_current_buffer(surface, buffer, NULL, release_point);
-			set_current_shm(surface, texture);
-			surface->last_width = wl_shm_buffer_get_width(shm);
-			surface->last_height = wl_shm_buffer_get_height(shm);
-			surface->last_stride = texture->stride;
-			uint32_t format = wl_shm_buffer_get_format(shm);
-			surface->last_format = format == WL_SHM_FORMAT_ARGB8888 ? "bgra8888"
-				: format == WL_SHM_FORMAT_XRGB8888 ? "bgrx8888"
-				: "rgba8888";
-			surface->last_source = "cpu";
-			surface->last_resource_id = texture->image.resource_id;
-			wl_buffer_send_release(buffer);
-		} else if (gpu) {
-			np_presentation_set_current_buffer(surface, buffer, gpu, release_point);
-			surface->last_width = gpu->width;
-			surface->last_height = gpu->height;
-			surface->last_stride = (uint32_t)gpu->stride;
-			surface->last_format = gpu->format == 0x34325241 ? "bgra8888"
-				: gpu->format == 0x34325258 ? "bgrx8888"
-				: gpu->format == 0x34324241 ? "rgba8888"
-				: "rgba8888";
-			surface->last_source = "gpu";
-			surface->last_resource_id = gpu->resource_id;
-		} else {
-			np_sync_point_signal(release_point);
-			if (np_trace_enabled())
-				fprintf(stderr, "[wayland] scene surface=%u: unsupported buffer\n",
-				        surface->id);
-			return;
-		}
-		if (np_trace_enabled()) {
-			struct np_surface_mapping mapping;
-			if (np_scale_resolve(surface, (uint32_t)surface->last_width,
-			                     (uint32_t)surface->last_height, &mapping))
-				fprintf(stderr,
-				        "[wayland] published surface=%u resource=%u pixels=%dx%d "
-				        "scale=%d logical=%.0fx%.0f\n",
-				        surface->id, surface->last_resource_id,
-				        surface->last_width, surface->last_height, surface->scale,
-				        mapping.logical_width, mapping.logical_height);
-		}
-		surface->has_published = true;
-		if (surface == root) surface->mapped = true;
-		np_presentation_queue_scene(surface, presentation_id);
-		return;
-	}
-
-	/* A role object may be destroyed before the wl_surface is unmapped. GTK
-	 * popovers do this, then reuse the same wl_surface for the next popup. The
-	 * null-buffer commit still has to drop the old GPU/shm buffer even though
-	 * np_scene_root() can no longer discover the former xdg role. */
-	if (buffer_commit == NP_BUFFER_DETACH) {
 		np_presentation_set_current_buffer(surface, NULL, NULL, release_point);
 		surface->has_published = false;
-		np_presentation_request_refresh(surface, presentation_id);
+		if (root && surface != root)
+			np_presentation_queue_scene(surface, presentation_id);
+		else
+			np_presentation_request_refresh(surface, presentation_id);
 		return;
 	}
-	if (!buffer) {
+	struct wl_shm_buffer *remote_shm = buffer ? wl_shm_buffer_get(buffer) : NULL;
+	struct np_gpu_buffer *remote_gpu = gpu_buffer ? gpu_buffer : np_gpu_buffer_get(buffer);
+	bool encoded = false;
+	if (remote_shm) {
+		encoded = publish_frame_remote(surface, remote_shm);
+	} else if (remote_gpu) {
+		const unsigned char *pixels = NULL;
+		if (np_gpu_buffer_begin_cpu_read(remote_gpu, &pixels)) {
+			encoded = encode_remote_pixels(
+				surface, pixels, remote_gpu->width, remote_gpu->height,
+				remote_gpu->stride, remote_gpu->format);
+			np_gpu_buffer_end_cpu_read(remote_gpu);
+		}
+	}
+	if (!encoded) {
 		np_sync_point_signal(release_point);
-		np_presentation_request_refresh(surface, presentation_id);
+		if (buffer) wl_buffer_send_release(buffer);
+		wl_client_post_implementation_error(
+			wl_resource_get_client(surface->resource),
+			"could not copy the committed buffer into the remote encoder");
 		return;
 	}
-
-	/* A drag icon is commonly committed immediately before start_drag assigns
-	 * its role. Publish the direct resource now and let the host retain it until
-	 * dragIconChanged supplies that role. */
-	if (!queue_unroled_frame(
-			surface, buffer, presentation_id, release_point, damage)) {
-		/* queue_unroled_frame owns release_point on every path.  If it installed
-		 * the buffer, current state owns the point; otherwise it signalled it. */
-		return;
+	np_presentation_set_current_buffer(surface, buffer, remote_gpu, release_point);
+	if (buffer) wl_buffer_send_release(buffer);
+	if (root) {
+		if (surface == root) surface->mapped = true;
+		np_presentation_queue_scene(surface, presentation_id);
+	} else {
+		queue_encoded_committed(surface, presentation_id);
 	}
-	if (presentation_id && surface->pending_presentation_id != presentation_id)
-		np_presentation_request_refresh(surface, presentation_id);
-#endif
+	return;
 }

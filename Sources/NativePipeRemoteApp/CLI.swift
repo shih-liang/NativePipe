@@ -18,7 +18,7 @@ struct RemotePipeCLI {
 
         One-shot SSH session (recommended):
           Opens local forwards for ports 1025/1026, starts the remote compositor
-          if needed, runs the NativePipe display client, then drops you into a
+          if needed, runs the RemotePipe display client, then drops you into a
           remote login shell with WAYLAND_DISPLAY set. Exit the shell to tear down.
 
           remotepipe lfs@172.16.0.34

@@ -17,6 +17,8 @@
 static void set_nonblocking(int fd) {
 	int flags = fcntl(fd, F_GETFL, 0);
 	if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+	flags = fcntl(fd, F_GETFD, 0);
+	if (flags >= 0) fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
 }
 
 bool np_media_listen(struct np_media *media) {
@@ -124,6 +126,32 @@ bool np_media_connected(struct np_media *media) {
 	return connected;
 }
 
+int np_media_connection_fd(struct np_media *media) {
+	if (!media || !media->lock_initialized) return -1;
+	pthread_mutex_lock(&media->lock);
+	int fd = media->conn_fd;
+	pthread_mutex_unlock(&media->lock);
+	return fd;
+}
+
+void np_media_disconnect(struct np_media *media) {
+	if (!media || !media->lock_initialized) return;
+	pthread_mutex_lock(&media->lock);
+	if (media->conn_fd >= 0) close(media->conn_fd);
+	media->conn_fd = -1;
+	media->just_attached = false;
+	pthread_mutex_unlock(&media->lock);
+}
+
+bool np_media_take_just_attached(struct np_media *media) {
+	if (!media || !media->lock_initialized) return false;
+	pthread_mutex_lock(&media->lock);
+	bool attached = media->just_attached;
+	media->just_attached = false;
+	pthread_mutex_unlock(&media->lock);
+	return attached;
+}
+
 static bool write_all(int fd, const void *buf, size_t len) {
 	const uint8_t *p = buf;
 	while (len) {
@@ -146,7 +174,9 @@ static bool write_all(int fd, const void *buf, size_t len) {
 	return true;
 }
 
-bool np_media_send(struct np_media *media, uint32_t surface_id,
+bool np_media_send(struct np_media *media, uint8_t codec, uint8_t flags,
+                   uint32_t surface_id,
+                   uint32_t resource_id,
                    uint16_t width, uint16_t height, uint64_t pts_ns,
                    uint16_t epoch, const uint8_t *payload, uint32_t length) {
 	if (!media || !media->lock_initialized || !payload || !length) return false;
@@ -155,15 +185,16 @@ bool np_media_send(struct np_media *media, uint32_t surface_id,
 	memset(hdr, 0, sizeof(hdr));
 	memcpy(hdr, NP_MEDIA_MAGIC, 4);
 	hdr[4] = NP_MEDIA_VERSION;
-	hdr[5] = NP_MEDIA_CODEC_H264;
-	hdr[6] = 0;
+	hdr[5] = codec;
+	hdr[6] = flags;
 	hdr[7] = 0;
 	memcpy(hdr + 8, &surface_id, 4);
-	memcpy(hdr + 12, &width, 2);
-	memcpy(hdr + 14, &height, 2);
-	memcpy(hdr + 16, &pts_ns, 8);
-	memcpy(hdr + 24, &length, 4);
-	memcpy(hdr + 28, &epoch, 2);
+	memcpy(hdr + 12, &resource_id, 4);
+	memcpy(hdr + 16, &width, 2);
+	memcpy(hdr + 18, &height, 2);
+	memcpy(hdr + 20, &pts_ns, 8);
+	memcpy(hdr + 28, &length, 4);
+	memcpy(hdr + 32, &epoch, 2);
 
 	pthread_mutex_lock(&media->lock);
 	if (media->conn_fd < 0) {

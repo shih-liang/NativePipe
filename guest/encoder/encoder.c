@@ -6,6 +6,7 @@
  * working hardware encode.
  */
 #include "encoder.h"
+#include "alpha.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,8 +45,17 @@ struct np_encoder {
 	uint8_t *pending_bgra;
 	int pending_width, pending_height, pending_stride;
 	uint64_t pending_pts;
+	uint32_t pending_resource_id;
+	uint8_t pending_flags;
 	uint16_t pending_epoch;
 	bool pending_force;
+	uint8_t *encoding_bgra;
+	int encoding_width, encoding_height, encoding_stride;
+	uint32_t encoding_resource_id;
+	uint8_t encoding_flags;
+	uint8_t *last_bgra;
+	int last_width, last_height, last_stride;
+	uint8_t last_flags;
 	int requested_width, requested_height;
 	uint16_t advertised_epoch;
 };
@@ -172,7 +182,9 @@ static bool setup(struct np_encoder *enc) {
 }
 
 static bool encode_bgra_now(struct np_encoder *enc, const uint8_t *bgra, int width, int height,
-                            int stride, uint64_t pts_ns, uint16_t epoch, bool force);
+	                            int stride, uint64_t pts_ns, uint32_t resource_id,
+	                            uint8_t flags, const uint8_t *alpha,
+	                            uint32_t alpha_size, uint16_t epoch, bool force);
 
 static void *encoder_worker(void *arg) {
 	struct np_encoder *enc = arg;
@@ -188,14 +200,42 @@ static void *encoder_worker(void *arg) {
 		int width = enc->pending_width, height = enc->pending_height;
 		int stride = enc->pending_stride;
 		uint64_t pts = enc->pending_pts;
+		uint32_t resource_id = enc->pending_resource_id;
+		uint8_t flags = enc->pending_flags;
 		uint16_t epoch = enc->pending_epoch;
 		bool force = enc->pending_force;
 		enc->pending_force = false;
 		enc->pending_bgra = NULL;
+		enc->encoding_bgra = pixels;
+		enc->encoding_width = width;
+		enc->encoding_height = height;
+		enc->encoding_stride = stride;
+		enc->encoding_resource_id = resource_id;
+		enc->encoding_flags = flags;
 		pthread_mutex_unlock(&enc->lock);
 
-		if (!encode_bgra_now(enc, pixels, width, height, stride, pts, epoch, force))
+		uint8_t *alpha = NULL;
+		uint32_t alpha_size = 0;
+		bool alpha_ok = !(flags & NP_ENCODER_FLAG_HAS_ALPHA) || np_alpha_pack_bgra(
+			pixels, width, height, stride, &alpha, &alpha_size);
+		bool encoded = alpha_ok && encode_bgra_now(
+			enc, pixels, width, height, stride, pts, resource_id, flags,
+			alpha, alpha_size, epoch, force);
+		if (!encoded)
 			fprintf(stderr, "[encoder] frame encode failed\n");
+		free(alpha);
+		pthread_mutex_lock(&enc->lock);
+		enc->encoding_bgra = NULL;
+		if (encoded) {
+			free(enc->last_bgra);
+			enc->last_bgra = pixels;
+			enc->last_width = width;
+			enc->last_height = height;
+			enc->last_stride = stride;
+			enc->last_flags = flags;
+			pixels = NULL;
+		}
+		pthread_mutex_unlock(&enc->lock);
 		free(pixels);
 	}
 	return NULL;
@@ -236,6 +276,7 @@ void np_encoder_destroy(struct np_encoder *enc) {
 	pthread_mutex_unlock(&enc->lock);
 	if (enc->worker_started) pthread_join(enc->worker, NULL);
 	free(enc->pending_bgra);
+	free(enc->last_bgra);
 	teardown_codec(enc);
 	pthread_cond_destroy(&enc->ready);
 	pthread_mutex_destroy(&enc->lock);
@@ -273,19 +314,73 @@ void np_encoder_force_keyframe(struct np_encoder *enc) {
 	pthread_mutex_unlock(&enc->lock);
 }
 
-static bool drain_packets(struct np_encoder *enc, uint64_t pts_ns) {
+bool np_encoder_replay_last(
+	struct np_encoder *enc, uint64_t pts_ns, uint32_t replacement_resource_id,
+	uint32_t *active_resource_id)
+{
+	if (active_resource_id) *active_resource_id = 0;
+	if (!enc || !replacement_resource_id || !active_resource_id) return false;
+	pthread_mutex_lock(&enc->lock);
+	enc->pending_force = true;
+	if (enc->pending_bgra) {
+		*active_resource_id = enc->pending_resource_id;
+		pthread_cond_signal(&enc->ready);
+		pthread_mutex_unlock(&enc->lock);
+		return true;
+	}
+	const uint8_t *source = enc->encoding_bgra
+		? enc->encoding_bgra : enc->last_bgra;
+	int width = enc->encoding_bgra ? enc->encoding_width : enc->last_width;
+	int height = enc->encoding_bgra ? enc->encoding_height : enc->last_height;
+	int stride = enc->encoding_bgra ? enc->encoding_stride : enc->last_stride;
+	uint8_t flags = enc->encoding_bgra ? enc->encoding_flags : enc->last_flags;
+	if (!source || width <= 0 || height <= 0 || stride <= 0 ||
+	    (size_t)height > SIZE_MAX / (size_t)stride) {
+		pthread_mutex_unlock(&enc->lock);
+		return false;
+	}
+	size_t size = (size_t)height * (size_t)stride;
+	uint8_t *copy = malloc(size);
+	if (!copy) {
+		pthread_mutex_unlock(&enc->lock);
+		return false;
+	}
+	memcpy(copy, source, size);
+	enc->pending_bgra = copy;
+	enc->pending_width = width;
+	enc->pending_height = height;
+	enc->pending_stride = stride;
+	enc->pending_pts = pts_ns;
+	enc->pending_resource_id = replacement_resource_id;
+	enc->pending_flags = flags;
+	enc->pending_epoch = enc->advertised_epoch;
+	*active_resource_id = replacement_resource_id;
+	pthread_cond_signal(&enc->ready);
+	pthread_mutex_unlock(&enc->lock);
+	return true;
+}
+
+static bool drain_packets(struct np_encoder *enc, uint64_t pts_ns,
+	                          uint32_t resource_id, uint8_t flags,
+	                          const uint8_t *alpha, uint32_t alpha_size) {
+	bool first = true;
 	for (;;) {
 		int ret = avcodec_receive_packet(enc->ctx, enc->packet);
 		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) return true;
 		if (ret < 0) return false;
-		enc->out(enc->user, enc->packet->data, (size_t)enc->packet->size, pts_ns, enc->epoch,
+		enc->out(enc->user, enc->packet->data, (size_t)enc->packet->size,
+		         pts_ns, resource_id, flags,
+		         first ? alpha : NULL, first ? alpha_size : 0, enc->epoch,
 		         (uint16_t)enc->width, (uint16_t)enc->height);
+		first = false;
 		av_packet_unref(enc->packet);
 	}
 }
 
 static bool encode_bgra_now(struct np_encoder *enc, const uint8_t *bgra, int width, int height,
-                            int stride, uint64_t pts_ns, uint16_t epoch, bool force) {
+	                            int stride, uint64_t pts_ns, uint32_t resource_id,
+	                            uint8_t flags, const uint8_t *alpha,
+	                            uint32_t alpha_size, uint16_t epoch, bool force) {
 	if (!enc || !bgra) return false;
 	if ((width & ~1) != enc->width || (height & ~1) != enc->height) {
 		if (!np_encoder_resize(enc, width, height)) return false;
@@ -313,21 +408,28 @@ static bool encode_bgra_now(struct np_encoder *enc, const uint8_t *bgra, int wid
 	}
 
 	if (avcodec_send_frame(enc->ctx, to_send) < 0) return false;
-	return drain_packets(enc, pts_ns);
+	return drain_packets(enc, pts_ns, resource_id, flags, alpha, alpha_size);
 }
 
 bool np_encoder_push_bgra(struct np_encoder *enc, const uint8_t *bgra, int width, int height,
-                          int stride, uint64_t pts_ns) {
-	if (!enc || !bgra || width < 2 || height < 2 || stride < width * 4) return false;
-	int even_width = width & ~1;
-	int even_height = height & ~1;
+	                          int stride, uint64_t pts_ns, uint32_t resource_id,
+	                          uint8_t flags) {
+	if (!enc || !bgra || !resource_id || width < 2 || height < 2 || stride < width * 4)
+		return false;
+	int even_width = (width + 1) & ~1;
+	int even_height = (height + 1) & ~1;
 	size_t packed_stride = (size_t)even_width * 4;
 	if ((size_t)even_height > SIZE_MAX / packed_stride) return false;
 	uint8_t *copy = malloc(packed_stride * (size_t)even_height);
 	if (!copy) return false;
-	for (int row = 0; row < even_height; row++)
-		memcpy(copy + (size_t)row * packed_stride,
-		       bgra + (size_t)row * (size_t)stride, packed_stride);
+	for (int row = 0; row < height; row++) {
+		uint8_t *dst = copy + (size_t)row * packed_stride;
+		memcpy(dst, bgra + (size_t)row * (size_t)stride, (size_t)width * 4);
+		if (even_width != width) memcpy(dst + (size_t)width * 4, dst + (size_t)(width - 1) * 4, 4);
+	}
+	if (even_height != height)
+		memcpy(copy + (size_t)height * packed_stride,
+		       copy + (size_t)(height - 1) * packed_stride, packed_stride);
 
 	pthread_mutex_lock(&enc->lock);
 	if (even_width != enc->requested_width || even_height != enc->requested_height) {
@@ -342,6 +444,8 @@ bool np_encoder_push_bgra(struct np_encoder *enc, const uint8_t *bgra, int width
 	enc->pending_height = even_height;
 	enc->pending_stride = (int)packed_stride;
 	enc->pending_pts = pts_ns;
+	enc->pending_resource_id = resource_id;
+	enc->pending_flags = flags;
 	enc->pending_epoch = enc->advertised_epoch;
 	pthread_cond_signal(&enc->ready);
 	pthread_mutex_unlock(&enc->lock);

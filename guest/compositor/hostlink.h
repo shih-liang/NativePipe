@@ -1,12 +1,8 @@
-// The window channel to the host, over vsock or TCP.
+// The RemotePipe window channel over loopback TCP (normally forwarded by SSH).
 //
 // NPIP provides versioned length framing around either JSON metadata or the
-// high-rate binary messages. Local VM traffic owns a dedicated vsock range;
-// RemotePipe keeps its legacy bidirectional TCP stream on 1025.
-//
-// This carries metadata only. Local VM pixels never travel here — a frame
-// message names a virtio-gpu resource that is already host memory. Remote
-// display sends compressed pixels on NativePipePort.media (NPEN) instead.
+// high-rate binary messages. Encoded pixels travel on the separate NPEN media
+// stream instead of this ordered state channel.
 
 #ifndef NATIVEPIPE_HOSTLINK_H
 #define NATIVEPIPE_HOSTLINK_H
@@ -17,17 +13,6 @@
 
 /// RemotePipe TCP surface port.
 #define NP_SURFACE_PORT 1025
-/// Local VM compositor vsock ports.
-#define NP_WINDOW_EVENT_PORT 4096
-#define NP_WINDOW_CONTROL_PORT 4097
-#define NP_WINDOW_INPUT_PORT 4098
-#define NP_WINDOW_FEEDBACK_PORT 4099
-
-enum np_host_transport {
-	NP_HOST_VSOCK = 0,
-	NP_HOST_TCP = 1,
-};
-
 /// Called for each command the host sends. `body` is the case's payload object.
 typedef void (*np_host_handler)(const char *name, cJSON *body, void *user_data);
 typedef void (*np_host_binary_handler)(const unsigned char *payload, size_t length,
@@ -37,7 +22,6 @@ struct np_host {
 	int listen_fd;
 	int conn_fd;
 	uint32_t port;
-	enum np_host_transport transport;
 	unsigned char *buffer;
 	size_t buffer_len;
 	size_t buffer_cap;
@@ -50,7 +34,6 @@ struct np_host {
 	size_t out_cap;
 };
 
-bool np_host_listen(struct np_host *host, uint32_t port);
 /// Listen on a loopback TCP port for remote / SSH-forwarded hosts.
 bool np_host_listen_tcp(struct np_host *host, uint32_t port);
 void np_host_finish(struct np_host *host);

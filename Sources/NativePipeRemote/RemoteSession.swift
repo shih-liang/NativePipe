@@ -24,7 +24,7 @@ public final class RemoteSession: @unchecked Sendable {
     private var surfaceSource: DispatchSourceRead?
     private var mediaSource: DispatchSourceRead?
     private var surfaceDecoder = FrameDecoder()
-    private let mediaDemuxer = MediaWire.Demuxer()
+    private var mediaDemuxer = MediaWire.Demuxer()
     private let readQueue = DispatchQueue(label: "com.nativepipe.remote.read", qos: .userInteractive)
     private let writeQueue = DispatchQueue(label: "com.nativepipe.remote.write", qos: .userInteractive)
     private var pendingWrites: [Windowing.HostCommand] = []
@@ -58,6 +58,7 @@ public final class RemoteSession: @unchecked Sendable {
         surfaceFD = surface
         mediaFD = media
         surfaceDecoder = FrameDecoder()
+        mediaDemuxer = MediaWire.Demuxer()
         pendingWrites.removeAll(keepingCapacity: true)
         writerScheduled = false
         lock.unlock()

@@ -1,10 +1,12 @@
 import XCTest
+@testable import NativePipeRemote
 
 final class NativePipeRemoteTests: XCTestCase {
-    func testPlaceholder() throws {
-        // Placeholder so SwiftPM can build even when remote test suites are
-        // not part of the focused change set.
-        XCTAssertTrue(true)
+    func testSessionStartsDisconnectedAndDisconnectIsIdempotent() {
+        let session = RemoteSession(host: "127.0.0.1", surfacePort: 1, mediaPort: 2)
+        XCTAssertFalse(session.isConnected)
+        session.disconnect()
+        session.disconnect()
+        XCTAssertFalse(session.isConnected)
     }
 }
-

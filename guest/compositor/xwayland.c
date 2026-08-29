@@ -8,6 +8,7 @@
 #include "hostlink.h"
 #include "window_events.h"
 #include "xdg_shell.h"
+#include "xwayland-shell-v1-server-protocol.h"
 
 #include <cjson/cJSON.h>
 #include <errno.h>
@@ -26,6 +27,7 @@
 #include <unistd.h>
 #include <wayland-server-core.h>
 #include <xcb/xcb.h>
+#include <xcb/composite.h>
 #include <xcb/xcbext.h>
 
 enum property_query_kind {
@@ -40,6 +42,7 @@ struct np_xwindow {
 	struct wl_list link;
 	xcb_window_t id;
 	uint32_t surface_id;
+	uint64_t surface_serial;
 	struct np_surface *surface;
 	int16_t x, y;
 	uint16_t width, height;
@@ -65,21 +68,129 @@ struct np_xwayland {
 	struct wl_event_source *xcb_source;
 	struct wl_event_source *sigchld_source;
 	int ready_fd;
+	char ready_bytes[64];
+	size_t ready_length;
 	int wm_fd;
 	pid_t pid;
 	struct wl_client *wayland_client;
 	struct wl_listener wayland_client_destroy;
 	xcb_connection_t *xcb;
 	xcb_screen_t *screen;
+	struct wl_global *shell_global;
 	xcb_atom_t wl_surface_id;
+	xcb_atom_t wl_surface_serial;
+	xcb_atom_t wm_s0;
+	xcb_atom_t net_wm_cm_s0;
+	xcb_atom_t net_supporting_wm_check;
 	xcb_atom_t net_wm_name;
 	xcb_atom_t utf8_string;
 	xcb_atom_t wm_protocols;
 	xcb_atom_t wm_delete_window;
+	xcb_window_t wm_window;
 	xcb_window_t focused;
 	struct wl_list windows;
 	struct wl_list queries;
 };
+
+static void xwayland_surface_resource_destroy(struct wl_resource *resource)
+{
+	struct np_surface *surface = wl_resource_get_user_data(resource);
+	if (surface && surface->xwayland_shell_surface == resource)
+		surface->xwayland_shell_surface = NULL;
+}
+
+static void xwayland_surface_destroy_request(
+	struct wl_client *client, struct wl_resource *resource)
+{
+	(void)client;
+	wl_resource_destroy(resource);
+}
+
+static void xwayland_surface_set_serial(
+	struct wl_client *client, struct wl_resource *resource,
+	uint32_t serial_lo, uint32_t serial_hi)
+{
+	(void)client;
+	struct np_surface *surface = wl_resource_get_user_data(resource);
+	uint64_t serial = (uint64_t)serial_lo | ((uint64_t)serial_hi << 32);
+	if (!surface) return;
+	if (!serial) {
+		wl_resource_post_error(
+			resource, XWAYLAND_SURFACE_V1_ERROR_INVALID_SERIAL,
+			"xwayland surface serial must be non-zero");
+		return;
+	}
+	surface->pending_xwayland_serial = serial;
+	surface->pending_xwayland_serial_set = true;
+}
+
+static const struct xwayland_surface_v1_interface xwayland_surface_implementation = {
+	.set_serial = xwayland_surface_set_serial,
+	.destroy = xwayland_surface_destroy_request,
+};
+
+static void xwayland_shell_destroy_request(
+	struct wl_client *client, struct wl_resource *resource)
+{
+	(void)client;
+	wl_resource_destroy(resource);
+}
+
+static void xwayland_shell_get_surface(
+	struct wl_client *client, struct wl_resource *resource,
+	uint32_t id, struct wl_resource *surface_resource)
+{
+	struct np_surface *surface = wl_resource_get_user_data(surface_resource);
+	if (!surface || surface->resource != surface_resource ||
+	    surface->xwayland_shell_surface ||
+	    !np_surface_assign_role(surface, NP_SURFACE_ROLE_XWAYLAND)) {
+		wl_resource_post_error(
+			resource, XWAYLAND_SHELL_V1_ERROR_ROLE,
+			"wl_surface already has a different role");
+		return;
+	}
+	struct wl_resource *role = wl_resource_create(
+		client, &xwayland_surface_v1_interface, 1, id);
+	if (!role) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	surface->xwayland_shell_surface = role;
+	wl_resource_set_implementation(
+		role, &xwayland_surface_implementation, surface,
+		xwayland_surface_resource_destroy);
+}
+
+static const struct xwayland_shell_v1_interface xwayland_shell_implementation = {
+	.destroy = xwayland_shell_destroy_request,
+	.get_xwayland_surface = xwayland_shell_get_surface,
+};
+
+static void xwayland_shell_bind(
+	struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+	struct np_xwayland *xw = data;
+	if (!xw || client != xw->wayland_client) {
+		wl_client_post_implementation_error(
+			client, "xwayland-shell-v1 is private to the managed Xwayland client");
+		return;
+	}
+	struct wl_resource *resource = wl_resource_create(
+		client, &xwayland_shell_v1_interface, version < 1 ? version : 1, id);
+	if (!resource) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	wl_resource_set_implementation(
+		resource, &xwayland_shell_implementation, xw, NULL);
+}
+
+static bool xwayland_global_filter(
+	const struct wl_client *client, const struct wl_global *global, void *data)
+{
+	struct np_xwayland *xw = data;
+	return !xw || global != xw->shell_global || client == xw->wayland_client;
+}
 
 static bool write_all(int fd, const void *bytes, size_t length)
 {
@@ -246,22 +357,61 @@ static void query_window_properties(struct np_xwayland *xw, struct np_xwindow *w
 
 static void associate_surface(struct np_xwayland *xw, struct np_xwindow *window)
 {
-	if (!xw->wayland_client || !window || !window->surface_id || window->surface)
+	if (!xw->wayland_client || !window || window->surface) return;
+	struct np_surface *surface = NULL;
+	if (window->surface_serial) {
+		struct np_surface *candidate;
+		wl_list_for_each(candidate, &xw->server->surfaces, link) {
+			if (candidate->xwayland_serial_committed &&
+			    candidate->xwayland_serial == window->surface_serial) {
+				surface = candidate;
+				break;
+			}
+		}
+		if (!surface) {
+			if (np_trace_enabled())
+				fprintf(stderr,
+				        "[xwayland] window=%u waits for surface serial=%llu\n",
+				        window->id,
+				        (unsigned long long)window->surface_serial);
+			return;
+		}
+	} else if (window->surface_id) {
+		struct wl_resource *resource = wl_client_get_object(
+			xw->wayland_client, window->surface_id);
+		if (!resource || strcmp(wl_resource_get_class(resource), "wl_surface") != 0) {
+			if (np_trace_enabled())
+				fprintf(stderr,
+				        "[xwayland] window=%u waits for wl_surface object=%u\n",
+				        window->id, window->surface_id);
+			return;
+		}
+		surface = wl_resource_get_user_data(resource);
+		if (!surface || surface->resource != resource) return;
+	} else {
 		return;
-	struct wl_resource *resource = wl_client_get_object(
-		xw->wayland_client, window->surface_id);
-	if (!resource || strcmp(wl_resource_get_class(resource), "wl_surface") != 0)
+	}
+	if (surface->xwayland_window ||
+	    !np_surface_assign_role(surface, NP_SURFACE_ROLE_XWAYLAND)) {
+		if (np_trace_enabled())
+			fprintf(stderr,
+			        "[xwayland] rejected association window=%u serial=%llu object=%u\n",
+			        window->id, (unsigned long long)window->surface_serial,
+			        window->surface_id);
 		return;
-	struct np_surface *surface = wl_resource_get_user_data(resource);
-	if (!surface || surface->resource != resource || surface->xwayland_window ||
-	    !np_surface_assign_role(surface, NP_SURFACE_ROLE_XWAYLAND))
-		return;
+	}
 
 	window->surface = surface;
 	surface->xwayland_window = window->id;
 	surface->xwayland_popup = window->override_redirect;
 	surface->window_id = surface->server->next_id++;
 	surface->mapped = false;
+	if (np_trace_enabled())
+		fprintf(stderr,
+		        "[xwayland] associated window=%u surface=%u serial=%llu object=%u popup=%d\n",
+		        window->id, surface->id,
+		        (unsigned long long)window->surface_serial, window->surface_id,
+		        window->override_redirect);
 
 	if (surface->xwayland_popup) {
 		struct np_surface *parent = surface->server->focused_window
@@ -469,10 +619,24 @@ static void handle_xevent(struct np_xwayland *xw, xcb_generic_event_t *generic)
 	}
 	case XCB_CLIENT_MESSAGE: {
 		xcb_client_message_event_t *event = (void *)generic;
-		if (event->type != xw->wl_surface_id || event->format != 32) break;
+		if (np_trace_enabled())
+			fprintf(stderr,
+			        "[xwayland] client-message window=%u type=%u format=%u id-atom=%u serial-atom=%u\n",
+			        event->window, event->type, event->format,
+			        xw->wl_surface_id, xw->wl_surface_serial);
+		if (event->format != 32 ||
+		    (event->type != xw->wl_surface_id &&
+		     event->type != xw->wl_surface_serial)) break;
 		struct np_xwindow *window = ensure_xwindow(xw, event->window);
 		if (!window) break;
-		window->surface_id = event->data.data32[0];
+		if (event->type == xw->wl_surface_serial) {
+			window->surface_serial = (uint64_t)event->data.data32[0] |
+			                         ((uint64_t)event->data.data32[1] << 32);
+			window->surface_id = 0;
+		} else {
+			window->surface_id = event->data.data32[0];
+			window->surface_serial = 0;
+		}
 		associate_surface(xw, window);
 		break;
 	}
@@ -541,16 +705,53 @@ static bool setup_xwm(struct np_xwayland *xw)
 	if (!screens.rem) return false;
 	xw->screen = screens.data;
 	xw->wl_surface_id = intern_atom(xw, "WL_SURFACE_ID");
+	xw->wl_surface_serial = intern_atom(xw, "WL_SURFACE_SERIAL");
+	xw->wm_s0 = intern_atom(xw, "WM_S0");
+	xw->net_wm_cm_s0 = intern_atom(xw, "_NET_WM_CM_S0");
+	xw->net_supporting_wm_check = intern_atom(xw, "_NET_SUPPORTING_WM_CHECK");
 	xw->net_wm_name = intern_atom(xw, "_NET_WM_NAME");
 	xw->utf8_string = intern_atom(xw, "UTF8_STRING");
 	xw->wm_protocols = intern_atom(xw, "WM_PROTOCOLS");
 	xw->wm_delete_window = intern_atom(xw, "WM_DELETE_WINDOW");
-	if (xw->wl_surface_id == XCB_ATOM_NONE) return false;
+	if (xw->wl_surface_id == XCB_ATOM_NONE ||
+	    xw->wl_surface_serial == XCB_ATOM_NONE ||
+	    xw->wm_s0 == XCB_ATOM_NONE ||
+	    xw->net_wm_cm_s0 == XCB_ATOM_NONE ||
+	    xw->net_supporting_wm_check == XCB_ATOM_NONE) return false;
 	uint32_t mask = XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT |
 	                XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY |
 	                XCB_EVENT_MASK_PROPERTY_CHANGE;
 	xcb_change_window_attributes(
 		xw->xcb, xw->screen->root, XCB_CW_EVENT_MASK, &mask);
+	/* Rootless Xwayland only creates a wl_surface for manually redirected
+	 * top-level X windows. Owning WM_S0 enables the inherited X sockets;
+	 * Composite redirection is the separate condition that enables pixels. */
+	xcb_composite_redirect_subwindows(
+		xw->xcb, xw->screen->root, XCB_COMPOSITE_REDIRECT_MANUAL);
+	static const char wm_name[] = "NativePipe XWM";
+	xw->wm_window = xcb_generate_id(xw->xcb);
+	xcb_create_window(
+		xw->xcb, XCB_COPY_FROM_PARENT, xw->wm_window, xw->screen->root,
+		0, 0, 10, 10, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT,
+		xw->screen->root_visual, 0, NULL);
+	xcb_change_property(
+		xw->xcb, XCB_PROP_MODE_REPLACE, xw->wm_window,
+		xw->net_wm_name, xw->utf8_string, 8,
+		sizeof(wm_name) - 1, wm_name);
+	xcb_change_property(
+		xw->xcb, XCB_PROP_MODE_REPLACE, xw->screen->root,
+		xw->net_supporting_wm_check, XCB_ATOM_WINDOW, 32,
+		1, &xw->wm_window);
+	xcb_change_property(
+		xw->xcb, XCB_PROP_MODE_REPLACE, xw->wm_window,
+		xw->net_supporting_wm_check, XCB_ATOM_WINDOW, 32,
+		1, &xw->wm_window);
+	/* Xwayland deliberately enables its inherited X listen sockets only
+	 * after the XWM owns WM_S0. */
+	xcb_set_selection_owner(
+		xw->xcb, xw->wm_window, xw->wm_s0, XCB_CURRENT_TIME);
+	xcb_set_selection_owner(
+		xw->xcb, xw->wm_window, xw->net_wm_cm_s0, XCB_CURRENT_TIME);
 	xcb_flush(xw->xcb);
 	struct wl_event_loop *loop = wl_display_get_event_loop(xw->server->display);
 	xw->xcb_source = wl_event_loop_add_fd(
@@ -563,14 +764,34 @@ static bool setup_xwm(struct np_xwayland *xw)
 static int xwayland_ready(int fd, uint32_t mask, void *data)
 {
 	struct np_xwayland *xw = data;
-	char buffer[32];
-	ssize_t count = read(fd, buffer, sizeof(buffer));
-	if (count <= 0 && !(mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR))) return 0;
+	bool complete = false;
+	if (mask & WL_EVENT_READABLE) {
+		for (;;) {
+			if (xw->ready_length == sizeof(xw->ready_bytes)) break;
+			ssize_t count = read(
+				fd, xw->ready_bytes + xw->ready_length,
+				sizeof(xw->ready_bytes) - xw->ready_length);
+			if (count > 0) {
+				xw->ready_length += (size_t)count;
+				complete = memchr(xw->ready_bytes, '\n', xw->ready_length) != NULL;
+				if (complete) break;
+				continue;
+			}
+			if (count < 0 && errno == EINTR) continue;
+			if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+			mask |= WL_EVENT_HANGUP;
+			break;
+		}
+	}
+	if (!complete && !(mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR)) &&
+	    xw->ready_length < sizeof(xw->ready_bytes))
+		return 0;
 	if (xw->ready_source) wl_event_source_remove(xw->ready_source);
 	xw->ready_source = NULL;
-	close(xw->ready_fd);
+	if (xw->ready_fd >= 0) close(xw->ready_fd);
 	xw->ready_fd = -1;
-	if (count <= 0 || !setup_xwm(xw)) {
+	xw->ready_length = 0;
+	if (!complete || !setup_xwm(xw)) {
 		fprintf(stderr, "[xwayland] could not establish XWM connection\n");
 		if (xw->pid > 0) kill(xw->pid, SIGTERM);
 	} else {
@@ -658,6 +879,7 @@ static int start_xwayland(int fd, uint32_t mask, void *data)
 	xw->pid = pid;
 	xw->wm_fd = wm_pair[0];
 	xw->ready_fd = ready_pipe[0];
+	xw->ready_length = 0;
 	struct wl_event_loop *loop = wl_display_get_event_loop(xw->server->display);
 	xw->ready_source = wl_event_loop_add_fd(
 		loop, xw->ready_fd,
@@ -668,7 +890,7 @@ static int start_xwayland(int fd, uint32_t mask, void *data)
 
 static int make_unix_listener(const char *path, bool abstract)
 {
-	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	if (fd < 0) return -1;
 	struct sockaddr_un address;
 	memset(&address, 0, sizeof(address));
@@ -736,13 +958,15 @@ static void clear_runtime_objects(struct np_xwayland *xw)
 	xw->ready_source = NULL;
 	if (xw->ready_fd >= 0) close(xw->ready_fd);
 	xw->ready_fd = -1;
+	xw->ready_length = 0;
 	if (xw->xcb_source) wl_event_source_remove(xw->xcb_source);
 	xw->xcb_source = NULL;
 	if (xw->xcb) xcb_disconnect(xw->xcb);
 	xw->xcb = NULL;
 	xw->screen = NULL;
+	xw->wm_window = XCB_WINDOW_NONE;
 	if (xw->wm_fd >= 0) close(xw->wm_fd);
-	xw->wm_fd = -1;
+	xw->ready_fd = xw->wm_fd = -1;
 	if (xw->wayland_client) wl_client_destroy(xw->wayland_client);
 	xw->wayland_client = NULL;
 	struct np_xquery *query, *query_next;
@@ -797,11 +1021,20 @@ bool np_xwayland_init(struct np_server *server)
 	xw->server = server;
 	snprintf(xw->program, sizeof(xw->program), "%s", program);
 	xw->listen_fd[0] = xw->listen_fd[1] = -1;
-	xw->ready_fd = xw->wm_fd = -1;
+	xw->wm_fd = -1;
 	xw->pid = -1;
 	wl_list_init(&xw->windows);
 	wl_list_init(&xw->queries);
 	server->xwayland = xw;
+	xw->shell_global = wl_global_create(
+		server->display, &xwayland_shell_v1_interface, 1,
+		xw, xwayland_shell_bind);
+	if (!xw->shell_global) {
+		np_xwayland_finish(server);
+		return false;
+	}
+	wl_display_set_global_filter(
+		server->display, xwayland_global_filter, xw);
 	if (!reserve_display(xw) || !create_auth_file(xw)) {
 		np_xwayland_finish(server);
 		return false;
@@ -811,6 +1044,10 @@ bool np_xwayland_init(struct np_server *server)
 	add_listen_sources(xw);
 	struct wl_event_loop *loop = wl_display_get_event_loop(server->display);
 	xw->sigchld_source = wl_event_loop_add_signal(loop, SIGCHLD, sigchld_received, xw);
+	if (!xw->sigchld_source) {
+		np_xwayland_finish(server);
+		return false;
+	}
 	fprintf(stderr, "[xwayland] lazy display reserved at %s\n", server->xwayland_display);
 	return true;
 }
@@ -819,6 +1056,9 @@ void np_xwayland_finish(struct np_server *server)
 {
 	struct np_xwayland *xw = server ? server->xwayland : NULL;
 	if (!xw) return;
+	if (xw->shell_global) wl_global_destroy(xw->shell_global);
+	xw->shell_global = NULL;
+	wl_display_set_global_filter(server->display, NULL, NULL);
 	remove_listen_sources(xw);
 	if (xw->sigchld_source) wl_event_source_remove(xw->sigchld_source);
 	if (xw->pid > 0) {
@@ -844,8 +1084,32 @@ void np_xwayland_surface_created(struct np_server *server, struct np_surface *su
 	wl_list_for_each(window, &xw->windows, link) associate_surface(xw, window);
 }
 
+void np_xwayland_commit_serial(struct np_surface *surface, uint64_t serial)
+{
+	if (!surface || !serial) return;
+	if (surface->xwayland_serial_committed) {
+		if (surface->xwayland_shell_surface)
+			wl_resource_post_error(
+				surface->xwayland_shell_surface,
+				XWAYLAND_SURFACE_V1_ERROR_ALREADY_ASSOCIATED,
+				"xwayland surface serial was committed more than once");
+		return;
+	}
+	surface->xwayland_serial = serial;
+	surface->xwayland_serial_committed = true;
+	struct np_xwayland *xw = surface->server
+		? surface->server->xwayland : NULL;
+	if (!xw) return;
+	struct np_xwindow *window;
+	wl_list_for_each(window, &xw->windows, link) associate_surface(xw, window);
+}
+
 void np_xwayland_surface_destroyed(struct np_server *server, struct np_surface *surface)
 {
+	if (surface && surface->xwayland_shell_surface) {
+		wl_resource_set_user_data(surface->xwayland_shell_surface, NULL);
+		surface->xwayland_shell_surface = NULL;
+	}
 	struct np_xwayland *xw = server ? server->xwayland : NULL;
 	struct np_xwindow *window = xw ? xwindow_for_surface(xw, surface) : NULL;
 	if (window) window->surface = NULL;

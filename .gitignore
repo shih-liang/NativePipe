@@ -1,0 +1,4 @@
+.build/
+guest/compositor/.build/
+guest/compositor/dist/
+.DS_Store

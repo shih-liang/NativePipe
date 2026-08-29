@@ -9,6 +9,7 @@
 #include "shm_texture.h"
 #include "syncobj.h"
 #include "window_events.h"
+#include "xwayland.h"
 #include "xdg_shell.h"
 #include "viewporter-server-protocol.h"
 #include "xdg-shell-server-protocol.h"
@@ -101,11 +102,6 @@ bool np_surface_watch_wait_fd(
 
 static bool surface_update_can_apply(
 	struct np_surface_update *update, struct np_surface_update *wait_owner) {
-#ifdef NP_REMOTE
-	(void)update;
-	(void)wait_owner;
-	return true;
-#else
 	struct np_surface *surface = update->surface;
 	if (update->wait_fifo_barrier && surface->fifo_barrier_active)
 		return false;
@@ -150,7 +146,6 @@ static bool surface_update_can_apply(
 	}
 	if (!update->buffer) return true;
 	return true;
-#endif
 }
 
 
@@ -334,6 +329,7 @@ static struct np_surface_update *snapshot_surface_update(struct np_surface *surf
 	                     surface->pending_offset_changed ||
 	                     surface->pending_input_region_changed ||
 	                     surface->pending_opaque_region_changed ||
+	                     surface->pending_xwayland_serial_set ||
 	                     np_syncobj_has_pending(surface) ||
 	                     surface->pending_geometry_set || scale_changed ||
 	                     surface->popup_geometry_acked ||
@@ -385,6 +381,8 @@ static struct np_surface_update *snapshot_surface_update(struct np_surface *surf
 	update->minimum_height = surface->pending_minimum_height;
 	update->maximum_width = surface->pending_maximum_width;
 	update->maximum_height = surface->pending_maximum_height;
+	update->xwayland_serial_set = surface->pending_xwayland_serial_set;
+	update->xwayland_serial = surface->pending_xwayland_serial;
 	update->damage = surface->pending_buffer_damage;
 	uint32_t buffer_width, buffer_height;
 	struct np_box converted_damage;
@@ -428,6 +426,7 @@ static struct np_surface_update *snapshot_surface_update(struct np_surface *surf
 	surface->pending_input_region_changed = false;
 	surface->pending_opaque_region_changed = false;
 	surface->pending_size_constraints_changed = false;
+	surface->pending_xwayland_serial_set = false;
 	np_box_clear(&surface->pending_surface_damage);
 	np_box_clear(&surface->pending_buffer_damage);
 
@@ -548,6 +547,8 @@ static void apply_surface_update_now(struct np_surface_update *update) {
 		apply_surface_update_now(dependency);
 	}
 	struct np_surface *surface = update->surface;
+	if (update->xwayland_serial_set)
+		np_xwayland_commit_serial(surface, update->xwayland_serial);
 	np_sync_point_destroy(update->acquire_point);
 	update->acquire_point = NULL;
 	bool scale_changed = surface->scale != update->scale;

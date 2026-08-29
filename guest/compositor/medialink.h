@@ -22,9 +22,14 @@ void np_media_accept(struct np_media *media);
 /// Drop a half-closed peer so a new client can attach.
 void np_media_pump(struct np_media *media);
 bool np_media_connected(struct np_media *media);
+int np_media_connection_fd(struct np_media *media);
+void np_media_disconnect(struct np_media *media);
+bool np_media_take_just_attached(struct np_media *media);
 
 /// Send one NPEN frame. Blocks briefly; drops if no client.
-bool np_media_send(struct np_media *media, uint32_t surface_id,
+bool np_media_send(struct np_media *media, uint8_t codec, uint8_t flags,
+                   uint32_t surface_id,
+                   uint32_t resource_id,
                    uint16_t width, uint16_t height, uint64_t pts_ns,
                    uint16_t epoch, const uint8_t *payload, uint32_t length);
 

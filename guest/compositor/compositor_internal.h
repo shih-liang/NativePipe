@@ -4,10 +4,8 @@
 #include "damage.h"
 #include "hostlink.h"
 #include "region.h"
-#ifdef NP_REMOTE
 #include "medialink.h"
 #include "../encoder/encoder.h"
-#endif
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -33,19 +31,12 @@ struct np_server {
 	struct wl_display *display;
 	struct wl_list surfaces;
 	struct wl_list shm_textures;
-	/* Guest-to-host events remain on `host`. Host-to-guest paths use separate
-	 * sockets so vsock credit and a slow writer cannot couple unrelated Wayland
-	 * lifetimes. Remote TCP keeps its existing single control stream. */
+	/* Ordered host and guest window state shares one NPIP TCP stream. Encoded
+	 * pixels use the independent NPEN media stream. */
 	struct np_host host;
-	#ifndef NP_REMOTE
-	struct np_host host_control;
-	struct np_host host_input;
-	struct np_host host_feedback;
-	#endif
 	bool host_session_ready;
-#ifdef NP_REMOTE
 	struct np_media media;
-#endif
+	uint32_t next_media_resource_id;
 	int drm_fd;
 	uint32_t next_id;
 	uint32_t next_presentation_id;
@@ -84,20 +75,11 @@ struct np_server {
 	int32_t cursor_hotspot_x, cursor_hotspot_y;
 	uint32_t drag_focus_surface;
 	struct wl_event_source *host_connection_source;
+	struct wl_event_source *media_connection_source;
+	int watched_media_fd;
 	struct wl_event_source *scene_retry_timer;
 	int watched_host_fd;
 	uint32_t watched_host_mask;
-	#ifndef NP_REMOTE
-	struct wl_event_source *host_control_connection_source;
-	struct wl_event_source *host_input_connection_source;
-	struct wl_event_source *host_feedback_connection_source;
-	int watched_host_control_fd;
-	int watched_host_input_fd;
-	int watched_host_feedback_fd;
-	uint32_t watched_host_control_mask;
-	uint32_t watched_host_input_mask;
-	uint32_t watched_host_feedback_mask;
-	#endif
 	char session_socket[128];
 	struct np_xwayland *xwayland;
 	char xwayland_display[16];
@@ -176,6 +158,8 @@ struct np_surface_update {
 	bool size_constraints_changed;
 	int32_t minimum_width, minimum_height;
 	int32_t maximum_width, maximum_height;
+	bool xwayland_serial_set;
+	uint64_t xwayland_serial;
 	struct np_box damage;
 	bool set_fifo_barrier;
 	bool wait_fifo_barrier;
@@ -273,6 +257,11 @@ struct np_surface {
 	struct wl_resource *decoration;
 	uint32_t xwayland_window;
 	bool xwayland_popup;
+	struct wl_resource *xwayland_shell_surface;
+	bool pending_xwayland_serial_set;
+	uint64_t pending_xwayland_serial;
+	bool xwayland_serial_committed;
+	uint64_t xwayland_serial;
 	struct wl_resource *fractional_scale;
 	int preferred_scale;
 	int reported_scale;
@@ -369,10 +358,8 @@ struct np_surface {
 	const char *last_source;
 	bool has_published;
 	cJSON *pending_frame;
-#ifdef NP_REMOTE
 	struct np_encoder *encoder;
 	uint16_t last_epoch;
-#endif
 };
 
 bool np_surface_assign_role(struct np_surface *surface,
@@ -449,6 +436,7 @@ void np_presentation_set_current_buffer(struct np_surface *surface,
                                         struct wl_resource *buffer,
                                         struct np_gpu_buffer *gpu_buffer,
                                         struct np_sync_point *release_point);
+bool np_presentation_republish_remote(struct np_surface *surface);
 
 /* Host transport and command dispatch. */
 void np_input_handle_host_binary(const unsigned char *payload, size_t length,
