@@ -1,6 +1,7 @@
 # RemotePipe Wayland compositor for a real Linux host.
 
-PKGS          := wayland-server libcjson xkbcommon xcb xcb-composite
+PKGS          := wayland-server libcjson xkbcommon xcb xcb-composite \
+	egl glesv2 gbm libdrm
 MEDIA_PKGS    := libavcodec libavutil libswscale
 CLIENT_PKGS   := wayland-client
 CFLAGS        += -O2 -Wall -Wextra -Wno-unused-parameter -std=gnu11 \
@@ -31,7 +32,8 @@ GENERATED := xdg-shell-server-protocol.h xdg-shell-client-protocol.h xdg-shell-p
 SOURCES := compositor.c surface.c surface_commit.c presentation.c \
 	subcompositor.c input.c host_session.c decoration.c scale.c scene.c region.c \
 	perf.c hostlink.c windowwire.c window_events.c xdg_shell.c text_input.c fifo.c \
-	data_device.c cursor_shape.c medialink.c dmabuf_remote.c syncobj_stub.c \
+	data_device.c cursor_shape.c medialink.c dmabuf_remote.c dmabuf_egl.c \
+	syncobj_stub.c \
 	xwayland.c remotepipe_main.c ../encoder/encoder.c ../encoder/alpha.c \
 	cursor-shape-v1-protocol.c xdg-shell-protocol.c viewporter-protocol.c \
 	fractional-scale-v1-protocol.c xdg-decoration-protocol.c \
@@ -62,7 +64,7 @@ print-binary:
 
 check-deps:
 	@pkg-config --exists $(PKGS) $(MEDIA_PKGS) || { \
-		echo 'error: install Wayland, cJSON, xkbcommon, XCB Composite and FFmpeg development packages'; \
+		echo 'error: install Wayland, cJSON, xkbcommon, XCB Composite, EGL/GLES, GBM/libdrm and FFmpeg development packages'; \
 		exit 1; \
 	}
 	@command -v wayland-scanner >/dev/null || { \

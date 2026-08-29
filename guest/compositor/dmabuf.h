@@ -7,7 +7,8 @@
 
 struct np_sync_point;
 
-/// Imports a single-plane linear dma-buf for CPU-side video encoding.
+/// Imports single-plane ARGB/XRGB dma-bufs for remote video encoding. Linear
+/// images are mapped directly; device modifiers use the matching EGL device.
 void np_dmabuf_advertise(struct wl_display *display, int drm_fd);
 
 /// A buffer created from linux-dmabuf, or NULL if this wl_buffer is wl_shm.
@@ -45,7 +46,7 @@ enum np_gpu_read_result np_gpu_buffer_render_status(
  * VIRTGPU_WAIT/export-sync-file per layer would duplicate that synchronization. */
 bool np_gpu_buffer_acquire_host_read(struct np_gpu_buffer *buffer);
 void np_gpu_buffer_end_host_read(struct np_gpu_buffer *buffer);
-/* RemotePipe maps linear dma-buf pixels only for the short encoder copy. */
+/* RemotePipe returns tightly packed/readable pixels for the short encoder copy. */
 bool np_gpu_buffer_begin_cpu_read(
 	struct np_gpu_buffer *buffer, const unsigned char **pixels);
 void np_gpu_buffer_end_cpu_read(struct np_gpu_buffer *buffer);

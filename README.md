@@ -14,15 +14,21 @@ pixels travel over SSH as H.264 instead of virtio-gpu resources.
 - client/server decorations, viewport, integer/fractional scale, output state,
   damage, frame callbacks and `wp_fifo_manager_v1`
 - rootless Xwayland (`DISPLAY` and `XAUTHORITY` are exported automatically)
-- `wl_shm` and single-plane linear ARGB/XRGB linux-dmabuf buffers
+- `wl_shm` and single-plane ARGB/XRGB linux-dmabuf v4 feedback, including
+  device-native modifiers for GPU-accelerated Xwayland
 - one immutable media resource per committed frame, window-level scene
   snapshots, decoder-safe reconnect and alpha sidecars for cursors, drag icons
   and translucent subsurfaces
 
 RemotePipe intentionally does not contain LightHouse VM hosting, virtio-gpu,
 Venus, VGL or blob-alignment code. Explicit DRM syncobj is not advertised on a
-remote machine; implicit dma-buf fences are observed before the CPU encoder
-reads a linear buffer.
+remote machine; implicit dma-buf fences are observed before the encoder reads a
+buffer. Linear images are mapped directly. Device-native tiled images are
+imported through the matching EGL render node and converted to packed BGRA.
+
+The compositor selects the first accessible DRM render node for dmabuf
+feedback. Set `REMOTEPIPE_RENDER_NODE=/dev/dri/renderD…` when a multi-GPU host
+needs a specific device.
 
 ## macOS client
 
@@ -44,15 +50,16 @@ cJSON, xkbcommon, XCB/XComposite and FFmpeg (`libavcodec`, `libavutil`,
 
 ```sh
 doas apk add build-base linux-headers wayland-dev wayland-protocols \
-  cjson-dev libxkbcommon-dev libxcb-dev ffmpeg-dev
+  cjson-dev libxkbcommon-dev libxcb-dev mesa-dev libdrm-dev ffmpeg-dev
 make -C guest/compositor
 make -C guest/compositor print-binary
 ```
 
 On Debian/Ubuntu the corresponding packages are `build-essential`,
 `libwayland-dev`, `wayland-protocols`, `libcjson-dev`, `libxkbcommon-dev`,
-`libxcb1-dev`, `libxcb-composite0-dev`, `libavcodec-dev`, `libavutil-dev` and
-`libswscale-dev`.
+`libxcb1-dev`, `libxcb-composite0-dev`, `libegl1-mesa-dev`,
+`libgles2-mesa-dev`, `libgbm-dev`, `libdrm-dev`, `libavcodec-dev`,
+`libavutil-dev` and `libswscale-dev`.
 
 `make install` installs `remotepipe-wayland` under `/usr/local/bin` by default.
 The compositor listens only on remote loopback:
