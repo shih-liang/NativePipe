@@ -9,6 +9,7 @@
 #include "text_input.h"
 #include "window_events.h"
 #include "xdg_shell.h"
+#include "xwayland.h"
 #include "xdg-shell-server-protocol.h"
 
 #include <errno.h>
@@ -380,6 +381,7 @@ void np_set_keyboard_focus(struct np_server *server, uint32_t window_id) {
 		fprintf(stderr, "[wayland] focus -> window %u: no such surface\n", window_id);
 	}
 	server->focused_window = window_id;
+	np_xwayland_set_focus(server, next);
 	np_text_input_focus_changed(server, previous, next);
 }
 
@@ -551,21 +553,29 @@ void np_input_handle_host_binary(const unsigned char *payload, size_t length, vo
 	if (length == 24 && memcmp(payload, "NPCF", 4) == 0) {
 		uint32_t window_id = read_le32(payload + 4);
 		struct np_surface *surface = np_surface_by_window(server, window_id);
-		if (!surface || !surface->toplevel) return;
+		if (!surface || !np_surface_is_toplevel(surface)) return;
 		int32_t width = (int32_t)read_le32(payload + 8);
 		int32_t height = (int32_t)read_le32(payload + 12);
 		uint32_t state_bits = read_le32(payload + 16);
 		/* payload + 20 is the host-side diagnostic serial. Wayland owns the
 		 * configure serial and flow control is tied to the output latch. */
-		np_xdg_configure_toplevel_from_host(
-			surface, width, height, state_bits);
+		if (surface->xwayland_window)
+			np_xwayland_configure(surface, width, height, state_bits);
+		else
+			np_xdg_configure_toplevel_from_host(surface, width, height, state_bits);
 		wl_display_flush_clients(server->display);
 		return;
 	}
 	if (length == 28 && memcmp(payload, "NPPF", 4) == 0) {
 		struct np_surface *surface = np_surface_by_window(
 			server, read_le32(payload + 4));
-		if (!surface || !surface->popup) return;
+		if (!surface || !np_surface_is_popup(surface)) return;
+		if (surface->xwayland_window) {
+			np_xwayland_configure(
+				surface, (int32_t)read_le32(payload + 16),
+				(int32_t)read_le32(payload + 20), 0);
+			return;
+		}
 		np_xdg_configure_popup(
 			surface, (int32_t)read_le32(payload + 8),
 			(int32_t)read_le32(payload + 12),
@@ -636,7 +646,7 @@ void np_input_handle_host_command(const char *name, cJSON *body, void *user_data
 	if (strcmp(name, "configure") == 0) {
 		uint32_t window_id = (uint32_t)json_int(body, "window", 0);
 		struct np_surface *surface = np_surface_by_window(server, window_id);
-		if (!surface || !surface->toplevel) return;
+		if (!surface || !np_surface_is_toplevel(surface)) return;
 
 		cJSON *size = cJSON_GetObjectItemCaseSensitive(body, "size");
 		int width = size ? json_int(size, "width", 0) : 0;
@@ -656,8 +666,10 @@ void np_input_handle_host_command(const char *name, cJSON *body, void *user_data
 			else if (strcmp(state->valuestring, "activated") == 0)
 				state_bits |= NP_CONFIGURE_ACTIVATED;
 		}
-		np_xdg_configure_toplevel_from_host(
-			surface, width, height, state_bits);
+		if (surface->xwayland_window)
+			np_xwayland_configure(surface, width, height, state_bits);
+		else
+			np_xdg_configure_toplevel_from_host(surface, width, height, state_bits);
 		// Flushed before allocating: the client starts repainting now, and the
 		// map round trip overlaps that instead of following it.
 		wl_display_flush_clients(server->display);
@@ -667,7 +679,9 @@ void np_input_handle_host_command(const char *name, cJSON *body, void *user_data
 
 	if (strcmp(name, "close") == 0) {
 		struct np_surface *surface = np_surface_by_window(server, (uint32_t)json_int(body, "window", 0));
-		if (surface && surface->toplevel) {
+		if (surface && surface->xwayland_window) {
+			np_xwayland_close(surface);
+		} else if (surface && surface->toplevel) {
 			// A request, not an order: the client decides whether to exit.
 			xdg_toplevel_send_close(surface->toplevel);
 			wl_display_flush_clients(server->display);
@@ -679,6 +693,10 @@ void np_input_handle_host_command(const char *name, cJSON *body, void *user_data
 		struct np_surface *surface = np_surface_by_window(
 			server, (uint32_t)json_int(body, "window", 0));
 		if (!surface || !surface->resource) return;
+		if (surface->xwayland_window) {
+			np_xwayland_force_quit(surface);
+			return;
+		}
 
 		struct wl_client *client = wl_resource_get_client(surface->resource);
 		pid_t pid = -1;
@@ -694,7 +712,9 @@ void np_input_handle_host_command(const char *name, cJSON *body, void *user_data
 
 	if (strcmp(name, "dismissPopup") == 0) {
 		struct np_surface *surface = np_surface_by_window(server, (uint32_t)json_int(body, "window", 0));
-		if (surface && surface->popup) {
+		if (surface && surface->xwayland_window && surface->xwayland_popup) {
+			np_xwayland_dismiss_popup(surface);
+		} else if (surface && surface->popup) {
 			xdg_popup_send_popup_done(surface->popup);
 			wl_display_flush_clients(server->display);
 		}

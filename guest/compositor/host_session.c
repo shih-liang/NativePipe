@@ -14,10 +14,11 @@
 #include <unistd.h>
 
 #ifndef NP_REMOTE
-static bool publish_session_environment(const char *socket)
+static bool publish_session_environment(struct np_server *server)
 {
 	const char *runtime = getenv("XDG_RUNTIME_DIR");
-	if (!runtime || !runtime[0] || !socket || !socket[0]) return false;
+	const char *socket = server->session_socket;
+	if (!runtime || !runtime[0] || !socket[0]) return false;
 
 	char path[1024];
 	char temporary[1088];
@@ -41,6 +42,10 @@ static bool publish_session_environment(const char *socket)
 	const char *bus = getenv("DBUS_SESSION_BUS_ADDRESS");
 	if (ok && bus && bus[0])
 		ok = fprintf(env, "DBUS_SESSION_BUS_ADDRESS=%s\n", bus) > 0;
+	if (ok && server->xwayland_display[0])
+		ok = fprintf(env, "DISPLAY=%s\n", server->xwayland_display) > 0;
+	if (ok && server->xwayland_auth[0])
+		ok = fprintf(env, "XAUTHORITY=%s\n", server->xwayland_auth) > 0;
 	if (ok) ok = fflush(env) == 0;
 	if (ok) ok = fsync(fd) == 0;
 	if (fclose(env) != 0) ok = false;
@@ -118,10 +123,10 @@ static void republish_state(struct np_server *server) {
 
 	wl_list_for_each_reverse(surface, &server->surfaces, link) {
 		cJSON *body;
-		if (surface->toplevel) {
+		if (np_surface_is_toplevel(surface)) {
 			uint32_t fields[] = {surface->window_id, surface->id};
 			np_window_event_send(server, NP_GUEST_TOPLEVEL_CREATED, fields, 2);
-		} else if (surface->popup) {
+		} else if (np_surface_is_popup(surface)) {
 			uint32_t fields[] = {
 				surface->window_id, surface->id, surface->popup_parent_window,
 				(uint32_t)surface->popup_x, (uint32_t)surface->popup_y,
@@ -322,7 +327,7 @@ void np_host_session_sync(struct np_server *server) {
 		/* channelReady is the host launch gate. The environment must be visible
 		 * before the event because the host may launch immediately on receipt. */
 #ifndef NP_REMOTE
-		if (!publish_session_environment(server->session_socket))
+		if (!publish_session_environment(server))
 			fprintf(stderr, "[wayland] could not publish the session environment\n");
 #endif
 		server->host_session_ready = true;

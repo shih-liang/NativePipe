@@ -70,12 +70,29 @@ public struct Request: Sendable {
         /// validates it against the live system before applying it.
         case reconcileResources(GuestResourceState)
 
+        /// Mirror host desktop preferences through the guest's ordinary
+        /// settings service. Repeated updates are latest-wins on the host.
+        case desktopPreferences(DesktopPreferences)
+
         /// Create `username` if missing. If `oldUsername` is set, rename that
         /// account to `username` instead (usermod). Does not set a password.
         case setUser(username: String, oldUsername: String?)
 
         /// Set the password for an existing guest account (`chpasswd`).
         case setPassword(username: String, password: String)
+    }
+}
+
+public struct DesktopPreferences: Sendable, Equatable {
+    public enum ColorScheme: UInt8, Sendable {
+        case light = 1
+        case dark = 2
+    }
+
+    public var colorScheme: ColorScheme
+
+    public init(colorScheme: ColorScheme) {
+        self.colorScheme = colorScheme
     }
 }
 
@@ -373,4 +390,5 @@ public enum GuestCapability {
     public static let getVersion = "agent.version"
     public static let environmentCatalog = "environment.catalog"
     public static let resourceSync = "resource.sync.v1"
+    public static let desktopPreferences = "integration.desktop-preferences"
 }

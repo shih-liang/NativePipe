@@ -12,6 +12,7 @@ import Foundation
 ///     NPVQ  getVersion    id(u64)
 ///     NPEU  refresh env   id(u64)
 ///     NPSY  sync resources id(u64) guestd_ver(str) env_revision(u64) profile(str)
+///     NPDP  desktop prefs id(u64) color_scheme(u8)
 ///     NPRZ  resize        id(u64) cols(u32) rows(u32)
 ///     NPLN  launch        id(u64) LaunchSpec
 ///     NPRU  run           id(u64) LaunchSpec
@@ -67,6 +68,7 @@ public enum ControlWire {
     public static let getVersionMagic: [UInt8] = Array("NPVQ".utf8)
     public static let refreshEnvironmentMagic: [UInt8] = Array("NPEU".utf8)
     public static let reconcileResourcesMagic: [UInt8] = Array("NPSY".utf8)
+    public static let desktopPreferencesMagic: [UInt8] = Array("NPDP".utf8)
     public static let resizeMagic: [UInt8] = Array("NPRZ".utf8)
     public static let launchMagic: [UInt8] = Array("NPLN".utf8)
     public static let runMagic: [UInt8] = Array("NPRU".utf8)
@@ -126,6 +128,7 @@ public enum ControlWire {
 
     private static let knownMagics: Set<[UInt8]> = [
         helloMagic, pingMagic, getVersionMagic, refreshEnvironmentMagic, reconcileResourcesMagic,
+        desktopPreferencesMagic,
         resizeMagic, launchMagic, runMagic,
         execMagic, readMagic, writeMagic, continueMagic, cancelMagic, statMagic, shutdownMagic,
         setUserMagic, setPasswordMagic, initInventoryMagic, initMountMagic, initExecuteMagic,
@@ -161,6 +164,11 @@ public enum ControlWire {
             appendString(desired.guestdVersion, to: &payload)
             append(desired.environmentRevision, to: &payload)
             appendString(desired.environmentProfile, to: &payload)
+            return payload
+        case .desktopPreferences(let preferences):
+            var payload = Data(desktopPreferencesMagic)
+            append(id, to: &payload)
+            payload.append(preferences.colorScheme.rawValue)
             return payload
         case .resizeConsole(let cols, let rows):
             var payload = Data(resizeMagic)

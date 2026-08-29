@@ -15,6 +15,8 @@ enum np_configure_state_bits {
 
 void np_xdg_shell_bind(struct wl_client *client, void *data,
                        uint32_t version, uint32_t id);
+void np_window_set_title(struct np_surface *surface, const char *title);
+void np_window_set_app_id(struct np_surface *surface, const char *app_id);
 void np_xdg_clear_configures(struct np_surface *surface);
 void np_xdg_send_initial_role_configure(struct np_surface *surface);
 void np_xdg_finish_toplevel_configure(struct np_surface *surface,

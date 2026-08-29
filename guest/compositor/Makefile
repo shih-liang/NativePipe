@@ -25,6 +25,8 @@ endif
 FFMPEG_PKGS   := libavcodec libavutil libswscale
 FFMPEG_CFLAGS := $(shell pkg-config --cflags $(FFMPEG_PKGS) 2>/dev/null)
 FFMPEG_LIBS   := $(shell pkg-config --libs $(FFMPEG_PKGS) 2>/dev/null)
+XCB_CFLAGS    := $(shell pkg-config --cflags xcb 2>/dev/null)
+XCB_LIBS      := $(shell pkg-config --libs xcb 2>/dev/null)
 
 PROTOCOL_DIR   := $(shell pkg-config --variable=pkgdatadir wayland-protocols)
 XDG_SHELL_XML  := $(PROTOCOL_DIR)/stable/xdg-shell/xdg-shell.xml
@@ -59,7 +61,7 @@ SHARED_SOURCES := compositor.c surface.c surface_commit.c presentation.c \
 # needs compositor-owned Vulkan storage, one texture per wl_buffer.
 VM_SOURCES := virtio_resource.c dmabuf.c shm_texture.c \
               syncobj.c linux-drm-syncobj-v1-protocol.c \
-              vk_context.c vk_surface_buffer.c vmpipe_main.c
+              vk_context.c vk_surface_buffer.c xwayland.c vmpipe_main.c
 
 REMOTE_SOURCES := medialink.c ../encoder/encoder.c dmabuf_stub.c syncobj_stub.c \
                   remotepipe_main.c
@@ -167,8 +169,11 @@ linux-drm-syncobj-v1-protocol.c: $(SYNCOBJ_XML)
 	wayland-scanner private-code $(SYNCOBJ_XML) $@
 
 $(BINARY): $(GENERATED) $(SHARED_SOURCES) $(VM_SOURCES) $(SOURCE_HASH) Makefile | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(SOURCE_DEFINE) $(VULKAN_CFLAGS) -o $@ \
-		$(SHARED_SOURCES) $(VM_SOURCES) $(LDLIBS) $(VULKAN_LIBS)
+	@if [ -z "$(XCB_LIBS)" ]; then \
+		echo "error: xcb pkg-config missing (required for rootless Xwayland)"; exit 1; \
+	fi
+	$(CC) $(CFLAGS) $(SOURCE_DEFINE) $(VULKAN_CFLAGS) $(XCB_CFLAGS) -o $@ \
+		$(SHARED_SOURCES) $(VM_SOURCES) $(LDLIBS) $(VULKAN_LIBS) $(XCB_LIBS)
 
 $(REMOTE_BINARY): $(GENERATED) $(SHARED_SOURCES) $(REMOTE_SOURCES) $(SOURCE_HASH) Makefile | $(BUILD_DIR)
 	@if [ -z "$(FFMPEG_LIBS)" ]; then \

@@ -16,6 +16,7 @@
 #include "syncobj.h"
 #include "text_input.h"
 #include "xdg_shell.h"
+#include "xwayland.h"
 #ifndef NP_REMOTE
 #include "virtio_resource.h"
 #endif
@@ -138,6 +139,8 @@ int np_compositor_run(int argc, char **argv)
 		return 1;
 	}
 	fprintf(stderr, "[wayland] WAYLAND_DISPLAY=%s\n", socket);
+	if (!np_xwayland_init(&server))
+		fprintf(stderr, "[wayland] Xwayland integration unavailable\n");
 	if (!np_host_session_set_socket(&server, socket)) {
 		fprintf(stderr, "[wayland] could not publish display name\n");
 		return 1;
@@ -160,6 +163,7 @@ int np_compositor_run(int argc, char **argv)
 	}
 
 	np_host_session_finish(&server);
+	np_xwayland_finish(&server);
 	wl_display_destroy(server.display);
 #ifndef NP_REMOTE
 	if (server.drm_fd >= 0) close(server.drm_fd);

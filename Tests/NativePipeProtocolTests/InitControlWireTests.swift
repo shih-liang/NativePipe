@@ -31,6 +31,16 @@ final class InitControlWireTests: XCTestCase {
         XCTAssertTrue(payload.suffix(bytes.count).elementsEqual(bytes))
     }
 
+    func testDesktopPreferencesUseCompactBinaryEnvelope() {
+        let payload = ControlWire.encode(
+            id: 11,
+            call: .desktopPreferences(.init(colorScheme: .dark)))
+
+        XCTAssertEqual(payload.count, 13)
+        XCTAssertEqual(Data(payload.prefix(4)), Data("NPDP".utf8))
+        XCTAssertEqual(payload.last, DesktopPreferences.ColorScheme.dark.rawValue)
+    }
+
     func testInitInventoryResponseDecodes() {
         var payload = Data("NPIB".utf8)
         append(UInt64(9), to: &payload)

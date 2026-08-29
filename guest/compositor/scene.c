@@ -17,7 +17,8 @@
 struct np_surface *np_scene_root(struct np_surface *surface)
 {
 	while (surface && surface->parent) surface = surface->parent;
-	return surface && (surface->toplevel || surface->popup) ? surface : NULL;
+	return surface && (np_surface_is_toplevel(surface) || np_surface_is_popup(surface))
+		? surface : NULL;
 }
 struct np_surface *np_scene_hit_test(struct np_surface *root, double x, double y,
 	                                double *local_x, double *local_y)
@@ -92,7 +93,8 @@ struct np_scene_item {
 struct np_surface *np_scene_root(struct np_surface *surface)
 {
 	while (surface && surface->parent) surface = surface->parent;
-	return surface && (surface->toplevel || surface->popup) ? surface : NULL;
+	return surface && (np_surface_is_toplevel(surface) || np_surface_is_popup(surface))
+		? surface : NULL;
 }
 
 void np_scene_note_damage(struct np_surface *surface,

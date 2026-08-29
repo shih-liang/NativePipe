@@ -7,6 +7,7 @@
 #include "scene.h"
 #include "syncobj.h"
 #include "window_events.h"
+#include "xwayland.h"
 #include "xdg_shell.h"
 
 #include <stdio.h>
@@ -17,11 +18,22 @@
 struct np_surface *np_surface_by_window(struct np_server *server, uint32_t window_id) {
 	struct np_surface *surface;
 	wl_list_for_each(surface, &server->surfaces, link) {
-		if ((surface->toplevel || surface->popup) && surface->window_id == window_id) {
+		if ((np_surface_is_toplevel(surface) || np_surface_is_popup(surface)) &&
+		    surface->window_id == window_id) {
 			return surface;
 		}
 	}
 	return NULL;
+}
+
+bool np_surface_is_toplevel(const struct np_surface *surface) {
+	return surface && (surface->toplevel ||
+	       (surface->xwayland_window && !surface->xwayland_popup));
+}
+
+bool np_surface_is_popup(const struct np_surface *surface) {
+	return surface && (surface->popup ||
+	       (surface->xwayland_window && surface->xwayland_popup));
 }
 
 struct np_surface *np_surface_by_id(struct np_server *server, uint32_t surface_id) {
@@ -170,6 +182,7 @@ static const struct wl_surface_interface surface_implementation = {
 static void surface_resource_destroy(struct wl_resource *resource) {
 	struct np_surface *surface = wl_resource_get_user_data(resource);
 	if (!surface) return;
+	np_xwayland_surface_destroyed(surface->server, surface);
 
 	/* A client disconnect destroys all of its protocol resources, but libwayland
 	 * does not promise that role objects are destroyed before wl_surface.  Every
@@ -216,12 +229,12 @@ static void surface_resource_destroy(struct wl_resource *resource) {
 	// Children may outlive their parent's resource. Remove both active stacking
 	// links and unapplied restack operations before any pointer can go stale.
 	np_subsurface_detach_tree(surface);
-	if (surface->toplevel) {
+	if (np_surface_is_toplevel(surface)) {
 		uint32_t fields[] = {surface->window_id};
 		np_window_event_send(surface->server, NP_GUEST_TOPLEVEL_DESTROYED,
 		                     fields, 1);
 	}
-	if (surface->popup) {
+	if (np_surface_is_popup(surface)) {
 		uint32_t fields[] = {surface->window_id};
 		np_window_event_send(surface->server, NP_GUEST_POPUP_DESTROYED,
 		                     fields, 1);
@@ -307,6 +320,7 @@ static void compositor_create_surface(struct wl_client *client, struct wl_resour
 	wl_resource_set_implementation(surface->resource, &surface_implementation, surface,
 	                               surface_resource_destroy);
 	wl_list_insert(&server->surfaces, &surface->link);
+	np_xwayland_surface_created(server, surface);
 
 	// A surface learns integer buffer scale from the outputs it has entered.
 	// Advertising wl_output.scale without enter leaves GTK/Qt with no applicable

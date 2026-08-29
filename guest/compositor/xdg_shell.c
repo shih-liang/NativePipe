@@ -103,9 +103,8 @@ static void toplevel_set_parent(struct wl_client *client, struct wl_resource *re
 	np_host_send(&surface->server->host, "parentChanged", body);
 }
 
-static void toplevel_set_title(struct wl_client *client, struct wl_resource *resource,
-                               const char *title) {
-	struct np_surface *surface = wl_resource_get_user_data(resource);
+void np_window_set_title(struct np_surface *surface, const char *title) {
+	if (!surface) return;
 	cJSON *body = cJSON_CreateObject();
 	cJSON_AddNumberToObject(body, "window", surface->window_id);
 	cJSON_AddStringToObject(body, "title", title ? title : "");
@@ -114,15 +113,24 @@ static void toplevel_set_title(struct wl_client *client, struct wl_resource *res
 	np_host_send(&surface->server->host, "titleChanged", body);
 }
 
-static void toplevel_set_app_id(struct wl_client *client, struct wl_resource *resource,
-                                const char *app_id) {
-	struct np_surface *surface = wl_resource_get_user_data(resource);
+void np_window_set_app_id(struct np_surface *surface, const char *app_id) {
+	if (!surface) return;
 	cJSON *body = cJSON_CreateObject();
 	cJSON_AddNumberToObject(body, "window", surface->window_id);
 	cJSON_AddStringToObject(body, "appID", app_id ? app_id : "");
 	free(surface->app_id);
 	surface->app_id = strdup(app_id ? app_id : "");
 	np_host_send(&surface->server->host, "appIDChanged", body);
+}
+
+static void toplevel_set_title(struct wl_client *client, struct wl_resource *resource,
+                               const char *title) {
+	np_window_set_title(wl_resource_get_user_data(resource), title);
+}
+
+static void toplevel_set_app_id(struct wl_client *client, struct wl_resource *resource,
+                                const char *app_id) {
+	np_window_set_app_id(wl_resource_get_user_data(resource), app_id);
 }
 
 static void toplevel_show_window_menu(struct wl_client *client, struct wl_resource *resource,

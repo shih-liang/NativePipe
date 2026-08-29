@@ -5,6 +5,7 @@ import ImageIO
 import IOSurface
 @preconcurrency import Metal
 import NativePipeProtocol
+import ScreenCaptureKit
 import UniformTypeIdentifiers
 
 public enum FrameTextureStatus: Sendable {
@@ -32,11 +33,16 @@ public struct DockWindow: Sendable, Identifiable, Equatable {
     public let isMiniaturized: Bool
     public let isZoomed: Bool
     public let isFullscreen: Bool
+    public let width: Double
+    public let height: Double
+    public let isVisible: Bool
+    public let isKey: Bool
 
     public init(
         id: UInt32, title: String, applicationID: String?,
         isMiniaturized: Bool = false, isZoomed: Bool = false,
-        isFullscreen: Bool = false
+        isFullscreen: Bool = false, width: Double = 0, height: Double = 0,
+        isVisible: Bool = false, isKey: Bool = false
     ) {
         self.id = id
         self.title = title
@@ -44,6 +50,38 @@ public struct DockWindow: Sendable, Identifiable, Equatable {
         self.isMiniaturized = isMiniaturized
         self.isZoomed = isZoomed
         self.isFullscreen = isFullscreen
+        self.width = width
+        self.height = height
+        self.isVisible = isVisible
+        self.isKey = isKey
+    }
+}
+
+public struct DockWindowCapture: Sendable {
+    public let png: Data
+    public let contentSize: CGSize
+    public let pixelSize: CGSize
+
+    public init(png: Data, contentSize: CGSize, pixelSize: CGSize) {
+        self.png = png
+        self.contentSize = contentSize
+        self.pixelSize = pixelSize
+    }
+}
+
+public enum ComputerUseWindowError: LocalizedError {
+    case unavailable
+    case hidden
+    case invalidCoordinates
+    case captureFailed
+
+    public var errorDescription: String? {
+        switch self {
+        case .unavailable: "the guest window no longer exists"
+        case .hidden: "the guest window is not visible"
+        case .invalidCoordinates: "input coordinates are outside the guest content"
+        case .captureFailed: "WindowServer could not capture the guest window"
+        }
     }
 }
 
@@ -326,6 +364,10 @@ public final class WindowBridge: NSObject {
 		let scale: Int
 	}
 	private var windowDisplayStates: [UInt32: WindowDisplayState] = [:]
+    private var presentationSuspended = false
+    private var suspendedVisibleWindows: [UInt32] = []
+    private var suspendedKeyWindow: UInt32?
+    private var computerPointerWindow: UInt32?
 
     /// Strong on purpose. There is no cycle to break — a frame source refers to
     /// the VM controller weakly, if at all — and a weak reference here silently
@@ -358,10 +400,40 @@ public final class WindowBridge: NSObject {
 
     public var windowCount: Int { windows.count }
 
+    /// Freeze host presentation without changing Wayland object lifetime.
+    /// `orderOut` is deliberately not `close`: the guest remains authoritative
+    /// and sees the same xdg_toplevels after VZ resumes.
+    public func setSuspended(_ suspended: Bool, hideWindows: Bool) {
+        guard presentationSuspended != suspended else { return }
+        presentationSuspended = suspended
+        if suspended {
+            for native in windows.values { unregisterDisplayClock(native) }
+            guard hideWindows else { return }
+            suspendedVisibleWindows = windows.compactMap { id, native in
+                native.window?.isVisible == true ? id : nil
+            }
+            suspendedKeyWindow = windows.first { $0.value.window?.isKeyWindow == true }?.key
+            for id in suspendedVisibleWindows { windows[id]?.window?.orderOut(nil) }
+            return
+        }
+
+        for native in windows.values {
+            native.invalidateSceneHistory()
+            registerDisplayClock(native, screen: native.window?.screen)
+        }
+        for id in suspendedVisibleWindows { windows[id]?.window?.orderFront(nil) }
+        if NSApp.isActive, let id = suspendedKeyWindow {
+            windows[id]?.window?.makeKey()
+        }
+        suspendedVisibleWindows.removeAll(keepingCapacity: true)
+        suspendedKeyWindow = nil
+        retryPendingFrames()
+    }
+
     /// Authoritative mapped xdg_toplevels for the VM host's window switcher.
     /// Popups, cursor surfaces and drag icons never become application windows.
     public var dockWindows: [DockWindow] {
-        windows.values.compactMap { native in
+        windows.values.compactMap { native -> DockWindow? in
             guard !native.isPopup, native.window != nil else { return nil }
             return DockWindow(
                 id: native.windowID,
@@ -369,7 +441,11 @@ public final class WindowBridge: NSObject {
                 applicationID: native.applicationID,
                 isMiniaturized: native.isMiniaturized,
                 isZoomed: native.isZoomed,
-                isFullscreen: native.isFullscreen)
+                isFullscreen: native.isFullscreen,
+                width: Double(native.window?.contentView?.bounds.width ?? 0),
+                height: Double(native.window?.contentView?.bounds.height ?? 0),
+                isVisible: native.window?.isVisible == true,
+                isKey: native.window?.isKeyWindow == true)
         }.sorted {
             $0.title.localizedStandardCompare($1.title) == .orderedAscending
         }
@@ -386,6 +462,153 @@ public final class WindowBridge: NSObject {
 
     public func iconForDockWindow(_ id: UInt32) -> NSImage? {
         windows[id]?.dockIcon
+    }
+
+    /// Capture only the AppKit content rect. A native SSD titlebar, WindowServer
+    /// shadow, and neighbouring applications are excluded, so returned pixels
+    /// share the exact top-left logical coordinate space accepted by input.
+    public func captureDockWindow(
+        _ id: UInt32, maximumWidth: Int, maximumHeight: Int
+    ) async throws -> DockWindowCapture {
+        guard maximumWidth > 0, maximumHeight > 0,
+              let native = dockWindow(id), let window = native.window else {
+            throw ComputerUseWindowError.unavailable
+        }
+        guard window.isVisible, !window.isMiniaturized else {
+            throw ComputerUseWindowError.hidden
+        }
+        let windowID = CGWindowID(window.windowNumber)
+        let shareable = try await SCShareableContent.current
+        guard let capturedWindow = shareable.windows.first(where: {
+            $0.windowID == windowID
+        }) else {
+            throw ComputerUseWindowError.captureFailed
+        }
+
+        let frame = window.frame
+        let content = window.contentRect(forFrameRect: frame)
+        guard frame.width > 0, frame.height > 0,
+              content.width > 0, content.height > 0 else {
+            throw ComputerUseWindowError.captureFailed
+        }
+
+        let filter = SCContentFilter(desktopIndependentWindow: capturedWindow)
+        let configuration = SCStreamConfiguration()
+        let pixelScale = max(CGFloat(filter.pointPixelScale), 1)
+        configuration.width = max(1, Int((frame.width * pixelScale).rounded(.up)))
+        configuration.height = max(1, Int((frame.height * pixelScale).rounded(.up)))
+        configuration.showsCursor = false
+        configuration.scalesToFit = true
+        configuration.preservesAspectRatio = true
+        configuration.ignoreShadowsSingleWindow = true
+        let full = try await SCScreenshotManager.captureImage(
+            contentFilter: filter, configuration: configuration)
+
+        let scaleX = CGFloat(full.width) / frame.width
+        let scaleY = CGFloat(full.height) / frame.height
+        let proposedCrop = CGRect(
+            x: (content.minX - frame.minX) * scaleX,
+            y: (frame.maxY - content.maxY) * scaleY,
+            width: content.width * scaleX,
+            height: content.height * scaleY).integral
+        let imageBounds = CGRect(x: 0, y: 0, width: full.width, height: full.height)
+        let crop = proposedCrop.intersection(imageBounds)
+        guard crop.width > 0, crop.height > 0,
+              let contentImage = full.cropping(to: crop),
+              let output = Self.scaled(
+                contentImage, maximumWidth: maximumWidth,
+                maximumHeight: maximumHeight) else {
+            throw ComputerUseWindowError.captureFailed
+        }
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            data, UTType.png.identifier as CFString, 1, nil) else {
+            throw ComputerUseWindowError.captureFailed
+        }
+        CGImageDestinationAddImage(destination, output, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw ComputerUseWindowError.captureFailed
+        }
+        return DockWindowCapture(
+            png: data as Data,
+            contentSize: content.size,
+            pixelSize: CGSize(width: output.width, height: output.height))
+    }
+
+    private static func scaled(
+        _ image: CGImage, maximumWidth: Int, maximumHeight: Int
+    ) -> CGImage? {
+        let ratio = min(
+            1, CGFloat(maximumWidth) / CGFloat(image.width),
+            CGFloat(maximumHeight) / CGFloat(image.height))
+        guard ratio < 1 else { return image }
+        let width = max(1, Int((CGFloat(image.width) * ratio).rounded(.down)))
+        let height = max(1, Int((CGFloat(image.height) * ratio).rounded(.down)))
+        guard let context = CGContext(
+            data: nil, width: width, height: height,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        context.interpolationQuality = .high
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return context.makeImage()
+    }
+
+    @discardableResult
+    public func computerPointerMove(window id: UInt32, x: Double, y: Double) -> Bool {
+        guard !presentationSuspended, x.isFinite, y.isFinite,
+              let native = dockWindow(id), let view = native.window?.contentView,
+              view.bounds.contains(CGPoint(x: x, y: y)) else { return false }
+        let point = CGPoint(x: x, y: y)
+        if computerPointerWindow != id {
+            if let old = computerPointerWindow { windows[old]?.pointerLeft() }
+            computerPointerWindow = id
+            native.pointerEntered(at: point)
+        }
+        native.pointerMoved(to: point)
+        return true
+    }
+
+    @discardableResult
+    public func computerPointerButton(
+        window id: UInt32, button: Windowing.PointerButton, pressed: Bool
+    ) -> Bool {
+        guard !presentationSuspended, computerPointerWindow == id,
+              let native = dockWindow(id) else { return false }
+        native.pointerButton(button, pressed: pressed)
+        return true
+    }
+
+    @discardableResult
+    public func computerScroll(
+        window id: UInt32, dx: Double, dy: Double, precise: Bool
+    ) -> Bool {
+        guard !presentationSuspended, computerPointerWindow == id,
+              dx.isFinite, dy.isFinite, let native = dockWindow(id) else { return false }
+        native.pointerScroll(dx: dx, dy: dy, precise: precise)
+        return true
+    }
+
+    @discardableResult
+    public func computerKey(
+        window id: UInt32, macKeyCode: UInt16, pressed: Bool,
+        modifierFlags: UInt64
+    ) -> Bool {
+        guard !presentationSuspended, let native = dockWindow(id) else { return false }
+        native.activateFromDock()
+        native.key(
+            macKeyCode, pressed: pressed,
+            flags: NSEvent.ModifierFlags(rawValue: UInt(modifierFlags)))
+        return true
+    }
+
+    @discardableResult
+    public func computerCommitText(window id: UInt32, text: String) -> Bool {
+        guard !presentationSuspended, !text.isEmpty, text.utf8.count <= 65_535,
+              !text.contains("\0"), let native = dockWindow(id) else { return false }
+        native.activateFromDock()
+        native.commitText(text)
+        return true
     }
 
     @discardableResult
@@ -455,6 +678,7 @@ public final class WindowBridge: NSObject {
 	}
 
 	func registerDisplayClock(_ window: NativeWindow, screen: NSScreen?) {
+		guard !presentationSuspended else { return }
 		displayClock.register(window, screen: screen)
 	}
 
@@ -595,6 +819,7 @@ public final class WindowBridge: NSObject {
             }
             if let windowID = surfaceToWindow.removeValue(forKey: surface) {
                 mappedApplicationWindows.remove(windowID)
+                if computerPointerWindow == windowID { computerPointerWindow = nil }
                 windows.removeValue(forKey: windowID)?.close()
             }
 
@@ -659,6 +884,7 @@ public final class WindowBridge: NSObject {
 
         case .toplevelDestroyed(let window):
             if let native = windows.removeValue(forKey: window) {
+                if computerPointerWindow == window { computerPointerWindow = nil }
                 mappedApplicationWindows.remove(window)
                 surfaceToWindow.removeValue(forKey: native.surfaceID)
                 native.close()
@@ -796,6 +1022,7 @@ public final class WindowBridge: NSObject {
 
     /// Called when a virtio-gpu resource becomes presentable after CREATE_BLOB.
     public func retryPendingFrames() {
+        guard !presentationSuspended else { return }
         for surface in Array(pendingScenes.keys) { startPendingScene(for: surface) }
         if let surface = cursorSurface,
            let frame = pendingSurfaceFrames.removeValue(forKey: surface) {
@@ -822,7 +1049,8 @@ public final class WindowBridge: NSObject {
     }
 
     private func startPendingScene(for surface: UInt32) {
-        guard resolvingScenes[surface] == nil,
+        guard !presentationSuspended,
+              resolvingScenes[surface] == nil,
               let work = pendingScenes[surface],
               let windowID = surfaceToWindow[surface],
               windows[windowID] != nil,
@@ -854,6 +1082,11 @@ public final class WindowBridge: NSObject {
             releaseScene(work.scene)
             pendingScenes[surface] = newer
             startPendingScene(for: surface)
+            return
+        }
+
+        if presentationSuspended {
+            pendingScenes[surface] = work
             return
         }
 
@@ -1059,6 +1292,10 @@ public final class WindowBridge: NSObject {
             completeCopiedPresentation(
                 surface: surface, presentationID: frame.presentationID)
             Self.note("ignored obsolete local committed frame for surface \(surface)")
+            return
+        }
+        guard !presentationSuspended else {
+            retainDeferred(frame, for: surface)
             return
         }
 
@@ -1337,5 +1574,9 @@ public final class WindowBridge: NSObject {
         mappedApplicationWindows.removeAll()
         surfaceToWindow.removeAll()
         knownSurfaces.removeAll()
+        presentationSuspended = false
+        suspendedVisibleWindows.removeAll(keepingCapacity: true)
+        suspendedKeyWindow = nil
+        computerPointerWindow = nil
     }
 }

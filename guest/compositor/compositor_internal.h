@@ -17,6 +17,7 @@ struct np_gpu_buffer;
 struct np_shm_texture;
 struct np_sync_surface;
 struct np_sync_point;
+struct np_xwayland;
 
 enum np_surface_role {
 	NP_SURFACE_ROLE_NONE = 0,
@@ -25,6 +26,7 @@ enum np_surface_role {
 	NP_SURFACE_ROLE_SUBSURFACE,
 	NP_SURFACE_ROLE_CURSOR,
 	NP_SURFACE_ROLE_DRAG_ICON,
+	NP_SURFACE_ROLE_XWAYLAND,
 };
 
 struct np_server {
@@ -97,6 +99,9 @@ struct np_server {
 	uint32_t watched_host_feedback_mask;
 	#endif
 	char session_socket[128];
+	struct np_xwayland *xwayland;
+	char xwayland_display[16];
+	char xwayland_auth[256];
 };
 
 struct np_input {
@@ -266,6 +271,8 @@ struct np_surface {
 	struct wl_resource *toplevel;
 	struct wl_resource *popup;
 	struct wl_resource *decoration;
+	uint32_t xwayland_window;
+	bool xwayland_popup;
 	struct wl_resource *fractional_scale;
 	int preferred_scale;
 	int reported_scale;
@@ -377,6 +384,8 @@ struct np_surface *np_surface_by_window(struct np_server *server,
                                         uint32_t window_id);
 struct np_surface *np_surface_by_id(struct np_server *server,
                                     uint32_t surface_id);
+bool np_surface_is_toplevel(const struct np_surface *surface);
+bool np_surface_is_popup(const struct np_surface *surface);
 
 /* Core protocol registration. */
 void np_compositor_bind(struct wl_client *client, void *data,
