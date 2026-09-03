@@ -225,7 +225,7 @@ jobs:
                 export DEBIAN_FRONTEND=noninteractive
                 apt-get update
                 apt-get install -y --no-install-recommends \
-                  build-essential pkg-config git ca-certificates patch file \
+              build-essential pkg-config git ca-certificates patch file libclang-dev \
                   libwayland-dev wayland-protocols libxkbcommon-dev \
                   libvulkan-dev libdrm-dev libegl1-mesa-dev libgles2-mesa-dev \
                   libgbm-dev libavcodec-dev libavutil-dev libswscale-dev \
@@ -235,7 +235,7 @@ jobs:
                 dpkg-query -W > .ci-toolchain-packages.txt
               else
                 apk add --no-cache \
-                  build-base pkgconf git ca-certificates patch file linux-headers \
+              build-base pkgconf git ca-certificates patch file linux-headers clang-dev \
                   wayland-dev wayland-protocols libxkbcommon-dev \
                   vulkan-loader-dev vulkan-headers libdrm-dev mesa-dev ffmpeg-dev \
                   libxcb-dev xcb-util-cursor-dev
