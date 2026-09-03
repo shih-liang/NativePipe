@@ -5,6 +5,58 @@ import XCTest
 
 @MainActor
 final class ViewportGeometryTests: XCTestCase {
+	func testClientDecoratedToplevelUsesExactCommittedGeometry() throws {
+		final class TextureSource: FrameSource {
+			let device: MTLDevice
+
+			init(device: MTLDevice) { self.device = device }
+
+			func surface(forResource resourceID: UInt32) -> IOSurfaceRef? { nil }
+
+			func metalTextures(
+				for layers: [Windowing.SceneLayer],
+				completion: @escaping @MainActor ([FrameTextureResolution]) -> Void
+			) {
+				completion(layers.map { layer in
+					let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+						pixelFormat: .bgra8Unorm, width: layer.width,
+						height: layer.height, mipmapped: false)
+					descriptor.usage = [.shaderRead]
+					return FrameTextureResolution(
+						status: .ready, texture: device.makeTexture(descriptor: descriptor))
+				})
+			}
+		}
+
+		guard let device = MTLCreateSystemDefaultDevice() else {
+			throw XCTSkip("Metal is unavailable")
+		}
+		let bridge = WindowBridge(frameSource: TextureSource(device: device))
+		bridge.apply(.surfaceCreated(surface: 8))
+		bridge.apply(.toplevelCreated(window: 3, surface: 8))
+		var committed = scene(presentationID: 1)
+		committed.width = 1_336
+		committed.height = 1_040
+		committed.scale = 2
+		committed.windowGeometry = .init(x: 14, y: 12, width: 640, height: 491)
+		committed.layers[0].width = 1_336
+		committed.layers[0].height = 1_040
+		committed.layers[0].bytesPerRow = 5_344
+		committed.layers[0].destination = .init(
+			x: 0, y: 0, width: 1_336, height: 1_040)
+		committed.layers[0].sourcePixels = .init(
+			x: 0, y: 0, width: 1_336, height: 1_040)
+		committed.layers[0].clip = .init(
+			x: 0, y: 0, width: 1_336, height: 1_040)
+
+		bridge.apply(.sceneCommitted(scene: committed))
+
+		XCTAssertEqual(
+			bridge.window(3)?.window?.contentView?.bounds.size,
+			NSSize(width: 640, height: 491))
+		bridge.closeAll()
+	}
+
 	func testLatestSceneCarriesDamageFromSkippedUnencodedScene() {
 		let layer = Windowing.SceneLayer(
 			surface: 1, resourceID: 10, width: 800, height: 600,

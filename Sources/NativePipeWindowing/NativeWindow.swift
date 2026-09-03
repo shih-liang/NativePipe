@@ -497,6 +497,19 @@ final class NativeWindow: NSObject {
         // as a SIGSEGV immediately after a guest toplevel is destroyed.
         window.isReleasedWhenClosed = false
         window.contentView = contentView
+        if !isPopup && !serverDecorated {
+            // `contentRect:` always describes the traditional area below the
+            // title bar. With `.fullSizeContentView`, however, SurfaceView
+            // expands across that title bar as Apple documents. Passing the
+            // Wayland window geometry as `contentRect` therefore makes the
+            // actual surface one title-bar taller. CSD has no separate AppKit
+            // content area: its xdg window geometry is the complete frame.
+            // Size the frame itself so SurfaceView is exactly the committed
+            // logical size and no unpainted strip is added at the bottom.
+            window.setFrame(
+                NSRect(origin: window.frame.origin, size: contentSize),
+                display: false)
+        }
         contentView.input = self
         window.delegate = self
         window.tabbingMode = .disallowed
