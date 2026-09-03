@@ -52,7 +52,7 @@ jobs:
           SOURCE_DATE_EPOCH: ${{ inputs.source_date_epoch }}
         run: |
           set -euo pipefail
-          test "$GITHUB_REPOSITORY" = "shih-liang/nativepipe"
+          test "$GITHUB_REPOSITORY" = "shih-liang/NativePipe"
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           [[ "$RELEASE_SEQUENCE" =~ ^[1-9][0-9]*$ ]]
           test "$RELEASE_TAG" = "nativepipe-runtime-v$VERSION-$RELEASE_SEQUENCE"
@@ -137,7 +137,7 @@ jobs:
               "version": os.environ["VERSION"],
               "releaseTag": os.environ["RELEASE_TAG"],
               "releaseSequence": int(os.environ["RELEASE_SEQUENCE"]),
-              "sourceRepository": "shih-liang/nativepipe",
+              "sourceRepository": "shih-liang/NativePipe",
               "sourceCommit": os.environ["SOURCE_COMMIT"],
               "architecture": os.environ["ARCHITECTURE"],
           }

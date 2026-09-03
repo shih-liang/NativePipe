@@ -21,4 +21,4 @@ nativepipe:
 stage-release:
 	@test -n "$(RELEASE_TAG)" || { echo 'RELEASE_TAG is required' >&2; exit 1; }
 	./scripts/stage-release-assets.sh "$(DIST_DIR)" "$(ARTIFACTS_ROOT)" \
-		shih-liang/nativepipe "$(RELEASE_TAG)" nativepipe-runtime
+		shih-liang/NativePipe "$(RELEASE_TAG)" nativepipe-runtime

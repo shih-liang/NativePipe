@@ -465,7 +465,7 @@ jobs:
     needs: [identity, package]
     permissions:
       contents: read
-    uses: shih-liang/nativepipe/.github/workflows/sign-nativepipe-runtime.yml@main
+    uses: shih-liang/NativePipe/.github/workflows/sign-nativepipe-runtime.yml@main
     with:
       aarch64_artifact: display-release-aarch64
       x86_64_artifact: display-release-x86_64
@@ -503,7 +503,7 @@ jobs:
           EXPECTED_PUBLIC_KEY_BASE64: ${{ vars.LIGHTHOUSE_RUNTIME_ED25519_PUBLIC_KEY_BASE64 }}
         run: |
           set -euo pipefail
-          test "$GITHUB_REPOSITORY" = "shih-liang/nativepipe"
+          test "$GITHUB_REPOSITORY" = "shih-liang/NativePipe"
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           [[ "$RELEASE_TAG" =~ ^nativepipe-runtime-v[0-9]+\.[0-9]+\.[0-9]+-[1-9][0-9]*$ ]]
           git fetch --force --tags origin \
