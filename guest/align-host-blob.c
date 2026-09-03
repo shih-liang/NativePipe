@@ -12,7 +12,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-#include <drm/virtgpu_drm.h>
+#include <virtgpu_drm.h>
 
 /* Low-kernel workaround for every guest-mappable Venus blob.  The implicit
  * Vulkan layer grows application VkDeviceMemory first; this ioctl boundary

@@ -581,4 +581,5 @@ jobs:
           fi
           gh release create "$RELEASE_TAG" release/* \
             --verify-tag --title "$RELEASE_TAG" \
+            --prerelease \
             --notes "Atomic NativePipe guest display runtime ABI 1."

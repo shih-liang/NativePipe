@@ -15,6 +15,22 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 
+/* DRM_IOCTL_SYNCOBJ_EVENTFD was added to the kernel UAPI before it reached
+ * every libdrm version used by our release builders.  Keep the ioctl ABI local
+ * so an older userspace header does not force the compositor back to blocking
+ * fence waits. */
+struct np_drm_syncobj_eventfd {
+	uint32_t handle;
+	uint32_t flags;
+	uint64_t point;
+	int32_t fd;
+	uint32_t pad;
+};
+
+#ifndef DRM_IOCTL_SYNCOBJ_EVENTFD
+#define DRM_IOCTL_SYNCOBJ_EVENTFD DRM_IOWR(0xCF, struct np_drm_syncobj_eventfd)
+#endif
+
 struct np_sync_timeline {
 	int drm_fd;
 	uint32_t handle;
@@ -93,7 +109,7 @@ int np_sync_point_wait_fd(struct np_sync_point *point)
 	if (!point) return -1;
 	int fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 	if (fd < 0) return -1;
-	struct drm_syncobj_eventfd event = {
+	struct np_drm_syncobj_eventfd event = {
 		.handle = point->timeline->handle,
 		.point = point->value,
 		.fd = fd,
