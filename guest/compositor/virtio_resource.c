@@ -2,8 +2,8 @@
 
 #include "virtio_resource.h"
 
-#include <drm/drm.h>
-#include <drm/virtgpu_drm.h>
+#include <drm.h>
+#include <virtgpu_drm.h>
 
 #include <errno.h>
 #include <fcntl.h>

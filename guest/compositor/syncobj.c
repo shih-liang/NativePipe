@@ -6,7 +6,7 @@
 #include "dmabuf.h"
 #include "linux-drm-syncobj-v1-server-protocol.h"
 
-#include <drm/drm.h>
+#include <drm.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>

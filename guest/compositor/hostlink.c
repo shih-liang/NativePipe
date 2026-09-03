@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/socket.h>
 #ifdef NP_REMOTE
 #include <netinet/in.h>
 #else
@@ -13,7 +14,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 

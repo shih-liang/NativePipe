@@ -11,6 +11,7 @@ COMMON_CFLAGS := $(shell pkg-config --cflags $(COMMON_PKGS) 2>/dev/null)
 COMMON_LIBS   := $(shell pkg-config --libs $(COMMON_PKGS) 2>/dev/null) -lm
 REMOTE_CFLAGS := $(shell pkg-config --cflags $(REMOTE_PKGS) 2>/dev/null)
 REMOTE_LIBS   := $(shell pkg-config --libs $(REMOTE_PKGS) 2>/dev/null) -pthread
+VM_CFLAGS     := $(shell pkg-config --cflags libdrm 2>/dev/null)
 
 PROJECT_ROOT   := $(abspath ../..)
 VULKAN_HEADERS ?= $(PROJECT_ROOT)/vendor/vulkan-headers/include
@@ -105,8 +106,8 @@ check-deps-remote:
 		exit 1; \
 	}
 check-deps-vmpipe:
-	@pkg-config --exists $(COMMON_PKGS) || { \
-		echo 'error: missing Wayland/xkbcommon development packages'; exit 1; \
+	@pkg-config --exists $(COMMON_PKGS) libdrm || { \
+		echo 'error: missing Wayland/xkbcommon/libdrm development packages'; exit 1; \
 	}
 	@test -f '$(VULKAN_HEADERS)/vulkan/vulkan.h' || \
 		pkg-config --exists vulkan || { echo 'error: Vulkan headers are required'; exit 1; }
@@ -163,7 +164,7 @@ $(REMOTE_BINARY): $(GENERATED) $(COMMON_SOURCES) $(REMOTE_SOURCES) \
 
 $(VM_BINARY): $(GENERATED) $(COMMON_SOURCES) $(VM_SOURCES) \
 	$(SOURCE_HASH) Makefile | $(BUILD_DIR) check-deps-vmpipe
-	$(CC) $(BASE_CFLAGS) $(COMMON_CFLAGS) $(VULKAN_CFLAGS) \
+	$(CC) $(BASE_CFLAGS) $(COMMON_CFLAGS) $(VM_CFLAGS) $(VULKAN_CFLAGS) \
 		$(SOURCE_DEFINE) -o $@ \
 		$(COMMON_SOURCES) $(VM_SOURCES) $(COMMON_LIBS) $(VULKAN_LIBS)
 

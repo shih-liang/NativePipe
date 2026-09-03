@@ -163,7 +163,7 @@ static void subcompositor_get_subsurface(struct wl_client *client, struct wl_res
 	}
 	for (struct np_surface *ancestor = parent; ancestor; ancestor = ancestor->parent) {
 		if (ancestor != surface) continue;
-		wl_resource_post_error(resource, WL_SUBCOMPOSITOR_ERROR_BAD_PARENT,
+		wl_resource_post_error(resource, WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE,
 		                       "subsurface parent creates a cycle");
 		return;
 	}
