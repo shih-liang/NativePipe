@@ -1515,7 +1515,8 @@ extension NativeWindow {
 /// rather than an NSTextStorage. That is the whole point of using
 /// zwp_text_input_v3 instead of forwarding keystrokes and hoping the client has
 /// its own input method.
-extension SurfaceView: @MainActor NSTextInputClient {
+@MainActor
+extension SurfaceView: NSTextInputClient {
     func insertText(_ string: Any, replacementRange: NSRange) {
         unconsumedKeyEvent = nil
         let text = (string as? NSAttributedString)?.string ?? (string as? String) ?? ""
