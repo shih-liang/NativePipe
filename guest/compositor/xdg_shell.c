@@ -324,12 +324,15 @@ void np_xdg_send_initial_role_configure(struct np_surface *surface) {
 	if (surface->toplevel) {
 		/* A pre-map maximize decision already contains the real AppKit content
 		 * size. Make it the initial configure so the first committed
-		 * window_geometry and buffer agree, rather than exposing a transient
-		 * 800x600 scene inside a maximized NSWindow. */
+		 * window_geometry and buffer agree. Otherwise the compositor has no
+		 * previous or expected dimensions: xdg-shell requires a zero-sized hint
+		 * so the client chooses its natural initial window size. Inventing an
+		 * 800x600 size leaves applications which recompute their natural size
+		 * drawing a smaller scene into a permanently larger native window. */
 		if (surface->host_configure_pending)
 			send_pending_host_toplevel_configure(surface);
 		else
-			send_host_toplevel_configure(surface, 800, 600, 0, false);
+			send_host_toplevel_configure(surface, 0, 0, 0, false);
 	} else if (surface->popup) {
 		/* The bufferless initial commit must always produce the popup's first
 		 * configure.  Waiting for a host round-trip leaves GTK/Qt/Firefox with
@@ -507,7 +510,7 @@ static void xdg_surface_get_toplevel(struct wl_client *client, struct wl_resourc
 	 * titlebar around a CSD window. */
 	np_decoration_use_client_default(surface);
 
-	/* The initial 800x600 suggestion is sent only after the role's required
+	/* The initial natural-size suggestion is sent only after the role's required
 	 * bufferless wl_surface.commit. Sending it here races the client role setup
 	 * and violates xdg-shell's initial configure handshake. */
 }
