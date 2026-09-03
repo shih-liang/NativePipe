@@ -247,7 +247,7 @@ jobs:
               cargo --version >> .ci-rustc.txt
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" \
                 test-remote-transport
-              # FluxWindow's runtime owns only the VM compositor. The remote
+              # The FluxWindow runtime owns only the VM compositor. The remote
               # nativepipe client and nativepipe-wayland are separate products.
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" dist-vmpipe
               make -C guest/session ARCH="$ARCH" LIBC="$LIBC" dist-target
