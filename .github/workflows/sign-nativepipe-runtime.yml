@@ -2,6 +2,9 @@ name: Sign NativePipe runtime runtime
 
 on:
   workflow_call:
+    secrets:
+      signing_key:
+        required: true
     inputs:
       aarch64_artifact:
         required: true
@@ -156,7 +159,7 @@ jobs:
       - name: Sign canonical manifests and checksums
         shell: bash
         env:
-          PRIVATE_KEY_BASE64: ${{ secrets.LIGHTHOUSE_RUNTIME_ED25519_PRIVATE_KEY_BASE64 }}
+          PRIVATE_KEY_BASE64: ${{ secrets.signing_key }}
           EXPECTED_PUBLIC_KEY_BASE64: ${{ vars.LIGHTHOUSE_RUNTIME_ED25519_PUBLIC_KEY_BASE64 }}
         run: |
           set -euo pipefail

@@ -466,6 +466,8 @@ jobs:
     permissions:
       contents: read
     uses: shih-liang/NativePipe/.github/workflows/sign-nativepipe-runtime.yml@main
+    secrets:
+      signing_key: ${{ secrets.LIGHTHOUSE_RUNTIME_ED25519_PRIVATE_KEY_BASE64 }}
     with:
       aarch64_artifact: display-release-aarch64
       x86_64_artifact: display-release-x86_64
