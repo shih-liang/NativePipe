@@ -780,16 +780,15 @@ void np_surface_commit(struct wl_client *client, struct wl_resource *resource) {
 	bool unmapping = xdg_role && surface->committed_buffer_attached &&
 	                 surface->pending_buffer_set && !surface->pending_buffer;
 	/* Capture this before snapshot_surface_update() consumes the pending ack.
-	 * The acked state belongs to this commit, but resize flow control does not
-	 * reopen until the commit's presentation id reaches the output latch. */
+	 * The xdg configure state becomes current at this commit boundary. Output
+	 * presentation is independent and must not throttle later resize configures. */
 	uint32_t configure_serial = surface->host_configure_acked
 		? surface->host_configure_acked_serial : 0;
 	if (surface->pending_buffer_set)
 		surface->committed_buffer_attached = surface->pending_buffer != NULL;
 	struct np_surface_update *update = snapshot_surface_update(surface);
 	if (configure_serial)
-		np_xdg_finish_toplevel_configure(
-			surface, configure_serial, update ? update->presentation_id : 0);
+		np_xdg_finish_toplevel_configure(surface, configure_serial);
 	if (update) np_surface_apply_update(update);
 	if (unmapping) {
 		surface->xdg_configure_phase = NP_XDG_AWAITING_INITIAL_COMMIT;

@@ -223,7 +223,6 @@ struct np_subsurface_stack_op {
 struct np_xdg_configure {
 	struct wl_list link;
 	uint32_t serial;
-	bool from_host;
 	bool popup_geometry;
 	int32_t popup_x, popup_y, popup_width, popup_height;
 };
@@ -320,17 +319,11 @@ struct np_surface {
 	int32_t host_configure_pending_width;
 	int32_t host_configure_pending_height;
 	uint32_t host_configure_pending_state_bits;
-	bool host_configure_in_flight;
 	uint32_t host_configure_acked_serial;
-	bool host_configure_acked_from_host;
 	bool host_configure_acked;
-	/* The configure gate opens only when the commit that answered it reaches
-	 * the output latch. Releasing it at wl_surface.commit lets FIFO-blocked
-	 * resize commits create an unbounded chain of swapchains. */
-	uint32_t host_configure_latch_presentation_id;
-	/* Coalesce AppKit resize samples and keep at most one host configure in
-	 * flight. A client rebuilding a Vulkan swapchain must never be flooded by
-	 * every mouse sample it could not yet commit. */
+	/* Coalesce all host resize records drained in one event-loop turn. The host
+	 * already samples at the physical display rate; xdg-shell lets a client
+	 * discard superseded configures and ack only the newest serial. */
 	struct wl_event_source *host_configure_idle;
 	bool pending_geometry_set;
 	int32_t pending_geometry_x, pending_geometry_y;

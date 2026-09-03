@@ -57,15 +57,11 @@ void np_xdg_clear_configures(struct np_surface *surface) {
 	}
 	surface->latest_configure_serial = 0;
 	surface->host_configure_acked_serial = 0;
-	surface->host_configure_acked_from_host = false;
 	surface->host_configure_acked = false;
 	surface->host_configure_pending = false;
-	surface->host_configure_in_flight = false;
-	surface->host_configure_latch_presentation_id = 0;
 }
 
-static uint32_t send_xdg_surface_configure(struct np_surface *surface,
-                                           bool from_host) {
+static uint32_t send_xdg_surface_configure(struct np_surface *surface) {
 	if (!surface || !surface->xdg_surface) return 0;
 	struct np_xdg_configure *configure = calloc(1, sizeof(*configure));
 	if (!configure) {
@@ -73,7 +69,6 @@ static uint32_t send_xdg_surface_configure(struct np_surface *surface,
 		return 0;
 	}
 	configure->serial = wl_display_next_serial(surface->server->display);
-	configure->from_host = from_host;
 	wl_list_insert(surface->xdg_configures.prev, &configure->link);
 	surface->latest_configure_serial = configure->serial;
 	xdg_surface_send_configure(surface->xdg_surface, configure->serial);
@@ -293,7 +288,7 @@ static void append_toplevel_state(struct wl_array *states, uint32_t value) {
 
 static void send_host_toplevel_configure(struct np_surface *surface,
 	                                     int32_t width, int32_t height,
-	                                     uint32_t state_bits, bool from_host) {
+	                                     uint32_t state_bits) {
 	if (!surface || !surface->toplevel || !surface->xdg_surface) return;
 	struct wl_array states;
 	wl_array_init(&states);
@@ -311,8 +306,7 @@ static void send_host_toplevel_configure(struct np_surface *surface,
 	// pixels the client attaches and must not be applied to this size.
 	xdg_toplevel_send_configure(surface->toplevel, width, height, &states);
 	wl_array_release(&states);
-	uint32_t serial = send_xdg_surface_configure(surface, from_host);
-	if (serial && from_host) surface->host_configure_in_flight = true;
+	uint32_t serial = send_xdg_surface_configure(surface);
 	if (np_trace_enabled())
 		fprintf(stderr,
 		        "[configure] send surface=%u serial=%u size=%dx%d states=0x%x\n",
@@ -332,7 +326,7 @@ void np_xdg_send_initial_role_configure(struct np_surface *surface) {
 		if (surface->host_configure_pending)
 			send_pending_host_toplevel_configure(surface);
 		else
-			send_host_toplevel_configure(surface, 0, 0, 0, false);
+			send_host_toplevel_configure(surface, 0, 0, 0);
 	} else if (surface->popup) {
 		/* The bufferless initial commit must always produce the popup's first
 		 * configure.  Waiting for a host round-trip leaves GTK/Qt/Firefox with
@@ -356,7 +350,7 @@ void np_xdg_configure_popup(struct np_surface *surface,
 	             XDG_POPUP_REPOSITIONED_SINCE_VERSION)
 		xdg_popup_send_repositioned(surface->popup, token);
 	xdg_popup_send_configure(surface->popup, x, y, width, height);
-	uint32_t serial = send_xdg_surface_configure(surface, false);
+	uint32_t serial = send_xdg_surface_configure(surface);
 	if (!serial) return;
 	struct np_xdg_configure *configure = wl_container_of(
 		surface->xdg_configures.prev, configure, link);
@@ -387,9 +381,12 @@ void np_xdg_configure_toplevel_from_host(struct np_surface *surface,
 	                                     int32_t width, int32_t height,
 	                                     uint32_t state_bits) {
 	if (!surface || !surface->toplevel || !surface->xdg_surface) return;
-	/* AppKit can sample a live resize much faster than a Vulkan WSI can rebuild.
-	 * Retain only the newest sample and allow one host configure to be in flight.
-	 * Its output latch releases the gate and sends the then-current size. */
+	/* The host samples live resize at the physical display rate. Retain only the
+	 * newest record drained in this event-loop turn, then send it from an idle.
+	 * Do not wait for an older configure's commit or presentation: xdg-shell
+	 * explicitly permits clients to discard superseded configures and ack only
+	 * the latest. A presentation gate serializes resize behind a complete guest
+	 * render/transport/Metal/display round trip. */
 	surface->host_configure_pending = true;
 	surface->host_configure_pending_width = width;
 	surface->host_configure_pending_height = height;
@@ -399,19 +396,17 @@ void np_xdg_configure_toplevel_from_host(struct np_surface *surface,
 	 * np_xdg_send_initial_role_configure instead of configuring too early. */
 	if (surface->xdg_configure_phase == NP_XDG_AWAITING_INITIAL_COMMIT)
 		return;
-	if (!surface->host_configure_in_flight)
-		schedule_pending_host_toplevel_configure(surface);
+	schedule_pending_host_toplevel_configure(surface);
 }
 
 static void send_pending_host_toplevel_configure(struct np_surface *surface) {
-	if (!surface || !surface->host_configure_pending ||
-	    surface->host_configure_in_flight)
+	if (!surface || !surface->host_configure_pending)
 		return;
 	int32_t width = surface->host_configure_pending_width;
 	int32_t height = surface->host_configure_pending_height;
 	uint32_t state_bits = surface->host_configure_pending_state_bits;
 	surface->host_configure_pending = false;
-	send_host_toplevel_configure(surface, width, height, state_bits, true);
+	send_host_toplevel_configure(surface, width, height, state_bits);
 }
 
 static void dispatch_pending_host_toplevel_configure(void *data) {
@@ -422,7 +417,7 @@ static void dispatch_pending_host_toplevel_configure(void *data) {
 
 static void schedule_pending_host_toplevel_configure(struct np_surface *surface) {
 	if (!surface || surface->host_configure_idle ||
-	    !surface->host_configure_pending || surface->host_configure_in_flight)
+	    !surface->host_configure_pending)
 		return;
 	struct wl_event_loop *loop = wl_display_get_event_loop(surface->server->display);
 	surface->host_configure_idle = wl_event_loop_add_idle(
@@ -439,40 +434,17 @@ void np_xdg_flush_pending_toplevel_configure(struct np_surface *surface) {
 }
 
 void np_xdg_finish_toplevel_configure(struct np_surface *surface,
-	                                       uint32_t serial,
-	                                       uint32_t presentation_id) {
+	                                   uint32_t serial) {
 	if (!surface || !serial) return;
 	if (np_trace_enabled())
 		fprintf(stderr,
-		        "[configure] committed surface=%u acked=%u current=%u serial=%u latch=%u\n",
+		        "[configure] committed surface=%u acked=%u current=%u serial=%u\n",
 		        surface->id, surface->host_configure_acked_serial,
-		        surface->latest_configure_serial, serial, presentation_id);
+		        surface->latest_configure_serial, serial);
 	if (surface->host_configure_acked_serial == serial) {
-		bool completed_host = surface->host_configure_acked_from_host;
 		surface->host_configure_acked_serial = 0;
-		surface->host_configure_acked_from_host = false;
 		surface->host_configure_acked = false;
-		if (completed_host) {
-			if (presentation_id) {
-				surface->host_configure_latch_presentation_id = presentation_id;
-			} else {
-				surface->host_configure_in_flight = false;
-				np_xdg_flush_pending_toplevel_configure(surface);
-			}
-		}
 	}
-}
-
-void np_xdg_toplevel_configure_latched(struct np_surface *surface,
-	                                   uint32_t presentation_id) {
-	if (!surface || !presentation_id ||
-	    surface->host_configure_latch_presentation_id != presentation_id)
-		return;
-	surface->host_configure_latch_presentation_id = 0;
-	surface->host_configure_in_flight = false;
-	/* This runs before wl_surface.frame callbacks for the same latch. Send the
-	 * newest size now so a client woken by that callback renders it directly. */
-	np_xdg_flush_pending_toplevel_configure(surface);
 }
 
 static void xdg_surface_get_toplevel(struct wl_client *client, struct wl_resource *resource,
@@ -908,7 +880,6 @@ static void xdg_surface_ack_configure(struct wl_client *client, struct wl_resour
 	/* ack_configure consumes this serial and every older configure. Multiple
 	 * acks before a commit are legal; the last one is the state that commit
 	 * answers. */
-	bool from_host = matched->from_host;
 	struct np_xdg_configure *tmp;
 	wl_list_for_each_safe(configure, tmp, &surface->xdg_configures, link) {
 		bool done = configure == matched;
@@ -917,14 +888,13 @@ static void xdg_surface_ack_configure(struct wl_client *client, struct wl_resour
 		if (done) break;
 	}
 	surface->host_configure_acked_serial = serial;
-	surface->host_configure_acked_from_host = from_host;
 	surface->host_configure_acked = true;
 	if (surface->xdg_configure_phase == NP_XDG_AWAITING_INITIAL_ACK)
 		surface->xdg_configure_phase = NP_XDG_CONFIGURED;
 	if (np_trace_enabled())
 		fprintf(stderr,
-		        "[configure] ack surface=%u serial=%u from_host=%d current=%u\n",
-		        surface->id, serial, from_host,
+		        "[configure] ack surface=%u serial=%u current=%u\n",
+		        surface->id, serial,
 		        surface->latest_configure_serial);
 }
 

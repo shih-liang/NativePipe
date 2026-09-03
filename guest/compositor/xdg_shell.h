@@ -20,10 +20,7 @@ void np_window_set_app_id(struct np_surface *surface, const char *app_id);
 void np_xdg_clear_configures(struct np_surface *surface);
 void np_xdg_send_initial_role_configure(struct np_surface *surface);
 void np_xdg_finish_toplevel_configure(struct np_surface *surface,
-                                      uint32_t serial,
-                                      uint32_t presentation_id);
-void np_xdg_toplevel_configure_latched(struct np_surface *surface,
-                                       uint32_t presentation_id);
+                                      uint32_t serial);
 void np_xdg_configure_toplevel_from_host(struct np_surface *surface,
                                          int32_t width, int32_t height,
                                          uint32_t state_bits);

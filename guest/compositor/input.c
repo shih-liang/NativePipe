@@ -814,7 +814,7 @@ bool np_input_handle_host_binary(const unsigned char *payload, size_t length,
 		int32_t height = (int32_t)read_le32(payload + 12);
 		uint32_t state_bits = read_le32(payload + 16);
 		/* payload + 20 is the host-side diagnostic serial. Wayland owns the
-		 * configure serial and flow control is tied to the output latch. */
+		 * configure serial; records are coalesced by the xdg-shell event-loop idle. */
 		np_xdg_configure_toplevel_from_host(surface, width, height, state_bits);
 		wl_display_flush_clients(server->display);
 		return true;
