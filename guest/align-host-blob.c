@@ -14,6 +14,34 @@
 
 #include <virtgpu_drm.h>
 
+/* The blob-create UAPI is stable in the kernel but is absent from older
+ * distro libdrm headers used to build portable guest artifacts. */
+#ifndef DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB
+#define DRM_VIRTGPU_RESOURCE_CREATE_BLOB 0x0a
+#define VIRTGPU_BLOB_MEM_GUEST             0x0001
+#define VIRTGPU_BLOB_MEM_HOST3D            0x0002
+#define VIRTGPU_BLOB_MEM_HOST3D_GUEST      0x0003
+#define VIRTGPU_BLOB_FLAG_USE_MAPPABLE     0x0001
+#define VIRTGPU_BLOB_FLAG_USE_SHAREABLE    0x0002
+#define VIRTGPU_BLOB_FLAG_USE_CROSS_DEVICE 0x0004
+struct drm_virtgpu_resource_create_blob {
+	__u32 blob_mem;
+	__u32 blob_flags;
+	__u32 bo_handle;
+	__u32 res_handle;
+	__u64 size;
+	__u32 pad;
+	__u32 cmd_size;
+	__u64 cmd;
+	__u64 blob_id;
+	__u32 blob_hints;
+	__u32 pad2;
+};
+#define DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_VIRTGPU_RESOURCE_CREATE_BLOB, \
+	         struct drm_virtgpu_resource_create_blob)
+#endif
+
 /* Low-kernel workaround for every guest-mappable Venus blob.  The implicit
  * Vulkan layer grows application VkDeviceMemory first; this ioctl boundary
  * also catches host-visible allocations made internally by the Venus ICD,
