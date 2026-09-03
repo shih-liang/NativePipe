@@ -23,6 +23,12 @@ OPEN_SANS_RELATIVE_PATH = Path("OpenSans-Regular.ttf")
 OPEN_SANS_SHA256 = "33e93bec67d91c396876db50694213802a39e43a911bb5c22322f0dbdf4d5e43"
 OPEN_SANS_LICENSE_PATH = Path(__file__).resolve().parents[1] / "LICENSES/OFL-1.1.txt"
 WL_DRM_XML_RELATIVE_PATH = Path("wl_drm/src/drm.xml")
+RUST_COPYRIGHT_FALLBACKS = {
+    "1.89.0": (
+        Path(__file__).resolve().parents[1] / "LICENSES/Rust-1.89.0-COPYRIGHT.txt",
+        "172020dbfd5b53a226dfde77616190a48dcff519b0bc0e6deb91a8450782c4af",
+    ),
+}
 
 
 def run(command: list[str], *, cwd: Path) -> str:
@@ -133,7 +139,9 @@ def package_license_files(package: dict[str, Any], source_root: Path) -> list[Pa
     return sorted(unique, key=lambda path: path.name)
 
 
-def rust_license_files(rustc: str, source_dir: Path) -> list[Path]:
+def rust_license_files(
+    rustc: str, source_dir: Path, expected_rust_version: str
+) -> list[Path]:
     sysroot = Path(run([rustc, "--print", "sysroot"], cwd=source_dir).strip()).resolve()
     if not sysroot.is_dir():
         raise NoticeError(f"Rust sysroot is not a directory: {sysroot}")
@@ -148,6 +156,15 @@ def rust_license_files(rustc: str, source_dir: Path) -> list[Path]:
     for candidate in candidates:
         if candidate.is_file() and candidate.name in required and required[candidate.name] is None:
             required[candidate.name] = candidate
+    if required["COPYRIGHT"] is None and expected_rust_version in RUST_COPYRIGHT_FALLBACKS:
+        fallback, expected_digest = RUST_COPYRIGHT_FALLBACKS[expected_rust_version]
+        try:
+            digest = hashlib.sha256(fallback.read_bytes()).hexdigest()
+        except OSError as error:
+            raise NoticeError(f"cannot read pinned Rust COPYRIGHT fallback: {error}") from error
+        if digest != expected_digest:
+            raise NoticeError("pinned Rust COPYRIGHT fallback failed its digest check")
+        required["COPYRIGHT"] = fallback
     missing = [name for name, path in required.items() if path is None]
     if missing:
         raise NoticeError(
@@ -245,7 +262,7 @@ def build_notice(
             + (", ".join(sorted(set(file_digests))) if file_digests else "no package-local text")
         )
 
-    for rust_path in rust_license_files(rustc, source_dir):
+    for rust_path in rust_license_files(rustc, source_dir, expected_rust_version):
         contents = normalized_text(rust_path)
         digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
         texts.setdefault(digest, contents)

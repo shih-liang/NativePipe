@@ -10,6 +10,7 @@ CARGO           ?= cargo
 RUSTC           ?= rustc
 STRIP           ?= strip
 RUST_VERSION    ?= 1.89.0
+RUST_CRT_FLAGS  := $(if $(filter musl,$(LIBC)),-C target-feature=-crt-static,)
 LICENSE_NOTICE  := dist/xwayland-satellite-$(ARCH)-$(LIBC).third-party-licenses.txt
 LICENSE_TOOL    := ../../scripts/generate-xwayland-license-notice.py
 
@@ -41,7 +42,7 @@ verify-source: $(SOURCE_DIR)/.patched
 
 $(BINARY): $(SOURCE_DIR)/.patched
 	cd $(SOURCE_DIR) && CARGO_INCREMENTAL=0 \
-		RUSTFLAGS="--remap-path-prefix=$$(pwd)=/usr/src/xwayland-satellite -C link-arg=-Wl,--build-id=none" \
+		RUSTFLAGS="--remap-path-prefix=$$(pwd)=/usr/src/xwayland-satellite -C link-arg=-Wl,--build-id=none $(RUST_CRT_FLAGS)" \
 		$(CARGO) build --release --locked
 	mkdir -p dist
 	install -m0755 $(SOURCE_DIR)/target/release/xwayland-satellite $@
@@ -55,7 +56,7 @@ $(LICENSE_NOTICE): $(BINARY) $(LICENSE_TOOL)
 
 test: $(SOURCE_DIR)/.patched
 	cd $(SOURCE_DIR) && CARGO_INCREMENTAL=0 \
-		RUSTFLAGS="--remap-path-prefix=$$(pwd)=/usr/src/xwayland-satellite" \
+		RUSTFLAGS="--remap-path-prefix=$$(pwd)=/usr/src/xwayland-satellite $(RUST_CRT_FLAGS)" \
 		$(CARGO) test --release --locked --lib
 
 # The upstream integration suite starts a real Xwayland server and therefore
@@ -64,7 +65,7 @@ test: $(SOURCE_DIR)/.patched
 # failures even without the RemotePipe patch.
 test-integration: $(SOURCE_DIR)/.patched
 	cd $(SOURCE_DIR) && CARGO_INCREMENTAL=0 \
-		RUSTFLAGS="--remap-path-prefix=$$(pwd)=/usr/src/xwayland-satellite" \
+		RUSTFLAGS="--remap-path-prefix=$$(pwd)=/usr/src/xwayland-satellite $(RUST_CRT_FLAGS)" \
 		$(CARGO) test --release --locked --test integration -- --test-threads=1
 
 clean:
