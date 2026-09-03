@@ -317,6 +317,7 @@ jobs:
           name: display-build-${{ matrix.architecture }}-${{ matrix.libc }}
           path: .ci-output
           if-no-files-found: error
+          include-hidden-files: true
           retention-days: 7
 
   package:
