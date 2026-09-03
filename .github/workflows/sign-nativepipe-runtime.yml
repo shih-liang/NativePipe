@@ -1,0 +1,214 @@
+name: Sign NativePipe runtime runtime
+
+on:
+  workflow_call:
+    inputs:
+      aarch64_artifact:
+        required: true
+        type: string
+      x86_64_artifact:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+      release_tag:
+        required: true
+        type: string
+      release_sequence:
+        required: true
+        type: string
+      source_commit:
+        required: true
+        type: string
+      source_date_epoch:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    name: Verify trusted source and sign
+    runs-on: ubuntu-24.04
+    environment: lighthouse-runtime-release
+    permissions:
+      contents: read
+    steps:
+      - name: Check out protected release policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Prove the release tag points into protected main
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          SOURCE_DATE_EPOCH: ${{ inputs.source_date_epoch }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "shih-liang/nativepipe"
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$RELEASE_SEQUENCE" =~ ^[1-9][0-9]*$ ]]
+          test "$RELEASE_TAG" = "nativepipe-runtime-v$VERSION-$RELEASE_SEQUENCE"
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]]
+          git fetch --force --tags origin \
+            "+refs/heads/main:refs/remotes/origin/main"
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$SOURCE_COMMIT"
+          if ! git merge-base --is-ancestor "$SOURCE_COMMIT" refs/remotes/origin/main; then
+            echo "release tag must point to a commit reachable from protected main" >&2
+            exit 1
+          fi
+          test "$(git show -s --format=%ct "$SOURCE_COMMIT")" = "$SOURCE_DATE_EPOCH"
+          export LC_ALL=C
+          decimal_gt() {
+            if (( ${#1} != ${#2} )); then
+              (( ${#1} > ${#2} ))
+            else
+              [[ "$1" > "$2" ]]
+            fi
+          }
+          if decimal_gt "$RELEASE_SEQUENCE" 18446744073709551615; then
+            echo "release sequence exceeds UInt64" >&2
+            exit 1
+          fi
+          highest=0
+          highest_tag=
+          while IFS= read -r previous_tag; do
+            [[ "$previous_tag" == "$RELEASE_TAG" ]] && continue
+            if [[ "$previous_tag" =~ ^nativepipe-runtime-v[0-9]+\.[0-9]+\.[0-9]+-([1-9][0-9]*)$ ]]; then
+              candidate=${BASH_REMATCH[1]}
+              decimal_gt "$candidate" 18446744073709551615 && continue
+              if decimal_gt "$candidate" "$highest"; then
+                highest=$candidate
+                highest_tag=$previous_tag
+              fi
+            fi
+          done < <(git tag --list 'nativepipe-runtime-v*')
+          if ! decimal_gt "$RELEASE_SEQUENCE" "$highest"; then
+            echo "release sequence $RELEASE_SEQUENCE is not greater than existing maximum $highest" >&2
+            exit 1
+          fi
+          if [[ -n "$highest_tag" ]]; then
+            previous_commit=$(git rev-parse "refs/tags/$highest_tag^{commit}")
+            if ! git merge-base --is-ancestor "$previous_commit" "$SOURCE_COMMIT"; then
+              echo "release source must descend from the latest signed release" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Download aarch64 release assets
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: ${{ inputs.aarch64_artifact }}
+          path: release
+
+      - name: Download x86_64 release assets
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: ${{ inputs.x86_64_artifact }}
+          path: release
+
+      - name: Verify unsigned candidates before signing
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          SOURCE_DATE_EPOCH: ${{ inputs.source_date_epoch }}
+        run: |
+          set -euo pipefail
+          test "$(find release -maxdepth 1 -type f | wc -l)" -eq 12
+          for architecture in aarch64 x86_64; do
+            manifest="release/nativepipe-runtime-$architecture.runtime-manifest.json"
+            python3 scripts/verify_nativepipe_runtime.py "$manifest"
+            MANIFEST="$manifest" ARCHITECTURE="$architecture" python3 - <<'PY'
+          import json, os, pathlib
+          manifest = json.loads(pathlib.Path(os.environ["MANIFEST"]).read_text())
+          expected = {
+              "component": "nativepipe-runtime",
+              "version": os.environ["VERSION"],
+              "releaseTag": os.environ["RELEASE_TAG"],
+              "releaseSequence": int(os.environ["RELEASE_SEQUENCE"]),
+              "sourceRepository": "shih-liang/nativepipe",
+              "sourceCommit": os.environ["SOURCE_COMMIT"],
+              "architecture": os.environ["ARCHITECTURE"],
+          }
+          for key, value in expected.items():
+              if manifest.get(key) != value or type(manifest.get(key)) is not type(value):
+                  raise SystemExit(f"manifest {key} does not match the trusted release identity")
+          source = pathlib.Path(os.environ["MANIFEST"]).with_name(
+              f"nativepipe-runtime-{os.environ['ARCHITECTURE']}.source.json"
+          )
+          source_value = json.loads(source.read_text())
+          if source_value.get("sourceDateEpoch") != int(os.environ["SOURCE_DATE_EPOCH"]):
+              raise SystemExit("source epoch does not match the trusted tag commit")
+          PY
+          done
+
+      - name: Sign canonical manifests and checksums
+        shell: bash
+        env:
+          PRIVATE_KEY_BASE64: ${{ secrets.LIGHTHOUSE_RUNTIME_ED25519_PRIVATE_KEY_BASE64 }}
+          EXPECTED_PUBLIC_KEY_BASE64: ${{ vars.LIGHTHOUSE_RUNTIME_ED25519_PUBLIC_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "${PRIVATE_KEY_BASE64:-}" || {
+            echo "missing protected Ed25519 private key" >&2
+            exit 1
+          }
+          test -n "${EXPECTED_PUBLIC_KEY_BASE64:-}" || {
+            echo "missing pinned runtime Ed25519 public key" >&2
+            exit 1
+          }
+          key_dir=$(mktemp -d)
+          trap 'rm -rf "$key_dir"' EXIT HUP INT TERM
+          umask 077
+          printf '%s' "$PRIVATE_KEY_BASE64" | base64 --decode > "$key_dir/private.pem"
+          openssl pkey -in "$key_dir/private.pem" -check -noout
+          openssl pkey -in "$key_dir/private.pem" -pubout \
+            -out release/nativepipe-runtime-ed25519-public-key.pem
+          openssl pkey -in "$key_dir/private.pem" -pubout -outform DER \
+            -out "$key_dir/public.der"
+          test "$(wc -c < "$key_dir/public.der" | tr -d '[:space:]')" -eq 44
+          test "$(od -An -tx1 -N12 "$key_dir/public.der" | tr -d '[:space:]')" = \
+            '302a300506032b6570032100'
+          expected_raw="$key_dir/expected-public.raw"
+          printf '%s' "$EXPECTED_PUBLIC_KEY_BASE64" | base64 --decode > "$expected_raw"
+          test "$(wc -c < "$expected_raw" | tr -d '[:space:]')" -eq 32
+          test "$(base64 -w0 < "$expected_raw")" = "$EXPECTED_PUBLIC_KEY_BASE64"
+          test "$(tail -c 32 "$key_dir/public.der" | base64 -w0)" = \
+            "$EXPECTED_PUBLIC_KEY_BASE64"
+          for architecture in aarch64 x86_64; do
+            manifest="release/nativepipe-runtime-$architecture.runtime-manifest.json"
+            signature="release/nativepipe-runtime-$architecture.runtime-manifest.sig"
+            openssl pkeyutl -sign -rawin -inkey "$key_dir/private.pem" \
+              -in "$manifest" -out "$signature"
+            python3 scripts/verify_nativepipe_runtime.py "$manifest" \
+              --require-signature release/nativepipe-runtime-ed25519-public-key.pem
+          done
+          (
+            cd release
+            find . -maxdepth 1 -type f ! -name SHA256SUMS ! -name SHA256SUMS.sig \
+              -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sed 's#  \./#  #'
+          ) > release/SHA256SUMS
+          openssl pkeyutl -sign -rawin -inkey "$key_dir/private.pem" \
+            -in release/SHA256SUMS -out release/SHA256SUMS.sig
+          openssl pkeyutl -verify -rawin -pubin \
+            -inkey release/nativepipe-runtime-ed25519-public-key.pem \
+            -in release/SHA256SUMS -sigfile release/SHA256SUMS.sig
+
+      - name: Upload immutable signed release candidate
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: signed-nativepipe-runtime
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14

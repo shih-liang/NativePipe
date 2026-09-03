@@ -1,0 +1,48 @@
+name: NativePipe continuous integration
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nativepipe-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  swift:
+    name: Swift package
+    runs-on: macos-15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+      - name: Build and test
+        run: make test
+
+  transport-and-package:
+    name: Transport and package policy
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+      - name: Install compositor build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            libavcodec-dev libavutil-dev libdrm-dev libegl1-mesa-dev \
+            libgbm-dev libgles2-mesa-dev libswscale-dev libvulkan-dev \
+            libwayland-dev libxkbcommon-dev wayland-protocols
+      - name: Build the complete remote compositor
+        run: make -C guest/compositor remote
+      - name: Test remote transport
+        run: make -C guest/compositor test-remote-transport
+      - name: Verify source and license inventory
+        run: python3 scripts/check-license-inventory.py
+      - name: Test deterministic package builder
+        env:
+          OPENSSL: openssl
+        run: python3 -m unittest discover -s Tests/PackagingTests -v

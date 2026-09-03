@@ -10,7 +10,7 @@ import Foundation
 ///     +------+-------+--------+------------+============+
 ///
 /// The payload is opaque bytes. On the control channel it is `ControlWire`
-/// binary; on the window channel it may still be JSON or `WindowWire` binary.
+/// binary; on the window channel it is `WindowWire` binary.
 public enum WireFormat {
     public static let magic: [UInt8] = Array("NPIP".utf8)
     public static let version: UInt8 = 1

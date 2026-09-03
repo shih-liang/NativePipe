@@ -4,7 +4,7 @@ import NativePipeProtocol
 /// Manual argv split so ssh flags (`-i`, `-p`, `-o`, …) pass through untouched.
 struct RemotePipeCLI {
     var destination: String?
-    var compositor: String = "remotepipe-wayland"
+    var compositor: String = "nativepipe-wayland"
     var host: String = "127.0.0.1"
     var surfacePort: UInt16 = UInt16(NativePipePort.surface)
     var mediaPort: UInt16 = UInt16(NativePipePort.media)
@@ -13,24 +13,24 @@ struct RemotePipeCLI {
 
     static let usage = """
         Usage:
-          remotepipe user@host [ssh-args…] [--compositor PATH]
-          remotepipe --host 127.0.0.1 [--surface-port N] [--media-port N]
+          nativepipe user@host [ssh-args…] [--compositor PATH]
+          nativepipe --host 127.0.0.1 [--surface-port N] [--media-port N]
 
         One-shot SSH session (recommended):
           Opens local forwards for ports 1025/1026, starts the remote compositor
-          if needed, runs the RemotePipe display client, then drops you into a
+          if needed, runs the NativePipe display client, then drops you into a
           remote login shell with WAYLAND_DISPLAY set. Exit the shell to tear down.
 
-          remotepipe lfs@172.16.0.34
-          remotepipe user@host --compositor ~/bin/remotepipe-wayland
-          remotepipe user@host -i ~/.ssh/id_ed25519 -p 2222
-          remotepipe user@host -- -o ProxyJump=bastion
+          nativepipe lfs@172.16.0.34
+          nativepipe user@host --compositor ~/bin/nativepipe-wayland
+          nativepipe user@host -i ~/.ssh/id_ed25519 -p 2222
+          nativepipe user@host -- -o ProxyJump=bastion
 
         Local-only (manual ssh -L already set up):
-          remotepipe --host 127.0.0.1
+          nativepipe --host 127.0.0.1
 
         Options:
-          --compositor PATH   Remote compositor binary (default: remotepipe-wayland)
+          --compositor PATH   Remote compositor binary (default: nativepipe-wayland)
           --host ADDR         Local mode: connect to ADDR (default 127.0.0.1)
           --surface-port N    Local mode / override local forward port (default 1025)
           --media-port N      Local mode / override local forward port (default 1026)

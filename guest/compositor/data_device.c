@@ -3,13 +3,11 @@
 #include "data_device.h"
 
 #include "compositor_internal.h"
-#include "hostlink.h"
 #include "scale.h"
 #include "scene.h"
 #include "window_events.h"
 #include "windowwire.h"
 
-#include <cjson/cJSON.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -296,64 +294,14 @@ static void announce_offer(struct wl_resource *device, struct wl_resource *offer
 // Clipboard transport
 //
 // Wayland moves selection data over a pipe the receiver supplies, and the host
-// channel carries JSON. Base64 is the bridge. It costs a third in size, which
-// for clipboard payloads is worth not having to add a second binary framing and
-// keep the two in step — the same reasoning that kept only pointer motion and
-// scroll on the fast path.
+// channel carries the requested bytes directly in an optional length-prefixed
+// binary field, without a textual intermediate.
 // ---------------------------------------------------------------------------
 
 /// A clipboard payload larger than this is refused rather than buffered. The
 /// point is to bound what one paste can make the compositor hold, not to
 /// support moving disk images through the selection.
-#define NP_CLIP_MAX (16u * 1024u * 1024u)
-
-static const char NP_B64_ALPHABET[] =
-	"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-static char *np_base64_encode(const unsigned char *data, size_t len) {
-	char *out = malloc(((len + 2) / 3) * 4 + 1);
-	if (!out) return NULL;
-	size_t o = 0;
-	for (size_t i = 0; i < len; i += 3) {
-		unsigned v = data[i] << 16;
-		if (i + 1 < len) v |= data[i + 1] << 8;
-		if (i + 2 < len) v |= data[i + 2];
-		out[o++] = NP_B64_ALPHABET[(v >> 18) & 0x3f];
-		out[o++] = NP_B64_ALPHABET[(v >> 12) & 0x3f];
-		out[o++] = i + 1 < len ? NP_B64_ALPHABET[(v >> 6) & 0x3f] : '=';
-		out[o++] = i + 2 < len ? NP_B64_ALPHABET[v & 0x3f] : '=';
-	}
-	out[o] = '\0';
-	return out;
-}
-
-static unsigned char *np_base64_decode(const char *text, size_t *out_len) {
-	static signed char reverse[256];
-	static bool built = false;
-	if (!built) {
-		memset(reverse, -1, sizeof(reverse));
-		for (int i = 0; i < 64; i++) reverse[(unsigned char)NP_B64_ALPHABET[i]] = (signed char)i;
-		built = true;
-	}
-	size_t len = strlen(text);
-	unsigned char *out = malloc(len / 4 * 3 + 3);
-	if (!out) return NULL;
-	size_t o = 0;
-	unsigned accumulator = 0;
-	int bits = 0;
-	for (size_t i = 0; i < len; i++) {
-		signed char value = reverse[(unsigned char)text[i]];
-		if (value < 0) continue;               // '=' and any stray whitespace
-		accumulator = (accumulator << 6) | (unsigned)value;
-		bits += 6;
-		if (bits >= 8) {
-			bits -= 8;
-			out[o++] = (unsigned char)((accumulator >> bits) & 0xff);
-		}
-	}
-	*out_len = o;
-	return out;
-}
+#define NP_CLIP_MAX (7u * 1024u * 1024u)
 
 /// Draining a guest client's selection into a buffer, on its way to the host.
 struct np_clip_read {
@@ -377,18 +325,24 @@ struct np_clip_write {
 };
 
 static void clip_read_finish(struct np_clip_read *read_state, bool ok) {
-	cJSON *body = cJSON_CreateObject();
-	cJSON_AddNumberToObject(body, "token", read_state->token);
-	cJSON_AddStringToObject(body, "mimeType", read_state->mime);
-	char *encoded = ok ? np_base64_encode(read_state->data, read_state->len) : NULL;
-	if (encoded) {
-		cJSON_AddStringToObject(body, "base64", encoded);
-		free(encoded);
-	} else {
-		cJSON_AddNullToObject(body, "base64");
-	}
-	np_host_send(&read_state->server->host, "selectionData", body);
+	struct np_window_message message;
+	np_window_message_init(&message, NP_WINDOW_GUEST_TO_HOST,
+	                       NP_GUEST_SELECTION_DATA);
+	np_window_put_u32(&message, read_state->token);
+	np_window_put_string(&message, read_state->mime);
+	np_window_put_optional_bytes(&message, read_state->data, read_state->len, ok);
+	(void)np_window_event_send_message(read_state->server, &message);
+	np_window_message_clear(&message);
 
+	if (read_state->source) wl_event_source_remove(read_state->source);
+	close(read_state->fd);
+	wl_list_remove(&read_state->link);
+	free(read_state->mime);
+	free(read_state->data);
+	free(read_state);
+}
+
+static void clip_read_cancel(struct np_clip_read *read_state) {
 	if (read_state->source) wl_event_source_remove(read_state->source);
 	close(read_state->fd);
 	wl_list_remove(&read_state->link);
@@ -441,11 +395,14 @@ void np_data_serve_host_request(struct np_server *server, uint32_t token,
 	struct np_clip_read *read_state = failed ? NULL : calloc(1, sizeof(*read_state));
 	if (failed || !read_state) {
 		if (!failed) { close(pipe_fds[0]); close(pipe_fds[1]); }
-		cJSON *body = cJSON_CreateObject();
-		cJSON_AddNumberToObject(body, "token", token);
-		cJSON_AddStringToObject(body, "mimeType", mime_type);
-		cJSON_AddNullToObject(body, "base64");
-		np_host_send(&server->host, "selectionData", body);
+		struct np_window_message message;
+		np_window_message_init(&message, NP_WINDOW_GUEST_TO_HOST,
+		                       NP_GUEST_SELECTION_DATA);
+		np_window_put_u32(&message, token);
+		np_window_put_string(&message, mime_type);
+		np_window_put_optional_bytes(&message, NULL, 0, false);
+		(void)np_window_event_send_message(server, &message);
+		np_window_message_clear(&message);
 		free(read_state);
 		return;
 	}
@@ -509,22 +466,26 @@ static void clip_request_from_host(struct np_server *server, const char *mime_ty
 	}
 	pending->token = ++server->next_clip_token;
 	pending->fd = fd;
-	wl_list_insert(&server->clip_writes, &pending->link);
+	wl_list_insert(&server->clip_pending, &pending->link);
 
-	cJSON *body = cJSON_CreateObject();
-	cJSON_AddNumberToObject(body, "token", pending->token);
-	cJSON_AddStringToObject(body, "mimeType", mime_type);
-	np_host_send(&server->host, "hostSelectionRequest", body);
+	struct np_window_message message;
+	np_window_message_init(&message, NP_WINDOW_GUEST_TO_HOST,
+	                       NP_GUEST_HOST_SELECTION_REQUEST);
+	np_window_put_u32(&message, pending->token);
+	np_window_put_string(&message, mime_type);
+	(void)np_window_event_send_message(server, &message);
+	np_window_message_clear(&message);
 }
 
 /// Completes a paste: the host answered, so the bytes go into the pipe the
 /// client supplied. Nothing here blocks — an unread pipe just leaves the write
 /// pending until the loop says it will take more.
 void np_data_deliver_host_data(struct np_server *server, uint32_t token,
-                                   const char *base64) {
+	                           const unsigned char *bytes, size_t length,
+	                           bool present) {
 	struct np_clip_pending *pending, *tmp;
 	int fd = -1;
-	wl_list_for_each_safe(pending, tmp, &server->clip_writes, link) {
+	wl_list_for_each_safe(pending, tmp, &server->clip_pending, link) {
 		if (pending->token != token) continue;
 		fd = pending->fd;
 		wl_list_remove(&pending->link);
@@ -533,9 +494,12 @@ void np_data_deliver_host_data(struct np_server *server, uint32_t token,
 	}
 	if (fd < 0) return;
 
-	size_t len = 0;
-	unsigned char *data = base64 ? np_base64_decode(base64, &len) : NULL;
-	if (!data || len == 0) {
+	unsigned char *data = NULL;
+	if (present && length) {
+		data = malloc(length);
+		if (data) memcpy(data, bytes, length);
+	}
+	if (!data || length == 0) {
 		// Closing an empty pipe is a valid answer: the client sees EOF and
 		// concludes the selection had nothing in that type.
 		free(data);
@@ -553,7 +517,7 @@ void np_data_deliver_host_data(struct np_server *server, uint32_t token,
 	if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 	write_state->fd = fd;
 	write_state->data = data;
-	write_state->len = len;
+	write_state->len = length;
 	wl_list_insert(&server->clip_writes, &write_state->link);
 
 	struct wl_event_loop *loop = wl_display_get_event_loop(server->display);
@@ -562,21 +526,54 @@ void np_data_deliver_host_data(struct np_server *server, uint32_t token,
 	clip_write_ready(fd, WL_EVENT_WRITABLE, write_state);
 }
 
+void np_data_host_disconnected(struct np_server *server) {
+	struct np_clip_read *read_state, *read_tmp;
+	wl_list_for_each_safe(read_state, read_tmp, &server->clip_reads, link)
+		clip_read_cancel(read_state);
+
+	struct np_clip_pending *pending, *pending_tmp;
+	wl_list_for_each_safe(pending, pending_tmp, &server->clip_pending, link) {
+		close(pending->fd);
+		wl_list_remove(&pending->link);
+		free(pending);
+	}
+
+	for (int i = 0; i < server->host_mime_count; i++) {
+		free(server->host_mime[i]);
+		server->host_mime[i] = NULL;
+	}
+	server->host_mime_count = 0;
+
+	/* A host-owned offer disappeared with its transport. Every bound data
+	 * device must observe that change or a later paste can wait forever for a
+	 * host that no longer owns the selection. */
+	struct np_input *device;
+	wl_list_for_each(device, &server->data_devices, link)
+		np_data_send_selection(server, device->resource);
+	wl_display_flush_clients(server->display);
+}
+
 /// Tells the host what the guest's selection now offers, so it can put matching
 /// types on NSPasteboard. An empty list means the guest gave the selection up.
 static void announce_selection_to_host(struct np_server *server) {
-	cJSON *types = cJSON_CreateArray();
+	struct np_window_message message;
+	np_window_message_init(&message, NP_WINDOW_GUEST_TO_HOST,
+	                       NP_GUEST_SELECTION_OFFERED);
+	uint32_t count = 0;
+	if (server->selection_source) {
+		struct np_data_source *source = wl_resource_get_user_data(server->selection_source);
+		if (source) count = (uint32_t)source->mime_count;
+	}
+	np_window_put_u32(&message, count);
 	if (server->selection_source) {
 		struct np_data_source *source = wl_resource_get_user_data(server->selection_source);
 		if (source) {
-			for (int i = 0; i < source->mime_count; i++) {
-				cJSON_AddItemToArray(types, cJSON_CreateString(source->mime_types[i]));
-			}
+			for (int i = 0; i < source->mime_count; i++)
+				np_window_put_string(&message, source->mime_types[i]);
 		}
 	}
-	cJSON *body = cJSON_CreateObject();
-	cJSON_AddItemToObject(body, "mimeTypes", types);
-	np_host_send(&server->host, "selectionOffered", body);
+	(void)np_window_event_send_message(server, &message);
+	np_window_message_clear(&message);
 }
 
 /// Announces the current selection to one data device: a fresh offer, its types,

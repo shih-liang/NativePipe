@@ -55,7 +55,7 @@ enum SSHBootstrap {
         if !out.contains("ready") {
             throw CLIError.invalidUsage("compositor did not become ready:\n\(out)")
         }
-        fputs("remotepipe: \(out.trimmingCharacters(in: .whitespacesAndNewlines))\n", stderr)
+        fputs("nativepipe: \(out.trimmingCharacters(in: .whitespacesAndNewlines))\n", stderr)
     }
 
     /// Background `ssh -N` holding LocalForwards. Survives without a TTY.
@@ -108,15 +108,15 @@ enum SSHBootstrap {
         sshArguments: [String]
     ) throws -> Process {
         let remote = """
-            RUNTIME="/tmp/remotepipe-xdg-$(id -u)"; \
-            ENV="$RUNTIME/remotepipe-wayland.env"; \
+            RUNTIME="/tmp/nativepipe-xdg-$(id -u)"; \
+            ENV="$RUNTIME/nativepipe-wayland.env"; \
             if [ ! -f "$ENV" ]; then \
-              echo "remotepipe: missing $ENV (is the compositor running?)" >&2; \
+              echo "nativepipe: missing $ENV (is the compositor running?)" >&2; \
               exit 1; \
             fi; \
             . "$ENV"; \
             if [ -z "${WAYLAND_DISPLAY:-}" ] || [ -z "${XDG_RUNTIME_DIR:-}" ]; then \
-              echo "remotepipe: $ENV incomplete" >&2; \
+              echo "nativepipe: $ENV incomplete" >&2; \
               exit 1; \
             fi; \
             export WAYLAND_DISPLAY XDG_RUNTIME_DIR; \
@@ -124,8 +124,8 @@ enum SSHBootstrap {
             [ -z "${XAUTHORITY:-}" ] || export XAUTHORITY; \
             [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] || export DBUS_SESSION_BUS_ADDRESS; \
             printf 'WAYLAND_DISPLAY=%s XDG_RUNTIME_DIR=%s\\n' "$WAYLAND_DISPLAY" "$XDG_RUNTIME_DIR" \
-              > /tmp/remotepipe-shell-started; \
-            printf 'remotepipe: remote shell WAYLAND_DISPLAY=%s (runtime %s)\\n' \
+              > /tmp/nativepipe-shell-started; \
+            printf 'nativepipe: remote shell WAYLAND_DISPLAY=%s (runtime %s)\\n' \
               "$WAYLAND_DISPLAY" "$XDG_RUNTIME_DIR" >&2; \
             exec "${SHELL:-/bin/bash}" -l
             """
@@ -161,18 +161,18 @@ enum SSHBootstrap {
         let path = shellEscape(compositor)
         // Dedicated XDG_RUNTIME_DIR so a session compositor that already owns
         // $XDG_RUNTIME_DIR/wayland-0 cannot collide with ours. Clients in the
-        // RemotePipe ssh shell inherit the same runtime + display variables.
+        // The NativePipe ssh shell inherits the same runtime + display variables.
         return """
             set -e
             COMPOSITOR=\(path)
-            RUNTIME="/tmp/remotepipe-xdg-$(id -u)"
-            LOG="$RUNTIME/remotepipe-wayland.log"
-            ENV="$RUNTIME/remotepipe-wayland.env"
-            PID="$RUNTIME/remotepipe-wayland.pid"
+            RUNTIME="/tmp/nativepipe-xdg-$(id -u)"
+            LOG="$RUNTIME/nativepipe-wayland.log"
+            ENV="$RUNTIME/nativepipe-wayland.env"
+            PID="$RUNTIME/nativepipe-wayland.pid"
             mkdir -p "$RUNTIME"
             chmod 700 "$RUNTIME"
             if ! command -v "$COMPOSITOR" >/dev/null 2>&1 && [ ! -x "$COMPOSITOR" ]; then
-              echo "remotepipe: compositor not found: $COMPOSITOR" >&2
+              echo "nativepipe: compositor not found: $COMPOSITOR" >&2
               exit 127
             fi
             listening() {
@@ -196,13 +196,13 @@ enum SSHBootstrap {
             }
             if ! owned_compositor; then
               if tracked_alive; then
-                echo "remotepipe: tracked compositor is alive but both ports are not ready" >&2
-                echo "remotepipe: inspect $LOG or stop PID $(cat "$PID") before retrying" >&2
+                echo "nativepipe: tracked compositor is alive but both ports are not ready" >&2
+                echo "nativepipe: inspect $LOG or stop PID $(cat "$PID") before retrying" >&2
                 exit 1
               fi
               if listening; then
-                echo 'remotepipe: ports 1025/1026 belong to an untracked process' >&2
-                echo "remotepipe: stop it or remove stale $PID after verifying ownership" >&2
+                echo 'nativepipe: ports 1025/1026 belong to an untracked process' >&2
+                echo "nativepipe: stop it or remove stale $PID after verifying ownership" >&2
                 exit 1
               fi
               rm -f "$ENV" "$PID"
@@ -219,13 +219,13 @@ enum SSHBootstrap {
               done
             fi
             if ! owned_compositor; then
-              echo "remotepipe: compositor failed to listen on 127.0.0.1:1025/1026" >&2
+              echo "nativepipe: compositor failed to listen on 127.0.0.1:1025/1026" >&2
               tail -n 40 "$LOG" 2>/dev/null >&2 || true
               rm -f "$PID"
               exit 1
             fi
             if [ ! -f "$ENV" ]; then
-              echo "remotepipe: compositor is up but WAYLAND_DISPLAY is unknown" >&2
+              echo "nativepipe: compositor is up but WAYLAND_DISPLAY is unknown" >&2
               tail -n 40 "$LOG" 2>/dev/null >&2 || true
               exit 1
             fi

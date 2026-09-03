@@ -1,0 +1,584 @@
+name: Build NativePipe runtime
+
+on:
+  push:
+    tags:
+      - "nativepipe-runtime-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semantic version for an unsigned build
+        required: true
+        type: string
+      release_sequence:
+        description: Positive runtime set generation; must match platform releaseSequence and lock setGeneration
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nativepipe-runtime-release
+  cancel-in-progress: false
+
+env:
+  COMPONENT: nativepipe-runtime
+  GUEST_RUNTIME_ABI: "1"
+
+jobs:
+  identity:
+    name: Validate release identity
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      release_tag: ${{ steps.identity.outputs.release_tag }}
+      release_sequence: ${{ steps.identity.outputs.release_sequence }}
+      source_commit: ${{ steps.identity.outputs.source_commit }}
+      source_date_epoch: ${{ steps.identity.outputs.source_date_epoch }}
+    steps:
+      - name: Check out the exact source revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag, version, and monotonic sequence
+        id: identity
+        shell: bash
+        env:
+          DISPATCH_VERSION: ${{ inputs.version }}
+          DISPATCH_SEQUENCE: ${{ inputs.release_sequence }}
+        run: |
+          set -euo pipefail
+          # This value is the atomic guest-runtime set generation. Release the
+          # matching platform artifact with the same releaseSequence and set
+          # GuestRuntime.lock.json setGeneration to it. This workflow does not
+          # coordinate with the platform repository; the FluxWindow host rejects
+          # any platform/display pair whose signed sequences do not both match
+          # the lock. Do not add setGeneration to the frozen display manifest.
+          version_pattern='[0-9]+\.[0-9]+\.[0-9]+'
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            release_tag=${GITHUB_REF_NAME}
+            if [[ ! "$release_tag" =~ ^nativepipe-runtime-v(${version_pattern})-([1-9][0-9]*)$ ]]; then
+              echo "invalid display release tag: $release_tag" >&2
+              exit 1
+            fi
+            version=${BASH_REMATCH[1]}
+            sequence=${BASH_REMATCH[2]}
+            tag_commit=$(git rev-list -n 1 "$release_tag")
+            test "$tag_commit" = "$GITHUB_SHA"
+            git fetch --force --tags origin \
+              "+refs/heads/main:refs/remotes/origin/main"
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+              echo "release tag must point to a commit reachable from protected main" >&2
+              exit 1
+            fi
+          else
+            version=$DISPATCH_VERSION
+            sequence=$DISPATCH_SEQUENCE
+            if [[ ! "$version" =~ ^${version_pattern}$ ]] ||
+               [[ ! "$sequence" =~ ^[1-9][0-9]*$ ]]; then
+              echo "workflow inputs must be a semantic version and a positive sequence" >&2
+              exit 1
+            fi
+            release_tag="nativepipe-runtime-v${version}-${sequence}"
+          fi
+
+          export LC_ALL=C
+          decimal_gt() {
+            if (( ${#1} != ${#2} )); then
+              (( ${#1} > ${#2} ))
+            else
+              [[ "$1" > "$2" ]]
+            fi
+          }
+          if decimal_gt "$sequence" 18446744073709551615; then
+            echo "release sequence exceeds UInt64" >&2
+            exit 1
+          fi
+          highest=0
+          highest_tag=
+          while IFS= read -r existing; do
+            [[ "$existing" == "$release_tag" ]] && continue
+            if [[ "$existing" =~ ^nativepipe-runtime-v(${version_pattern})-([1-9][0-9]*)$ ]]; then
+              candidate=${BASH_REMATCH[2]}
+              decimal_gt "$candidate" 18446744073709551615 && continue
+              if decimal_gt "$candidate" "$highest"; then
+                highest=$candidate
+                highest_tag=$existing
+              fi
+            fi
+          done < <(git tag --list 'nativepipe-runtime-v*')
+          if ! decimal_gt "$sequence" "$highest"; then
+            echo "release sequence $sequence is not greater than published maximum $highest" >&2
+            exit 1
+          fi
+          if [[ -n "$highest_tag" ]]; then
+            previous_commit=$(git rev-parse "refs/tags/$highest_tag^{commit}")
+            if ! git merge-base --is-ancestor "$previous_commit" HEAD; then
+              echo "release source must descend from the latest published release" >&2
+              exit 1
+            fi
+          fi
+
+          source_commit=$(git rev-parse HEAD)
+          source_date_epoch=$(git show -s --format=%ct HEAD)
+          {
+            echo "version=$version"
+            echo "release_tag=$release_tag"
+            echo "release_sequence=$sequence"
+            echo "source_commit=$source_commit"
+            echo "source_date_epoch=$source_date_epoch"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Atomic guest runtime set generation"
+            echo
+            echo "Display release sequence: \`$sequence\`"
+            echo
+            echo "The platform releaseSequence and baseline lock setGeneration must use the same value."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  source_policy:
+    name: Source and license policy
+    needs: identity
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the exact source revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Fail closed on missing or ambiguous source licenses
+        run: python3 scripts/check-license-inventory.py
+
+      - name: Validate deterministic packager
+        run: python3 -m unittest discover -s Tests/PackagingTests -v
+
+  swift_tests:
+    name: Swift protocol and window tests
+    needs: identity
+    runs-on: macos-15
+    steps:
+      - name: Check out the exact source revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Test shared host protocol and window state
+        run: make test
+
+  guest_build:
+    name: Guest ${{ matrix.architecture }}-${{ matrix.libc }}
+    needs: [identity, source_policy]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: aarch64
+            docker_architecture: arm64
+            libc: gnu
+            runner: ubuntu-24.04-arm
+            image: rust:1.89.0-bookworm
+          - architecture: aarch64
+            docker_architecture: arm64
+            libc: musl
+            runner: ubuntu-24.04-arm
+            image: rust:1.89.0-alpine3.22
+          - architecture: x86_64
+            docker_architecture: amd64
+            libc: gnu
+            runner: ubuntu-24.04
+            image: rust:1.89.0-bookworm
+          - architecture: x86_64
+            docker_architecture: amd64
+            libc: musl
+            runner: ubuntu-24.04
+            image: rust:1.89.0-alpine3.22
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out the exact source revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Resolve and record the builder image
+        id: image
+        shell: bash
+        env:
+          BUILDER_IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          docker pull "$BUILDER_IMAGE"
+          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$BUILDER_IMAGE")
+          test -n "$digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Build and unit-test both display backends
+        shell: bash
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+          DOCKER_ARCHITECTURE: ${{ matrix.docker_architecture }}
+          LIBC: ${{ matrix.libc }}
+          BUILDER_IMAGE: ${{ steps.image.outputs.digest }}
+          SOURCE_DATE_EPOCH: ${{ needs.identity.outputs.source_date_epoch }}
+        run: |
+          set -euo pipefail
+          docker run --rm --platform "linux/$DOCKER_ARCHITECTURE" \
+            -e ARCH="$ARCHITECTURE" -e LIBC="$LIBC" \
+            -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+            -v "$PWD:/src" -w /src "$BUILDER_IMAGE" sh -euxc '
+              if [ "$LIBC" = gnu ]; then
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update
+                apt-get install -y --no-install-recommends \
+                  build-essential pkg-config git ca-certificates patch file \
+                  libwayland-dev wayland-protocols libxkbcommon-dev \
+                  libvulkan-dev libdrm-dev libegl1-mesa-dev libgles2-mesa-dev \
+                  libgbm-dev libavcodec-dev libavutil-dev libswscale-dev \
+                  libxcb1-dev libxcb-xfixes0-dev libxcb-randr0-dev \
+                  libxcb-render0-dev libxcb-shape0-dev libxcb-composite0-dev \
+                  libxcb-res0-dev libxcb-cursor-dev
+                dpkg-query -W > .ci-toolchain-packages.txt
+              else
+                apk add --no-cache \
+                  build-base pkgconf git ca-certificates patch file linux-headers \
+                  wayland-dev wayland-protocols libxkbcommon-dev \
+                  vulkan-loader-dev vulkan-headers libdrm-dev mesa-dev ffmpeg-dev \
+                  libxcb-dev xcb-util-cursor-dev
+                apk info -vv > .ci-toolchain-packages.txt
+              fi
+              export LC_ALL=C TZ=UTC
+              cc --version > .ci-compiler.txt
+              rustc --version --verbose > .ci-rustc.txt
+              cargo --version >> .ci-rustc.txt
+              make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" \
+                test-remote-transport
+              # FluxWindow's runtime owns only the VM compositor. The remote
+              # nativepipe client and nativepipe-wayland are separate products.
+              make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" dist-vmpipe
+              make -C guest/session ARCH="$ARCH" LIBC="$LIBC" dist-target
+              make -C guest/xwayland-satellite ARCH="$ARCH" LIBC="$LIBC" test
+              make -C guest/xwayland-satellite ARCH="$ARCH" LIBC="$LIBC" dist-target
+            '
+
+      - name: Stage only runtime files from this target
+        shell: bash
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+          LIBC: ${{ matrix.libc }}
+          BUILDER_DIGEST: ${{ steps.image.outputs.digest }}
+          SOURCE_COMMIT: ${{ needs.identity.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          root=.ci-output/payload-root
+          install -Dm0755 \
+            "guest/session/dist/nativepipe-session-$ARCHITECTURE-$LIBC" \
+            "$root/guest/session/dist/nativepipe-session-$ARCHITECTURE-$LIBC"
+          install -Dm0755 \
+            "guest/session/dist/nativepipe-align-blob-$ARCHITECTURE-$LIBC.so" \
+            "$root/guest/session/dist/nativepipe-align-blob-$ARCHITECTURE-$LIBC.so"
+          install -Dm0755 \
+            "guest/session/dist/nativepipe-vulkan-layer-$ARCHITECTURE-$LIBC.so" \
+            "$root/guest/session/dist/nativepipe-vulkan-layer-$ARCHITECTURE-$LIBC.so"
+              install -Dm0755 \
+                "guest/xwayland-satellite/dist/xwayland-satellite-$ARCHITECTURE-$LIBC" \
+                "$root/guest/xwayland-satellite/dist/xwayland-satellite-$ARCHITECTURE-$LIBC"
+              install -Dm0644 \
+                "guest/xwayland-satellite/dist/xwayland-satellite-$ARCHITECTURE-$LIBC.third-party-licenses.txt" \
+                "$root/guest/xwayland-satellite/dist/xwayland-satellite-$ARCHITECTURE-$LIBC.third-party-licenses.txt"
+          install -Dm0755 \
+            "guest/compositor/dist/vmpipe-wayland-$ARCHITECTURE-$LIBC" \
+            "$root/Packages/NativePipe/guest/compositor/dist/vmpipe-wayland-$ARCHITECTURE-$LIBC"
+          mkdir -p .ci-output/toolchain
+          install -m0644 .ci-toolchain-packages.txt .ci-compiler.txt .ci-rustc.txt \
+            .ci-output/toolchain/
+          ARCHITECTURE="$ARCHITECTURE" LIBC="$LIBC" \
+          BUILDER_DIGEST="$BUILDER_DIGEST" SOURCE_COMMIT="$SOURCE_COMMIT" \
+            python3 - <<'PY'
+          import json, os, pathlib
+          output = {
+              "schemaVersion": 1,
+              "architecture": os.environ["ARCHITECTURE"],
+              "libc": os.environ["LIBC"],
+              "sourceCommit": os.environ["SOURCE_COMMIT"],
+              "builderImage": os.environ["BUILDER_DIGEST"],
+              "commands": [
+                  {"name": "remote-dual-lane-transport-gates", "status": "passed"},
+                  {"name": "shared-compositor-remote-and-vmpipe", "status": "passed"},
+                  {"name": "guest-session-and-vulkan-shims", "status": "passed"},
+                  {"name": "xwayland-satellite-unit-tests", "status": "passed"},
+                  {"name": "xwayland-satellite-cargo-and-rust-license-notice", "status": "passed"},
+              ],
+              "status": "passed",
+          }
+          pathlib.Path(".ci-output/build-result.json").write_text(
+              json.dumps(output, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload target build
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: display-build-${{ matrix.architecture }}-${{ matrix.libc }}
+          path: .ci-output
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    name: Atomic ${{ matrix.architecture }} runtime archive
+    needs: [identity, swift_tests, guest_build]
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: [aarch64, x86_64]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the exact source revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Download GNU build
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: display-build-${{ matrix.architecture }}-gnu
+          path: .release-input/gnu
+
+      - name: Download musl build
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: display-build-${{ matrix.architecture }}-musl
+          path: .release-input/musl
+
+      - name: Create the runtime-only payload plan and test record
+        shell: bash
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          set -euo pipefail
+          guest/compositor/source-hash.sh > .release-input/COMPOSITOR_SOURCE.sha256
+          python3 - <<'PY'
+          import json, os, pathlib
+
+          arch = os.environ["ARCHITECTURE"]
+          files = []
+          def add(source, destination, mode):
+              path = pathlib.Path(source)
+              if not path.is_file():
+                  raise SystemExit(f"missing release input: {source}")
+              files.append({"source": source, "path": destination, "mode": mode})
+
+          add(
+              f".release-input/musl/payload-root/guest/session/dist/nativepipe-session-{arch}-musl",
+              f"guest/session/dist/nativepipe-session-{arch}", 493,
+          )
+          for libc in ("gnu", "musl"):
+              prefix = f".release-input/{libc}/payload-root"
+              add(
+                  f"{prefix}/guest/session/dist/nativepipe-align-blob-{arch}-{libc}.so",
+                  f"guest/session/dist/nativepipe-align-blob-{arch}-{libc}.so", 420,
+              )
+              add(
+                  f"{prefix}/guest/session/dist/nativepipe-vulkan-layer-{arch}-{libc}.so",
+                  f"guest/session/dist/nativepipe-vulkan-layer-{arch}-{libc}.so", 420,
+              )
+              add(
+                  f"{prefix}/guest/xwayland-satellite/dist/xwayland-satellite-{arch}-{libc}",
+                  f"guest/xwayland-satellite/dist/xwayland-satellite-{arch}-{libc}", 493,
+              )
+              add(
+                  f"{prefix}/guest/xwayland-satellite/dist/xwayland-satellite-{arch}-{libc}.third-party-licenses.txt",
+                  f"guest/xwayland-satellite/dist/xwayland-satellite-{arch}-{libc}.third-party-licenses.txt", 420,
+              )
+              add(
+                  f"{prefix}/Packages/NativePipe/guest/compositor/dist/vmpipe-wayland-{arch}-{libc}",
+                  f"Packages/NativePipe/guest/compositor/dist/vmpipe-wayland-{arch}-{libc}", 493,
+              )
+          for source, destination, mode in (
+              ("guest/session/profile.d/nativepipe.sh", "guest/session/profile.d/nativepipe.sh", 420),
+              ("guest/session/implicit_layer/VkLayer_NATIVEPIPE_blob_alignment.json", "guest/session/implicit_layer/VkLayer_NATIVEPIPE_blob_alignment.json", 420),
+              ("guest/session/systemd/nativepipe-session.service", "guest/session/systemd/nativepipe-session.service", 420),
+              ("guest/session/openrc/nativepipe-session", "guest/session/openrc/nativepipe-session", 493),
+              ("guest/xwayland-satellite/VERSION", "guest/xwayland-satellite/VERSION", 420),
+              (".release-input/COMPOSITOR_SOURCE.sha256", "Packages/NativePipe/guest/compositor/COMPOSITOR_SOURCE.sha256", 420),
+          ):
+              add(source, destination, mode)
+          pathlib.Path(".release-input/payload.json").write_text(
+              json.dumps({"schemaVersion": 1, "files": files}, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+
+          results = []
+          for libc in ("gnu", "musl"):
+              value = json.loads(pathlib.Path(f".release-input/{libc}/build-result.json").read_text())
+              if value.get("status") != "passed" or value.get("architecture") != arch or value.get("libc") != libc:
+                  raise SystemExit(f"invalid {arch}-{libc} test result")
+              results.append(value)
+          pathlib.Path(".release-input/tests.json").write_text(
+              json.dumps({"status": "passed", "targets": results}, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Package twice and require byte-identical output
+        shell: bash
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+          VERSION: ${{ needs.identity.outputs.version }}
+          RELEASE_TAG: ${{ needs.identity.outputs.release_tag }}
+          RELEASE_SEQUENCE: ${{ needs.identity.outputs.release_sequence }}
+          SOURCE_COMMIT: ${{ needs.identity.outputs.source_commit }}
+          SOURCE_DATE_EPOCH: ${{ needs.identity.outputs.source_date_epoch }}
+        run: |
+          set -euo pipefail
+          for output in .release-a .release-b; do
+            python3 scripts/package_nativepipe_runtime.py \
+              --repo-root . \
+              --payload-plan .release-input/payload.json \
+              --tests-input .release-input/tests.json \
+              --output-dir "$output" \
+              --version "$VERSION" \
+              --release-tag "$RELEASE_TAG" \
+              --release-sequence "$RELEASE_SEQUENCE" \
+              --architecture "$ARCHITECTURE" \
+              --source-repository "$GITHUB_REPOSITORY" \
+              --source-commit "$SOURCE_COMMIT" \
+              --source-date-epoch "$SOURCE_DATE_EPOCH" \
+              --builder-id "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            python3 scripts/verify_nativepipe_runtime.py \
+              "$output/nativepipe-runtime-$ARCHITECTURE.runtime-manifest.json"
+          done
+          names_a=$(cd .release-a && find . -maxdepth 1 -type f -print | LC_ALL=C sort)
+          names_b=$(cd .release-b && find . -maxdepth 1 -type f -print | LC_ALL=C sort)
+          test "$names_a" = "$names_b"
+          while IFS= read -r relative; do
+            cmp ".release-a/$relative" ".release-b/$relative"
+          done <<EOF
+          $names_a
+          EOF
+
+      - name: Upload unsigned architecture release
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: display-release-${{ matrix.architecture }}
+          path: .release-a
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 7
+
+  sign:
+    name: Sign verified display runtime
+    if: github.event_name == 'push'
+    needs: [identity, package]
+    permissions:
+      contents: read
+    uses: shih-liang/nativepipe/.github/workflows/sign-nativepipe-runtime.yml@main
+    with:
+      aarch64_artifact: display-release-aarch64
+      x86_64_artifact: display-release-x86_64
+      version: ${{ needs.identity.outputs.version }}
+      release_tag: ${{ needs.identity.outputs.release_tag }}
+      release_sequence: ${{ needs.identity.outputs.release_sequence }}
+      source_commit: ${{ needs.identity.outputs.source_commit }}
+      source_date_epoch: ${{ needs.identity.outputs.source_date_epoch }}
+
+  publish:
+    name: Publish signed display runtime
+    if: github.event_name == 'push'
+    needs: [identity, sign]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out protected publication policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Download signed release candidate
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: signed-nativepipe-runtime
+          path: release
+
+      - name: Verify signed artifact and trusted tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.identity.outputs.release_tag }}
+          SOURCE_COMMIT: ${{ needs.identity.outputs.source_commit }}
+          EXPECTED_PUBLIC_KEY_BASE64: ${{ vars.LIGHTHOUSE_RUNTIME_ED25519_PUBLIC_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "shih-liang/nativepipe"
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_TAG" =~ ^nativepipe-runtime-v[0-9]+\.[0-9]+\.[0-9]+-[1-9][0-9]*$ ]]
+          git fetch --force --tags origin \
+            "+refs/heads/main:refs/remotes/origin/main" \
+            "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$SOURCE_COMMIT"
+          git merge-base --is-ancestor "$SOURCE_COMMIT" refs/remotes/origin/main
+          export LC_ALL=C
+          decimal_gt() {
+            if (( ${#1} != ${#2} )); then
+              (( ${#1} > ${#2} ))
+            else
+              [[ "$1" > "$2" ]]
+            fi
+          }
+          highest=0
+          highest_tag=
+          while IFS= read -r previous_tag; do
+            [[ "$previous_tag" == "$RELEASE_TAG" ]] && continue
+            if [[ "$previous_tag" =~ ^nativepipe-runtime-v[0-9]+\.[0-9]+\.[0-9]+-([1-9][0-9]*)$ ]]; then
+              candidate=${BASH_REMATCH[1]}
+              decimal_gt "$candidate" 18446744073709551615 && continue
+              if decimal_gt "$candidate" "$highest"; then
+                highest=$candidate
+                highest_tag=$previous_tag
+              fi
+            fi
+          done < <(git tag --list 'nativepipe-runtime-v*')
+          [[ "$RELEASE_TAG" =~ -([1-9][0-9]*)$ ]]
+          sequence=${BASH_REMATCH[1]}
+          ! decimal_gt "$sequence" 18446744073709551615
+          decimal_gt "$sequence" "$highest"
+          if [[ -n "$highest_tag" ]]; then
+            previous_commit=$(git rev-parse "refs/tags/$highest_tag^{commit}")
+            git merge-base --is-ancestor "$previous_commit" "$SOURCE_COMMIT"
+          fi
+          test -n "${EXPECTED_PUBLIC_KEY_BASE64:-}"
+          key_dir=$(mktemp -d)
+          trap 'rm -rf "$key_dir"' EXIT HUP INT TERM
+          printf '%s' "$EXPECTED_PUBLIC_KEY_BASE64" | base64 --decode \
+            > "$key_dir/expected-public.raw"
+          test "$(wc -c < "$key_dir/expected-public.raw" | tr -d '[:space:]')" -eq 32
+          openssl pkey -pubin \
+            -in release/nativepipe-runtime-ed25519-public-key.pem \
+            -outform DER -out "$key_dir/public.der"
+          test "$(wc -c < "$key_dir/public.der" | tr -d '[:space:]')" -eq 44
+          test "$(od -An -tx1 -N12 "$key_dir/public.der" | tr -d '[:space:]')" = \
+            '302a300506032b6570032100'
+          cmp "$key_dir/expected-public.raw" <(tail -c 32 "$key_dir/public.der")
+          test -s release/SHA256SUMS
+          test "$(wc -c < release/SHA256SUMS.sig | tr -d '[:space:]')" -eq 64
+          (cd release && sha256sum --check --strict SHA256SUMS)
+          openssl pkeyutl -verify -rawin -pubin \
+            -inkey release/nativepipe-runtime-ed25519-public-key.pem \
+            -in release/SHA256SUMS -sigfile release/SHA256SUMS.sig
+          manifest_count=0
+          for architecture in aarch64 x86_64; do
+            manifest="release/nativepipe-runtime-$architecture.runtime-manifest.json"
+            python3 scripts/verify_nativepipe_runtime.py "$manifest" \
+              --require-signature release/nativepipe-runtime-ed25519-public-key.pem
+            manifest_count=$((manifest_count + 1))
+          done
+          test "$manifest_count" -eq 2
+
+      - name: Publish an immutable GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.identity.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "release already exists and will not be mutated: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" release/* \
+            --verify-tag --title "$RELEASE_TAG" \
+            --notes "Atomic NativePipe guest display runtime ABI 1."

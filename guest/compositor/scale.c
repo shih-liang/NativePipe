@@ -1,6 +1,7 @@
 #include "scale.h"
 #include "compositor_internal.h"
 #include "fractional-scale-v1-server-protocol.h"
+#include "scene.h"
 #include "viewporter-server-protocol.h"
 
 #include <stdlib.h>
@@ -388,20 +389,92 @@ static void fractional_manager_bind(struct wl_client *client, void *data,
 	                               data, NULL);
 }
 
+struct np_output_state {
+	struct wl_list link;
+	struct np_server *server;
+	struct wl_global *global;
+	uint32_t id;
+	char *name;
+	int32_t x, y, width, height;
+	int32_t pixel_width, pixel_height;
+	int32_t physical_width_mm, physical_height_mm;
+	int32_t scale, refresh_millihz;
+};
+
+static struct np_output_state *output_state_by_id(
+	struct np_server *server, uint32_t id)
+{
+	struct np_output_state *state;
+	wl_list_for_each(state, &server->output_states, link) {
+		if (state->global && state->id == id) return state;
+	}
+	return NULL;
+}
+
+static struct np_output_state *first_output_state(struct np_server *server)
+{
+	struct np_output_state *state;
+	wl_list_for_each(state, &server->output_states, link) {
+		if (state->global) return state;
+	}
+	return NULL;
+}
+
+static bool output_state_has_resources(const struct np_output_state *state)
+{
+	struct np_output *output;
+	wl_list_for_each(output, &state->server->outputs, link) {
+		if (output->state == state) return true;
+	}
+	return false;
+}
+
+static void output_state_maybe_destroy(struct np_output_state *state)
+{
+	if (!state || state->global || output_state_has_resources(state)) return;
+	wl_list_remove(&state->link);
+	free(state->name);
+	free(state);
+}
+
 static void output_resource_destroy(struct wl_resource *resource)
 {
 	struct np_output *output = wl_resource_get_user_data(resource);
-	if (!output)
-		return;
+	if (!output) return;
+	struct np_output_state *state = output->state;
 	wl_list_remove(&output->link);
 	free(output);
+	output_state_maybe_destroy(state);
 }
 
-static void output_send_state(struct np_server *server, struct wl_resource *resource)
+static void output_release(struct wl_client *client, struct wl_resource *resource)
+{
+	(void)client;
+	wl_resource_destroy(resource);
+}
+
+static const struct wl_output_interface output_implementation = {
+	.release = output_release,
+};
+
+static void output_send_state(
+	const struct np_output_state *state, struct wl_resource *resource)
 {
 	uint32_t version = (uint32_t)wl_resource_get_version(resource);
+	wl_output_send_geometry(
+		resource, state->x, state->y,
+		state->physical_width_mm, state->physical_height_mm,
+		WL_OUTPUT_SUBPIXEL_UNKNOWN, "Apple", state->name,
+		WL_OUTPUT_TRANSFORM_NORMAL);
+	wl_output_send_mode(
+		resource, WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED,
+		state->pixel_width, state->pixel_height, state->refresh_millihz);
 	if (version >= WL_OUTPUT_SCALE_SINCE_VERSION)
-		wl_output_send_scale(resource, server->output_scale);
+		wl_output_send_scale(resource, state->scale);
+	if (version >= WL_OUTPUT_NAME_SINCE_VERSION)
+		wl_output_send_name(resource, state->name);
+	if (version >= WL_OUTPUT_DESCRIPTION_SINCE_VERSION)
+		wl_output_send_description(resource, state->name);
 	if (version >= WL_OUTPUT_DONE_SINCE_VERSION)
 		wl_output_send_done(resource);
 }
@@ -409,9 +482,10 @@ static void output_send_state(struct np_server *server, struct wl_resource *reso
 static void output_bind(struct wl_client *client, void *data,
 	                   uint32_t version, uint32_t id)
 {
-	struct np_server *server = data;
+	struct np_output_state *state = data;
+	struct np_server *server = state->server;
 	struct wl_resource *resource = wl_resource_create(
-		client, &wl_output_interface, (int)version, id);
+		client, &wl_output_interface, (int)(version > 4 ? 4 : version), id);
 	if (!resource) {
 		wl_client_post_no_memory(client);
 		return;
@@ -423,27 +497,117 @@ static void output_bind(struct wl_client *client, void *data,
 		return;
 	}
 	output->resource = resource;
+	output->state = state;
 	wl_list_insert(&server->outputs, &output->link);
-	wl_resource_set_implementation(resource, NULL, output, output_resource_destroy);
-	wl_output_send_geometry(resource, 0, 0, 345, 224, WL_OUTPUT_SUBPIXEL_UNKNOWN,
-	                        "Apple", "NativePipe", WL_OUTPUT_TRANSFORM_NORMAL);
-	wl_output_send_mode(resource, WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED,
-	                    server->output_width, server->output_height, 60000);
-	output_send_state(server, resource);
+	wl_resource_set_implementation(
+		resource, &output_implementation, output, output_resource_destroy);
+	output_send_state(state, resource);
 
 	struct np_surface *surface;
 	wl_list_for_each(surface, &server->surfaces, link) {
-		if (wl_resource_get_client(surface->resource) == client)
+		if (surface->output_id == state->id &&
+		    wl_resource_get_client(surface->resource) == client)
 			wl_surface_send_enter(surface->resource, resource);
+	}
+}
+
+static struct np_output_state *output_state_create(
+	struct np_server *server, const struct np_host_output *value)
+{
+	struct np_output_state *state = calloc(1, sizeof(*state));
+	if (!state) return NULL;
+	state->name = strdup(value->name);
+	if (!state->name) {
+		free(state);
+		return NULL;
+	}
+	state->server = server;
+	state->id = value->id;
+	state->x = value->x;
+	state->y = value->y;
+	state->width = value->width;
+	state->height = value->height;
+	state->pixel_width = value->pixel_width;
+	state->pixel_height = value->pixel_height;
+	state->physical_width_mm = value->physical_width_mm;
+	state->physical_height_mm = value->physical_height_mm;
+	state->scale = value->scale;
+	state->refresh_millihz = value->refresh_millihz;
+	wl_list_insert(server->output_states.prev, &state->link);
+	state->global = wl_global_create(
+		server->display, &wl_output_interface, 4, state, output_bind);
+	if (!state->global) {
+		wl_list_remove(&state->link);
+		free(state->name);
+		free(state);
+		return NULL;
+	}
+	return state;
+}
+
+static void output_send_enter_or_leave(
+	struct np_surface *surface, struct np_output_state *state, bool entering)
+{
+	if (!surface || !state) return;
+	struct wl_client *client = wl_resource_get_client(surface->resource);
+	struct np_output *output;
+	wl_list_for_each(output, &state->server->outputs, link) {
+		if (output->state != state ||
+		    wl_resource_get_client(output->resource) != client) continue;
+		if (entering) wl_surface_send_enter(surface->resource, output->resource);
+		else wl_surface_send_leave(surface->resource, output->resource);
+	}
+}
+
+static void output_state_remove(struct np_output_state *state)
+{
+	if (!state || !state->global) return;
+	struct np_surface *surface;
+	wl_list_for_each(surface, &state->server->surfaces, link) {
+		if (surface->output_id != state->id) continue;
+		output_send_enter_or_leave(surface, state, false);
+		surface->output_id = 0;
+	}
+	wl_global_destroy(state->global);
+	state->global = NULL;
+	output_state_maybe_destroy(state);
+}
+
+static void output_state_update(
+	struct np_output_state *state, const struct np_host_output *value)
+{
+	char *name = strdup(value->name);
+	if (!name) return;
+	free(state->name);
+	state->name = name;
+	state->x = value->x;
+	state->y = value->y;
+	state->width = value->width;
+	state->height = value->height;
+	state->pixel_width = value->pixel_width;
+	state->pixel_height = value->pixel_height;
+	state->physical_width_mm = value->physical_width_mm;
+	state->physical_height_mm = value->physical_height_mm;
+	state->scale = value->scale;
+	state->refresh_millihz = value->refresh_millihz;
+	struct np_output *output;
+	wl_list_for_each(output, &state->server->outputs, link) {
+		if (output->state == state) output_send_state(state, output->resource);
 	}
 }
 
 void np_scale_surface_enter_outputs(struct np_surface *surface,
 	                                struct wl_client *client)
 {
+	if (!surface) return;
+	if (!surface->output_id) {
+		struct np_output_state *state = first_output_state(surface->server);
+		if (state) surface->output_id = state->id;
+	}
 	struct np_output *output;
 	wl_list_for_each(output, &surface->server->outputs, link) {
-		if (wl_resource_get_client(output->resource) == client)
+		if (output->state->id == surface->output_id &&
+		    wl_resource_get_client(output->resource) == client)
 			wl_surface_send_enter(surface->resource, output->resource);
 	}
 }
@@ -455,10 +619,90 @@ void np_scale_changed(struct np_surface *surface, int scale)
 	send_preferred_scale(surface, scale);
 }
 
+bool np_scale_update_outputs(struct np_server *server,
+	                         const struct np_host_output *values,
+	                         size_t count)
+{
+	if (!server || (!values && count)) return false;
+	for (size_t i = 0; i < count; i++) {
+		const struct np_host_output *value = &values[i];
+		if (!value->id || !value->name || !value->name[0] ||
+		    strlen(value->name) > 255 || value->width <= 0 ||
+		    value->height <= 0 || value->pixel_width <= 0 ||
+		    value->pixel_height <= 0 || value->physical_width_mm < 0 ||
+		    value->physical_height_mm < 0 || value->scale <= 0 ||
+		    value->refresh_millihz <= 0) return false;
+		for (size_t j = 0; j < i; j++)
+			if (values[j].id == value->id) return false;
+	}
+
+	struct np_output_state *state, *temporary;
+	wl_list_for_each_safe(state, temporary, &server->output_states, link) {
+		if (!state->global) continue;
+		bool present = false;
+		for (size_t i = 0; i < count; i++)
+			if (values[i].id == state->id) present = true;
+		if (!present) output_state_remove(state);
+	}
+	for (size_t i = 0; i < count; i++) {
+		state = output_state_by_id(server, values[i].id);
+		if (state) output_state_update(state, &values[i]);
+		else if (!output_state_create(server, &values[i])) return false;
+	}
+	state = first_output_state(server);
+	if (state) {
+		server->output_scale = state->scale;
+		server->output_width = state->pixel_width;
+		server->output_height = state->pixel_height;
+		struct np_surface *surface;
+		wl_list_for_each(surface, &server->surfaces, link) {
+			if (surface->output_id) continue;
+			surface->output_id = state->id;
+			output_send_enter_or_leave(surface, state, true);
+			np_scale_changed(surface, state->scale);
+		}
+	}
+	wl_display_flush_clients(server->display);
+	return true;
+}
+
+void np_scale_window_output_changed(struct np_server *server,
+	                                uint32_t window_id, uint32_t output_id)
+{
+	struct np_surface *root = np_surface_by_window(server, window_id);
+	if (!root) return;
+	struct np_output_state *next = output_state_by_id(server, output_id);
+	struct np_surface *surface;
+	wl_list_for_each(surface, &server->surfaces, link) {
+		if (np_scene_root(surface) != root) continue;
+		struct np_output_state *previous = output_state_by_id(
+			server, surface->output_id);
+		if (previous == next) continue;
+		output_send_enter_or_leave(surface, previous, false);
+		surface->output_id = next ? next->id : 0;
+		output_send_enter_or_leave(surface, next, true);
+		if (next) np_scale_changed(surface, next->scale);
+	}
+	wl_display_flush_clients(server->display);
+}
+
 void np_scale_advertise(struct wl_display *display, struct np_server *server)
 {
-	wl_global_create(display, &wl_output_interface, 2, server, output_bind);
 	wl_global_create(display, &wp_viewporter_interface, 1, server, viewporter_bind);
 	wl_global_create(display, &wp_fractional_scale_manager_v1_interface, 1,
 	                 server, fractional_manager_bind);
+	struct np_host_output fallback = {
+		.id = UINT32_MAX,
+		.name = "NativePipe virtual display",
+		.x = 0, .y = 0,
+		.width = server->output_width / server->output_scale,
+		.height = server->output_height / server->output_scale,
+		.pixel_width = server->output_width,
+		.pixel_height = server->output_height,
+		.physical_width_mm = 345,
+		.physical_height_mm = 224,
+		.scale = server->output_scale,
+		.refresh_millihz = 60000,
+	};
+	(void)output_state_create(server, &fallback);
 }

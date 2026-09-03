@@ -8,7 +8,10 @@ import NativePipeWindowing
 /// Thread-safe remote frame store. H.264 parsing and VideoToolbox submission
 /// stay on `decodeQueue`; only the finished IOSurface is observed by AppKit.
 public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
-    private final class Stream {
+    // The decoder callback may arrive on a VideoToolbox worker before it is
+    // serialized back onto decodeQueue.  The stream itself is only mutated on
+    // decodeQueue, so carrying its identity across that hop is safe.
+    private final class Stream: @unchecked Sendable {
         let decoder = H264Decoder()
         var epoch: UInt16 = 0
         var resourceIDs: [UInt32] = []
@@ -22,6 +25,13 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
         let width: Int
         let height: Int
         let bytes: Data
+    }
+
+    /// CVPixelBuffer is a reference-counted CoreVideo object that Swift does
+    /// not annotate Sendable.  We retain it only to move the decoded frame onto
+    /// decodeQueue; all subsequent access remains serialized there.
+    private struct DecodedFrame: @unchecked Sendable {
+        let pixelBuffer: CVPixelBuffer
     }
 
     private final class StoredFrame {
@@ -130,10 +140,11 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
                 self.streams[id] = stream
                 stream.decoder.onFrame = { [weak self, weak stream] resourceID, pixelBuffer in
                     guard let self, let stream else { return }
+                    let decodedFrame = DecodedFrame(pixelBuffer: pixelBuffer)
                     self.decodeQueue.async { [weak self, weak stream] in
                         guard let self, let stream else { return }
                         self.receiveDecoded(
-                            pixelBuffer, stream: stream,
+                            decodedFrame.pixelBuffer, stream: stream,
                             surfaceID: id, resourceID: resourceID)
                     }
                 }
@@ -177,7 +188,7 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
                 guard width <= Int.max / height,
                       let alpha = MediaWire.decodeAlphaRLE(
                         payload, pixelCount: width * height) else {
-                    fputs("remotepipe: rejected malformed alpha sidecar\n", stderr)
+                    fputs("nativepipe: rejected malformed alpha sidecar\n", stderr)
                     return
                 }
                 self.receiveAlpha(

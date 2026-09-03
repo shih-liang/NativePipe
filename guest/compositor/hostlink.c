@@ -2,21 +2,29 @@
 
 #include "hostlink.h"
 
-#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#ifdef NP_REMOTE
 #include <netinet/in.h>
+#else
+#include <linux/vm_sockets.h>
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #define NP_MAGIC "NPIP"
 #define NP_VERSION 1
 #define NP_HEADER 12
 #define NP_MAX_PAYLOAD (8 * 1024 * 1024)
+#ifdef NP_REMOTE
+#define NP_REMOTE_HELLO_SIZE 16
+#define NP_REMOTE_SURFACE_LANE 1
+#endif
 
 static void set_nonblocking(int fd) {
 	int flags = fcntl(fd, F_GETFL, 0);
@@ -25,39 +33,68 @@ static void set_nonblocking(int fd) {
 	if (flags >= 0) fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
 }
 
-bool np_host_listen_tcp(struct np_host *host, uint32_t port) {
+static uint64_t monotonic_millis(void) {
+	struct timespec now;
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+	return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+}
+
+bool np_host_listen(struct np_host *host, uint32_t port) {
 	memset(host, 0, sizeof(*host));
 	host->listen_fd = -1;
 	host->conn_fd = -1;
 	host->port = port;
 
-	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	int fd;
+#ifdef NP_REMOTE
+	fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (fd < 0) {
 		fprintf(stderr, "[wayland] tcp socket: %s\n", strerror(errno));
 		return false;
 	}
 	int yes = 1;
 	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-
 	struct sockaddr_in addr;
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
 	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 	addr.sin_port = htons((uint16_t)port);
+#else
+	fd = socket(AF_VSOCK, SOCK_STREAM, 0);
+	if (fd < 0) {
+		fprintf(stderr, "[wayland] vsock socket: %s\n", strerror(errno));
+		return false;
+	}
+	struct sockaddr_vm addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.svm_family = AF_VSOCK;
+	addr.svm_cid = VMADDR_CID_ANY;
+	addr.svm_port = port;
+#endif
 	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		fprintf(stderr, "[wayland] tcp bind %u: %s\n", port, strerror(errno));
+		fprintf(stderr, "[wayland] %s bind %u: %s\n",
+#ifdef NP_REMOTE
+		        "tcp",
+#else
+		        "vsock",
+#endif
+		        port, strerror(errno));
 		close(fd);
 		return false;
 	}
 	if (listen(fd, 1) < 0) {
-		fprintf(stderr, "[wayland] tcp listen: %s\n", strerror(errno));
+		fprintf(stderr, "[wayland] vsock listen: %s\n", strerror(errno));
 		close(fd);
 		return false;
 	}
 
 	set_nonblocking(fd);
 	host->listen_fd = fd;
+#ifdef NP_REMOTE
 	fprintf(stderr, "[wayland] window channel listening on 127.0.0.1:%u\n", port);
+#else
+	fprintf(stderr, "[wayland] window channel listening on vsock port %u\n", port);
+#endif
 	return true;
 }
 
@@ -72,14 +109,41 @@ void np_host_finish(struct np_host *host) {
 }
 
 void np_host_accept(struct np_host *host) {
-	if (host->listen_fd < 0 || host->conn_fd >= 0) return;
+	if (host->listen_fd < 0) return;
 	int fd = accept(host->listen_fd, NULL, NULL);
 	if (fd < 0) return;
+	if (host->conn_fd >= 0) {
+#ifdef NP_REMOTE
+		/* The surface lane is the admission lane. Replace a peer that has not
+		 * completed NPRH, but once it has presented a valid token retain it while
+		 * the matching media lane arrives. This prevents two simultaneous clients
+		 * from continually crossing their surface/media sockets. Extra dials are
+		 * still accepted and closed so the listener cannot spin. */
+		if (host->remote_handshake_ready) {
+			close(fd);
+			return;
+		}
+#else
+		close(fd);
+		return;
+#endif
+		close(host->conn_fd);
+	}
 	set_nonblocking(fd);
 	host->conn_fd = fd;
 	host->buffer_len = 0;
 	host->out_head = 0;
 	host->out_len = 0;
+	host->remote_hello_len = 0;
+	host->remote_session_token = 0;
+	host->remote_handshake_ready = false;
+	host->input_enabled = false;
+	host->remote_accept_millis = monotonic_millis();
+#ifdef NP_REMOTE
+	host->output_enabled = false;
+#else
+	host->output_enabled = true;
+#endif
 	fprintf(stderr, "[wayland] host attached on port %u\n", host->port);
 }
 
@@ -92,6 +156,12 @@ void np_host_disconnect(struct np_host *host) {
 	host->buffer_len = 0;
 	host->out_head = 0;
 	host->out_len = 0;
+	host->remote_hello_len = 0;
+	host->remote_session_token = 0;
+	host->remote_handshake_ready = false;
+	host->output_enabled = false;
+	host->input_enabled = false;
+	host->remote_accept_millis = 0;
 	if (was_connected)
 		fprintf(stderr, "[wayland] host detached from port %u\n", host->port);
 }
@@ -141,6 +211,12 @@ bool np_host_send_binary(struct np_host *host, const void *payload, size_t lengt
 	if (!host || !payload || !length || length > NP_MAX_PAYLOAD ||
 	    host->conn_fd < 0)
 		return false;
+#ifdef NP_REMOTE
+	/* Until the surface and media sockets have presented the same nonce there
+	 * is no session.  Discard live state here; the paired-session replay is the
+	 * sole authoritative snapshot and channelReady must be its first frame. */
+	if (!host->output_enabled) return false;
+#endif
 	size_t frame_size = NP_HEADER + length;
 	if (!reserve_outbound(host, frame_size)) {
 		/* Structural and presentation messages are ordered state.  Dropping one
@@ -161,37 +237,128 @@ bool np_host_send_binary(struct np_host *host, const void *payload, size_t lengt
 	memcpy(host->out + host->out_len + sizeof(header), payload, length);
 	host->out_len += frame_size;
 	flush_outbound(host);
-	return true;
-}
-
-void np_host_send(struct np_host *host, const char *name, cJSON *body) {
-	cJSON *envelope = cJSON_CreateObject();
-	cJSON_AddItemToObject(envelope, name, body ? body : cJSON_CreateObject());
-	char *payload = cJSON_PrintUnformatted(envelope);
-	cJSON_Delete(envelope);
-	if (!payload) return;
-
-	// Dropping rather than queueing is deliberate: with no host attached there
-	// is nothing to draw into, and a backlog of stale frames helps nobody.
-	if (host->conn_fd < 0) {
-		free(payload);
-		return;
-	}
-
-	np_host_send_binary(host, payload, strlen(payload));
-	free(payload);
+	return host->conn_fd >= 0;
 }
 
 void np_host_flush(struct np_host *host) {
 	if (host->conn_fd < 0) return;
+#ifdef NP_REMOTE
+	if (!host->output_enabled) return;
+#endif
 	flush_outbound(host);
 }
 
-void np_host_pump(struct np_host *host, np_host_handler handler,
+void np_host_set_output_enabled(struct np_host *host, bool enabled) {
+	if (!host) return;
+#ifdef NP_REMOTE
+	host->output_enabled = enabled;
+	if (!enabled) {
+		host->out_head = 0;
+		host->out_len = 0;
+	}
+#else
+	(void)enabled;
+	host->output_enabled = true;
+#endif
+}
+
+void np_host_set_input_enabled(struct np_host *host, bool enabled) {
+	if (!host) return;
+#ifdef NP_REMOTE
+	host->input_enabled = enabled;
+#else
+	(void)enabled;
+	host->input_enabled = true;
+#endif
+}
+
+bool np_host_unpaired_expired(const struct np_host *host,
+                              uint64_t timeout_millis) {
+#ifdef NP_REMOTE
+	if (!host || host->conn_fd < 0 || host->output_enabled ||
+	    host->remote_accept_millis == 0)
+		return false;
+	uint64_t now = monotonic_millis();
+	return now >= host->remote_accept_millis &&
+	       now - host->remote_accept_millis >= timeout_millis;
+#else
+	(void)host;
+	(void)timeout_millis;
+	return false;
+#endif
+}
+
+uint64_t np_host_session_token(const struct np_host *host) {
+	return host && host->remote_handshake_ready
+		? host->remote_session_token : 0;
+}
+
+enum np_remote_pair_state np_remote_pair_tokens(uint64_t surface_token,
+                                                uint64_t media_token) {
+	if (surface_token == 0 || media_token == 0)
+		return NP_REMOTE_PAIR_INCOMPLETE;
+	return surface_token == media_token
+		? NP_REMOTE_PAIR_MATCHED : NP_REMOTE_PAIR_MISMATCHED;
+}
+
+#ifdef NP_REMOTE
+static bool pump_remote_handshake(struct np_host *host) {
+	while (host->remote_hello_len < NP_REMOTE_HELLO_SIZE) {
+		ssize_t got = recv(
+			host->conn_fd, host->remote_hello + host->remote_hello_len,
+			NP_REMOTE_HELLO_SIZE - host->remote_hello_len, 0);
+		if (got > 0) {
+			host->remote_hello_len += (size_t)got;
+			continue;
+		}
+		if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+			return false;
+		np_host_disconnect(host);
+		return false;
+	}
+	const unsigned char *hello = host->remote_hello;
+	if (memcmp(hello, "NPRH", 4) != 0 || hello[4] != 1 ||
+	    hello[5] != NP_REMOTE_SURFACE_LANE || hello[6] != 0 || hello[7] != 0) {
+		fprintf(stderr, "[wayland] invalid remote surface handshake\n");
+		np_host_disconnect(host);
+		return false;
+	}
+	uint64_t token = 0;
+	for (unsigned int index = 0; index < 8; index++)
+		token |= (uint64_t)hello[8 + index] << (index * 8);
+	if (token == 0) {
+		np_host_disconnect(host);
+		return false;
+	}
+	host->remote_session_token = token;
+	host->remote_handshake_ready = true;
+	return true;
+}
+#endif
+
+void np_host_pump(struct np_host *host,
                   np_host_binary_handler binary_handler, void *user_data) {
 	np_host_accept(host);
 	if (host->conn_fd < 0) return;
-	flush_outbound(host);
+#ifdef NP_REMOTE
+	if (!host->remote_handshake_ready && !pump_remote_handshake(host)) return;
+	/* A conforming host waits for channelReady before sending HostCommand. Do
+	 * not leave early bytes unread on a level-triggered fd (that spins the
+	 * compositor); reject the half-session instead. */
+	if (!host->input_enabled) {
+		unsigned char unexpected;
+		ssize_t got = recv(host->conn_fd, &unexpected, 1, MSG_PEEK | MSG_DONTWAIT);
+		if (got > 0) {
+			fprintf(stderr, "[wayland] command arrived before channel pairing\n");
+			np_host_disconnect(host);
+		} else if (got == 0 ||
+		           (got < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+			np_host_disconnect(host);
+		}
+		return;
+	}
+#endif
+	if (host->output_enabled) flush_outbound(host);
 	if (host->conn_fd < 0) return;
 
 	for (;;) {
@@ -243,22 +410,15 @@ void np_host_pump(struct np_host *host, np_host_handler handler,
 		if (host->buffer_len - offset < (size_t)NP_HEADER + length) break;
 
 		const unsigned char *payload = frame + NP_HEADER;
-		if (length >= 4 &&
-		    (memcmp(payload, "NPMO", 4) == 0 ||
-		     memcmp(payload, "NPSC", 4) == 0 ||
-		     memcmp(payload, "NPCF", 4) == 0 ||
-		     memcmp(payload, "NPPF", 4) == 0 ||
-		     memcmp(payload, "NPFT", 4) == 0)) {
-			if (binary_handler) binary_handler(payload, length, user_data);
-		} else {
-			cJSON *message = cJSON_ParseWithLength((const char *)payload, length);
-			if (message) {
-				cJSON *entry = message->child;  // single-key object, as Swift encodes it
-				if (entry && entry->string) {
-					handler(entry->string, entry, user_data);
-				}
-				cJSON_Delete(message);
-			}
+		if (!binary_handler || length < 4) {
+			fprintf(stderr, "[wayland] invalid binary window payload\n");
+			np_host_disconnect(host);
+			return;
+		}
+		if (!binary_handler(payload, length, user_data)) {
+			fprintf(stderr, "[wayland] malformed binary window payload\n");
+			np_host_disconnect(host);
+			return;
 		}
 		offset += NP_HEADER + length;
 	}

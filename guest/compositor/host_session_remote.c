@@ -3,8 +3,12 @@
 #define _GNU_SOURCE
 
 #include "compositor_internal.h"
+#include "data_device.h"
+#include "host_session_common.h"
 #include "scene.h"
 #include "window_events.h"
+#include "windowwire.h"
+#include "xwayland.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -15,7 +19,7 @@
 
 static const char *session_environment_name(void)
 {
-	return "remotepipe-wayland.env";
+	return "nativepipe-wayland.env";
 }
 
 static bool session_environment_path(char *path, size_t size)
@@ -81,7 +85,7 @@ static int host_channel_readable(int fd, uint32_t mask, void *data) {
 	struct np_server *server = data;
 	(void)fd;
 	if (mask & WL_EVENT_WRITABLE) np_host_flush(&server->host);
-	np_host_pump(&server->host, np_input_handle_host_command, np_input_handle_host_binary, server);
+	np_host_pump(&server->host, np_input_handle_host_binary, server);
 	np_presentation_flush(server);
 	np_host_session_sync(server);
 	wl_display_flush_clients(server->display);
@@ -97,47 +101,8 @@ static int host_channel_readable(int fd, uint32_t mask, void *data) {
 /// path look like recovery without being it.
 static void republish_state(struct np_server *server) {
 	struct np_surface *surface;
-
-	// Surfaces first, and in creation order: a role or a parent reference is
-	// meaningless to the host until the surface it names exists.
-	wl_list_for_each_reverse(surface, &server->surfaces, link) {
-		uint32_t fields[] = {surface->id};
-		np_window_event_send(server, NP_GUEST_SURFACE_CREATED, fields, 1);
-	}
-
-	wl_list_for_each_reverse(surface, &server->surfaces, link) {
-		cJSON *body;
-		if (np_surface_is_toplevel(surface)) {
-			uint32_t fields[] = {surface->window_id, surface->id};
-			np_window_event_send(server, NP_GUEST_TOPLEVEL_CREATED, fields, 2);
-		} else if (np_surface_is_popup(surface)) {
-			uint32_t fields[] = {
-				surface->window_id, surface->id, surface->popup_parent_window,
-				(uint32_t)surface->popup_x, (uint32_t)surface->popup_y,
-				(uint32_t)surface->popup_width, (uint32_t)surface->popup_height,
-			};
-			np_window_event_send(server, NP_GUEST_POPUP_CREATED, fields, 7);
-		}
-
-		if (surface->title) {
-			body = cJSON_CreateObject();
-			cJSON_AddNumberToObject(body, "window", surface->window_id);
-			cJSON_AddStringToObject(body, "title", surface->title);
-			np_host_send(&server->host, "titleChanged", body);
-		}
-		if (surface->app_id) {
-			body = cJSON_CreateObject();
-			cJSON_AddNumberToObject(body, "window", surface->window_id);
-			cJSON_AddStringToObject(body, "appID", surface->app_id);
-			np_host_send(&server->host, "appIDChanged", body);
-		}
-		if (surface->decoration_negotiated) {
-			body = cJSON_CreateObject();
-			cJSON_AddNumberToObject(body, "window", surface->window_id);
-			cJSON_AddBoolToObject(body, "serverSide", surface->decoration_server_side);
-			np_host_send(&server->host, "decorationModeChanged", body);
-		}
-	}
+	np_host_session_replay_metadata(server);
+	if (!np_host_connected(&server->host)) return;
 
 	/* A new host has no decoder history or media resources. Re-encode every
 	 * current surface as an IDR and rebuild the same window scene graph used by
@@ -145,50 +110,40 @@ static void republish_state(struct np_server *server) {
 	 * forever for frames that belonged to the previous TCP connection. */
 	wl_list_for_each_reverse(surface, &server->surfaces, link) {
 		(void)np_presentation_republish_remote(surface);
+		if (!np_host_connected(&server->host)) break;
 	}
 }
 
 static void discard_disconnected_host_reads(struct np_server *server) {
-	(void)server;
+	np_data_host_disconnected(server);
 }
 
-static void sync_one_host_source(
-	struct np_server *server, struct np_host *host,
-	struct wl_event_source **source, int *watched_fd, uint32_t *watched_mask,
-	wl_event_loop_fd_func_t callback)
-{
-	/* Writability is watched only while this stream has queued bytes. */
-	uint32_t mask = WL_EVENT_READABLE | WL_EVENT_HANGUP | WL_EVENT_ERROR;
-	if (np_host_has_backlog(host)) mask |= WL_EVENT_WRITABLE;
-
-	if (*watched_fd == host->conn_fd) {
-		if (*source && *watched_mask != mask) {
-			wl_event_source_fd_update(*source, mask);
-			*watched_mask = mask;
-		}
-		return;
-	}
-	if (*source) {
-		wl_event_source_remove(*source);
-		*source = NULL;
-	}
-	*watched_fd = host->conn_fd;
-	*watched_mask = mask;
-	if (host->conn_fd >= 0) {
-		struct wl_event_loop *loop = wl_display_get_event_loop(server->display);
-		*source = wl_event_loop_add_fd(
-			loop, host->conn_fd, mask, callback, server);
-	}
-}
+static void close_host_session(struct np_server *server);
 
 static bool all_host_channels_connected(struct np_server *server)
 {
 	if (!np_host_connected(&server->host)) return false;
-	return np_media_connected(&server->media);
+	if (!np_media_connected(&server->media)) return false;
+	uint64_t surface_token = np_host_session_token(&server->host);
+	uint64_t media_token = np_media_session_token(&server->media);
+	enum np_remote_pair_state pair = np_remote_pair_tokens(
+		surface_token, media_token);
+	if (pair == NP_REMOTE_PAIR_MISMATCHED) {
+		fprintf(stderr, "[wayland] remote channel session tokens do not match\n");
+		/* Surface is the admission lane. Keep its candidate token and reject only
+		 * the mismatched media follower; a queued matching media lane can then
+		 * attach without two simultaneous clients knocking each other out. */
+		np_media_disconnect(&server->media);
+		return false;
+	}
+	return pair == NP_REMOTE_PAIR_MATCHED;
 }
 
 static void close_host_session(struct np_server *server)
 {
+	np_host_set_output_enabled(&server->host, false);
+	np_host_set_input_enabled(&server->host, false);
+	np_media_set_session_ready(&server->media, false);
 	np_host_disconnect(&server->host);
 	np_media_disconnect(&server->media);
 }
@@ -209,19 +164,24 @@ static int media_connection_readable(int fd, uint32_t mask, void *data)
 	(void)mask;
 	struct np_server *server = data;
 	np_media_pump(&server->media);
+	handle_media_attachment(server);
 	np_host_session_sync(server);
 	return 0;
 }
 
 static void sync_media_source(struct np_server *server)
 {
-	int fd = np_media_connection_fd(&server->media);
-	if (server->watched_media_fd == fd) return;
+	int fd;
+	uint64_t generation;
+	np_media_connection_identity(&server->media, &fd, &generation);
+	if (server->watched_media_fd == fd &&
+	    server->watched_media_generation == generation) return;
 	if (server->media_connection_source) {
 		wl_event_source_remove(server->media_connection_source);
 		server->media_connection_source = NULL;
 	}
 	server->watched_media_fd = fd;
+	server->watched_media_generation = generation;
 	if (fd >= 0) {
 		struct wl_event_loop *loop = wl_display_get_event_loop(server->display);
 		server->media_connection_source = wl_event_loop_add_fd(
@@ -245,15 +205,34 @@ void np_host_session_sync(struct np_server *server) {
 		 * before the event because the host may launch immediately on receipt. */
 		if (!publish_session_environment(server))
 			fprintf(stderr, "[wayland] could not publish the session environment\n");
+		uint32_t ready[] = {
+			(uint32_t)getpid(), NP_WINDOW_PROTOCOL_VERSION,
+		};
+		/* Open the surface gate only for channelReady.  Everything emitted while
+		 * the two TCP lanes were unpaired was deliberately discarded and will be
+		 * reconstructed by republish_state below. */
+		np_host_set_output_enabled(&server->host, true);
 		server->host_session_ready = true;
-		cJSON *ready = cJSON_CreateObject();
-		cJSON_AddNumberToObject(ready, "sessionID", (double)(uint32_t)getpid());
-		cJSON_AddNumberToObject(ready, "protocolVersion", 2);
-		np_host_send(&server->host, "channelReady", ready);
+		if (!np_window_event_send(server, NP_GUEST_SESSION_STARTED, ready, 2)) {
+			server->host_session_ready = false;
+			close_host_session(server);
+			return;
+		}
+		np_host_set_input_enabled(&server->host, true);
+		np_media_set_session_ready(&server->media, true);
 		republish_state(server);
+		/* Replay is ordinary ordered output and may itself discover a closed or
+		 * backlogged surface lane. Fail both lanes in this same synchronization
+		 * turn instead of leaving media enabled for a session that never received
+		 * its authoritative snapshot. */
+		if (!all_host_channels_connected(server)) {
+			server->host_session_ready = false;
+			discard_disconnected_host_reads(server);
+			close_host_session(server);
+		}
 	}
 
-	sync_one_host_source(
+	np_host_session_watch(
 		server, &server->host, &server->host_connection_source,
 		&server->watched_host_fd, &server->watched_host_mask,
 		host_channel_readable);
@@ -264,7 +243,7 @@ static int host_listener_readable(int fd, uint32_t mask, void *data) {
 	struct np_server *server = data;
 	(void)fd;
 	(void)mask;
-	np_host_pump(&server->host, np_input_handle_host_command, np_input_handle_host_binary, server);
+	np_host_pump(&server->host, np_input_handle_host_binary, server);
 	np_presentation_flush(server);
 	np_host_session_sync(server);
 	wl_display_flush_clients(server->display);
@@ -281,6 +260,21 @@ static int media_listener_readable(int fd, uint32_t mask, void *data) {
 	np_host_session_sync(server);
 	return 0;
 }
+
+static int remote_pair_timeout(void *data)
+{
+	struct np_server *server = data;
+	if (!server->host_session_ready &&
+	    np_host_unpaired_expired(&server->host, 10000)) {
+		fprintf(stderr, "[wayland] remote lane pairing timed out\n");
+		close_host_session(server);
+		discard_disconnected_host_reads(server);
+		np_host_session_sync(server);
+	}
+	if (server->remote_pair_timeout_source)
+		wl_event_source_timer_update(server->remote_pair_timeout_source, 1000);
+	return 0;
+}
 void np_host_session_reset_readiness(void)
 {
 	unpublish_session_environment();
@@ -288,7 +282,7 @@ void np_host_session_reset_readiness(void)
 
 bool np_host_session_listen(struct np_server *server)
 {
-	return np_host_listen_tcp(&server->host, NP_SURFACE_PORT) &&
+	return np_host_listen(&server->host, NP_SURFACE_PORT) &&
 	       np_media_listen(&server->media);
 }
 
@@ -309,12 +303,15 @@ void np_host_session_attach(struct np_server *server, struct wl_event_loop *loop
 	if (server->media.listen_fd >= 0)
 		wl_event_loop_add_fd(loop, server->media.listen_fd, WL_EVENT_READABLE,
 		                     media_listener_readable, server);
+	server->remote_pair_timeout_source = wl_event_loop_add_timer(
+		loop, remote_pair_timeout, server);
+	if (server->remote_pair_timeout_source)
+		wl_event_source_timer_update(server->remote_pair_timeout_source, 1000);
 }
 
 void np_host_session_pump(struct np_server *server)
 {
-	np_host_pump(&server->host, np_input_handle_host_command,
-	             np_input_handle_host_binary, server);
+	np_host_pump(&server->host, np_input_handle_host_binary, server);
 	np_media_pump(&server->media);
 	np_media_accept(&server->media);
 	handle_media_attachment(server);
@@ -322,6 +319,10 @@ void np_host_session_pump(struct np_server *server)
 
 void np_host_session_finish(struct np_server *server)
 {
+	if (server->remote_pair_timeout_source) {
+		wl_event_source_remove(server->remote_pair_timeout_source);
+		server->remote_pair_timeout_source = NULL;
+	}
 	np_media_finish(&server->media);
 	np_host_finish(&server->host);
 	unpublish_session_environment();

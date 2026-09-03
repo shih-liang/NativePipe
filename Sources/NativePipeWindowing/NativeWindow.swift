@@ -71,6 +71,21 @@ final class DisplayClock: NSObject {
 	}
 }
 
+@MainActor
+private final class FrameCaptureWaiter {
+    private var continuation: CheckedContinuation<RenderedFrameCapture, Error>?
+
+    init(_ continuation: CheckedContinuation<RenderedFrameCapture, Error>) {
+        self.continuation = continuation
+    }
+
+    func finish(_ result: Result<RenderedFrameCapture, Error>) {
+        guard let continuation else { return }
+        self.continuation = nil
+        continuation.resume(with: result)
+    }
+}
+
 /// One `xdg_toplevel`, one `NSWindow`.
 ///
 /// This class is a translator and nothing else. There is no scene graph, no
@@ -157,15 +172,16 @@ final class NativeWindow: NSObject {
     }()
     private lazy var asyncScenePresenter: AsyncMetalScenePresenter? = {
         guard let metalDevice, let renderer = sceneRenderer else { return nil }
+        let markRetry: @MainActor @Sendable () -> Void = { [weak self] in
+            self?.presenterNeedsDisplayRetry = true
+        }
         return AsyncMetalScenePresenter(
             layer: contentView.metalLayer, device: metalDevice, renderer: renderer,
-            requestDisplayRetry: { [weak self] in
+            requestDisplayRetry: {
                 RunLoop.main.perform(
                     inModes: [.common, RunLoop.Mode("NSEventTrackingRunLoopMode")]
                 ) {
-                    MainActor.assumeIsolated {
-                        self?.presenterNeedsDisplayRetry = true
-                    }
+                    MainActor.assumeIsolated { markRetry() }
                 }
             })
     }()
@@ -338,7 +354,7 @@ final class NativeWindow: NSObject {
     func present(
         scene: Windowing.SceneSnapshot, layers: [ResolvedSceneLayer],
         latchIDs: [UInt32],
-        readComplete: @escaping @MainActor (Bool) -> Void
+        readComplete: @escaping @MainActor @Sendable (Bool) -> Void
     ) -> Bool {
         prepareWindow(for: scene)
         guard let presenter = asyncScenePresenter,
@@ -367,6 +383,25 @@ final class NativeWindow: NSObject {
 	func invalidateSceneHistory() {
 		asyncScenePresenter?.invalidateDrawableAges()
 	}
+
+    /// Capture the next compositor-protected presentation. The guest republishes
+    /// current state even when the client is idle, so static windows work without
+    /// retaining a CAMetalDrawable or adding a per-frame history copy.
+    func captureFrame() async throws -> RenderedFrameCapture {
+        guard let presenter = asyncScenePresenter, bridge != nil else {
+            throw ComputerUseWindowError.captureFailed
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            let waiter = FrameCaptureWaiter(continuation)
+            let requestID = presenter.captureNextFrame { result in waiter.finish(result) }
+            bridge?.send(.captureFrame(surface: surfaceID))
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                presenter.cancelCapture(requestID)
+                waiter.finish(.failure(ComputerUseWindowError.captureFailed))
+            }
+        }
+    }
 
     private func awaitPresentation(_ presentation: Presentation) {
         guard !pendingPresentations.contains(presentation) else { return }
@@ -795,9 +830,14 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         let scene: Windowing.SceneSnapshot
         let layers: [ResolvedSceneLayer]
         let drawableSize: CGSize
-        let readComplete: @MainActor (Bool) -> Void
-        let latches: [@MainActor () -> Void]
-        let presented: (@MainActor () -> Void)?
+        let readComplete: @MainActor @Sendable (Bool) -> Void
+        let latches: [@MainActor @Sendable () -> Void]
+        let presented: (@MainActor @Sendable () -> Void)?
+    }
+
+    private struct CaptureRequest: @unchecked Sendable {
+        let id: UInt64
+        let completion: @MainActor @Sendable (Result<RenderedFrameCapture, Error>) -> Void
     }
 
 	private let layer: CAMetalLayer
@@ -810,6 +850,8 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
 	private var epoch: UInt64 = 0
 	private var drainScheduled = false
 	private var drawableAges: DrawableAgeTracker
+    private var captureRequests: [CaptureRequest] = []
+    private var nextCaptureID: UInt64 = 0
 
     private enum ProcessResult: Equatable {
         case handled
@@ -846,12 +888,29 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
 		queue.async { self.drawableAges.invalidate() }
 	}
 
+    func captureNextFrame(
+        completion: @escaping @MainActor @Sendable (Result<RenderedFrameCapture, Error>) -> Void
+    ) -> UInt64 {
+        lock.lock()
+        nextCaptureID &+= 1
+        let id = nextCaptureID
+        captureRequests.append(CaptureRequest(id: id, completion: completion))
+        lock.unlock()
+        return id
+    }
+
+    func cancelCapture(_ id: UInt64) {
+        lock.lock()
+        captureRequests.removeAll { $0.id == id }
+        lock.unlock()
+    }
+
     func enqueue(
         scene: Windowing.SceneSnapshot, layers: [ResolvedSceneLayer],
         drawableSize: CGSize,
-        readComplete: @escaping @MainActor (Bool) -> Void,
-        latched: @escaping @MainActor () -> Void,
-        presented: (@MainActor () -> Void)? = nil
+        readComplete: @escaping @MainActor @Sendable (Bool) -> Void,
+        latched: @escaping @MainActor @Sendable () -> Void,
+        presented: (@MainActor @Sendable () -> Void)? = nil
     ) {
         lock.lock()
         let superseded = pending
@@ -885,11 +944,15 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         epoch &+= 1
         let cancelled = pending
         pending = nil
+        let captures = captureRequests
+        captureRequests.removeAll(keepingCapacity: true)
         lock.unlock()
         if let work = cancelled {
             finish(work, success: false)
             latch(work)
         }
+        completeCaptures(captures, result: .failure(
+            ComputerUseWindowError.captureFailed))
     }
 
     private func takeNext() -> Work? {
@@ -948,6 +1011,7 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
                 DispatchQueue.main.async { presented() }
             }
         }
+		let captures = takeCaptureRequests()
 		let plan = drawableAges.plan(
 			drawableID: drawable.texture.gpuResourceID._impl,
 			scene: scene, drawableWidth: drawable.texture.width,
@@ -956,8 +1020,8 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
             try renderer.encode(
                 scene: scene, layers: work.layers,
 				damage: plan.damage, redrawAll: plan.redrawAll,
-                drawable: drawable
-            ) { command in
+				drawable: drawable, capture: !captures.isEmpty
+            ) { command, captured in
                 if command.status != .completed, let error = command.error {
                     FileHandle.standardError.write(
                         Data("[nsw] Metal scene failed: \(error)\n".utf8))
@@ -965,6 +1029,12 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
 				if command.status != .completed {
 					self.queue.async { self.drawableAges.invalidate() }
 				}
+                if !captures.isEmpty {
+                    let result: Result<RenderedFrameCapture, Error> = captured.map {
+                        .success($0)
+                    } ?? .failure(ComputerUseWindowError.captureFailed)
+                    self.completeCaptures(captures, result: result)
+                }
                 self.finish(work, success: command.status == .completed)
             }
 			drawableAges.commit(plan)
@@ -977,6 +1047,7 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
                 Data("[nsw] could not encode Metal scene: \(error)\n".utf8))
 			finish(work, success: false)
 			latch(work)
+            completeCaptures(captures, result: .failure(error))
 			return .handled
         }
         return .handled
@@ -986,6 +1057,28 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return work.epoch == epoch
+    }
+
+    private func takeCaptureRequests() -> [CaptureRequest] {
+        lock.lock()
+        defer { lock.unlock() }
+        let requests = captureRequests
+        captureRequests.removeAll(keepingCapacity: true)
+        return requests
+    }
+
+    private func completeCaptures(
+        _ requests: [CaptureRequest],
+        result: Result<RenderedFrameCapture, Error>
+    ) {
+        guard !requests.isEmpty else { return }
+        RunLoop.main.perform(
+            inModes: [.common, RunLoop.Mode("NSEventTrackingRunLoopMode")]
+        ) {
+            MainActor.assumeIsolated {
+                for request in requests { request.completion(result) }
+            }
+        }
     }
 
     /// Retry only when no newer scene is already waiting. A drawable-pool miss
@@ -1422,7 +1515,7 @@ extension NativeWindow {
 /// rather than an NSTextStorage. That is the whole point of using
 /// zwp_text_input_v3 instead of forwarding keystrokes and hoping the client has
 /// its own input method.
-extension SurfaceView: NSTextInputClient {
+extension SurfaceView: @MainActor NSTextInputClient {
     func insertText(_ string: Any, replacementRange: NSRange) {
         unconsumedKeyEvent = nil
         let text = (string as? NSAttributedString)?.string ?? (string as? String) ?? ""

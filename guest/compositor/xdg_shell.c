@@ -2,24 +2,24 @@
 
 #include "compositor_internal.h"
 #include "decoration.h"
-#include "hostlink.h"
 #include "window_events.h"
 #include "windowwire.h"
+#include "xwayland.h"
 #include "xdg-shell-server-protocol.h"
 
-#include <cjson/cJSON.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wayland-server-core.h>
 
-static cJSON *object_with_u32(const char *key, uint32_t value) {
-	cJSON *object = cJSON_CreateObject();
-	cJSON_AddNumberToObject(object, key, value);
-	return object;
-}
-
 static void schedule_pending_host_toplevel_configure(struct np_surface *surface);
+static void send_pending_host_toplevel_configure(struct np_surface *surface);
+
+static void send_window_message(struct np_surface *surface,
+	                            struct np_window_message *message) {
+	(void)np_window_event_send_message(surface->server, message);
+	np_window_message_clear(message);
+}
 
 static bool valid_pointer_grab(struct np_surface *surface,
 	                           struct wl_client *client, uint32_t serial) {
@@ -92,35 +92,40 @@ static void toplevel_destroy_handler(struct wl_client *client, struct wl_resourc
 static void toplevel_set_parent(struct wl_client *client, struct wl_resource *resource,
                                 struct wl_resource *parent) {
 	struct np_surface *surface = wl_resource_get_user_data(resource);
-	cJSON *body = cJSON_CreateObject();
-	cJSON_AddNumberToObject(body, "window", surface->window_id);
+	struct np_window_message message;
+	np_window_message_init(&message, NP_WINDOW_GUEST_TO_HOST,
+	                       NP_GUEST_PARENT_CHANGED);
+	np_window_put_u32(&message, surface->window_id);
+	np_window_put_bool(&message, parent != NULL);
 	if (parent) {
 		struct np_surface *other = wl_resource_get_user_data(parent);
-		cJSON_AddNumberToObject(body, "parent", other->window_id);
-	} else {
-		cJSON_AddNullToObject(body, "parent");
+		np_window_put_u32(&message, other->window_id);
 	}
-	np_host_send(&surface->server->host, "parentChanged", body);
+	send_window_message(surface, &message);
 }
 
 void np_window_set_title(struct np_surface *surface, const char *title) {
 	if (!surface) return;
-	cJSON *body = cJSON_CreateObject();
-	cJSON_AddNumberToObject(body, "window", surface->window_id);
-	cJSON_AddStringToObject(body, "title", title ? title : "");
+	struct np_window_message message;
+	np_window_message_init(&message, NP_WINDOW_GUEST_TO_HOST,
+	                       NP_GUEST_TITLE_CHANGED);
+	np_window_put_u32(&message, surface->window_id);
+	np_window_put_string(&message, title ? title : "");
 	free(surface->title);
 	surface->title = strdup(title ? title : "");
-	np_host_send(&surface->server->host, "titleChanged", body);
+	send_window_message(surface, &message);
 }
 
 void np_window_set_app_id(struct np_surface *surface, const char *app_id) {
 	if (!surface) return;
-	cJSON *body = cJSON_CreateObject();
-	cJSON_AddNumberToObject(body, "window", surface->window_id);
-	cJSON_AddStringToObject(body, "appID", app_id ? app_id : "");
+	struct np_window_message message;
+	np_window_message_init(&message, NP_WINDOW_GUEST_TO_HOST,
+	                       NP_GUEST_APP_ID_CHANGED);
+	np_window_put_u32(&message, surface->window_id);
+	np_window_put_string(&message, app_id ? app_id : "");
 	free(surface->app_id);
 	surface->app_id = strdup(app_id ? app_id : "");
-	np_host_send(&surface->server->host, "appIDChanged", body);
+	send_window_message(surface, &message);
 }
 
 static void toplevel_set_title(struct wl_client *client, struct wl_resource *resource,
@@ -143,10 +148,9 @@ static void toplevel_move(struct wl_client *client, struct wl_resource *resource
 	// never has to infer a draggable region.
 	struct np_surface *surface = wl_resource_get_user_data(resource);
 	if (!valid_pointer_grab(surface, client, serial)) return;
-	cJSON *body = cJSON_CreateObject();
-	cJSON_AddNumberToObject(body, "window", surface->window_id);
-	cJSON_AddNumberToObject(body, "serial", serial);
-	np_host_send(&surface->server->host, "interactiveMoveRequested", body);
+	uint32_t fields[] = {surface->window_id, serial};
+	np_window_event_send(surface->server, NP_GUEST_INTERACTIVE_MOVE_REQUESTED,
+	                     fields, 2);
 }
 
 static void toplevel_resize(struct wl_client *client, struct wl_resource *resource,
@@ -157,37 +161,29 @@ static void toplevel_resize(struct wl_client *client, struct wl_resource *resour
 	    !xdg_toplevel_resize_edge_is_valid(
 		    edges, wl_resource_get_version(resource)))
 		return;
-	cJSON *body = cJSON_CreateObject();
-	cJSON_AddNumberToObject(body, "window", surface->window_id);
-	cJSON_AddNumberToObject(body, "edges", edges);
-	cJSON_AddNumberToObject(body, "serial", serial);
-	np_host_send(&surface->server->host, "interactiveResizeRequested", body);
-}
-
-static void add_size_constraint(cJSON *body, const char *key,
-                                int32_t width, int32_t height) {
-	if (width > 0 || height > 0) {
-		cJSON *size = cJSON_CreateObject();
-		cJSON_AddNumberToObject(size, "width", width);
-		cJSON_AddNumberToObject(size, "height", height);
-		cJSON_AddItemToObject(body, key, size);
-	} else {
-		cJSON_AddNullToObject(body, key);
-	}
+	uint32_t fields[] = {surface->window_id, edges, serial};
+	np_window_event_send(surface->server, NP_GUEST_INTERACTIVE_RESIZE_REQUESTED,
+	                     fields, 3);
 }
 
 static void send_size_constraints(struct np_surface *surface) {
-	cJSON *body = cJSON_CreateObject();
-	cJSON_AddNumberToObject(body, "window", surface->window_id);
-	/* Always publish a complete snapshot.  Optional associated values cannot
-	 * distinguish an omitted key from an explicit protocol reset after JSON
-	 * decoding, and a partial update was also lost when NSWindow did not exist
-	 * yet. */
-	add_size_constraint(body, "minimum", surface->minimum_width,
-	                    surface->minimum_height);
-	add_size_constraint(body, "maximum", surface->maximum_width,
-	                    surface->maximum_height);
-	np_host_send(&surface->server->host, "sizeConstraintsChanged", body);
+	struct np_window_message message;
+	np_window_message_init(&message, NP_WINDOW_GUEST_TO_HOST,
+	                       NP_GUEST_SIZE_CONSTRAINTS_CHANGED);
+	np_window_put_u32(&message, surface->window_id);
+	bool has_minimum = surface->minimum_width > 0 || surface->minimum_height > 0;
+	np_window_put_bool(&message, has_minimum);
+	if (has_minimum) {
+		np_window_put_i32(&message, surface->minimum_width);
+		np_window_put_i32(&message, surface->minimum_height);
+	}
+	bool has_maximum = surface->maximum_width > 0 || surface->maximum_height > 0;
+	np_window_put_bool(&message, has_maximum);
+	if (has_maximum) {
+		np_window_put_i32(&message, surface->maximum_width);
+		np_window_put_i32(&message, surface->maximum_height);
+	}
+	send_window_message(surface, &message);
 }
 
 void np_xdg_apply_size_constraints(struct np_surface *surface,
@@ -229,30 +225,37 @@ static void toplevel_set_min_size(struct wl_client *client, struct wl_resource *
 	surface->pending_size_constraints_changed = true;
 }
 
-static void toplevel_request_flag(struct np_surface *surface, const char *name, bool enabled) {
-	cJSON *body = cJSON_CreateObject();
-	cJSON_AddNumberToObject(body, "window", surface->window_id);
-	cJSON_AddBoolToObject(body, "enabled", enabled);
-	np_host_send(&surface->server->host, name, body);
+static void toplevel_request_flag(struct np_surface *surface, uint8_t opcode,
+	                              bool enabled) {
+	struct np_window_message message;
+	np_window_message_init(&message, NP_WINDOW_GUEST_TO_HOST, opcode);
+	np_window_put_u32(&message, surface->window_id);
+	np_window_put_bool(&message, enabled);
+	send_window_message(surface, &message);
 }
 
 static void toplevel_set_maximized(struct wl_client *client, struct wl_resource *resource) {
-	toplevel_request_flag(wl_resource_get_user_data(resource), "maximizeRequested", true);
+	toplevel_request_flag(wl_resource_get_user_data(resource),
+	                      NP_GUEST_MAXIMIZE_REQUESTED, true);
 }
 static void toplevel_unset_maximized(struct wl_client *client, struct wl_resource *resource) {
-	toplevel_request_flag(wl_resource_get_user_data(resource), "maximizeRequested", false);
+	toplevel_request_flag(wl_resource_get_user_data(resource),
+	                      NP_GUEST_MAXIMIZE_REQUESTED, false);
 }
 static void toplevel_set_fullscreen(struct wl_client *client, struct wl_resource *resource,
                                     struct wl_resource *output) {
-	toplevel_request_flag(wl_resource_get_user_data(resource), "fullscreenRequested", true);
+	toplevel_request_flag(wl_resource_get_user_data(resource),
+	                      NP_GUEST_FULLSCREEN_REQUESTED, true);
 }
 static void toplevel_unset_fullscreen(struct wl_client *client, struct wl_resource *resource) {
-	toplevel_request_flag(wl_resource_get_user_data(resource), "fullscreenRequested", false);
+	toplevel_request_flag(wl_resource_get_user_data(resource),
+	                      NP_GUEST_FULLSCREEN_REQUESTED, false);
 }
 static void toplevel_set_minimized(struct wl_client *client, struct wl_resource *resource) {
 	struct np_surface *surface = wl_resource_get_user_data(resource);
-	np_host_send(&surface->server->host, "minimizeRequested",
-	             object_with_u32("window", surface->window_id));
+	uint32_t fields[] = {surface->window_id};
+	np_window_event_send(surface->server, NP_GUEST_MINIMIZE_REQUESTED,
+	                     fields, 1);
 }
 
 static const struct xdg_toplevel_interface toplevel_implementation = {
@@ -319,7 +322,14 @@ static void send_host_toplevel_configure(struct np_surface *surface,
 void np_xdg_send_initial_role_configure(struct np_surface *surface) {
 	if (!surface || !surface->xdg_surface) return;
 	if (surface->toplevel) {
-		send_host_toplevel_configure(surface, 800, 600, 0, false);
+		/* A pre-map maximize decision already contains the real AppKit content
+		 * size. Make it the initial configure so the first committed
+		 * window_geometry and buffer agree, rather than exposing a transient
+		 * 800x600 scene inside a maximized NSWindow. */
+		if (surface->host_configure_pending)
+			send_pending_host_toplevel_configure(surface);
+		else
+			send_host_toplevel_configure(surface, 800, 600, 0, false);
 	} else if (surface->popup) {
 		/* The bufferless initial commit must always produce the popup's first
 		 * configure.  Waiting for a host round-trip leaves GTK/Qt/Firefox with
@@ -381,6 +391,11 @@ void np_xdg_configure_toplevel_from_host(struct np_surface *surface,
 	surface->host_configure_pending_width = width;
 	surface->host_configure_pending_height = height;
 	surface->host_configure_pending_state_bits = state_bits;
+	/* xdg-shell's first configure follows the role's bufferless initial commit.
+	 * Retain a host decision that wins this race and consume it from
+	 * np_xdg_send_initial_role_configure instead of configuring too early. */
+	if (surface->xdg_configure_phase == NP_XDG_AWAITING_INITIAL_COMMIT)
+		return;
 	if (!surface->host_configure_in_flight)
 		schedule_pending_host_toplevel_configure(surface);
 }
@@ -484,6 +499,9 @@ static void xdg_surface_get_toplevel(struct wl_client *client, struct wl_resourc
 
 	uint32_t fields[] = {surface->window_id, surface->id};
 	np_window_event_send(surface->server, NP_GUEST_TOPLEVEL_CREATED, fields, 2);
+	np_window_event_send_force_quit_capability(
+		surface->server, surface->window_id,
+		!np_xwayland_owns_client(surface->server, client));
 	/* Decoration policy is compositor state.  Send the client-side default
 	 * before the first frame so AppKit never constructs a transient second
 	 * titlebar around a CSD window. */

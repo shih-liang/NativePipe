@@ -1,4 +1,4 @@
-// RemotePipe Wayland compositor assembly.
+// Shared RemotePipe/VMPipe Wayland compositor assembly.
 //
 // Protocol state, input, presentation and host transport live in focused
 // translation units. This file owns only process setup and the event loop.
@@ -17,6 +17,9 @@
 #include "text_input.h"
 #include "xdg_shell.h"
 #include "xwayland.h"
+#ifndef NP_REMOTE
+#include "virtio_resource.h"
+#endif
 #include "fifo-v1-server-protocol.h"
 #include "text-input-v3-server-protocol.h"
 #include "xdg-shell-server-protocol.h"
@@ -61,17 +64,28 @@ int np_compositor_run(int argc, char **argv)
 	server.output_width = 3024;
 	server.output_height = 1964;
 	server.keymap_fd = -1;
+	memcpy(server.keyboard_layout, "us", sizeof("us"));
+	server.key_repeat_rate = 25;
+	server.key_repeat_delay = 600;
 	server.drm_fd = -1;
 	server.watched_host_fd = -1;
+#ifdef NP_REMOTE
 	server.watched_media_fd = -1;
+#else
+	server.watched_host_control_fd = -1;
+	server.watched_host_input_fd = -1;
+	server.watched_host_feedback_fd = -1;
+#endif
 	wl_list_init(&server.surfaces);
 	wl_list_init(&server.shm_textures);
+	wl_list_init(&server.output_states);
 	wl_list_init(&server.outputs);
 	wl_list_init(&server.pointers);
 	wl_list_init(&server.keyboards);
 	wl_list_init(&server.data_devices);
 	wl_list_init(&server.data_offers);
 	wl_list_init(&server.clip_reads);
+	wl_list_init(&server.clip_pending);
 	wl_list_init(&server.clip_writes);
 	wl_list_init(&server.text_inputs);
 
@@ -79,8 +93,17 @@ int np_compositor_run(int argc, char **argv)
 	signal(SIGPIPE, SIG_IGN);
 	np_host_session_reset_readiness();
 
+#ifdef NP_REMOTE
 	fprintf(stderr,
-	        "[wayland] remote build: TCP 1025/1026, H.264 encode, no virtio blobs\n");
+	        "[wayland] remote backend: TCP 1025/1026 and immutable H.264 resources\n");
+#else
+	server.drm_fd = np_virtio_open_lookup_node();
+	if (server.drm_fd < 0) {
+		fprintf(stderr,
+		        "[wayland] no virtio-gpu render node; cannot allocate host buffers\n");
+		return 1;
+	}
+#endif
 
 	server.display = wl_display_create();
 	if (!server.display) {
@@ -109,7 +132,10 @@ int np_compositor_run(int argc, char **argv)
 	wl_global_create(server.display, &zwp_text_input_manager_v3_interface,
 	                 1, &server, np_text_input_manager_bind);
 	np_decoration_advertise(server.display, &server);
-		 np_dmabuf_advertise(server.display, server.drm_fd);
+	np_dmabuf_advertise(server.display, server.drm_fd);
+#ifndef NP_REMOTE
+	np_syncobj_advertise(server.display, &server);
+#endif
 
 	/* Host endpoints exist before the Wayland socket becomes launchable. */
 	if (!np_host_session_listen(&server)) return 1;
@@ -120,12 +146,12 @@ int np_compositor_run(int argc, char **argv)
 		return 1;
 	}
 	fprintf(stderr, "[wayland] WAYLAND_DISPLAY=%s\n", socket);
-	if (!np_xwayland_init(&server))
-		fprintf(stderr, "[wayland] Xwayland integration unavailable\n");
 	if (!np_host_session_set_socket(&server, socket)) {
 		fprintf(stderr, "[wayland] could not publish display name\n");
 		return 1;
 	}
+	if (!np_xwayland_init(&server))
+		fprintf(stderr, "[wayland] Xwayland integration unavailable\n");
 
 	if (!np_input_create_keymap(&server))
 		fprintf(stderr, "[wayland] no keymap; keyboard input will not work\n");
@@ -146,5 +172,8 @@ int np_compositor_run(int argc, char **argv)
 	np_host_session_finish(&server);
 	np_xwayland_finish(&server);
 	wl_display_destroy(server.display);
+#ifndef NP_REMOTE
+	if (server.drm_fd >= 0) close(server.drm_fd);
+#endif
 	return 0;
 }

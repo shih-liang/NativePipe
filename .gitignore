@@ -1,4 +1,9 @@
 .build/
+dist/
 guest/compositor/.build/
 guest/compositor/dist/
+guest/session/dist/
+guest/xwayland-satellite/.build/
+guest/xwayland-satellite/dist/
+__pycache__/
 .DS_Store

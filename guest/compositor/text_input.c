@@ -1,10 +1,10 @@
 #include "text_input.h"
 
 #include "compositor_internal.h"
-#include "hostlink.h"
 #include "text-input-v3-server-protocol.h"
+#include "window_events.h"
+#include "windowwire.h"
 
-#include <cjson/cJSON.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wayland-server-core.h>
@@ -24,6 +24,22 @@ struct np_text_input {
 	/* Echoed back in done so clients can discard obsolete IME events. */
 	uint32_t serial;
 };
+
+static void send_message(struct np_server *server,
+	                     struct np_window_message *message) {
+	(void)np_window_event_send_message(server, message);
+	np_window_message_clear(message);
+}
+
+static void send_enabled(struct np_server *server, uint32_t window,
+	                     bool enabled) {
+	struct np_window_message message;
+	np_window_message_init(&message, NP_WINDOW_GUEST_TO_HOST,
+	                       NP_GUEST_TEXT_INPUT_ENABLED);
+	np_window_put_u32(&message, window);
+	np_window_put_bool(&message, enabled);
+	send_message(server, &message);
+}
 
 static void text_input_enable(struct wl_client *client, struct wl_resource *resource) {
 	struct np_text_input *input = wl_resource_get_user_data(resource);
@@ -81,28 +97,29 @@ static void text_input_commit(struct wl_client *client, struct wl_resource *reso
 	input->enabled = input->pending_enabled;
 
 	if (was_enabled != input->enabled) {
-		cJSON *body = cJSON_CreateObject();
-		cJSON_AddNumberToObject(body, "window", server->focused_window);
-		cJSON_AddBoolToObject(body, "enabled", input->enabled);
-		np_host_send(&server->host, "textInputEnabled", body);
+		send_enabled(server, server->focused_window, input->enabled);
 	}
 	if (input->enabled && input->pending_cursor_set) {
-		cJSON *body = cJSON_CreateObject();
-		cJSON_AddNumberToObject(body, "window", server->focused_window);
-		cJSON_AddNumberToObject(body, "x", input->pending_cursor_x);
-		cJSON_AddNumberToObject(body, "y", input->pending_cursor_y);
-		cJSON_AddNumberToObject(body, "width", input->pending_cursor_width);
-		cJSON_AddNumberToObject(body, "height", input->pending_cursor_height);
-		np_host_send(&server->host, "textInputCursorRect", body);
+		struct np_window_message message;
+		np_window_message_init(&message, NP_WINDOW_GUEST_TO_HOST,
+		                       NP_GUEST_TEXT_INPUT_CURSOR_RECT);
+		np_window_put_u32(&message, server->focused_window);
+		np_window_put_i32(&message, input->pending_cursor_x);
+		np_window_put_i32(&message, input->pending_cursor_y);
+		np_window_put_i32(&message, input->pending_cursor_width);
+		np_window_put_i32(&message, input->pending_cursor_height);
+		send_message(server, &message);
 		input->pending_cursor_set = false;
 	}
 	if (input->enabled && input->pending_surrounding) {
-		cJSON *body = cJSON_CreateObject();
-		cJSON_AddNumberToObject(body, "window", server->focused_window);
-		cJSON_AddStringToObject(body, "text", input->pending_surrounding);
-		cJSON_AddNumberToObject(body, "cursor", input->pending_cursor_index);
-		cJSON_AddNumberToObject(body, "anchor", input->pending_anchor_index);
-		np_host_send(&server->host, "textInputSurroundingText", body);
+		struct np_window_message message;
+		np_window_message_init(&message, NP_WINDOW_GUEST_TO_HOST,
+		                       NP_GUEST_TEXT_INPUT_SURROUNDING_TEXT);
+		np_window_put_u32(&message, server->focused_window);
+		np_window_put_string(&message, input->pending_surrounding);
+		np_window_put_i32(&message, input->pending_cursor_index);
+		np_window_put_i32(&message, input->pending_anchor_index);
+		send_message(server, &message);
 		free(input->pending_surrounding);
 		input->pending_surrounding = NULL;
 	}
@@ -127,10 +144,7 @@ static void text_input_resource_destroy(struct wl_resource *resource) {
 	struct np_text_input *input = wl_resource_get_user_data(resource);
 	if (!input) return;
 	if (input->enabled) {
-		cJSON *body = cJSON_CreateObject();
-		cJSON_AddNumberToObject(body, "window", input->server->focused_window);
-		cJSON_AddBoolToObject(body, "enabled", false);
-		np_host_send(&input->server->host, "textInputEnabled", body);
+		send_enabled(input->server, input->server->focused_window, false);
 	}
 	wl_list_remove(&input->link);
 	free(input->pending_surrounding);
@@ -152,11 +166,7 @@ void np_text_input_focus_changed(struct np_server *server,
 			if (input->enabled) {
 				input->enabled = false;
 				input->pending_enabled = false;
-				cJSON *body = cJSON_CreateObject();
-				cJSON_AddNumberToObject(body, "window",
-				                        previous ? previous->window_id : 0);
-				cJSON_AddBoolToObject(body, "enabled", false);
-				np_host_send(&server->host, "textInputEnabled", body);
+				send_enabled(server, previous ? previous->window_id : 0, false);
 			}
 		}
 		if (next && owner == wl_resource_get_client(next->resource)) {

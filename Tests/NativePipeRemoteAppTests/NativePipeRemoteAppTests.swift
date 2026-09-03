@@ -5,11 +5,11 @@ final class NativePipeRemoteAppTests: XCTestCase {
     func testParsesDestinationAndPassesSSHOptions() throws {
         let cli = try RemotePipeCLI.parse([
             "lfs@example.test", "-p", "2222",
-            "--compositor", "/opt/remotepipe-wayland",
+            "--compositor", "/opt/nativepipe-wayland",
         ])
         XCTAssertEqual(cli.destination, "lfs@example.test")
         XCTAssertEqual(cli.sshArguments, ["-p", "2222"])
-        XCTAssertEqual(cli.compositor, "/opt/remotepipe-wayland")
+        XCTAssertEqual(cli.compositor, "/opt/nativepipe-wayland")
     }
 
     func testLocalPortsAndExplicitSSHSeparator() throws {
@@ -29,12 +29,12 @@ final class NativePipeRemoteAppTests: XCTestCase {
     }
 
     func testEnsureScriptUsesPrivatePerUserRuntimeAndStrictOwnership() {
-        let script = SSHBootstrap.ensureScript(compositor: "/opt/remotepipe wayland")
-        XCTAssertTrue(script.contains("/tmp/remotepipe-xdg-$(id -u)"))
+        let script = SSHBootstrap.ensureScript(compositor: "/opt/nativepipe wayland")
+        XCTAssertTrue(script.contains("/tmp/nativepipe-xdg-$(id -u)"))
         XCTAssertTrue(script.contains("chmod 700 \"$RUNTIME\""))
         XCTAssertTrue(script.contains("tracked_alive"))
         XCTAssertTrue(script.contains("ports 1025/1026 belong to an untracked process"))
         XCTAssertTrue(script.contains("tracked compositor is alive but both ports are not ready"))
-        XCTAssertTrue(script.contains("'/opt/remotepipe wayland'"))
+        XCTAssertTrue(script.contains("'/opt/nativepipe wayland'"))
     }
 }

@@ -6,7 +6,7 @@ import NativePipeRemote
 import Darwin
 #endif
 
-/// `remotepipe` — SSH orchestration only. Display/protocol live in NativePipe*.
+/// `nativepipe` — SSH orchestration only. Display/protocol live in NativePipe*.
 @main
 enum RemotePipeMain {
     static func main() {
@@ -17,7 +17,7 @@ enum RemotePipeMain {
         do {
             cli = try RemotePipeCLI.parse()
         } catch {
-            fputs("remotepipe: \(error)\n\n\(RemotePipeCLI.usage)\n", stderr)
+            fputs("nativepipe: \(error)\n\n\(RemotePipeCLI.usage)\n", stderr)
             exit(2)
         }
         if cli.wantHelp {
@@ -80,26 +80,43 @@ final class RemotePipeAppDelegate: NSObject, NSApplicationDelegate {
             surfacePort: cli.surfacePort,
             mediaPort: cli.mediaPort)
         self.session = session
-        do {
-            try session.connect()
-            fputs(
-                "remotepipe: display connected to \(cli.host):\(cli.surfacePort)/\(cli.mediaPort)\n",
-                stderr)
-            fputs("remotepipe: waiting for remote windows…\n", stderr)
-        } catch {
-            fputs("remotepipe: connect failed: \(error)\n", stderr)
-            fputs(
-                """
-                Tip: use one-shot SSH mode, or forward ports manually:
+        session.onStateChange = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .connected:
+                fputs(
+                    "nativepipe: display connected to \(self.cli.host):"
+                        + "\(self.cli.surfacePort)/\(self.cli.mediaPort)\n",
+                    stderr)
+                fputs("nativepipe: waiting for remote windows…\n", stderr)
+            case .disconnected:
+                fputs("nativepipe: display disconnected\n", stderr)
+            }
+        }
+        Task { @MainActor [weak self, weak session] in
+            guard let self, let session, self.session === session else { return }
+            do {
+                try await session.connect()
+                fputs(
+                    "nativepipe: transport established; waiting for compositor handshake…\n",
+                    stderr)
+            } catch is CancellationError {
+                return
+            } catch {
+                fputs("nativepipe: connect failed: \(error)\n", stderr)
+                fputs(
+                    """
+                    Tip: use one-shot SSH mode, or forward ports manually:
 
-                  remotepipe user@host
-                  # or:
-                  ssh -N -L 1025:127.0.0.1:1025 -L 1026:127.0.0.1:1026 user@linux
-                  remotepipe --host 127.0.0.1
+                      nativepipe user@host
+                      # or:
+                      ssh -N -L 1025:127.0.0.1:1025 -L 1026:127.0.0.1:1026 user@linux
+                      nativepipe --host 127.0.0.1
 
-                """,
-                stderr)
-            NSApp.terminate(nil)
+                    """,
+                    stderr)
+                NSApp.terminate(nil)
+            }
         }
     }
 
@@ -111,7 +128,7 @@ final class RemotePipeAppDelegate: NSObject, NSApplicationDelegate {
                 preferredSurface: cli.surfacePort,
                 preferredMedia: cli.mediaPort)
             fputs(
-                "remotepipe: forwarding localhost:\(forwards.surface)/\(forwards.media) "
+                "nativepipe: forwarding localhost:\(forwards.surface)/\(forwards.media) "
                     + "→ \(destination):\(NativePipePort.surface)/\(NativePipePort.media)\n",
                 stderr)
             try SSHBootstrap.ensureCompositor(
@@ -123,9 +140,9 @@ final class RemotePipeAppDelegate: NSObject, NSApplicationDelegate {
                 sshArguments: cli.sshArguments,
                 forwards: forwards)
             tunnelProcess = tunnel
-            fputs("remotepipe: ssh tunnel ready\n", stderr)
+            fputs("nativepipe: ssh tunnel ready\n", stderr)
         } catch {
-            fputs("remotepipe: \(error)\n", stderr)
+            fputs("nativepipe: \(error)\n", stderr)
             NSApp.terminate(nil)
             return
         }
@@ -136,14 +153,39 @@ final class RemotePipeAppDelegate: NSObject, NSApplicationDelegate {
             surfacePort: forwards.surface,
             mediaPort: forwards.media)
         self.session = session
+        session.onStateChange = { state in
+            switch state {
+            case .connected:
+                fputs(
+                    "nativepipe: display connected on 127.0.0.1:"
+                        + "\(forwards.surface)/\(forwards.media)\n",
+                    stderr)
+                fputs("nativepipe: waiting for remote windows…\n", stderr)
+            case .disconnected:
+                fputs("nativepipe: display disconnected\n", stderr)
+            }
+        }
+        Task { @MainActor [weak self, weak session] in
+            guard let self, let session, self.session === session else { return }
+            await self.finishSSHSession(
+                session: session, tunnel: tunnel,
+                destination: destination)
+        }
+    }
+
+    private func finishSSHSession(
+        session: DisplaySession, tunnel: Process,
+        destination: String
+    ) async {
         do {
-            try session.connect()
+            try await session.connect()
             fputs(
-                "remotepipe: display connected on 127.0.0.1:\(forwards.surface)/\(forwards.media)\n",
+                "nativepipe: transport established; waiting for compositor handshake…\n",
                 stderr)
-            fputs("remotepipe: waiting for remote windows…\n", stderr)
+        } catch is CancellationError {
+            return
         } catch {
-            fputs("remotepipe: display connect failed: \(error)\n", stderr)
+            fputs("nativepipe: display connect failed: \(error)\n", stderr)
             tunnel.terminate()
             NSApp.terminate(nil)
             return
@@ -151,7 +193,7 @@ final class RemotePipeAppDelegate: NSObject, NSApplicationDelegate {
 
         if isatty(FileHandle.standardInput.fileDescriptor) == 0 {
             fputs(
-                "remotepipe: stdin is not a TTY — display-only mode "
+                "nativepipe: stdin is not a TTY — display-only mode "
                     + "(run from Terminal for a remote shell; Quit to exit)\n",
                 stderr)
             return
@@ -159,34 +201,37 @@ final class RemotePipeAppDelegate: NSObject, NSApplicationDelegate {
 
         let shell: Process
         do {
-            fputs("remotepipe: starting interactive ssh shell…\n", stderr)
+            fputs("nativepipe: starting interactive ssh shell…\n", stderr)
             fflush(stderr)
             shell = try SSHBootstrap.startInteractiveShell(
                 destination: destination,
                 sshArguments: cli.sshArguments)
             shellProcess = shell
-            fputs("remotepipe: ssh shell pid=\(shell.processIdentifier)\n", stderr)
+            fputs("nativepipe: ssh shell pid=\(shell.processIdentifier)\n", stderr)
             fflush(stderr)
         } catch {
-            fputs("remotepipe: failed to start ssh shell: \(error)\n", stderr)
+            fputs("nativepipe: failed to start ssh shell: \(error)\n", stderr)
             tunnel.terminate()
             session.disconnect()
             NSApp.terminate(nil)
             return
         }
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        let handleShellExit: @MainActor @Sendable (Int32) -> Void = { [weak self] status in
+            if status != 0 {
+                fputs("nativepipe: ssh shell exited \(status)\n", stderr)
+            }
+            self?.session?.disconnect()
+            if let tunnel = self?.tunnelProcess, tunnel.isRunning {
+                tunnel.terminate()
+            }
+            NSApp.terminate(nil)
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
             shell.waitUntilExit()
             let status = shell.terminationStatus
-            DispatchQueue.main.async {
-                if status != 0 {
-                    fputs("remotepipe: ssh shell exited \(status)\n", stderr)
-                }
-                self?.session?.disconnect()
-                if let tunnel = self?.tunnelProcess, tunnel.isRunning {
-                    tunnel.terminate()
-                }
-                NSApp.terminate(nil)
+            Task { @MainActor in
+                handleShellExit(status)
             }
         }
     }
@@ -197,7 +242,7 @@ final class RemotePipeAppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(appMenuItem)
         let appMenu = NSMenu()
         appMenu.addItem(
-            withTitle: "Quit remotepipe",
+            withTitle: "Quit NativePipe",
             action: #selector(NSApplication.terminate(_:)),
             keyEquivalent: "q")
         appMenuItem.submenu = appMenu

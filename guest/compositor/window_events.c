@@ -4,6 +4,12 @@
 #include "hostlink.h"
 #include "windowwire.h"
 
+bool np_window_event_send_message(struct np_server *server,
+                                  struct np_window_message *message) {
+	if (!server || !message || !message->ok) return false;
+	return np_host_send_binary(&server->host, message->data, message->len);
+}
+
 bool np_window_event_send(struct np_server *server, uint8_t opcode,
                           const uint32_t *values, size_t count) {
 	if (!server || count > 16) return false;
@@ -18,6 +24,18 @@ bool np_window_event_send(struct np_server *server, uint8_t opcode,
 		payload[8 + i * 4 + 3] = (unsigned char)(value >> 24);
 	}
 	return np_host_send_binary(&server->host, payload, 8 + count * 4);
+}
+
+bool np_window_event_send_force_quit_capability(
+    struct np_server *server, uint32_t window, bool supported) {
+	struct np_window_message message;
+	np_window_message_init(&message, NP_WINDOW_GUEST_TO_HOST,
+	                       NP_GUEST_FORCE_QUIT_CAPABILITY_CHANGED);
+	np_window_put_u32(&message, window);
+	np_window_put_bool(&message, supported);
+	bool sent = np_window_event_send_message(server, &message);
+	np_window_message_clear(&message);
+	return sent;
 }
 
 bool np_window_event_send_popup_placement(
@@ -39,8 +57,7 @@ bool np_window_event_send_popup_placement(
 	np_window_put_u32(&message, adjustment);
 	np_window_put_u32(&message, token);
 	np_window_put_bool(&message, reactive);
-	bool sent = message.ok && np_host_send_binary(
-		&server->host, message.data, message.len);
+	bool sent = np_window_event_send_message(server, &message);
 	np_window_message_clear(&message);
 	return sent;
 }

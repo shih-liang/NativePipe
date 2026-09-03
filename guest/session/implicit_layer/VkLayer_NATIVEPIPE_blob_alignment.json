@@ -1,0 +1,20 @@
+{
+    "file_format_version": "1.2.0",
+    "layer": {
+        "name": "VK_LAYER_NATIVEPIPE_blob_alignment",
+        "type": "GLOBAL",
+        "library_path": "/usr/libexec/nativepipe/nativepipe-vulkan-blob-alignment.so",
+        "api_version": "1.4.0",
+        "implementation_version": "1",
+        "description": "NativePipe 16 KiB blob alignment workaround for legacy virtio-gpu kernels",
+        "functions": {
+            "vkNegotiateLoaderLayerInterfaceVersion": "nativepipe_NegotiateLoaderLayerInterfaceVersion"
+        },
+        "enable_environment": {
+            "NATIVEPIPE_BLOB_ALIGNMENT": "16384"
+        },
+        "disable_environment": {
+            "NATIVEPIPE_DISABLE_BLOB_ALIGNMENT": "1"
+        }
+    }
+}

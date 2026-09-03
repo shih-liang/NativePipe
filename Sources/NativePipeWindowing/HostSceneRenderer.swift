@@ -9,6 +9,16 @@ struct ResolvedSceneLayer {
     let texture: MTLTexture
 }
 
+/// CPU-owned copy of one fully composed drawable. It is produced only for an
+/// explicit Computer Use request; the ordinary presentation path performs no
+/// readback and keeps no history texture.
+struct RenderedFrameCapture: Sendable {
+    let pixels: Data
+    let width: Int
+    let height: Int
+    let bytesPerRow: Int
+}
+
 extension Windowing.SceneSnapshot {
     /// A latest-value queue may discard an unencoded scene, but its damage is
     /// still part of the transition recorded for the drawable pool. The newest
@@ -170,6 +180,7 @@ struct DrawableAgeTracker {
 /// Textures are bound conventionally, one draw call per layer; this deliberately
 /// avoids argument-buffer descriptors on the NativePipe boundary.
 final class HostSceneRenderer: @unchecked Sendable {
+    private static let maximumCaptureBytes = 256 * 1024 * 1024
     enum RendererError: Error {
         case shaderLibrary
         case pipeline
@@ -316,7 +327,8 @@ final class HostSceneRenderer: @unchecked Sendable {
         scene: Windowing.SceneSnapshot, layers: [ResolvedSceneLayer],
         damage: [Windowing.Rect], redrawAll: Bool,
         drawable: CAMetalDrawable,
-        completion: @escaping (MTLCommandBuffer) -> Void
+        capture: Bool = false,
+        completion: @escaping @Sendable (MTLCommandBuffer, RenderedFrameCapture?) -> Void
     ) throws {
         guard layers.count == scene.layers.count,
               let command = queue.makeCommandBuffer() else {
@@ -364,10 +376,50 @@ final class HostSceneRenderer: @unchecked Sendable {
             encoder.endEncoding()
         }
 
+        let readback: (buffer: MTLBuffer, bytesPerRow: Int)?
+        if capture {
+            let (rowBytes, rowOverflow) = target.width.multipliedReportingOverflow(by: 4)
+            let (alignedBytes, alignOverflow) = rowBytes.addingReportingOverflow(255)
+            let bytesPerRow = alignOverflow ? 0 : alignedBytes & ~255
+            let (byteCount, sizeOverflow) = bytesPerRow.multipliedReportingOverflow(
+                by: target.height)
+            guard !rowOverflow, !alignOverflow, !sizeOverflow,
+                  bytesPerRow > 0, byteCount > 0,
+                  byteCount <= Self.maximumCaptureBytes,
+                  let buffer = target.device.makeBuffer(
+                    length: byteCount, options: .storageModeShared),
+                  let blit = command.makeBlitCommandEncoder() else {
+                throw RendererError.commandBuffer
+            }
+            blit.copy(
+                from: target, sourceSlice: 0, sourceLevel: 0,
+                sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                sourceSize: MTLSize(
+                    width: target.width, height: target.height, depth: 1),
+                to: buffer, destinationOffset: 0,
+                destinationBytesPerRow: bytesPerRow,
+                destinationBytesPerImage: byteCount)
+            blit.endEncoding()
+            readback = (buffer, bytesPerRow)
+        } else {
+            readback = nil
+        }
+
         command.addCompletedHandler { command in
             // Retain every source wrapper until Metal has completed its reads.
             withExtendedLifetime(layers) {}
-            completion(command)
+            let captured: RenderedFrameCapture?
+            if command.status == .completed, let readback {
+                captured = RenderedFrameCapture(
+                    pixels: Data(
+                        bytes: readback.buffer.contents(),
+                        count: readback.buffer.length),
+                    width: target.width, height: target.height,
+                    bytesPerRow: readback.bytesPerRow)
+            } else {
+                captured = nil
+            }
+            completion(command, captured)
         }
         command.present(drawable)
         command.commit()

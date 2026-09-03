@@ -2,6 +2,7 @@
 #define NP_SCALE_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "damage.h"
@@ -19,6 +20,15 @@ struct np_surface_mapping {
 	double source_height_pixels;
 	double logical_width;
 	double logical_height;
+};
+
+struct np_host_output {
+	uint32_t id;
+	const char *name;
+	int32_t x, y, width, height;
+	int32_t pixel_width, pixel_height;
+	int32_t physical_width_mm, physical_height_mm;
+	int32_t scale, refresh_millihz;
 };
 
 bool np_scale_transform_swaps_axes(int32_t transform);
@@ -50,5 +60,10 @@ void np_scale_advertise(struct wl_display *display, struct np_server *server);
 void np_scale_surface_enter_outputs(struct np_surface *surface,
 	                                struct wl_client *client);
 void np_scale_changed(struct np_surface *surface, int scale);
+bool np_scale_update_outputs(struct np_server *server,
+	                         const struct np_host_output *outputs,
+	                         size_t count);
+void np_scale_window_output_changed(struct np_server *server,
+	                                uint32_t window_id, uint32_t output_id);
 
 #endif

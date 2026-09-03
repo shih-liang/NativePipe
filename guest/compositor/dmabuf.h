@@ -7,8 +7,9 @@
 
 struct np_sync_point;
 
-/// Imports single-plane ARGB/XRGB dma-bufs for remote video encoding. Linear
-/// images are mapped directly; device modifiers use the matching EGL device.
+/// Advertises linux-dmabuf for the selected backend. RemotePipe imports
+/// single-plane ARGB/XRGB images for encoding; VMPipe maps the exported
+/// virtio-gpu resource directly to the host-visible GPU object.
 void np_dmabuf_advertise(struct wl_display *display, int drm_fd);
 
 /// A buffer created from linux-dmabuf, or NULL if this wl_buffer is wl_shm.

@@ -12,6 +12,11 @@ import NativePipeWindowing
 public final class DisplaySession {
     public let controller: RemoteDisplayController
 
+    public var onStateChange: ((RemoteSession.State) -> Void)? {
+        get { controller.onStateChange }
+        set { controller.onStateChange = newValue }
+    }
+
     public init(
         host: String = "127.0.0.1",
         surfacePort: UInt16 = UInt16(NativePipePort.surface),
@@ -23,8 +28,8 @@ public final class DisplaySession {
             mediaPort: mediaPort)
     }
 
-    public func connect() throws {
-        try controller.connect()
+    public func connect() async throws {
+        try await controller.connect()
     }
 
     public func disconnect() {

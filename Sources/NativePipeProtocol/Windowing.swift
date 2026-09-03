@@ -48,7 +48,7 @@ extension Windowing {
 	}
 
     /// Things the guest's translator reports upward.
-    public enum GuestEvent: Codable, Sendable {
+    public enum GuestEvent: Sendable {
         /// The compositor sends this before replaying its authoritative state
         /// on every new transport connection. A connected vsock alone is not
         /// evidence that the guest event loop owns and can write the channel.
@@ -65,6 +65,11 @@ extension Windowing {
         /// appears on the first commit that carries a frame, because a window
         /// shown before it has content flashes empty.
         case toplevelCreated(window: UInt32, surface: UInt32)
+        /// True only when the compositor can identify and terminate the
+        /// Wayland client that owns this toplevel.  Xwayland-satellite owns the
+        /// Wayland connection for all X11 windows, so killing that peer would
+        /// incorrectly terminate every X11 application in the session.
+        case forceQuitCapabilityChanged(window: UInt32, supported: Bool)
         case toplevelDestroyed(window: UInt32)
 
         /// A surface took the popup role: a menu, dropdown or tooltip anchored to
@@ -106,7 +111,7 @@ extension Windowing {
         case committed(surface: UInt32, frame: Frame)
 
         /// One atomic xdg-window scene. This case is carried by the bounded
-        /// binary NPSN wire message rather than JSON; `layers` are ordered from
+        /// binary NPSN wire message; `layers` are ordered from
         /// back to front and name existing virtio-gpu resources.
         case sceneCommitted(scene: SceneSnapshot)
 
@@ -139,7 +144,7 @@ extension Windowing {
         case selectionOffered(mimeTypes: [String])
         /// The bytes for a `selectionRequest`. Nil data means the source could
         /// not supply that type; the host must not wait for a retry.
-        case selectionData(token: UInt32, mimeType: String, base64: String?)
+        case selectionData(token: UInt32, mimeType: String, data: Data?)
         /// A guest client is pasting and wants the macOS pasteboard's contents.
         case hostSelectionRequest(token: UInt32, mimeType: String)
 
@@ -479,7 +484,7 @@ extension Windowing {
 extension Windowing {
     /// Instructions the host sends down. Geometry, focus and lifetime are macOS
     /// decisions; the guest applies them to the Wayland objects.
-    public enum HostCommand: Codable, Sendable {
+    public enum HostCommand: Sendable {
         /// The window changed size or state. `size` is in logical window-
         /// geometry coordinates (AppKit points), never backing pixels. The
         /// client's wl_surface buffer scale determines pixel density separately.
@@ -507,7 +512,10 @@ extension Windowing {
 		case outputsChanged(displays: [Display])
 		/// The wl_output currently containing this xdg window. Nil leaves all
 		/// outputs, for example while AppKit is moving it between screens.
-		case windowOutputChanged(window: UInt32, outputID: UInt32?)
+        case windowOutputChanged(window: UInt32, outputID: UInt32?)
+        /// Host input policy. Layout is an XKB layout name; rate zero disables
+        /// repeat. Existing wl_keyboard resources receive the new keymap.
+        case inputPreferences(layout: String, repeatRate: Int, repeatDelay: Int)
 
         case keyboardFocus(window: UInt32?)
         case key(window: UInt32, keycode: UInt32, pressed: Bool, modifiers: Modifiers)
@@ -525,6 +533,12 @@ extension Windowing {
         /// frame, so its guest output-ring slot can be reused safely.
         case frameReleased(surface: UInt32, presentationID: UInt32)
 
+        /// Ask the guest compositor to republish its current immutable scene.
+        /// The resulting presentation owns every source buffer until the host
+        /// has copied the composed drawable for an explicit Computer Use
+        /// capture. This avoids WindowServer/ScreenCaptureKit entirely.
+        case captureFrame(surface: UInt32)
+
         // MARK: Clipboard — the mirror image of the guest's three events.
 
         /// The host is pasting into macOS and needs the guest selection's bytes.
@@ -533,7 +547,7 @@ extension Windowing {
         /// empty list clears the selection inside the guest.
         case hostSelectionOffered(mimeTypes: [String])
         /// The bytes for a `hostSelectionRequest`.
-        case hostSelectionData(token: UInt32, mimeType: String, base64: String?)
+        case hostSelectionData(token: UInt32, mimeType: String, data: Data?)
 
         // MARK: Text input
 
@@ -560,9 +574,7 @@ extension Windowing {
         case middle
     }
 
-    /// Encoded as a bare number, not as the `{"rawValue": …}` object Swift
-    /// synthesises for an OptionSet. The other end reads it with a JSON integer
-    /// accessor, which would silently see zero and drop every modifier.
+    /// Encoded as a bare little-endian bit field by WindowWire.
     public struct Modifiers: OptionSet, Codable, Sendable {
         public let rawValue: UInt32
         public init(rawValue: UInt32) { self.rawValue = rawValue }

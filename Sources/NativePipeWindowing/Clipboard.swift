@@ -23,6 +23,8 @@ final class ClipboardBridge {
     /// tell the Mac's own copies apart from the echo of a guest's.
     private var lastSeenChangeCount: Int
     private var poll: Timer?
+    private var allowsHostToGuest = true
+    private var allowsGuestToHost = true
 
     /// Preference order, best first. The guest is asked for the first type it
     /// actually offers rather than for everything, because the announcement is
@@ -67,11 +69,30 @@ final class ClipboardBridge {
         pendingGuestReads.removeAll()
     }
 
+    func setPolicy(hostToGuest: Bool, guestToHost: Bool) {
+        let hostChanged = allowsHostToGuest != hostToGuest
+        allowsHostToGuest = hostToGuest
+        allowsGuestToHost = guestToHost
+        if hostToGuest {
+            start()
+        } else {
+            poll?.invalidate()
+            poll = nil
+            if hostChanged { output?(.hostSelectionOffered(mimeTypes: [])) }
+        }
+        if !guestToHost {
+            let pending = Array(pendingGuestReads.values)
+            pendingGuestReads.removeAll()
+            for completion in pending { completion(nil) }
+        }
+    }
+
     // MARK: - Guest owns the selection
 
     /// A guest client took the selection. Fetch the best type it offers and put
     /// it on the Mac's pasteboard.
     func guestOffered(mimeTypes: [String]) {
+        guard allowsGuestToHost else { return }
         guard !mimeTypes.isEmpty else { return }
         let offered = Set(mimeTypes)
         guard let match = Self.guestToNative.first(where: { offered.contains($0.mime) }) else {
@@ -107,6 +128,7 @@ final class ClipboardBridge {
     }
 
     private func requestFromGuest(mime: String, completion: @escaping (Data?) -> Void) {
+        guard allowsGuestToHost else { completion(nil); return }
         nextToken &+= 1
         let token = nextToken
         pendingGuestReads[token] = completion
@@ -114,14 +136,15 @@ final class ClipboardBridge {
     }
 
     /// The guest answered a `selectionRequest`.
-    func guestSuppliedData(token: UInt32, base64: String?) {
+    func guestSuppliedData(token: UInt32, data: Data?) {
         guard let completion = pendingGuestReads.removeValue(forKey: token) else { return }
-        completion(base64.flatMap { Data(base64Encoded: $0) })
+        completion(data)
     }
 
     // MARK: - Mac owns the selection
 
     private func pollPasteboard() {
+        guard allowsHostToGuest else { return }
         let current = pasteboard.changeCount
         guard current != lastSeenChangeCount else { return }
         lastSeenChangeCount = current
@@ -137,6 +160,10 @@ final class ClipboardBridge {
 
     /// A guest client is pasting and wants the Mac's clipboard in `mimeType`.
     func guestRequestedHostData(token: UInt32, mimeType: String) {
+        guard allowsHostToGuest else {
+            output?(.hostSelectionData(token: token, mimeType: mimeType, data: nil))
+            return
+        }
         let native = Self.guestToNative.first { $0.mime == mimeType }?.native
         var data: Data?
         if let native {
@@ -149,11 +176,15 @@ final class ClipboardBridge {
                 data = pasteboard.data(forType: native)
             }
         }
+        if let bytes = data, bytes.count > WindowWire.maximumClipboardDataSize {
+            Self.note("refusing \(bytes.count)-byte host selection")
+            data = nil
+        }
         // Answering with nil rather than staying silent matters: the guest has a
         // client blocked on a pipe, and it closes that pipe when the answer
         // arrives. No answer would leave the paste hanging forever.
         output?(.hostSelectionData(
             token: token, mimeType: mimeType,
-            base64: data.map { $0.base64EncodedString() }))
+            data: data))
     }
 }

@@ -4,8 +4,10 @@
 #include "damage.h"
 #include "hostlink.h"
 #include "region.h"
+#ifdef NP_REMOTE
 #include "medialink.h"
 #include "../encoder/encoder.h"
+#endif
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -16,6 +18,8 @@ struct np_shm_texture;
 struct np_sync_surface;
 struct np_sync_point;
 struct np_xwayland;
+struct np_window_frame;
+struct np_output_state;
 
 enum np_surface_role {
 	NP_SURFACE_ROLE_NONE = 0,
@@ -24,29 +28,39 @@ enum np_surface_role {
 	NP_SURFACE_ROLE_SUBSURFACE,
 	NP_SURFACE_ROLE_CURSOR,
 	NP_SURFACE_ROLE_DRAG_ICON,
-	NP_SURFACE_ROLE_XWAYLAND,
 };
 
 struct np_server {
 	struct wl_display *display;
 	struct wl_list surfaces;
 	struct wl_list shm_textures;
-	/* Ordered host and guest window state shares one NPIP TCP stream. Encoded
-	 * pixels use the independent NPEN media stream. */
+	/* Guest-to-host events remain on `host`. Host-to-guest paths use separate
+	 * sockets so vsock credit and a slow writer cannot couple unrelated Wayland
+	 * lifetimes. Remote TCP keeps its existing single control stream. */
 	struct np_host host;
-	bool host_session_ready;
+#ifndef NP_REMOTE
+	struct np_host host_control;
+	struct np_host host_input;
+	struct np_host host_feedback;
+#else
 	struct np_media media;
 	uint32_t next_media_resource_id;
+#endif
+	bool host_session_ready;
 	int drm_fd;
 	uint32_t next_id;
 	uint32_t next_presentation_id;
 	int output_scale;
 	int output_width;
 	int output_height;
+	struct wl_list output_states;
 	struct wl_list outputs;
 	struct wl_list pointers;
 	struct wl_list keyboards;
 	int keymap_fd;
+	char keyboard_layout[64];
+	int32_t key_repeat_rate;
+	int32_t key_repeat_delay;
 	struct wl_resource *selection_source;
 	struct wl_list data_devices;
 	struct wl_list data_offers;
@@ -54,6 +68,7 @@ struct np_server {
 	int host_mime_count;
 	uint32_t next_clip_token;
 	struct wl_list clip_reads;
+	struct wl_list clip_pending;
 	struct wl_list clip_writes;
 	struct wl_list text_inputs;
 	struct wl_resource *drag_source;
@@ -75,11 +90,26 @@ struct np_server {
 	int32_t cursor_hotspot_x, cursor_hotspot_y;
 	uint32_t drag_focus_surface;
 	struct wl_event_source *host_connection_source;
+#ifdef NP_REMOTE
 	struct wl_event_source *media_connection_source;
+	struct wl_event_source *remote_pair_timeout_source;
 	int watched_media_fd;
+	uint64_t watched_media_generation;
+#endif
 	struct wl_event_source *scene_retry_timer;
 	int watched_host_fd;
 	uint32_t watched_host_mask;
+#ifndef NP_REMOTE
+	struct wl_event_source *host_control_connection_source;
+	struct wl_event_source *host_input_connection_source;
+	struct wl_event_source *host_feedback_connection_source;
+	int watched_host_control_fd;
+	int watched_host_input_fd;
+	int watched_host_feedback_fd;
+	uint32_t watched_host_control_mask;
+	uint32_t watched_host_input_mask;
+	uint32_t watched_host_feedback_mask;
+#endif
 	char session_socket[128];
 	struct np_xwayland *xwayland;
 	char xwayland_display[16];
@@ -91,11 +121,13 @@ struct np_input {
 	struct wl_resource *resource;
 	struct np_server *server;
 	uint32_t last_enter_serial;
+	uint8_t active_scroll_axes;
 };
 
 struct np_output {
 	struct wl_list link;
 	struct wl_resource *resource;
+	struct np_output_state *state;
 };
 
 struct np_viewport_state {
@@ -158,8 +190,6 @@ struct np_surface_update {
 	bool size_constraints_changed;
 	int32_t minimum_width, minimum_height;
 	int32_t maximum_width, maximum_height;
-	bool xwayland_serial_set;
-	uint64_t xwayland_serial;
 	struct np_box damage;
 	bool set_fifo_barrier;
 	bool wait_fifo_barrier;
@@ -198,6 +228,13 @@ struct np_xdg_configure {
 	int32_t popup_x, popup_y, popup_width, popup_height;
 };
 
+enum { NP_SHM_DAMAGE_HISTORY_CAPACITY = 8 };
+
+struct np_shm_damage_record {
+	uint64_t serial;
+	struct np_box damage;
+};
+
 enum np_xdg_configure_phase {
 	NP_XDG_NO_ROLE,
 	NP_XDG_AWAITING_INITIAL_COMMIT,
@@ -228,6 +265,17 @@ struct np_surface {
 	struct wl_listener current_buffer_destroy;
 	struct np_gpu_buffer *current_gpu;
 	struct np_shm_texture *current_shm;
+	/* A wl_shm client may rotate several wl_buffers. Damage describes the
+	 * transition from the preceding surface contents, not the bytes changed
+	 * since this particular wl_buffer was last used. Keep a bounded surface
+	 * history so each compositor-owned texture can catch up to its buffer age. */
+	uint64_t shm_damage_epoch;
+	uint64_t shm_damage_serial;
+	uint32_t shm_damage_width, shm_damage_height;
+	uint32_t shm_damage_history_count;
+	bool shm_damage_geometry_valid;
+	struct np_shm_damage_record
+		shm_damage_history[NP_SHM_DAMAGE_HISTORY_CAPACITY];
 	struct np_sync_surface *syncobj;
 	struct np_sync_point *current_release_point;
 	int pending_scale;
@@ -255,13 +303,6 @@ struct np_surface {
 	struct wl_resource *toplevel;
 	struct wl_resource *popup;
 	struct wl_resource *decoration;
-	uint32_t xwayland_window;
-	bool xwayland_popup;
-	struct wl_resource *xwayland_shell_surface;
-	bool pending_xwayland_serial_set;
-	uint64_t pending_xwayland_serial;
-	bool xwayland_serial_committed;
-	uint64_t xwayland_serial;
 	struct wl_resource *fractional_scale;
 	int preferred_scale;
 	int reported_scale;
@@ -270,6 +311,7 @@ struct np_surface {
 	struct np_viewport_state viewport_state;
 	bool pending_viewport_changed;
 	uint32_t window_id;
+	uint32_t output_id;
 	struct wl_list xdg_configures;
 	uint32_t latest_configure_serial;
 	enum np_xdg_configure_phase xdg_configure_phase;
@@ -357,9 +399,12 @@ struct np_surface {
 	uint32_t last_stride;
 	const char *last_source;
 	bool has_published;
-	cJSON *pending_frame;
+	unsigned char *pending_frame;
+	size_t pending_frame_size;
+#ifdef NP_REMOTE
 	struct np_encoder *encoder;
 	uint16_t last_epoch;
+#endif
 };
 
 bool np_surface_assign_role(struct np_surface *surface,
@@ -417,7 +462,8 @@ void np_presentation_flush(struct np_server *server);
 void np_presentation_clear_scene_wait(struct np_surface *surface);
 void np_presentation_request_refresh(struct np_surface *surface,
                                      uint32_t presentation_id);
-void np_presentation_add_viewport(struct np_surface *surface, cJSON *frame);
+void np_presentation_add_viewport(struct np_surface *surface,
+                                  struct np_window_frame *frame);
 bool np_presentation_queue_last(struct np_surface *surface,
                                 uint32_t presentation_id);
 bool np_presentation_refresh_current_shm(struct np_surface *surface,
@@ -436,13 +482,13 @@ void np_presentation_set_current_buffer(struct np_surface *surface,
                                         struct wl_resource *buffer,
                                         struct np_gpu_buffer *gpu_buffer,
                                         struct np_sync_point *release_point);
+#ifdef NP_REMOTE
 bool np_presentation_republish_remote(struct np_surface *surface);
+#endif
 
 /* Host transport and command dispatch. */
-void np_input_handle_host_binary(const unsigned char *payload, size_t length,
+bool np_input_handle_host_binary(const unsigned char *payload, size_t length,
                                  void *user_data);
-void np_input_handle_host_command(const char *name, cJSON *body,
-                                  void *user_data);
 void np_host_session_reset_readiness(void);
 bool np_host_session_listen(struct np_server *server);
 bool np_host_session_set_socket(struct np_server *server, const char *socket);

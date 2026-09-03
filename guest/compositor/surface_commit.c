@@ -9,7 +9,6 @@
 #include "shm_texture.h"
 #include "syncobj.h"
 #include "window_events.h"
-#include "xwayland.h"
 #include "xdg_shell.h"
 #include "viewporter-server-protocol.h"
 #include "xdg-shell-server-protocol.h"
@@ -329,7 +328,6 @@ static struct np_surface_update *snapshot_surface_update(struct np_surface *surf
 	                     surface->pending_offset_changed ||
 	                     surface->pending_input_region_changed ||
 	                     surface->pending_opaque_region_changed ||
-	                     surface->pending_xwayland_serial_set ||
 	                     np_syncobj_has_pending(surface) ||
 	                     surface->pending_geometry_set || scale_changed ||
 	                     surface->popup_geometry_acked ||
@@ -381,8 +379,6 @@ static struct np_surface_update *snapshot_surface_update(struct np_surface *surf
 	update->minimum_height = surface->pending_minimum_height;
 	update->maximum_width = surface->pending_maximum_width;
 	update->maximum_height = surface->pending_maximum_height;
-	update->xwayland_serial_set = surface->pending_xwayland_serial_set;
-	update->xwayland_serial = surface->pending_xwayland_serial;
 	update->damage = surface->pending_buffer_damage;
 	uint32_t buffer_width, buffer_height;
 	struct np_box converted_damage;
@@ -394,6 +390,21 @@ static struct np_surface_update *snapshot_surface_update(struct np_surface *surf
 		    &surface->pending_surface_damage, &converted_damage))
 		np_box_union(&update->damage, converted_damage.x, converted_damage.y,
 		          converted_damage.width, converted_damage.height);
+	if (np_trace_enabled() && damaged)
+		fprintf(stderr,
+		        "[damage] surface=%u upload=%lld,%lld %lldx%lld "
+		        "surface=%lld,%lld %lldx%lld buffer=%lld,%lld %lldx%lld\n",
+		        surface->id,
+		        (long long)update->damage.x, (long long)update->damage.y,
+		        (long long)update->damage.width, (long long)update->damage.height,
+		        (long long)surface->pending_surface_damage.x,
+		        (long long)surface->pending_surface_damage.y,
+		        (long long)surface->pending_surface_damage.width,
+		        (long long)surface->pending_surface_damage.height,
+		        (long long)surface->pending_buffer_damage.x,
+		        (long long)surface->pending_buffer_damage.y,
+		        (long long)surface->pending_buffer_damage.width,
+		        (long long)surface->pending_buffer_damage.height);
 	update->set_fifo_barrier = surface->pending_fifo_set_barrier;
 	update->wait_fifo_barrier = surface->pending_fifo_wait_barrier;
 	if (!np_syncobj_take_commit(
@@ -426,7 +437,6 @@ static struct np_surface_update *snapshot_surface_update(struct np_surface *surf
 	surface->pending_input_region_changed = false;
 	surface->pending_opaque_region_changed = false;
 	surface->pending_size_constraints_changed = false;
-	surface->pending_xwayland_serial_set = false;
 	np_box_clear(&surface->pending_surface_damage);
 	np_box_clear(&surface->pending_buffer_damage);
 
@@ -547,8 +557,6 @@ static void apply_surface_update_now(struct np_surface_update *update) {
 		apply_surface_update_now(dependency);
 	}
 	struct np_surface *surface = update->surface;
-	if (update->xwayland_serial_set)
-		np_xwayland_commit_serial(surface, update->xwayland_serial);
 	np_sync_point_destroy(update->acquire_point);
 	update->acquire_point = NULL;
 	bool scale_changed = surface->scale != update->scale;
@@ -596,6 +604,32 @@ static void apply_surface_update_now(struct np_surface_update *update) {
 			surface, update->minimum_width, update->minimum_height,
 			update->maximum_width, update->maximum_height);
 	}
+	uint32_t content_width = surface->last_width > 0
+		? (uint32_t)surface->last_width : 0;
+	uint32_t content_height = surface->last_height > 0
+		? (uint32_t)surface->last_height : 0;
+	if (update->buffer_commit == NP_BUFFER_DETACH) {
+		content_width = content_height = 0;
+	} else if (update->buffer_commit == NP_BUFFER_ATTACH) {
+		struct wl_shm_buffer *shm = update->buffer
+			? wl_shm_buffer_get(update->buffer) : NULL;
+		if (shm) {
+			int32_t width = wl_shm_buffer_get_width(shm);
+			int32_t height = wl_shm_buffer_get_height(shm);
+			content_width = width > 0 ? (uint32_t)width : 0;
+			content_height = height > 0 ? (uint32_t)height : 0;
+		} else if (update->gpu_buffer) {
+			content_width = update->gpu_buffer->width > 0
+				? (uint32_t)update->gpu_buffer->width : 0;
+			content_height = update->gpu_buffer->height > 0
+				? (uint32_t)update->gpu_buffer->height : 0;
+		} else {
+			content_width = content_height = 0;
+		}
+	}
+	np_shm_texture_prepare_commit(
+		surface, content_width, content_height,
+		update->viewport_changed || update->transform_changed || scale_changed);
 	bool scene_structure_changed =
 		update->buffer_commit == NP_BUFFER_DETACH || update->geometry_set ||
 		update->popup_geometry_changed || update->viewport_changed ||
@@ -657,6 +691,7 @@ static void apply_surface_update_now(struct np_surface_update *update) {
 		      np_presentation_queue_last(surface, update->presentation_id)))
 			np_presentation_request_refresh(surface, update->presentation_id);
 	}
+	np_shm_texture_note_damage(surface, &update->damage);
 
 	if (update->set_fifo_barrier) {
 		surface->fifo_barrier_active = true;

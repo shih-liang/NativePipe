@@ -12,12 +12,31 @@
 #include <unistd.h>
 #include <wayland-server-protocol.h>
 
+
 #define NP_SCENE_MAGIC "NPSN"
 #define NP_SCENE_VERSION 2u
 #define NP_SCENE_HEADER_SIZE 72u
 #define NP_SCENE_LAYER_SIZE 88u
 #define NP_SCENE_MAX_LAYERS 128u
 
+#ifndef NP_REMOTE
+enum np_scene_reference_kind { NP_SCENE_GPU, NP_SCENE_SHM };
+
+struct np_scene_reference {
+	enum np_scene_reference_kind kind;
+	union {
+		struct np_gpu_buffer *gpu;
+		struct np_shm_texture *shm;
+	};
+};
+
+struct np_scene_presentation {
+	struct wl_list link;
+	uint32_t id;
+	uint32_t reference_count;
+	struct np_scene_reference references[NP_SCENE_MAX_LAYERS];
+};
+#endif
 
 struct np_scene_item {
 	struct np_surface *surface;
@@ -26,6 +45,9 @@ struct np_scene_item {
 	uint16_t format, flags;
 	uint32_t transform;
 	float destination[4], source[4], clip[4];
+#ifndef NP_REMOTE
+	struct np_scene_reference reference;
+#endif
 };
 
 struct np_surface *np_scene_root(struct np_surface *surface)
@@ -181,9 +203,12 @@ static enum np_scene_build_result collect_surface(
 	struct np_scene_item items[NP_SCENE_MAX_LAYERS], uint32_t *count,
 	struct np_box *scene_damage)
 {
-	if (!surface->has_published
-	    || !surface->last_resource_id
-	)
+#ifdef NP_REMOTE
+	if (!surface->has_published || !surface->last_resource_id)
+#else
+	if (!surface->has_published ||
+	    (!surface->current_gpu && !surface->current_shm))
+#endif
 		return NP_SCENE_READY;
 	if (*count >= NP_SCENE_MAX_LAYERS) return NP_SCENE_INVALID;
 
@@ -209,10 +234,17 @@ static enum np_scene_build_result collect_surface(
 	item->width = (uint32_t)surface->last_width;
 	item->height = (uint32_t)surface->last_height;
 	item->stride = surface->last_stride;
-	item->format =
-		1u; /* VideoToolbox output is always BGRA after alpha reconstruction. */
+	#ifdef NP_REMOTE
+	item->format = 1u; /* Decoder output is BGRA after alpha reconstruction. */
 	item->flags = surface->last_format &&
 	              strcmp(surface->last_format, "bgrx8888") == 0 ? 1u : 0u;
+	#else
+	item->format = surface->last_format &&
+	               strcmp(surface->last_format, "bgrx8888") == 0 ? 2u :
+	               surface->last_format &&
+	               strcmp(surface->last_format, "rgba8888") == 0 ? 3u : 1u;
+	item->flags = item->format == 2u ? 1u : 0u;
+	#endif
 	item->transform = (uint32_t)surface->transform;
 
 	float x = (float)x_value;
@@ -232,7 +264,20 @@ static enum np_scene_build_result collect_surface(
 	item->clip[2] = (float)(clip_x1 - clip_x0);
 	item->clip[3] = (float)(clip_y1 - clip_y0);
 
+#ifdef NP_REMOTE
 	item->resource_id = surface->last_resource_id;
+#else
+	if (surface->current_gpu) {
+		item->resource_id = surface->current_gpu->resource_id;
+		item->reference.kind = NP_SCENE_GPU;
+		item->reference.gpu = surface->current_gpu;
+	} else {
+		item->resource_id = surface->current_shm->image.resource_id;
+		item->stride = surface->current_shm->stride;
+		item->reference.kind = NP_SCENE_SHM;
+		item->reference.shm = surface->current_shm;
+	}
+#endif
 	collect_item_damage(item, scene_damage);
 	return item->resource_id != 0 ? NP_SCENE_READY : NP_SCENE_INVALID;
 }
@@ -291,14 +336,76 @@ static void put_f32(unsigned char *p, float value)
 	put_u32(p, bits);
 }
 
+#ifndef NP_REMOTE
+static void release_references(struct np_scene_presentation *presentation)
+{
+	for (uint32_t i = 0; i < presentation->reference_count; i++) {
+		struct np_scene_reference *reference = &presentation->references[i];
+		if (reference->kind == NP_SCENE_GPU)
+			np_gpu_buffer_end_host_read(reference->gpu);
+		else
+			np_shm_texture_end_host_read(reference->shm);
+	}
+	presentation->reference_count = 0;
+}
+
+static bool same_reference(const struct np_scene_reference *a,
+	                       const struct np_scene_reference *b)
+{
+	if (a->kind != b->kind) return false;
+	return a->kind == NP_SCENE_GPU ? a->gpu == b->gpu : a->shm == b->shm;
+}
+
+/* A texture may appear more than once in one subsurface tree. Hold and release
+ * each imported object once per presentation, independent of layer count. */
+static bool retain_reference(struct np_scene_presentation *presentation,
+	                         struct np_scene_reference reference)
+{
+	for (uint32_t i = 0; i < presentation->reference_count; i++) {
+		if (same_reference(&presentation->references[i], &reference)) return true;
+	}
+	if (presentation->reference_count >= NP_SCENE_MAX_LAYERS) return false;
+	if (reference.kind == NP_SCENE_GPU) {
+		if (!np_gpu_buffer_acquire_host_read(reference.gpu)) return false;
+	} else {
+		np_shm_texture_begin_host_read(reference.shm);
+	}
+	presentation->references[presentation->reference_count++] = reference;
+	return true;
+}
+#endif
 
 enum np_scene_build_result np_scene_hold_current(
 	struct np_surface *surface, uint32_t presentation_id, int *wait_fd)
 {
 	if (wait_fd) *wait_fd = -1;
+#ifdef NP_REMOTE
 	if (!surface || !presentation_id || !surface->has_published)
 		return NP_SCENE_INVALID;
 	return NP_SCENE_READY;
+#else
+	if (!surface || !presentation_id ||
+	    (!surface->current_gpu && !surface->current_shm))
+		return NP_SCENE_INVALID;
+	struct np_scene_presentation *presentation = calloc(1, sizeof(*presentation));
+	if (!presentation) return NP_SCENE_NO_MEMORY;
+	wl_list_init(&presentation->link);
+	presentation->id = presentation_id;
+	struct np_scene_reference reference;
+	if (surface->current_gpu) {
+		reference.kind = NP_SCENE_GPU;
+		reference.gpu = surface->current_gpu;
+	} else {
+		reference.kind = NP_SCENE_SHM;
+		reference.shm = surface->current_shm;
+	}
+	if (!retain_reference(presentation, reference)) {
+		free(presentation);
+		return NP_SCENE_INVALID;
+	}
+	wl_list_insert(&surface->scene_presentations, &presentation->link);
+	return NP_SCENE_READY;
+#endif
 }
 
 enum np_scene_build_result np_scene_build(
@@ -340,10 +447,27 @@ enum np_scene_build_result np_scene_build(
 		return collected == NP_SCENE_READY ? NP_SCENE_INVALID : collected;
 	}
 
+#ifndef NP_REMOTE
+	struct np_scene_presentation *presentation = calloc(1, sizeof(*presentation));
+	if (!presentation) return NP_SCENE_NO_MEMORY;
+	wl_list_init(&presentation->link);
+	presentation->id = presentation_id;
+	for (uint32_t i = 0; i < count; i++) {
+		if (!retain_reference(presentation, items[i].reference)) {
+			release_references(presentation);
+			free(presentation);
+			return NP_SCENE_INVALID;
+		}
+	}
+#endif
 
 	size_t size = NP_SCENE_HEADER_SIZE + (size_t)count * NP_SCENE_LAYER_SIZE;
 	unsigned char *bytes = calloc(1, size);
 	if (!bytes) {
+#ifndef NP_REMOTE
+		release_references(presentation);
+		free(presentation);
+#endif
 		return NP_SCENE_NO_MEMORY;
 	}
 	memcpy(bytes, NP_SCENE_MAGIC, 4);
@@ -389,6 +513,9 @@ enum np_scene_build_result np_scene_build(
 		put_f32(layer + 80, 1.0f);
 	}
 
+#ifndef NP_REMOTE
+	wl_list_insert(&root->scene_presentations, &presentation->link);
+#endif
 	packet->data = bytes;
 	packet->size = size;
 	return NP_SCENE_READY;
@@ -396,13 +523,39 @@ enum np_scene_build_result np_scene_build(
 
 void np_scene_presented(struct np_surface *root, uint32_t presentation_id)
 {
+#ifdef NP_REMOTE
 	(void)root;
 	(void)presentation_id;
+#else
+	if (!root || !presentation_id) return;
+	struct np_scene_presentation *presentation, *tmp;
+	wl_list_for_each_safe(presentation, tmp, &root->scene_presentations, link) {
+		if (presentation->id != presentation_id) continue;
+		if (np_trace_enabled())
+			fprintf(stderr,
+			        "[scene] release surface=%u present=%u references=%u\n",
+			        root->id, presentation_id, presentation->reference_count);
+		wl_list_remove(&presentation->link);
+		release_references(presentation);
+		free(presentation);
+		return;
+	}
+#endif
 }
 
 void np_scene_discard_presentations(struct np_surface *surface)
 {
+#ifdef NP_REMOTE
 	(void)surface;
+#else
+	if (!surface) return;
+	struct np_scene_presentation *presentation, *tmp;
+	wl_list_for_each_safe(presentation, tmp, &surface->scene_presentations, link) {
+		wl_list_remove(&presentation->link);
+		release_references(presentation);
+		free(presentation);
+	}
+#endif
 }
 
 void np_scene_destroy(struct np_surface *surface)

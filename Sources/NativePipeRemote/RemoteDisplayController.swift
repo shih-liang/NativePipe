@@ -9,6 +9,7 @@ public final class RemoteDisplayController {
     public let session: RemoteSession
     public let frames: RemoteFrameSource
     public let bridge: WindowBridge
+    public var onStateChange: ((RemoteSession.State) -> Void)?
 
     public init(
         host: String = "127.0.0.1",
@@ -38,12 +39,18 @@ public final class RemoteDisplayController {
                     self?.bridge.closeAll()
                     self?.frames.removeAll()
                 }
+                self?.onStateChange?(state)
             }
         }
     }
 
-    public func connect() throws {
-        try session.connect()
+    public func connect() async throws {
+        // A caller may replace a live transport without waiting for EOF. Drop
+        // the previous transport generation's authoritative window state
+        // before the new compositor replays its own state after channelReady.
+        bridge.closeAll()
+        frames.removeAll()
+        try await session.connect()
     }
 
     public func disconnect() {

@@ -1,0 +1,16 @@
+#!/sbin/openrc-run
+
+description="NativePipe empty session (autologin compositor)"
+command="/usr/libexec/nativepipe/nativepipe-session"
+command_background=true
+pidfile="/run/nativepipe-session.pid"
+output_log="/var/log/nativepipe-session.log"
+error_log="/var/log/nativepipe-session.log"
+supervisor="supervise-daemon"
+respawn_delay=2
+
+depend() {
+	need localmount
+	after nativepipe-guestd
+	before net
+}

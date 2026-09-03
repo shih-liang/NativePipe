@@ -1,5 +1,7 @@
 #include "decoration.h"
 #include "compositor_internal.h"
+#include "window_events.h"
+#include "windowwire.h"
 #include "xdg-decoration-server-protocol.h"
 
 #include <wayland-server-core.h>
@@ -14,10 +16,13 @@ static void send_host_mode(struct np_surface *surface, bool server_side)
 
 	surface->decoration_negotiated = true;
 	surface->decoration_server_side = server_side;
-	cJSON *body = cJSON_CreateObject();
-	cJSON_AddNumberToObject(body, "window", surface->window_id);
-	cJSON_AddBoolToObject(body, "serverSide", server_side);
-	np_host_send(&surface->server->host, "decorationModeChanged", body);
+	struct np_window_message message;
+	np_window_message_init(&message, NP_WINDOW_GUEST_TO_HOST,
+	                       NP_GUEST_DECORATION_MODE_CHANGED);
+	np_window_put_u32(&message, surface->window_id);
+	np_window_put_bool(&message, server_side);
+	(void)np_window_event_send_message(surface->server, &message);
+	np_window_message_clear(&message);
 }
 
 void np_decoration_use_client_default(struct np_surface *surface)

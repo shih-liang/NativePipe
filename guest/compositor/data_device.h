@@ -1,6 +1,8 @@
 #ifndef NATIVEPIPE_DATA_DEVICE_H
 #define NATIVEPIPE_DATA_DEVICE_H
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <wayland-util.h>
 
@@ -16,7 +18,9 @@ void np_data_send_selection(struct np_server *server,
 void np_data_serve_host_request(struct np_server *server, uint32_t token,
                                 const char *mime_type);
 void np_data_deliver_host_data(struct np_server *server, uint32_t token,
-                               const char *base64);
+                               const unsigned char *bytes, size_t length,
+                               bool present);
+void np_data_host_disconnected(struct np_server *server);
 void np_data_drag_leave(struct np_server *server, uint32_t window_id);
 void np_data_drag_enter(struct np_server *server, struct np_surface *surface,
                         wl_fixed_t x, wl_fixed_t y);

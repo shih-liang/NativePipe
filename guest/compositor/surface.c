@@ -7,7 +7,6 @@
 #include "scene.h"
 #include "syncobj.h"
 #include "window_events.h"
-#include "xwayland.h"
 #include "xdg_shell.h"
 
 #include <stdio.h>
@@ -27,13 +26,11 @@ struct np_surface *np_surface_by_window(struct np_server *server, uint32_t windo
 }
 
 bool np_surface_is_toplevel(const struct np_surface *surface) {
-	return surface && (surface->toplevel ||
-	       (surface->xwayland_window && !surface->xwayland_popup));
+	return surface && surface->toplevel;
 }
 
 bool np_surface_is_popup(const struct np_surface *surface) {
-	return surface && (surface->popup ||
-	       (surface->xwayland_window && surface->xwayland_popup));
+	return surface && surface->popup;
 }
 
 struct np_surface *np_surface_by_id(struct np_server *server, uint32_t surface_id) {
@@ -88,6 +85,10 @@ static void surface_damage(struct wl_client *client, struct wl_resource *resourc
                            int32_t x, int32_t y, int32_t width, int32_t height) {
 	struct np_surface *surface = wl_resource_get_user_data(resource);
 	np_box_union(&surface->pending_surface_damage, x, y, width, height);
+	if (np_trace_enabled())
+		fprintf(stderr,
+		        "[damage] surface=%u space=surface rect=%d,%d %dx%d\n",
+		        surface->id, x, y, width, height);
 }
 
 
@@ -150,6 +151,10 @@ static void surface_damage_buffer(struct wl_client *client, struct wl_resource *
                                   int32_t x, int32_t y, int32_t width, int32_t height) {
 	struct np_surface *surface = wl_resource_get_user_data(resource);
 	np_box_union(&surface->pending_buffer_damage, x, y, width, height);
+	if (np_trace_enabled())
+		fprintf(stderr,
+		        "[damage] surface=%u space=buffer rect=%d,%d %dx%d\n",
+		        surface->id, x, y, width, height);
 }
 
 static void surface_offset(struct wl_client *client, struct wl_resource *resource,
@@ -182,7 +187,6 @@ static const struct wl_surface_interface surface_implementation = {
 static void surface_resource_destroy(struct wl_resource *resource) {
 	struct np_surface *surface = wl_resource_get_user_data(resource);
 	if (!surface) return;
-	np_xwayland_surface_destroyed(surface->server, surface);
 
 	/* A client disconnect destroys all of its protocol resources, but libwayland
 	 * does not promise that role objects are destroyed before wl_surface.  Every
@@ -243,8 +247,9 @@ static void surface_resource_destroy(struct wl_resource *resource) {
 	np_window_event_send(surface->server, NP_GUEST_SURFACE_DESTROYED,
 	                     destroyed_fields, 1);
 	if (surface->pending_frame) {
-		cJSON_Delete(surface->pending_frame);
+		free(surface->pending_frame);
 		surface->pending_frame = NULL;
+		surface->pending_frame_size = 0;
 	}
 	np_presentation_clear_scene_wait(surface);
 	np_xdg_clear_configures(surface);
@@ -261,10 +266,6 @@ static void surface_resource_destroy(struct wl_resource *resource) {
 	}
 	np_presentation_set_current_buffer(surface, NULL, NULL, NULL);
 	np_syncobj_surface_destroyed(surface);
-	if (surface->encoder) {
-		np_encoder_destroy(surface->encoder);
-		surface->encoder = NULL;
-	}
 	free(surface->title);
 	free(surface->app_id);
 	surface->title = surface->app_id = NULL;
@@ -272,6 +273,13 @@ static void surface_resource_destroy(struct wl_resource *resource) {
 	np_region_fini(&surface->input_region);
 	np_region_fini(&surface->pending_opaque_region);
 	np_region_fini(&surface->opaque_region);
+#ifdef NP_REMOTE
+	if (surface->encoder) {
+		np_encoder_destroy(surface->encoder);
+		surface->encoder = NULL;
+	}
+#endif
+	np_scene_destroy(surface);
 	wl_list_remove(&surface->link);
 	free(surface);
 }
@@ -315,7 +323,6 @@ static void compositor_create_surface(struct wl_client *client, struct wl_resour
 	wl_resource_set_implementation(surface->resource, &surface_implementation, surface,
 	                               surface_resource_destroy);
 	wl_list_insert(&server->surfaces, &surface->link);
-	np_xwayland_surface_created(server, surface);
 
 	// A surface learns integer buffer scale from the outputs it has entered.
 	// Advertising wl_output.scale without enter leaves GTK/Qt with no applicable

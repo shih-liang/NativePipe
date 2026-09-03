@@ -239,14 +239,39 @@ final class MediaWireSmokeTests: XCTestCase {
     }
 
     func testWindowChannelReadyRoundTrip() throws {
-        let event = Windowing.GuestEvent.channelReady(sessionID: 42, protocolVersion: 1)
-        let data = try JSONEncoder().encode(event)
-        let decoded = try JSONDecoder().decode(Windowing.GuestEvent.self, from: data)
+        var data = Data(WindowWire.lifecycleMagic)
+        data.append(contentsOf: [1, 1, 0, 0])
+        append(UInt32(42), to: &data)
+        append(WindowWire.windowProtocolVersion, to: &data)
+        let decoded = try WindowWire.guestEvent(from: data)
         guard case .channelReady(let sessionID, let protocolVersion) = decoded else {
             return XCTFail("not a channel-ready event")
         }
         XCTAssertEqual(sessionID, 42)
-        XCTAssertEqual(protocolVersion, 1)
+        XCTAssertEqual(protocolVersion, WindowWire.windowProtocolVersion)
+    }
+
+    func testWindowChannelReadyRejectsWrongProtocolVersion() {
+        var data = Data(WindowWire.lifecycleMagic)
+        data.append(contentsOf: [1, 1, 0, 0])
+        append(UInt32(42), to: &data)
+        append(WindowWire.windowProtocolVersion + 1, to: &data)
+        XCTAssertThrowsError(try WindowWire.guestEvent(from: data)) {
+            XCTAssertEqual($0 as? WindowWire.DecodeError, .malformed)
+        }
+    }
+
+    func testControlAndClipboardCommandsAreBinary() throws {
+        let close = try WindowWire.commandPayload(for: .close(window: 42))
+        XCTAssertEqual(Array(close.prefix(4)), WindowWire.lifecycleMagic)
+        XCTAssertEqual(close[4], 2)
+        XCTAssertEqual(close[5], 2)
+
+        let bytes = Data([0, 1, 2, 0xff])
+        let selection = try WindowWire.commandPayload(for: .hostSelectionData(
+            token: 7, mimeType: "application/octet-stream", data: bytes))
+        XCTAssertFalse(String(decoding: selection, as: UTF8.self).contains("base64"))
+        XCTAssertTrue(selection.suffix(bytes.count).elementsEqual(bytes))
     }
 
     func testMediaDemuxerRejectsOversizedFrameAndResynchronizes() {
