@@ -16,7 +16,7 @@ import Foundation
 ///     NPRZ  resize        id(u64) cols(u32) rows(u32)
 ///     NPLN  launch        id(u64) LaunchSpec
 ///     NPRU  run           id(u64) LaunchSpec
-///     NPXC  exec          id(u64) cols(u32) rows(u32) LaunchSpec
+///     NPXC  exec          id(u64) cols(u32) rows(u32) terminal(u32) LaunchSpec
 ///     NPRE  read path     id(u64) path_len(u16) path
 ///     NPWR  write path    id(u64) path(str) mode(u32) size(u64) bytes
 ///     NPCT  list continue id(u64)
@@ -186,11 +186,12 @@ public enum ControlWire {
             append(id, to: &payload)
             appendLaunchSpec(spec, to: &payload)
             return payload
-        case .exec(let spec, let cols, let rows):
+        case .exec(let spec, let cols, let rows, let terminal):
             var payload = Data(execMagic)
             append(id, to: &payload)
             append(UInt32(clamping: cols), to: &payload)
             append(UInt32(clamping: rows), to: &payload)
+            append(terminal ? UInt32(1) : UInt32(0), to: &payload)
             appendLaunchSpec(spec, to: &payload)
             return payload
         case .readPath(let path):

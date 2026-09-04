@@ -27,9 +27,9 @@ public struct Request: Sendable {
         /// Run a command to completion and return status + captured output.
         case run(spec: LaunchSpec)
 
-        /// Interactive PTY exec. Guest allocates a PTY, starts the process, and
-        /// accepts one vsock connection from the dedicated session port range.
-        case exec(spec: LaunchSpec, cols: Int, rows: Int)
+        /// Streaming exec. Interactive callers request a PTY; redirected callers
+        /// use a byte-clean socket so EOF and arbitrary binary stdin survive.
+        case exec(spec: LaunchSpec, cols: Int, rows: Int, terminal: Bool)
 
         /// Read a guest file (raw bytes) or list one directory level.
         case readPath(path: String)
