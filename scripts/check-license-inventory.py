@@ -57,7 +57,7 @@ def main() -> None:
     if not isinstance(entries, list):
         fail("entries must be an array")
     by_id = {entry.get("id"): entry for entry in entries if isinstance(entry, dict)}
-    required = {"nativepipe-original", "wayland-generated-protocols", "xwayland-satellite"}
+    required = {"nativepipe-original", "wayland-generated-protocols"}
     if set(by_id) != required:
         fail(f"expected exactly {sorted(required)}, found {sorted(str(key) for key in by_id)}")
 
@@ -70,66 +70,7 @@ def main() -> None:
     protocols = by_id["wayland-generated-protocols"]
     if protocols.get("licenseExpression") != "MIT":
         fail("Wayland protocol sources must retain their embedded MIT notices")
-    xwayland = by_id["xwayland-satellite"]
-    if xwayland.get("licenseExpression") != "MPL-2.0":
-        fail("xwayland-satellite must remain MPL-2.0")
-    expected_xwayland_artifacts = [
-        "guest/xwayland-satellite/dist/xwayland-satellite-*-gnu",
-        "guest/xwayland-satellite/dist/xwayland-satellite-*-musl",
-        "guest/xwayland-satellite/dist/xwayland-satellite-*-gnu.third-party-licenses.txt",
-        "guest/xwayland-satellite/dist/xwayland-satellite-*-musl.third-party-licenses.txt",
-    ]
-    if xwayland.get("releaseArtifactPaths") != expected_xwayland_artifacts:
-        fail("xwayland-satellite release binaries must be explicitly attributed")
-    locked = xwayland.get("lockedCargoAndRustLicenses")
-    if not isinstance(locked, dict):
-        fail("xwayland-satellite locked Cargo/Rust license policy is missing")
-    if locked.get("generator") != "scripts/generate-xwayland-license-notice.py":
-        fail("xwayland-satellite license notice generator is not pinned")
-    if locked.get("rustVersion") != "1.89.0":
-        fail("xwayland-satellite Rust standard-library license version is not pinned")
-    if locked.get("rustStandardLibraryLicenseExpression") != "MIT OR Apache-2.0":
-        fail("Rust standard-library license expression is unresolved")
-    policy = str(locked.get("policy", ""))
-    if "non-NOASSERTION" not in policy or "distribution COPYRIGHT" not in policy:
-        fail("xwayland-satellite Cargo/Rust license collection policy is incomplete")
-    expected_embedded_assets = [
-        {
-            "path": "OpenSans-Regular.ttf",
-            "sha256": "33e93bec67d91c396876db50694213802a39e43a911bb5c22322f0dbdf4d5e43",
-            "licenseExpression": "OFL-1.1",
-            "notice": (
-                "Open Sans 3.003; copyright 2020 The Open Sans Project Authors. "
-                "The font's embedded name table declares SIL Open Font License 1.1 "
-                "and the exact OFL-1.1 text is bundled in each generated third-party notice."
-            ),
-        },
-        {
-            "path": "wl_drm/src/drm.xml",
-            "licenseExpression": "MIT",
-            "notice": (
-                "The generator extracts and bundles the copyright and permission "
-                "notice embedded in the pinned protocol XML."
-            ),
-        },
-    ]
-    if locked.get("embeddedAssets") != expected_embedded_assets:
-        fail("xwayland-satellite embedded font/protocol license policy is incomplete")
-    generator = ROOT / str(locked["generator"])
-    if not generator.is_file():
-        fail("xwayland-satellite license notice generator is missing")
-    commit_file = ROOT / str(xwayland.get("sourceCommitFile", ""))
-    try:
-        upstream_commit = commit_file.read_text(encoding="utf-8").strip()
-    except OSError as error:
-        fail(f"cannot read xwayland-satellite upstream commit: {error}")
-    if len(upstream_commit) != 40 or any(c not in "0123456789abcdef" for c in upstream_commit):
-        fail("xwayland-satellite upstream commit must be a lowercase full Git hash")
-
-    for required_policy_path in (
-        ".github/workflows/build-linux.yml",
-        "scripts/generate-xwayland-license-notice.py",
-    ):
+    for required_policy_path in (".github/workflows/build-linux.yml",):
         matches = [entry["id"] for entry in entries if matched(required_policy_path, entry)]
         if matches != ["nativepipe-original"]:
             fail(f"release policy provenance is missing or ambiguous: {required_policy_path}")
@@ -140,13 +81,6 @@ def main() -> None:
     for relative in license_files:
         if not isinstance(relative, str) or not (ROOT / relative).is_file():
             fail(f"missing release license file: {relative!r}")
-    mpl = (ROOT / str(xwayland["licenseFile"])).read_text(encoding="utf-8")
-    if "Mozilla Public License Version 2.0" not in mpl or "Exhibit A" not in mpl:
-        fail("xwayland-satellite MPL-2.0 text is incomplete")
-    ofl = (ROOT / "LICENSES/OFL-1.1.txt").read_text(encoding="utf-8")
-    if "SIL OPEN FONT LICENSE Version 1.1" not in ofl or "PERMISSION & CONDITIONS" not in ofl:
-        fail("Open Sans OFL-1.1 text is incomplete")
-
     uncovered: list[str] = []
     ambiguous: list[str] = []
     for path in source_files():

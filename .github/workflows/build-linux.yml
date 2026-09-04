@@ -24,22 +24,22 @@ jobs:
             docker_architecture: arm64
             libc: gnu
             runner: ubuntu-24.04-arm
-            image: rust:1.89.0-bookworm
+            image: debian:bookworm-slim
           - architecture: aarch64
             docker_architecture: arm64
             libc: musl
             runner: ubuntu-24.04-arm
-            image: rust:1.89.0-alpine3.22
+            image: alpine:3.22
           - architecture: x86_64
             docker_architecture: amd64
             libc: gnu
             runner: ubuntu-24.04
-            image: rust:1.89.0-bookworm
+            image: debian:bookworm-slim
           - architecture: x86_64
             docker_architecture: amd64
             libc: musl
             runner: ubuntu-24.04
-            image: rust:1.89.0-alpine3.22
+            image: alpine:3.22
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -62,25 +62,18 @@ jobs:
                 export DEBIAN_FRONTEND=noninteractive
                 apt-get update
                 apt-get install -y --no-install-recommends \
-                  build-essential pkg-config git ca-certificates patch file python3 libclang-dev \
+                  build-essential pkg-config \
                   libwayland-dev wayland-protocols libxkbcommon-dev \
-                  libvulkan-dev libdrm-dev libegl1-mesa-dev libgles2-mesa-dev \
-                  libgbm-dev libavcodec-dev libavutil-dev libswscale-dev \
-                  libxcb1-dev libxcb-xfixes0-dev libxcb-randr0-dev \
-                  libxcb-render0-dev libxcb-shape0-dev libxcb-composite0-dev \
-                  libxcb-res0-dev libxcb-cursor-dev
+                  libvulkan-dev libdrm-dev
               else
                 apk add --no-cache \
-                  build-base pkgconf git ca-certificates patch file python3 linux-headers clang-dev \
+                  build-base pkgconf linux-headers \
                   wayland-dev wayland-protocols libxkbcommon-dev \
-                  vulkan-loader-dev vulkan-headers libdrm-dev mesa-dev ffmpeg-dev \
-                  libxcb-dev xcb-util-cursor-dev
+                  vulkan-loader-dev vulkan-headers libdrm-dev
               fi
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-remote-transport
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" dist-vmpipe
               make -C guest/session ARCH="$ARCH" LIBC="$LIBC" dist-target
-              make -C guest/xwayland-satellite ARCH="$ARCH" LIBC="$LIBC" test
-              make -C guest/xwayland-satellite ARCH="$ARCH" LIBC="$LIBC" dist-target
             '
 
       - name: Collect checkout-shaped output
@@ -100,12 +93,6 @@ jobs:
           install -Dm0755 \
             "guest/session/dist/nativepipe-vulkan-layer-$ARCHITECTURE-$LIBC.so" \
             "$root/guest/session/dist/nativepipe-vulkan-layer-$ARCHITECTURE-$LIBC.so"
-          install -Dm0755 \
-            "guest/xwayland-satellite/dist/xwayland-satellite-$ARCHITECTURE-$LIBC" \
-            "$root/guest/xwayland-satellite/dist/xwayland-satellite-$ARCHITECTURE-$LIBC"
-          install -Dm0644 \
-            "guest/xwayland-satellite/dist/xwayland-satellite-$ARCHITECTURE-$LIBC.third-party-licenses.txt" \
-            "$root/guest/xwayland-satellite/dist/xwayland-satellite-$ARCHITECTURE-$LIBC.third-party-licenses.txt"
           install -Dm0755 \
             "guest/compositor/dist/vmpipe-wayland-$ARCHITECTURE-$LIBC" \
             "$root/guest/compositor/dist/vmpipe-wayland-$ARCHITECTURE-$LIBC"
@@ -144,10 +131,9 @@ jobs:
             mkdir -p "$root"
             cp -R ".release-input/nativepipe-linux-$architecture-gnu/." "$root/"
             cp -R ".release-input/nativepipe-linux-$architecture-musl/." "$root/"
-            mkdir -p "$root/guest/session" "$root/guest/xwayland-satellite"
+            mkdir -p "$root/guest/session"
             cp -R guest/session/implicit_layer guest/session/openrc \
               guest/session/profile.d guest/session/systemd "$root/guest/session/"
-            cp guest/xwayland-satellite/VERSION "$root/guest/xwayland-satellite/"
             cp -R LICENSES "$root/LICENSES"
             tar -C "$root" -czf "release/nativepipe-linux-$architecture.tar.gz" .
           done

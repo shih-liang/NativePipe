@@ -1,4 +1,4 @@
-// Lazy X socket activation for the externally built xwayland-satellite.
+// Lazy X socket activation for the distribution-provided xwayland-satellite.
 
 #define _GNU_SOURCE
 
@@ -23,7 +23,7 @@
 #include <unistd.h>
 #include <wayland-server-core.h>
 
-#define XWAYLAND_SATELLITE_PATH "/usr/libexec/nativepipe/xwayland-satellite"
+#define XWAYLAND_SATELLITE_NAME "xwayland-satellite"
 
 struct np_xwayland {
 	struct np_server *server;
@@ -35,6 +35,30 @@ struct np_xwayland {
 	struct wl_event_source *sigchld_source;
 	pid_t pid;
 };
+
+static bool executable_in_path(const char *name)
+{
+	const char *path = getenv("PATH");
+	if (!name || !name[0]) return false;
+	if (!path || !path[0]) path = "/usr/local/bin:/usr/bin:/bin";
+	char *copy = strdup(path);
+	if (!copy) return false;
+	bool found = false;
+	char *save = NULL;
+	for (char *directory = strtok_r(copy, ":", &save); directory;
+	     directory = strtok_r(NULL, ":", &save)) {
+		char candidate[4096];
+		int length = snprintf(candidate, sizeof(candidate), "%s/%s",
+		                      directory, name);
+		if (length > 0 && length < (int)sizeof(candidate) &&
+		    access(candidate, X_OK) == 0) {
+			found = true;
+			break;
+		}
+	}
+	free(copy);
+	return found;
+}
 
 static bool write_all(int fd, const void *bytes, size_t length)
 {
@@ -233,7 +257,7 @@ static int start_satellite(int fd, uint32_t mask, void *data)
 		snprintf(listen1, sizeof(listen1), "%d", xw->listen_fd[1]);
 		setenv("WAYLAND_DISPLAY", xw->server->session_socket, 1);
 		unsetenv("WAYLAND_SOCKET");
-		execl(XWAYLAND_SATELLITE_PATH, "xwayland-satellite",
+		execlp(XWAYLAND_SATELLITE_NAME, XWAYLAND_SATELLITE_NAME,
 		      xw->server->xwayland_display,
 		      "-auth", xw->auth_path,
 		      "-nolisten", "tcp",
@@ -288,7 +312,7 @@ static int sigchld_received(int signal_number, void *data)
 
 bool np_xwayland_init(struct np_server *server)
 {
-	if (!server || access(XWAYLAND_SATELLITE_PATH, X_OK) < 0) return false;
+	if (!server || !executable_in_path(XWAYLAND_SATELLITE_NAME)) return false;
 	struct np_xwayland *xw = calloc(1, sizeof(*xw));
 	if (!xw) return false;
 	xw->server = server;

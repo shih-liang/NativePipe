@@ -31,12 +31,10 @@ input, clipboard and Wayland drag-and-drop, decorations, viewport and output
 scale, damage, presentation feedback, frame callbacks, and
 `wp_fifo_manager_v1`.
 
-Rootless X11 support is a pinned xwayland-satellite v0.8.2 source build. Its
-upstream commit is recorded in `guest/xwayland-satellite/UPSTREAM_COMMIT`; the
-checked-in patch only drops a pointer leave that has no corresponding forwarded
-enter. The normal test target runs deterministic Rust library tests. The
-separate `test-integration` target starts a real Xwayland server and belongs on
-an isolated graphical test host.
+Rootless X11 uses the guest distribution's `xwayland-satellite` and Xwayland
+packages. NativePipe neither fetches nor builds that Rust project. The
+compositor finds `xwayland-satellite` through the session `PATH`, starts it only
+when an X11 client connects, and leaves X11 disabled when the package is absent.
 
 For NativePipe, one immutable media resource represents each committed frame.
 The SSH channels carry binary NPIP window/scene messages and NPEN H.264 frames
@@ -115,20 +113,18 @@ The important targets are:
 make -C guest/compositor remote
 make -C guest/compositor vmpipe
 make -C guest/session dist-target
-make -C guest/xwayland-satellite test
-make -C guest/xwayland-satellite dist-target
 ```
 
 The compositor needs Wayland, xkbcommon, and Vulkan headers. The remote backend
 also needs EGL/GLES, GBM, DRM, and FFmpeg development packages. The session
-helpers need DRM and Vulkan headers. xwayland-satellite fetches only its pinned
-commit and builds with Cargo's checked-in lock file.
+helpers need DRM and Vulkan headers. Rootless X11 additionally requires the
+distribution packages `xwayland-satellite` and Xwayland at runtime.
 
 ## Linux Actions artifacts and releases
 
-`.github/workflows/build-linux.yml` builds the VM compositor, session helpers,
-and xwayland-satellite for aarch64/x86_64 and GNU/musl. Every successful run
-uploads four checkout-shaped artifacts:
+`.github/workflows/build-linux.yml` builds the VM compositor and session helpers
+for aarch64/x86_64 and GNU/musl. Every successful run uploads four
+checkout-shaped artifacts:
 
 ```text
 nativepipe-linux-aarch64-gnu
@@ -152,10 +148,8 @@ publishing the release.
 
 `LICENSES/source-inventory.json` records checked-in source origins. Wayland XML
 and generated protocol sources retain their embedded MIT notices.
-xwayland-satellite and its derivative patch retain MPL-2.0. Each Actions-built
-xwayland-satellite binary has a sibling `*.third-party-licenses.txt` generated
-from the pinned Cargo dependency graph, Rust distribution notices, Open Sans,
-and the bundled `wl_drm` protocol.
+The guest distribution, rather than NativePipe, distributes and updates
+xwayland-satellite and its license notices.
 
 Project-original integration files remain
 `LicenseRef-NativePipe-Original`: publishing the repository does not itself
