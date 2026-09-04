@@ -25,9 +25,9 @@ hash_file()
 
 (
 	cd "$ROOT"
-	for file in ./*.c ./*.h ./*.xml ./Makefile ./source-hash.sh; do
-		[ -f "$file" ] && printf '%s\n' "$file"
-	done | LC_ALL=C sort |
+	find . ../encoder -type f \( -name '*.c' -o -name '*.h' -o -name '*.xml' \
+		-o -name Makefile -o -name source-hash.sh \) \
+		! -path './.build/*' ! -path './dist/*' | LC_ALL=C sort |
 	while IFS= read -r file; do
 		printf '%s  %s\n' "$(hash_file "$file")" "$file"
 	done

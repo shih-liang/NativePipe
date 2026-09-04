@@ -1,13 +1,9 @@
 #ifndef NP_COMPOSITOR_INTERNAL_H
 #define NP_COMPOSITOR_INTERNAL_H
 
+#include "backend.h"
 #include "damage.h"
-#include "hostlink.h"
 #include "region.h"
-#ifdef NP_REMOTE
-#include "medialink.h"
-#include "../encoder/encoder.h"
-#endif
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -34,20 +30,11 @@ struct np_server {
 	struct wl_display *display;
 	struct wl_list surfaces;
 	struct wl_list shm_textures;
-	/* Guest-to-host events remain on `host`. Host-to-guest paths use separate
-	 * sockets so vsock credit and a slow writer cannot couple unrelated Wayland
-	 * lifetimes. Remote TCP keeps its existing single control stream. */
-	struct np_host host;
-#ifndef NP_REMOTE
-	struct np_host host_control;
-	struct np_host host_input;
-	struct np_host host_feedback;
-#else
-	struct np_media media;
-	uint32_t next_media_resource_id;
-#endif
+	/* The selected backend is fixed by the linked np_backend_run symbol.  Its
+	 * transport, GPU/encoder and event-source state never leaks into Wayland
+	 * protocol state. */
+	void *backend_state;
 	bool host_session_ready;
-	int drm_fd;
 	uint32_t next_id;
 	uint32_t next_presentation_id;
 	int output_scale;
@@ -89,27 +76,7 @@ struct np_server {
 	struct wl_resource *cursor_surface;
 	int32_t cursor_hotspot_x, cursor_hotspot_y;
 	uint32_t drag_focus_surface;
-	struct wl_event_source *host_connection_source;
-#ifdef NP_REMOTE
-	struct wl_event_source *media_connection_source;
-	struct wl_event_source *remote_pair_timeout_source;
-	int watched_media_fd;
-	uint64_t watched_media_generation;
-#endif
 	struct wl_event_source *scene_retry_timer;
-	int watched_host_fd;
-	uint32_t watched_host_mask;
-#ifndef NP_REMOTE
-	struct wl_event_source *host_control_connection_source;
-	struct wl_event_source *host_input_connection_source;
-	struct wl_event_source *host_feedback_connection_source;
-	int watched_host_control_fd;
-	int watched_host_input_fd;
-	int watched_host_feedback_fd;
-	uint32_t watched_host_control_mask;
-	uint32_t watched_host_input_mask;
-	uint32_t watched_host_feedback_mask;
-#endif
 	char session_socket[128];
 	struct np_xwayland *xwayland;
 	char xwayland_display[16];
@@ -146,12 +113,6 @@ struct np_frame_callback {
 struct np_fifo {
 	struct wl_resource *resource;
 	struct np_surface *surface;
-};
-
-enum np_buffer_commit_kind {
-	NP_BUFFER_UNCHANGED,
-	NP_BUFFER_ATTACH,
-	NP_BUFFER_DETACH,
 };
 
 struct np_surface_update {
@@ -410,10 +371,7 @@ struct np_surface {
 	bool has_published;
 	unsigned char *pending_frame;
 	size_t pending_frame_size;
-#ifdef NP_REMOTE
-	struct np_encoder *encoder;
-	uint16_t last_epoch;
-#endif
+	void *backend_surface_state;
 };
 
 bool np_surface_assign_role(struct np_surface *surface,
@@ -460,6 +418,8 @@ uint32_t np_presentation_next_id(struct np_server *server);
 bool np_presentation_bind_callbacks(struct np_surface *surface,
                                     uint32_t presentation_id);
 bool np_presentation_has_unbound_callbacks(struct np_surface *surface);
+void np_presentation_rebind_callbacks(
+	struct np_surface *surface, uint32_t from, uint32_t to);
 void np_presentation_process_presented(struct np_server *server,
                                        uint32_t surface_id,
                                        uint32_t presentation_id);
@@ -475,37 +435,16 @@ void np_presentation_add_viewport(struct np_surface *surface,
                                   struct np_window_frame *frame);
 bool np_presentation_queue_last(struct np_surface *surface,
                                 uint32_t presentation_id);
-bool np_presentation_refresh_current_shm(struct np_surface *surface,
-                                         uint32_t presentation_id,
-                                         const struct np_box *damage);
 void np_presentation_queue_scene(struct np_surface *surface,
                                  uint32_t presentation_id);
-void np_presentation_publish_buffer(struct np_surface *surface,
-                                    struct wl_resource *buffer,
-                                    struct np_gpu_buffer *gpu_buffer,
-                                    enum np_buffer_commit_kind buffer_commit,
-                                    uint32_t presentation_id,
-                                    struct np_sync_point *release_point,
-                                    const struct np_box *damage);
 void np_presentation_set_current_buffer(struct np_surface *surface,
                                         struct wl_resource *buffer,
                                         struct np_gpu_buffer *gpu_buffer,
                                         struct np_sync_point *release_point);
-#ifdef NP_REMOTE
-bool np_presentation_republish_remote(struct np_surface *surface);
-#endif
 
 /* Host transport and command dispatch. */
 bool np_input_handle_host_binary(const unsigned char *payload, size_t length,
                                  void *user_data);
-void np_host_session_reset_readiness(void);
-bool np_host_session_listen(struct np_server *server);
-bool np_host_session_set_socket(struct np_server *server, const char *socket);
-void np_host_session_attach(struct np_server *server,
-                            struct wl_event_loop *loop);
-void np_host_session_sync(struct np_server *server);
-void np_host_session_finish(struct np_server *server);
-
 void np_set_keyboard_focus(struct np_server *server, uint32_t window_id);
 void np_input_clear_pointer_focus_for_drag(struct np_server *server);
 void np_input_restore_pointer_focus_after_drag(struct np_server *server,

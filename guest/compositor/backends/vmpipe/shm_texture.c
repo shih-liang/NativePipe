@@ -1,6 +1,7 @@
 #include "shm_texture.h"
 
 #include "compositor_internal.h"
+#include "shm_texture_internal.h"
 #include "vk_surface_buffer.h"
 
 #include <stdio.h>

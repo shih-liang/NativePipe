@@ -3,7 +3,7 @@
 NativePipe is both the standalone macOS remote-Linux client and the shared
 display, input and transport technology used by FluxWindow. There is one
 Wayland protocol and surface-state implementation in `guest/compositor`; two
-small backends select how frames and events cross the machine boundary:
+concrete backends select how frames and events cross the machine boundary:
 
 - `nativepipe-wayland` uses loopback TCP and H.264/alpha media resources for an
   SSH-forwarded remote Linux machine.
@@ -14,6 +14,14 @@ The standalone client and FluxWindow therefore share commit, damage, popup,
 input, clipboard, drag-and-drop, scaling, presentation, frame-callback, and
 Xwayland semantics.
 They do not carry two copied compositor state machines.
+
+Backend selection happens entirely at link time. Both implementations export
+the same `np_backend_run` symbol, while the shared `main.c` only calls that
+symbol. `vmpipe-wayland` links `backends/vmpipe`; `nativepipe-wayland` links
+`backends/remote`. There is no runtime backend factory, command-line selector,
+or `NP_REMOTE` conditional compilation in the compositor frontend. Transport
+state, imported GPU resources, encoded media state and presentation holds are
+opaque to the shared Wayland server.
 
 ## Display behavior
 
@@ -53,9 +61,9 @@ This produces the standalone `.build/release/nativepipe` command. It is never
 copied into FluxWindow.app or the `nativepipe-runtime` guest archive.
 
 `make test` covers the standalone protocol, windowing, and remote-client stack
-without renderer SDKs. `make test-gpu` additionally enables NativePipeGPU and
-requires the virglrenderer, MoltenVK, and ANGLE/libepoxy SDK prefixes used by
-FluxWindow.
+without renderer SDKs. FluxWindow owns its VZ custom virtio-gpu device and the
+virglrenderer, MoltenVK, and ANGLE/libepoxy integration because those components
+are specific to its VM host process.
 
 The command has no third-party Swift dependencies. VideoToolbox decodes into
 IOSurface-backed BGRA frames and the shared Metal scene renderer composites the

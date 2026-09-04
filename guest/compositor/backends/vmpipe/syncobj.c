@@ -2,6 +2,7 @@
 
 #include "syncobj.h"
 
+#include "backend_internal.h"
 #include "compositor_internal.h"
 #include "dmabuf.h"
 #include "linux-drm-syncobj-v1-server-protocol.h"
@@ -263,7 +264,16 @@ static void manager_import_timeline(
 {
 	struct np_server *server = wl_resource_get_user_data(resource);
 	struct drm_syncobj_handle import = { .fd = fd };
-	int result = ioctl(server->drm_fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &import);
+	struct np_vmpipe_backend *backend = np_vmpipe_backend(server);
+	if (!backend || backend->drm_fd < 0) {
+		close(fd);
+		wl_resource_post_error(
+			resource, WP_LINUX_DRM_SYNCOBJ_MANAGER_V1_ERROR_INVALID_TIMELINE,
+			"DRM device is unavailable");
+		return;
+	}
+	int result = ioctl(
+		backend->drm_fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &import);
 	int import_errno = errno;
 	close(fd);
 	if (result < 0 || !import.handle) {
@@ -279,11 +289,11 @@ static void manager_import_timeline(
 	struct np_sync_timeline *timeline = calloc(1, sizeof(*timeline));
 	if (!timeline) {
 		struct drm_syncobj_destroy destroy = { .handle = import.handle };
-		ioctl(server->drm_fd, DRM_IOCTL_SYNCOBJ_DESTROY, &destroy);
+		ioctl(backend->drm_fd, DRM_IOCTL_SYNCOBJ_DESTROY, &destroy);
 		wl_client_post_no_memory(client);
 		return;
 	}
-	timeline->drm_fd = server->drm_fd;
+	timeline->drm_fd = backend->drm_fd;
 	timeline->handle = import.handle;
 	timeline->references = 1;
 	struct wl_resource *timeline_resource = wl_resource_create(

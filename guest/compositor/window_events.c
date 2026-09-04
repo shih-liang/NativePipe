@@ -1,13 +1,13 @@
 #include "window_events.h"
 
+#include "backend.h"
 #include "compositor_internal.h"
-#include "hostlink.h"
 #include "windowwire.h"
 
 bool np_window_event_send_message(struct np_server *server,
                                   struct np_window_message *message) {
 	if (!server || !message || !message->ok) return false;
-	return np_host_send_binary(&server->host, message->data, message->len);
+	return np_backend_send_binary(server, message->data, message->len);
 }
 
 bool np_window_event_send(struct np_server *server, uint8_t opcode,
@@ -23,7 +23,7 @@ bool np_window_event_send(struct np_server *server, uint8_t opcode,
 		payload[8 + i * 4 + 2] = (unsigned char)(value >> 16);
 		payload[8 + i * 4 + 3] = (unsigned char)(value >> 24);
 	}
-	return np_host_send_binary(&server->host, payload, 8 + count * 4);
+	return np_backend_send_binary(server, payload, 8 + count * 4);
 }
 
 bool np_window_event_send_force_quit_capability(

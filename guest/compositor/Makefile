@@ -1,11 +1,12 @@
-# One Wayland protocol/state core with two transport/render backends:
+# One Wayland frontend with two link-selected transport/render backends. Both
+# backends export np_backend_run; main.c contains no backend selection logic:
 #   vmpipe:    vsock + virtio-gpu/Venus resources
 #   remotepipe: loopback TCP + immutable H.264 media resources
 
 COMMON_PKGS   := wayland-server xkbcommon
 REMOTE_PKGS   := egl glesv2 gbm libdrm libavcodec libavutil libswscale
 CLIENT_PKGS   := wayland-client
-BASE_CFLAGS   := -O2 -Wall -Wextra -Wno-unused-parameter -std=gnu11
+BASE_CFLAGS   := -O2 -Wall -Wextra -Wno-unused-parameter -std=gnu11 -I.
 STRIP         ?= strip
 COMMON_CFLAGS := $(shell pkg-config --cflags $(COMMON_PKGS) 2>/dev/null)
 COMMON_LIBS   := $(shell pkg-config --libs $(COMMON_PKGS) 2>/dev/null) -lm
@@ -43,9 +44,11 @@ GENERATED := xdg-shell-server-protocol.h xdg-shell-client-protocol.h xdg-shell-p
 	fifo-v1-server-protocol.h fifo-v1-protocol.c \
 	linux-drm-syncobj-v1-server-protocol.h linux-drm-syncobj-v1-protocol.c
 
-COMMON_SOURCES := compositor.c surface.c surface_commit.c presentation.c \
+ENTRY_SOURCE := main.c
+
+FRONTEND_SOURCES := compositor.c surface.c surface_commit.c presentation.c \
 	subcompositor.c input.c decoration.c scale.c scene.c region.c perf.c \
-	hostlink.c host_session_common.c windowwire.c window_events.c \
+	windowwire.c window_events.c \
 	xdg_shell.c text_input.c fifo.c \
 	data_device.c cursor_shape.c xwayland.c \
 	cursor-shape-v1-protocol.c xdg-shell-protocol.c viewporter-protocol.c \
@@ -53,12 +56,21 @@ COMMON_SOURCES := compositor.c surface.c surface_commit.c presentation.c \
 	text-input-v3-protocol.c linux-dmabuf-unstable-v1-protocol.c \
 	fifo-v1-protocol.c
 
-VM_SOURCES := host_session_vmpipe.c virtio_resource.c dmabuf.c shm_texture.c \
-	syncobj.c linux-drm-syncobj-v1-protocol.c vk_context.c \
-	vk_surface_buffer.c vmpipe_main.c
+BACKEND_COMMON_SOURCES := hostlink.c host_session_common.c
+COMMON_SOURCES := $(ENTRY_SOURCE) $(FRONTEND_SOURCES) $(BACKEND_COMMON_SOURCES)
 
-REMOTE_SOURCES := host_session_remote.c medialink.c dmabuf_remote.c \
-	dmabuf_egl.c syncobj_stub.c remotepipe_main.c \
+VM_SOURCES := backends/vmpipe/backend.c backends/vmpipe/host_session.c \
+	backends/vmpipe/host_transport.c backends/vmpipe/virtio_resource.c \
+	backends/vmpipe/dmabuf.c backends/vmpipe/shm_texture.c \
+	backends/vmpipe/syncobj.c backends/vmpipe/vk_context.c \
+	backends/vmpipe/vk_surface_buffer.c backends/vmpipe/presentation.c \
+	backends/vmpipe/scene.c linux-drm-syncobj-v1-protocol.c
+
+REMOTE_SOURCES := backends/remote/backend.c backends/remote/host_session.c \
+	backends/remote/host_transport.c backends/remote/medialink.c \
+	backends/remote/dmabuf.c backends/remote/dmabuf_egl.c \
+	backends/remote/syncobj.c backends/remote/shm_texture.c \
+	backends/remote/presentation.c backends/remote/scene.c \
 	../encoder/encoder.c ../encoder/alpha.c
 
 ARCH          ?= $(shell uname -m | sed 's/^arm64$$/aarch64/')
@@ -89,9 +101,10 @@ shmclient: $(SHMCLIENT)
 vkpresent: $(VKPRESENT)
 
 test-remote-transport: | $(BUILD_DIR)
-	$(CC) -O0 -g -Wall -Wextra -Werror -std=gnu11 -DNP_REMOTE \
-		-I. -o $(BUILD_DIR)/remote-transport-test \
-		tests/remote_transport_test.c hostlink.c medialink.c -pthread
+	$(CC) -O0 -g -Wall -Wextra -Werror -std=gnu11 -I. \
+		-Ibackends/remote -o $(BUILD_DIR)/remote-transport-test \
+		tests/remote_transport_test.c hostlink.c \
+		backends/remote/host_transport.c backends/remote/medialink.c -pthread
 	$(BUILD_DIR)/remote-transport-test
 
 print-binary:
@@ -159,13 +172,13 @@ linux-drm-syncobj-v1-protocol.c: $(SYNCOBJ_XML)
 $(REMOTE_BINARY): $(GENERATED) $(COMMON_SOURCES) $(REMOTE_SOURCES) \
 	$(SOURCE_HASH) Makefile | $(BUILD_DIR) check-deps-remote
 	$(CC) $(BASE_CFLAGS) $(COMMON_CFLAGS) $(REMOTE_CFLAGS) \
-		$(SOURCE_DEFINE) -DNP_REMOTE -o $@ \
+		-Ibackends/remote $(SOURCE_DEFINE) -o $@ \
 		$(COMMON_SOURCES) $(REMOTE_SOURCES) $(COMMON_LIBS) $(REMOTE_LIBS)
 
 $(VM_BINARY): $(GENERATED) $(COMMON_SOURCES) $(VM_SOURCES) \
 	$(SOURCE_HASH) Makefile | $(BUILD_DIR) check-deps-vmpipe
 	$(CC) $(BASE_CFLAGS) $(COMMON_CFLAGS) $(VM_CFLAGS) $(VULKAN_CFLAGS) \
-		$(SOURCE_DEFINE) -o $@ \
+		-Ibackends/vmpipe $(SOURCE_DEFINE) -o $@ \
 		$(COMMON_SOURCES) $(VM_SOURCES) $(COMMON_LIBS) $(VULKAN_LIBS)
 
 $(DIST_REMOTE): $(REMOTE_BINARY)

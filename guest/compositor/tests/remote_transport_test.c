@@ -1,5 +1,6 @@
 #include "hostlink.h"
 #include "medialink.h"
+#include "session_pair.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -67,6 +68,8 @@ static void lane_hellos_and_pairing_are_validated(void)
 	memset(&host, 0, sizeof(host));
 	host.listen_fd = -1;
 	host.conn_fd = sockets[0];
+	host.requires_handshake = true;
+	host.replace_unready_peer = true;
 	uint8_t hello[16] = { 'N', 'P', 'R', 'H', 1, 1, 0, 0 };
 	for (unsigned int index = 0; index < 8; index++)
 		hello[8 + index] = (uint8_t)(token >> (index * 8));
@@ -86,6 +89,8 @@ static void lane_hellos_and_pairing_are_validated(void)
 	memset(&host, 0, sizeof(host));
 	host.listen_fd = -1;
 	host.conn_fd = sockets[0];
+	host.requires_handshake = true;
+	host.replace_unready_peer = true;
 	write_hello(sockets[1], 1, token);
 	np_host_pump(&host, count_command, NULL);
 	assert(np_host_connected(&host));
@@ -102,6 +107,8 @@ static void lane_hellos_and_pairing_are_validated(void)
 	memset(&host, 0, sizeof(host));
 	host.listen_fd = -1;
 	host.conn_fd = sockets[0];
+	host.requires_handshake = true;
+	host.replace_unready_peer = true;
 	write_hello(sockets[1], 2, token);
 	np_host_pump(&host, NULL, NULL);
 	assert(host.conn_fd < 0);
@@ -179,6 +186,8 @@ static void half_handshake_can_be_replaced_without_listener_spin(void)
 		return;
 	}
 	host.conn_fd = -1;
+	host.requires_handshake = true;
+	host.replace_unready_peer = true;
 
 	int first_peer = local_dial(path);
 	np_host_accept(&host);

@@ -2,6 +2,8 @@
 
 #define _GNU_SOURCE
 
+#include "backend.h"
+#include "backend_internal.h"
 #include "compositor_internal.h"
 #include "data_device.h"
 #include "host_session_common.h"
@@ -70,10 +72,10 @@ static void unpublish_session_environment(void)
 
 static int host_channel_readable(int fd, uint32_t mask, void *data) {
 	struct np_server *server = data;
-	if (mask & WL_EVENT_WRITABLE) np_host_flush(&server->host);
-	np_host_pump(&server->host, np_input_handle_host_binary, server);
+	if (mask & WL_EVENT_WRITABLE) np_host_flush(&np_vmpipe_backend(server)->host);
+	np_host_pump(&np_vmpipe_backend(server)->host, np_input_handle_host_binary, server);
 	np_presentation_flush(server);
-	np_host_session_sync(server);
+	np_backend_session_sync(server);
 	wl_display_flush_clients(server->display);
 	return 0;
 }
@@ -81,27 +83,27 @@ static int host_channel_readable(int fd, uint32_t mask, void *data) {
 static int host_control_channel_readable(int fd, uint32_t mask, void *data) {
 	struct np_server *server = data;
 	(void)fd;
-	if (mask & WL_EVENT_WRITABLE) np_host_flush(&server->host_control);
-	np_host_pump(&server->host_control, np_input_handle_host_binary, server);
-	np_host_session_sync(server);
+	if (mask & WL_EVENT_WRITABLE) np_host_flush(&np_vmpipe_backend(server)->host_control);
+	np_host_pump(&np_vmpipe_backend(server)->host_control, np_input_handle_host_binary, server);
+	np_backend_session_sync(server);
 	return 0;
 }
 
 static int host_input_channel_readable(int fd, uint32_t mask, void *data) {
 	struct np_server *server = data;
 	(void)fd;
-	if (mask & WL_EVENT_WRITABLE) np_host_flush(&server->host_input);
-	np_host_pump(&server->host_input, np_input_handle_host_binary, server);
-	np_host_session_sync(server);
+	if (mask & WL_EVENT_WRITABLE) np_host_flush(&np_vmpipe_backend(server)->host_input);
+	np_host_pump(&np_vmpipe_backend(server)->host_input, np_input_handle_host_binary, server);
+	np_backend_session_sync(server);
 	return 0;
 }
 
 static int host_feedback_channel_readable(int fd, uint32_t mask, void *data) {
 	struct np_server *server = data;
 	(void)fd;
-	if (mask & WL_EVENT_WRITABLE) np_host_flush(&server->host_feedback);
-	np_host_pump(&server->host_feedback, np_input_handle_host_binary, server);
-	np_host_session_sync(server);
+	if (mask & WL_EVENT_WRITABLE) np_host_flush(&np_vmpipe_backend(server)->host_feedback);
+	np_host_pump(&np_vmpipe_backend(server)->host_feedback, np_input_handle_host_binary, server);
+	np_backend_session_sync(server);
 	return 0;
 }
 
@@ -173,21 +175,21 @@ static void discard_disconnected_host_reads(struct np_server *server) {
 
 static bool all_host_channels_connected(struct np_server *server)
 {
-	if (!np_host_connected(&server->host)) return false;
-	return np_host_connected(&server->host_control) &&
-	       np_host_connected(&server->host_input) &&
-	       np_host_connected(&server->host_feedback);
+	if (!np_host_connected(&np_vmpipe_backend(server)->host)) return false;
+	return np_host_connected(&np_vmpipe_backend(server)->host_control) &&
+	       np_host_connected(&np_vmpipe_backend(server)->host_input) &&
+	       np_host_connected(&np_vmpipe_backend(server)->host_feedback);
 }
 
 static void close_host_session(struct np_server *server)
 {
-	np_host_disconnect(&server->host);
-	np_host_disconnect(&server->host_control);
-	np_host_disconnect(&server->host_input);
-	np_host_disconnect(&server->host_feedback);
+	np_host_disconnect(&np_vmpipe_backend(server)->host);
+	np_host_disconnect(&np_vmpipe_backend(server)->host_control);
+	np_host_disconnect(&np_vmpipe_backend(server)->host_input);
+	np_host_disconnect(&np_vmpipe_backend(server)->host_feedback);
 }
 
-void np_host_session_sync(struct np_server *server) {
+void np_backend_session_sync(struct np_server *server) {
 	bool connected = all_host_channels_connected(server);
 	if (server->host_session_ready && !connected) {
 		server->host_session_ready = false;
@@ -212,20 +214,20 @@ void np_host_session_sync(struct np_server *server) {
 	}
 
 	np_host_session_watch(
-		server, &server->host, &server->host_connection_source,
-		&server->watched_host_fd, &server->watched_host_mask,
+		server, &np_vmpipe_backend(server)->host, &np_vmpipe_backend(server)->host_connection_source,
+		&np_vmpipe_backend(server)->watched_host_fd, &np_vmpipe_backend(server)->watched_host_mask,
 		host_channel_readable);
 	np_host_session_watch(
-		server, &server->host_control, &server->host_control_connection_source,
-		&server->watched_host_control_fd, &server->watched_host_control_mask,
+		server, &np_vmpipe_backend(server)->host_control, &np_vmpipe_backend(server)->host_control_connection_source,
+		&np_vmpipe_backend(server)->watched_host_control_fd, &np_vmpipe_backend(server)->watched_host_control_mask,
 		host_control_channel_readable);
 	np_host_session_watch(
-		server, &server->host_input, &server->host_input_connection_source,
-		&server->watched_host_input_fd, &server->watched_host_input_mask,
+		server, &np_vmpipe_backend(server)->host_input, &np_vmpipe_backend(server)->host_input_connection_source,
+		&np_vmpipe_backend(server)->watched_host_input_fd, &np_vmpipe_backend(server)->watched_host_input_mask,
 		host_input_channel_readable);
 	np_host_session_watch(
-		server, &server->host_feedback, &server->host_feedback_connection_source,
-		&server->watched_host_feedback_fd, &server->watched_host_feedback_mask,
+		server, &np_vmpipe_backend(server)->host_feedback, &np_vmpipe_backend(server)->host_feedback_connection_source,
+		&np_vmpipe_backend(server)->watched_host_feedback_fd, &np_vmpipe_backend(server)->watched_host_feedback_mask,
 		host_feedback_channel_readable);
 }
 
@@ -233,9 +235,9 @@ static int host_listener_readable(int fd, uint32_t mask, void *data) {
 	struct np_server *server = data;
 	(void)fd;
 	(void)mask;
-	np_host_pump(&server->host, np_input_handle_host_binary, server);
+	np_host_pump(&np_vmpipe_backend(server)->host, np_input_handle_host_binary, server);
 	np_presentation_flush(server);
-	np_host_session_sync(server);
+	np_backend_session_sync(server);
 	wl_display_flush_clients(server->display);
 	return 0;
 }
@@ -244,8 +246,8 @@ static int host_control_listener_readable(int fd, uint32_t mask, void *data) {
 	struct np_server *server = data;
 	(void)fd;
 	(void)mask;
-	np_host_pump(&server->host_control, np_input_handle_host_binary, server);
-	np_host_session_sync(server);
+	np_host_pump(&np_vmpipe_backend(server)->host_control, np_input_handle_host_binary, server);
+	np_backend_session_sync(server);
 	return 0;
 }
 
@@ -253,8 +255,8 @@ static int host_input_listener_readable(int fd, uint32_t mask, void *data) {
 	struct np_server *server = data;
 	(void)fd;
 	(void)mask;
-	np_host_pump(&server->host_input, np_input_handle_host_binary, server);
-	np_host_session_sync(server);
+	np_host_pump(&np_vmpipe_backend(server)->host_input, np_input_handle_host_binary, server);
+	np_backend_session_sync(server);
 	return 0;
 }
 
@@ -262,25 +264,25 @@ static int host_feedback_listener_readable(int fd, uint32_t mask, void *data) {
 	struct np_server *server = data;
 	(void)fd;
 	(void)mask;
-	np_host_pump(&server->host_feedback, np_input_handle_host_binary, server);
-	np_host_session_sync(server);
+	np_host_pump(&np_vmpipe_backend(server)->host_feedback, np_input_handle_host_binary, server);
+	np_backend_session_sync(server);
 	return 0;
 }
 
-void np_host_session_reset_readiness(void)
+void np_backend_session_reset_readiness(void)
 {
 	unpublish_session_environment();
 }
 
-bool np_host_session_listen(struct np_server *server)
+bool np_backend_session_listen(struct np_server *server)
 {
-	return np_host_listen(&server->host, NP_WINDOW_EVENT_PORT) &&
-	       np_host_listen(&server->host_control, NP_WINDOW_CONTROL_PORT) &&
-	       np_host_listen(&server->host_input, NP_WINDOW_INPUT_PORT) &&
-	       np_host_listen(&server->host_feedback, NP_WINDOW_FEEDBACK_PORT);
+	return np_host_listen(&np_vmpipe_backend(server)->host, NP_WINDOW_EVENT_PORT) &&
+	       np_host_listen(&np_vmpipe_backend(server)->host_control, NP_WINDOW_CONTROL_PORT) &&
+	       np_host_listen(&np_vmpipe_backend(server)->host_input, NP_WINDOW_INPUT_PORT) &&
+	       np_host_listen(&np_vmpipe_backend(server)->host_feedback, NP_WINDOW_FEEDBACK_PORT);
 }
 
-bool np_host_session_set_socket(struct np_server *server, const char *socket)
+bool np_backend_session_set_socket(struct np_server *server, const char *socket)
 {
 	if (!socket) return false;
 	if (strlen(socket) >= sizeof(server->session_socket)) return false;
@@ -288,23 +290,36 @@ bool np_host_session_set_socket(struct np_server *server, const char *socket)
 	return true;
 }
 
-void np_host_session_attach(struct np_server *server, struct wl_event_loop *loop)
+void np_backend_session_attach(struct np_server *server, struct wl_event_loop *loop)
 {
-	wl_event_loop_add_fd(loop, server->host.listen_fd, WL_EVENT_READABLE,
+	wl_event_loop_add_fd(loop, np_vmpipe_backend(server)->host.listen_fd, WL_EVENT_READABLE,
 	                     host_listener_readable, server);
-	wl_event_loop_add_fd(loop, server->host_control.listen_fd, WL_EVENT_READABLE,
+	wl_event_loop_add_fd(loop, np_vmpipe_backend(server)->host_control.listen_fd, WL_EVENT_READABLE,
 	                     host_control_listener_readable, server);
-	wl_event_loop_add_fd(loop, server->host_input.listen_fd, WL_EVENT_READABLE,
+	wl_event_loop_add_fd(loop, np_vmpipe_backend(server)->host_input.listen_fd, WL_EVENT_READABLE,
 	                     host_input_listener_readable, server);
-	wl_event_loop_add_fd(loop, server->host_feedback.listen_fd, WL_EVENT_READABLE,
+	wl_event_loop_add_fd(loop, np_vmpipe_backend(server)->host_feedback.listen_fd, WL_EVENT_READABLE,
 	                     host_feedback_listener_readable, server);
 }
 
-void np_host_session_finish(struct np_server *server)
+void np_backend_session_finish(struct np_server *server)
 {
-	np_host_finish(&server->host);
-	np_host_finish(&server->host_control);
-	np_host_finish(&server->host_input);
-	np_host_finish(&server->host_feedback);
+	np_host_finish(&np_vmpipe_backend(server)->host);
+	np_host_finish(&np_vmpipe_backend(server)->host_control);
+	np_host_finish(&np_vmpipe_backend(server)->host_input);
+	np_host_finish(&np_vmpipe_backend(server)->host_feedback);
 	unpublish_session_environment();
+}
+
+bool np_backend_connected(const struct np_server *server)
+{
+	struct np_vmpipe_backend *backend = np_vmpipe_backend(server);
+	return backend && np_host_connected(&backend->host);
+}
+
+bool np_backend_send_binary(
+	struct np_server *server, const void *payload, size_t length)
+{
+	struct np_vmpipe_backend *backend = np_vmpipe_backend(server);
+	return backend && np_host_send_binary(&backend->host, payload, length);
 }

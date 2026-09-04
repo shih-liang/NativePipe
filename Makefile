@@ -3,14 +3,9 @@ RELEASE_TAG ?=
 DIST_DIR ?= $(CURDIR)/dist
 SWIFT_FLAGS ?= --disable-sandbox --build-system native
 
-.PHONY: test test-gpu nativepipe stage-release
+.PHONY: test nativepipe stage-release
 
 test:
-	NATIVEPIPE_OMIT_GPU=1 swift test $(SWIFT_FLAGS)
-
-# Requires NATIVEPIPE_VIRGL_PREFIX, NATIVEPIPE_MOLTENVK_PREFIX and
-# NATIVEPIPE_ANGLE_PREFIX, or equivalent SDKs under vendor/*-prefix.
-test-gpu:
 	swift test $(SWIFT_FLAGS)
 
 nativepipe:

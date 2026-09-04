@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 
 #include "compositor_internal.h"
+#include "backend.h"
 #include "scale.h"
 #include "scene.h"
 #include "syncobj.h"
@@ -273,12 +274,7 @@ static void surface_resource_destroy(struct wl_resource *resource) {
 	np_region_fini(&surface->input_region);
 	np_region_fini(&surface->pending_opaque_region);
 	np_region_fini(&surface->opaque_region);
-#ifdef NP_REMOTE
-	if (surface->encoder) {
-		np_encoder_destroy(surface->encoder);
-		surface->encoder = NULL;
-	}
-#endif
+	np_backend_surface_destroy(surface);
 	np_scene_destroy(surface);
 	wl_list_remove(&surface->link);
 	free(surface);

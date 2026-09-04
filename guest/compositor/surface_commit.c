@@ -73,7 +73,7 @@ static int wait_fd_ready(int fd, uint32_t mask, void *data)
 	wl_list_for_each(surface, &server->surfaces, link)
 		np_surface_apply_unblocked(surface);
 	np_presentation_flush(server);
-	np_host_session_sync(server);
+	np_backend_session_sync(server);
 	wl_display_flush_clients(server->display);
 	return 0;
 }
@@ -667,17 +667,17 @@ static void apply_surface_update_now(struct np_surface_update *update) {
 
 	if (update->buffer_commit != NP_BUFFER_UNCHANGED) {
 		if (np_scene_root(surface)) {
-			np_presentation_publish_buffer(surface, update->buffer, update->gpu_buffer,
+			np_backend_publish_buffer(surface, update->buffer, update->gpu_buffer,
 			                       update->buffer_commit, update->presentation_id,
 			                       update->release_point, &update->damage);
 			update->release_point = NULL;
 		} else if (update->buffer || update->buffer_commit == NP_BUFFER_DETACH) {
-			np_presentation_publish_buffer(surface, update->buffer, update->gpu_buffer,
+			np_backend_publish_buffer(surface, update->buffer, update->gpu_buffer,
 			                       update->buffer_commit, update->presentation_id,
 			                       update->release_point, &update->damage);
 			update->release_point = NULL;
 		} else if (update->buffer_commit == NP_BUFFER_ATTACH && update->gpu_buffer) {
-			np_presentation_publish_buffer(surface, NULL, update->gpu_buffer,
+			np_backend_publish_buffer(surface, NULL, update->gpu_buffer,
 			                       NP_BUFFER_ATTACH, update->presentation_id,
 			                       update->release_point, &update->damage);
 			update->release_point = NULL;
@@ -686,7 +686,7 @@ static void apply_surface_update_now(struct np_surface_update *update) {
 		}
 	} else if (update->damage.width > 0 && surface->current_buffer &&
 	           wl_shm_buffer_get(surface->current_buffer)) {
-		(void)np_presentation_refresh_current_shm(
+		(void)np_backend_refresh_current_shm(
 			surface, update->presentation_id, &update->damage);
 	} else if (update->presentation_id) {
 		if (!((update->viewport_changed || update->geometry_set || scale_changed ||
