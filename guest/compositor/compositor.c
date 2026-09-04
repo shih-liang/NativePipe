@@ -164,7 +164,6 @@ int np_compositor_run(int argc, char **argv)
 		np_host_session_sync(&server);
 		wl_display_flush_clients(server.display);
 		wl_event_loop_dispatch(loop, -1);
-		np_host_session_pump(&server);
 		np_presentation_flush(&server);
 		np_host_session_sync(&server);
 	}

@@ -14,8 +14,8 @@
 
 
 #define NP_SCENE_MAGIC "NPSN"
-#define NP_SCENE_VERSION 2u
-#define NP_SCENE_HEADER_SIZE 72u
+#define NP_SCENE_VERSION 3u
+#define NP_SCENE_HEADER_SIZE 76u
 #define NP_SCENE_LAYER_SIZE 88u
 #define NP_SCENE_MAX_LAYERS 128u
 
@@ -492,6 +492,9 @@ enum np_scene_build_result np_scene_build(
 	put_i32(bytes + 60, (int32_t)scene_damage.y);
 	put_i32(bytes + 64, (int32_t)scene_damage.width);
 	put_i32(bytes + 68, (int32_t)scene_damage.height);
+	/* This serial is host-private correlation metadata. It identifies the last
+	 * AppKit configure whose Wayland ack became current with this scene. */
+	put_u32(bytes + 72, root->committed_host_configure_serial);
 
 	for (uint32_t i = 0; i < count; i++) {
 		unsigned char *layer = bytes + NP_SCENE_HEADER_SIZE +

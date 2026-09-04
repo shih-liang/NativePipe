@@ -813,9 +813,9 @@ bool np_input_handle_host_binary(const unsigned char *payload, size_t length,
 		int32_t width = (int32_t)read_le32(payload + 8);
 		int32_t height = (int32_t)read_le32(payload + 12);
 		uint32_t state_bits = read_le32(payload + 16);
-		/* payload + 20 is the host-side diagnostic serial. Wayland owns the
-		 * configure serial; records are coalesced by the xdg-shell event-loop idle. */
-		np_xdg_configure_toplevel_from_host(surface, width, height, state_bits);
+		uint32_t host_serial = read_le32(payload + 20);
+		np_xdg_configure_toplevel_from_host(
+			surface, width, height, state_bits, host_serial);
 		wl_display_flush_clients(server->display);
 		return true;
 	}
@@ -872,10 +872,11 @@ bool np_input_handle_host_binary(const unsigned char *payload, size_t length,
 		int32_t width = np_window_read_i32(&reader);
 		int32_t height = np_window_read_i32(&reader);
 		uint32_t states = np_window_read_u32(&reader);
-		(void)np_window_read_u32(&reader);
+		uint32_t host_serial = np_window_read_u32(&reader);
 		struct np_surface *surface = np_surface_by_window(server, window);
 		if (surface && np_surface_is_toplevel(surface)) {
-			np_xdg_configure_toplevel_from_host(surface, width, height, states);
+			np_xdg_configure_toplevel_from_host(
+				surface, width, height, states, host_serial);
 			wl_display_flush_clients(server->display);
 		}
 		break;

@@ -276,6 +276,10 @@ extension Windowing {
         public var height: Int
         public var scale: Int
         public var windowGeometry: Rect
+		/// Host-private serial of the most recent AppKit configure acknowledged by
+		/// the Wayland commit that produced this scene. It binds actual client
+		/// geometry to the configure generation without changing xdg-shell serials.
+		public var configureSerial: UInt32
         public var layers: [SceneLayer]
         /// Output-pixel regions whose composited result changed. The host keeps
         /// a short damage history for each drawable slot; an empty list means a
@@ -285,7 +289,8 @@ extension Windowing {
         public init(
             surface: UInt32, presentationID: UInt32,
             width: Int, height: Int, scale: Int,
-            windowGeometry: Rect, layers: [SceneLayer], damage: [Rect] = []
+			windowGeometry: Rect, configureSerial: UInt32 = 0,
+			layers: [SceneLayer], damage: [Rect] = []
         ) {
             self.surface = surface
             self.presentationID = presentationID
@@ -293,6 +298,7 @@ extension Windowing {
             self.height = height
             self.scale = scale
             self.windowGeometry = windowGeometry
+			self.configureSerial = configureSerial
             self.layers = layers
             self.damage = damage
         }

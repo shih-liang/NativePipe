@@ -199,6 +199,9 @@ struct np_surface_update {
 	struct wl_event_source *wait_source;
 	int wait_fd;
 	uint32_t presentation_id;
+	/* Diagnostic host serial of the xdg configure acknowledged by this commit.
+	 * Zero means the commit did not consume a host-originated configure. */
+	uint32_t host_configure_serial;
 };
 
 struct np_subsurface_position_update {
@@ -223,6 +226,9 @@ struct np_subsurface_stack_op {
 struct np_xdg_configure {
 	struct wl_list link;
 	uint32_t serial;
+	/* The host serial is not exposed to the Wayland client. It correlates the
+	 * committed window geometry with the AppKit configure that produced it. */
+	uint32_t host_serial;
 	bool popup_geometry;
 	int32_t popup_x, popup_y, popup_width, popup_height;
 };
@@ -319,11 +325,21 @@ struct np_surface {
 	int32_t host_configure_pending_width;
 	int32_t host_configure_pending_height;
 	uint32_t host_configure_pending_state_bits;
+	uint32_t host_configure_pending_serial;
 	uint32_t host_configure_acked_serial;
+	uint32_t host_configure_acked_host_serial;
 	bool host_configure_acked;
-	/* Coalesce all host resize records drained in one event-loop turn. The host
-	 * already samples at the physical display rate; xdg-shell lets a client
-	 * discard superseded configures and ack only the newest serial. */
+	/* A resizing configure is paced only until the client commits its reply.
+	 * This is deliberately not a presentation/FIFO quota: guest rendering,
+	 * transport and Metal never hold the next size hostage. While the client is
+	 * rebuilding, newer AppKit samples stay in host_configure_pending and replace
+	 * one another before they cross the Wayland socket. */
+	uint32_t host_resize_configure_awaiting_commit;
+	/* Last host configuration whose acknowledging commit has become current. */
+	uint32_t committed_host_configure_serial;
+	/* One latest-value mailbox for host resize records. While a client is
+	 * consuming the previous resizing configure, later display samples replace
+	 * this state instead of becoming an unbounded Wayland event backlog. */
 	struct wl_event_source *host_configure_idle;
 	bool pending_geometry_set;
 	int32_t pending_geometry_x, pending_geometry_y;
@@ -488,7 +504,6 @@ bool np_host_session_set_socket(struct np_server *server, const char *socket);
 void np_host_session_attach(struct np_server *server,
                             struct wl_event_loop *loop);
 void np_host_session_sync(struct np_server *server);
-void np_host_session_pump(struct np_server *server);
 void np_host_session_finish(struct np_server *server);
 
 void np_set_keyboard_focus(struct np_server *server, uint32_t window_id);

@@ -378,11 +378,16 @@ final class HostSceneRenderer: @unchecked Sendable {
 
         let readback: (buffer: MTLBuffer, bytesPerRow: Int)?
         if capture {
-            let (rowBytes, rowOverflow) = target.width.multipliedReportingOverflow(by: 4)
+            // Drawable capacity can exceed the committed scene during live
+            // resize. Computer-use captures expose the scene, not transparent
+            // backing-store headroom.
+            let captureWidth = limitWidth
+            let captureHeight = limitHeight
+            let (rowBytes, rowOverflow) = captureWidth.multipliedReportingOverflow(by: 4)
             let (alignedBytes, alignOverflow) = rowBytes.addingReportingOverflow(255)
             let bytesPerRow = alignOverflow ? 0 : alignedBytes & ~255
             let (byteCount, sizeOverflow) = bytesPerRow.multipliedReportingOverflow(
-                by: target.height)
+                by: captureHeight)
             guard !rowOverflow, !alignOverflow, !sizeOverflow,
                   bytesPerRow > 0, byteCount > 0,
                   byteCount <= Self.maximumCaptureBytes,
@@ -395,7 +400,7 @@ final class HostSceneRenderer: @unchecked Sendable {
                 from: target, sourceSlice: 0, sourceLevel: 0,
                 sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
                 sourceSize: MTLSize(
-                    width: target.width, height: target.height, depth: 1),
+                    width: captureWidth, height: captureHeight, depth: 1),
                 to: buffer, destinationOffset: 0,
                 destinationBytesPerRow: bytesPerRow,
                 destinationBytesPerImage: byteCount)
@@ -414,7 +419,7 @@ final class HostSceneRenderer: @unchecked Sendable {
                     pixels: Data(
                         bytes: readback.buffer.contents(),
                         count: readback.buffer.length),
-                    width: target.width, height: target.height,
+                    width: limitWidth, height: limitHeight,
                     bytesPerRow: readback.bytesPerRow)
             } else {
                 captured = nil

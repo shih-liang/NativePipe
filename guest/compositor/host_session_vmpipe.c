@@ -300,14 +300,6 @@ void np_host_session_attach(struct np_server *server, struct wl_event_loop *loop
 	                     host_feedback_listener_readable, server);
 }
 
-void np_host_session_pump(struct np_server *server)
-{
-	np_host_pump(&server->host, np_input_handle_host_binary, server);
-	np_host_pump(&server->host_control, np_input_handle_host_binary, server);
-	np_host_pump(&server->host_input, np_input_handle_host_binary, server);
-	np_host_pump(&server->host_feedback, np_input_handle_host_binary, server);
-}
-
 void np_host_session_finish(struct np_server *server)
 {
 	np_host_finish(&server->host);

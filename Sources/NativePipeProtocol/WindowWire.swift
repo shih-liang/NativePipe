@@ -5,7 +5,7 @@ import Foundation
 /// NPIP supplies only bounded length framing. Integer fields are explicitly
 /// little endian; this is a wire format, never a Swift struct memory dump.
 public enum WindowWire {
-    public static let windowProtocolVersion: UInt32 = 6
+    public static let windowProtocolVersion: UInt32 = 7
     public static let motionMagic: [UInt8] = Array("NPMO".utf8)
     public static let motionPayloadSize = 16
     public static let scrollMagic: [UInt8] = Array("NPSC".utf8)
@@ -14,8 +14,8 @@ public enum WindowWire {
     public static let popupConfigureMagic: [UInt8] = Array("NPPF".utf8)
     public static let sceneMagic: [UInt8] = Array("NPSN".utf8)
     public static let lifecycleMagic: [UInt8] = Array("NPW2".utf8)
-    public static let sceneVersion: UInt16 = 2
-    public static let sceneHeaderSize = 72
+    public static let sceneVersion: UInt16 = 3
+    public static let sceneHeaderSize = 76
     public static let sceneLayerSize = 88
     public static let maximumSceneLayers = 128
     public static let maximumFieldSize = 8 * 1024 * 1024
@@ -73,6 +73,7 @@ public enum WindowWire {
 			y: Int(try reader.integer() as Int32),
 			width: Int(try reader.integer() as Int32),
 			height: Int(try reader.integer() as Int32))
+		let configureSerial: UInt32 = try reader.integer()
 
         guard surface != 0, presentationID != 0,
               width > 0, height > 0, scale >= 1, scale <= 4,
@@ -136,7 +137,7 @@ public enum WindowWire {
         return .sceneCommitted(scene: Windowing.SceneSnapshot(
             surface: surface, presentationID: presentationID,
             width: width, height: height, scale: scale,
-			windowGeometry: geometry, layers: layers,
+			windowGeometry: geometry, configureSerial: configureSerial, layers: layers,
 			damage: damage.width > 0 ? [damage] : []))
     }
 

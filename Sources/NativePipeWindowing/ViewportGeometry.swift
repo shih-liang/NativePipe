@@ -1,6 +1,45 @@
 import CoreGraphics
 import NativePipeProtocol
 
+/// Which physical AppKit edges stay fixed while client-committed Wayland
+/// geometry replaces the provisional frame used during an interactive resize.
+struct WindowFrameAnchor: Equatable {
+    enum Horizontal: Equatable { case left, right }
+    enum Vertical: Equatable { case bottom, top }
+
+    var horizontal: Horizontal
+    var vertical: Vertical
+
+    static let topLeft = WindowFrameAnchor(horizontal: .left, vertical: .top)
+
+    static func inferred(from start: CGRect, to end: CGRect) -> Self {
+        let movedLeft = abs(end.minX - start.minX)
+        let movedRight = abs(end.maxX - start.maxX)
+        let movedBottom = abs(end.minY - start.minY)
+        let movedTop = abs(end.maxY - start.maxY)
+        return WindowFrameAnchor(
+            horizontal: movedLeft > movedRight ? .right : .left,
+            vertical: movedBottom >= movedTop ? .top : .bottom)
+    }
+
+    func frame(size: CGSize, relativeTo current: CGRect) -> CGRect {
+        CGRect(
+            x: horizontal == .left ? current.minX : current.maxX - size.width,
+            y: vertical == .bottom ? current.minY : current.maxY - size.height,
+            width: size.width,
+            height: size.height)
+    }
+}
+
+/// Core Animation positions a zero-anchor child in its flipped superlayer from
+/// the lower edge. Moving it by the unused height keeps the child's visual
+/// top-left at the view's visual top-left without changing its committed size.
+struct SurfaceLayerPlacement {
+    static func topLeftPosition(container: CGSize, child: CGSize) -> CGPoint {
+        CGPoint(x: 0, y: container.height - child.height)
+    }
+}
+
 /// The single transform at the AppKit/Wayland window boundary.
 ///
 /// Wayland describes the complete surface tree in surface-local logical units,

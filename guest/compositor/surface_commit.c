@@ -347,6 +347,8 @@ static struct np_surface_update *snapshot_surface_update(struct np_surface *surf
 	wl_list_init(&update->stack_ops);
 	wl_list_init(&update->buffer_destroy.link);
 	update->surface = surface;
+	update->host_configure_serial = surface->host_configure_acked
+		? surface->host_configure_acked_host_serial : 0;
 	update->buffer = surface->pending_buffer;
 	update->buffer_commit = !surface->pending_buffer_set ? NP_BUFFER_UNCHANGED
 		: surface->pending_buffer ? NP_BUFFER_ATTACH : NP_BUFFER_DETACH;
@@ -559,6 +561,8 @@ static void apply_surface_update_now(struct np_surface_update *update) {
 	struct np_surface *surface = update->surface;
 	np_sync_point_destroy(update->acquire_point);
 	update->acquire_point = NULL;
+	if (update->host_configure_serial)
+		surface->committed_host_configure_serial = update->host_configure_serial;
 	bool scale_changed = surface->scale != update->scale;
 	surface->scale = update->scale;
 	if (update->geometry_set) {

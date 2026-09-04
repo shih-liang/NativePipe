@@ -32,6 +32,7 @@ final class MediaWireSmokeTests: XCTestCase {
 		append(Int32(20), to: &payload)
 		append(Int32(30), to: &payload)
 		append(Int32(40), to: &payload)
+		append(UInt32(73), to: &payload) // host configure serial
 
         append(UInt32(9), to: &payload)
         append(UInt32(123), to: &payload)
@@ -52,6 +53,7 @@ final class MediaWireSmokeTests: XCTestCase {
         else { return XCTFail("not a scene") }
         XCTAssertEqual(scene.surface, 7)
         XCTAssertEqual(scene.presentationID, 19)
+		XCTAssertEqual(scene.configureSerial, 73)
         XCTAssertEqual(scene.windowGeometry, .init(x: -8, y: -4, width: 400, height: 300))
         XCTAssertEqual(scene.layers.count, 1)
         XCTAssertEqual(scene.layers[0].resourceID, 123)

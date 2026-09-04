@@ -23,7 +23,8 @@ void np_xdg_finish_toplevel_configure(struct np_surface *surface,
                                       uint32_t serial);
 void np_xdg_configure_toplevel_from_host(struct np_surface *surface,
                                          int32_t width, int32_t height,
-                                         uint32_t state_bits);
+                                         uint32_t state_bits,
+                                         uint32_t host_serial);
 void np_xdg_flush_pending_toplevel_configure(struct np_surface *surface);
 void np_xdg_configure_popup(struct np_surface *surface,
                             int32_t x, int32_t y,

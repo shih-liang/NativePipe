@@ -5,6 +5,19 @@ import XCTest
 
 @MainActor
 final class ViewportGeometryTests: XCTestCase {
+	func testCommittedLayerStaysAtVisualTopLeftOfFlippedContainer() {
+		XCTAssertEqual(
+			SurfaceLayerPlacement.topLeftPosition(
+				container: CGSize(width: 800, height: 600),
+				child: CGSize(width: 640, height: 480)),
+			CGPoint(x: 0, y: 120))
+		XCTAssertEqual(
+			SurfaceLayerPlacement.topLeftPosition(
+				container: CGSize(width: 640, height: 480),
+				child: CGSize(width: 800, height: 600)),
+			CGPoint(x: 0, y: -120))
+	}
+
 	func testClientDecoratedToplevelUsesExactCommittedGeometry() throws {
 		final class TextureSource: FrameSource {
 			let device: MTLDevice
@@ -54,6 +67,79 @@ final class ViewportGeometryTests: XCTestCase {
 		XCTAssertEqual(
 			bridge.window(3)?.window?.contentView?.bounds.size,
 			NSSize(width: 640, height: 491))
+		let initialTop = try XCTUnwrap(bridge.window(3)?.window).frame.maxY
+
+		var resized = committed
+		resized.presentationID = 2
+		resized.configureSerial = 7
+		resized.width = 1_220
+		resized.height = 860
+		resized.windowGeometry = .init(x: 14, y: 12, width: 610, height: 430)
+		resized.layers[0].resourceID = 2
+		resized.layers[0].width = 1_220
+		resized.layers[0].height = 860
+		resized.layers[0].bytesPerRow = 4_880
+		resized.layers[0].destination = .init(
+			x: 0, y: 0, width: 1_220, height: 860)
+		resized.layers[0].sourcePixels = resized.layers[0].destination
+		resized.layers[0].clip = resized.layers[0].destination
+		bridge.apply(.sceneCommitted(scene: resized))
+
+		let resizedWindow = try XCTUnwrap(bridge.window(3)?.window)
+		XCTAssertEqual(
+			resizedWindow.contentView?.bounds.size,
+			NSSize(width: 610, height: 430))
+		XCTAssertEqual(resizedWindow.frame.maxY, initialTop, accuracy: 0.5)
+		bridge.closeAll()
+	}
+
+	func testResizeAnchorTracksTheOppositeAppKitEdges() {
+		let start = CGRect(x: 100, y: 200, width: 600, height: 500)
+		let bottomRight = CGRect(x: 100, y: 140, width: 680, height: 560)
+		let anchor = WindowFrameAnchor.inferred(from: start, to: bottomRight)
+		XCTAssertEqual(anchor, .topLeft)
+		XCTAssertEqual(
+			anchor.frame(size: CGSize(width: 650, height: 540), relativeTo: bottomRight),
+			CGRect(x: 100, y: 160, width: 650, height: 540))
+
+		let topLeft = CGRect(x: 60, y: 200, width: 640, height: 550)
+		let opposite = WindowFrameAnchor.inferred(from: start, to: topLeft)
+		XCTAssertEqual(
+			opposite.frame(size: CGSize(width: 620, height: 520), relativeTo: topLeft),
+			CGRect(x: 80, y: 200, width: 620, height: 520))
+	}
+
+	func testResizeEndAlwaysSendsFreshFinalConfigureWithoutResizing() throws {
+		let bridge = WindowBridge(frameSource: nil)
+		var commands: [Windowing.HostCommand] = []
+		bridge.output = { commands.append($0) }
+		bridge.apply(.surfaceCreated(surface: 8))
+		bridge.apply(.toplevelCreated(window: 3, surface: 8))
+		let native = try XCTUnwrap(bridge.window(3))
+		native.revealToplevel(width: 640, height: 480)
+		let window = try XCTUnwrap(native.window)
+		commands.removeAll()
+
+		for _ in 0..<2 {
+			native.windowWillStartLiveResize(
+				Notification(name: NSWindow.willStartLiveResizeNotification,
+				             object: window))
+			native.windowDidEndLiveResize(
+				Notification(name: NSWindow.didEndLiveResizeNotification,
+				             object: window))
+		}
+
+		let configures = commands.compactMap { command -> (Windowing.Size, [Windowing.ToplevelState], UInt32)? in
+			guard case .configure(_, let size, let states, let serial) = command else {
+				return nil
+			}
+			return (size, states, serial)
+		}
+		XCTAssertEqual(configures.count, 2)
+		XCTAssertEqual(configures[0].0, configures[1].0)
+		XCTAssertFalse(configures[0].1.contains(.resizing))
+		XCTAssertFalse(configures[1].1.contains(.resizing))
+		XCTAssertNotEqual(configures[0].2, configures[1].2)
 		bridge.closeAll()
 	}
 

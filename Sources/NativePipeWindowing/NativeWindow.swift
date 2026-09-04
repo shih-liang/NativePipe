@@ -142,6 +142,11 @@ final class NativeWindow: NSObject {
     private var lastConfiguredSize: Windowing.Size?
     private var lastConfiguredStates: [Windowing.ToplevelState] = []
     private var configureSerial: UInt32 = 0
+	private var liveResizeStartFrame: NSRect?
+	private var pendingResizeCompletionAnchor: WindowFrameAnchor?
+	private var awaitingResizeCommitSerial: UInt32?
+	private var resizeCommitAnchor: WindowFrameAnchor?
+	private var applyingCommittedGeometry = false
 
     /// The xdg-shell window within the full wl_surface. GTK CSD buffers include
     /// transparent shadow margins outside this rectangle. AppKit must size and
@@ -155,6 +160,9 @@ final class NativeWindow: NSObject {
     private struct PendingConfigure {
         var size: Windowing.Size
         var states: [Windowing.ToplevelState]
+		/// State transitions at an interactive resize boundary must produce a
+		/// configure even when their size matches the last emitted record.
+		var force: Bool
     }
     private var pendingConfigure: PendingConfigure?
 	private var presenterNeedsDisplayRetry = false
@@ -443,8 +451,54 @@ final class NativeWindow: NSObject {
             // remains AppKit/configure-owned and must not follow stale frames.
             window.setContentSize(pointSize)
             position(window, forPopup: popup, size: pointSize)
+		} else if !isPopup {
+			applyCommittedToplevelGeometry(
+				pointSize, configureSerial: scene.configureSerial)
         }
     }
+
+	/// `xdg_toplevel.configure` supplies a size hint; the corresponding committed
+	/// window geometry is the actual result. During live resize AppKit remains the
+	/// provisional frame owner. After mouse-up, ignore older scenes until the
+	/// final configure generation is committed, then accept the client's result
+	/// without feeding the programmatic frame change back as another configure.
+	private func applyCommittedToplevelGeometry(
+		_ contentSize: NSSize, configureSerial committedSerial: UInt32
+	) {
+		guard let window, !window.inLiveResize,
+		      contentSize.width > 0, contentSize.height > 0 else { return }
+		if let required = awaitingResizeCommitSerial {
+			guard Self.serial(committedSerial, isAtOrAfter: required) else { return }
+			awaitingResizeCommitSerial = nil
+		}
+
+		let currentSize = contentView.bounds.size
+		guard abs(currentSize.width - contentSize.width) > 0.5 ||
+		      abs(currentSize.height - contentSize.height) > 0.5 else {
+			resizeCommitAnchor = nil
+			return
+		}
+
+		let targetFrameSize: NSSize
+		if serverDecorated {
+			targetFrameSize = window.frameRect(
+				forContentRect: NSRect(origin: .zero, size: contentSize)).size
+		} else {
+			// A full-size CSD content view covers the complete AppKit frame.
+			targetFrameSize = contentSize
+		}
+		let anchor = resizeCommitAnchor ?? .topLeft
+		let target = anchor.frame(size: targetFrameSize, relativeTo: window.frame)
+		resizeCommitAnchor = nil
+		applyingCommittedGeometry = true
+		window.setFrame(target, display: true)
+		applyingCommittedGeometry = false
+	}
+
+	private static func serial(_ candidate: UInt32, isAtOrAfter reference: UInt32) -> Bool {
+		guard candidate != 0 else { return false }
+		return Int32(bitPattern: candidate &- reference) >= 0
+	}
 
     private func effectiveGeometry(for frame: Windowing.Frame) -> Windowing.Rect {
         if let geometry = frame.windowGeometry,
@@ -660,14 +714,24 @@ final class NativeWindow: NSObject {
     /// AppKit points and Wayland surface coordinates are both logical units.
     /// Buffer scale controls attached pixel density and must never change an
     /// xdg_toplevel.configure size.
-    private func sendConfigure(states: [Windowing.ToplevelState]) {
-        guard window != nil else { return }
+    @discardableResult
+    private func sendConfigure(
+		states: [Windowing.ToplevelState], force: Bool = false
+	) -> Bool {
+        guard window != nil else { return false }
         let size = Windowing.Size(
             width: max(1, Int(contentView.bounds.width.rounded())),
             height: max(1, Int(contentView.bounds.height.rounded())))
-        guard size != lastConfiguredSize || states != lastConfiguredStates else { return }
+		guard force || size != lastConfiguredSize || states != lastConfiguredStates else {
+			return false
+		}
 
-        pendingConfigure = PendingConfigure(size: size, states: states)
+		// This is the host-side counterpart of Mutter's BEFORE_REDRAW slot: a
+		// later AppKit resize sample replaces only a record that has not crossed
+		// the transport yet. The display clock emits the current tuple before it
+		// wakes frame-throttled clients.
+		pendingConfigure = PendingConfigure(size: size, states: states, force: force)
+		return true
     }
 
 	func displayClockFired(_ displayLink: CADisplayLink) {
@@ -697,12 +761,19 @@ final class NativeWindow: NSObject {
     private func flushConfigure() {
         guard let pending = pendingConfigure else { return }
         pendingConfigure = nil
-        guard pending.size != lastConfiguredSize || pending.states != lastConfiguredStates else {
+		guard pending.force || pending.size != lastConfiguredSize ||
+		      pending.states != lastConfiguredStates else {
             return
         }
         lastConfiguredSize = pending.size
         lastConfiguredStates = pending.states
         configureSerial &+= 1
+		if let anchor = pendingResizeCompletionAnchor,
+		   !pending.states.contains(.resizing) {
+			awaitingResizeCommitSerial = configureSerial
+			resizeCommitAnchor = anchor
+			pendingResizeCompletionAnchor = nil
+		}
         if !pending.states.contains(.resizing) || Self.frameTrace {
             Self.note("configure window=\(windowID) -> \(pending.size.width)x\(pending.size.height)")
         }
@@ -765,9 +836,19 @@ extension NativeWindow: NSWindowDelegate {
     /// the display rate, but an old client frame is never stretched to it.
     func windowDidResize(_ notification: Notification) {
         guard !isPopup else { return }
-        sendConfigure(states: activeStates())
+		if !applyingCommittedGeometry {
+			sendConfigure(states: activeStates())
+		}
         bridge?.parentGeometryChanged(windowID)
     }
+
+	func windowWillStartLiveResize(_ notification: Notification) {
+		guard !isPopup, let window else { return }
+		liveResizeStartFrame = window.frame
+		pendingResizeCompletionAnchor = nil
+		awaitingResizeCommitSerial = nil
+		resizeCommitAnchor = nil
+	}
 
     func windowDidMove(_ notification: Notification) {
         bridge?.parentGeometryChanged(windowID)
@@ -781,7 +862,17 @@ extension NativeWindow: NSWindowDelegate {
 
     /// The drag is over; the client should land on the exact size immediately.
     func windowDidEndLiveResize(_ notification: Notification) {
-        sendConfigure(states: activeStates())
+		guard let window else { return }
+		let start = liveResizeStartFrame ?? window.frame
+		liveResizeStartFrame = nil
+		pendingResizeCompletionAnchor = WindowFrameAnchor.inferred(
+			from: start, to: window.frame)
+		// AppKit normally clears inLiveResize before this delegate callback, but
+		// remove the state explicitly so the protocol boundary never depends on
+		// callback timing. This final tuple replaces any unsent resizing tuple and
+		// must receive a fresh serial even when its dimensions are unchanged.
+		let finalStates = activeStates().filter { $0 != .resizing }
+		_ = sendConfigure(states: finalStates, force: true)
         // The final non-resizing state and exact size should not wait for the
         // next turn after AppKit leaves its tracking loop.
         flushConfigure()
@@ -838,6 +929,9 @@ extension NativeWindow: NSWindowDelegate {
 /// resize cannot mutate the pool concurrently. One latest-value pending slot
 /// drops stale resize frames.
 final class AsyncMetalScenePresenter: @unchecked Sendable {
+    private static let frameTrace =
+        ProcessInfo.processInfo.environment["NATIVEPIPE_FRAME_TRACE"] != nil
+
     private struct Work: @unchecked Sendable {
         let epoch: UInt64
         let scene: Windowing.SceneSnapshot
@@ -862,6 +956,7 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
     private var pending: Work?
 	private var epoch: UInt64 = 0
 	private var drainScheduled = false
+	private var appliedDrawableSize = CGSize.zero
 	private var drawableAges: DrawableAgeTracker
     private var captureRequests: [CaptureRequest] = []
     private var nextCaptureID: UInt64 = 0
@@ -1006,13 +1101,40 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
             latch(work)
             return .handled
         }
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        layer.drawableSize = work.drawableSize
-        CATransaction.commit()
+        if appliedDrawableSize != work.drawableSize {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.drawableSize = work.drawableSize
+            CATransaction.commit()
+            appliedDrawableSize = work.drawableSize
+            drawableAges.invalidate()
+            if Self.frameTrace {
+                let message =
+                    "[nsw] drawable capacity -> \(Int(work.drawableSize.width))x" +
+                    "\(Int(work.drawableSize.height))\n"
+                FileHandle.standardError.write(Data(message.utf8))
+            }
+        }
         let scene = work.scene
+        let drawableStart = ProcessInfo.processInfo.systemUptime
         guard let drawable = layer.nextDrawable() else {
+            if Self.frameTrace {
+                let elapsed =
+                    (ProcessInfo.processInfo.systemUptime - drawableStart) * 1_000
+                let message = String(
+                    format: "[nsw] nextDrawable nil after %.2f ms\n", elapsed)
+                FileHandle.standardError.write(Data(message.utf8))
+            }
             return .retryAfterDisplay
+        }
+        if Self.frameTrace {
+            let elapsed =
+                (ProcessInfo.processInfo.systemUptime - drawableStart) * 1_000
+            if elapsed >= 2 {
+                let message = String(
+                    format: "[nsw] nextDrawable waited %.2f ms\n", elapsed)
+                FileHandle.standardError.write(Data(message.utf8))
+            }
         }
         guard isCurrent(work) else {
             finish(work, success: false)
@@ -1176,10 +1298,10 @@ private final class SurfaceView: NSView {
     /// The legacy CPU/remote surface currently on screen, held for exactly as
     /// long as it is installed in the layer. GPU windows use `metalLayer`.
     private var displayed: IOSurfaceRef?
-	/// Pixel density of the most recently committed Wayland scene. The drawable
-	/// follows the live AppKit bounds at this density even while client content
-	/// is still at an older configured size.
-	private var metalScale: CGFloat = 1
+    /// Pixel density of the most recently committed Wayland scene. The Metal
+    /// layer follows the AppKit view, while HostSceneRenderer keeps older scene
+    /// pixels 1:1 at the drawable's top-left and clips them to the current view.
+    private var metalScale: CGFloat = 1
     /// Holds client content in AppKit point space without rubber-band scaling.
     /// If AppKit is ahead of the client during resize, the old scene remains at
     /// its committed size and is clipped (or leaves an unpainted edge) until an
@@ -1398,7 +1520,7 @@ private final class SurfaceView: NSView {
         surfaceLayer.isHidden = true
         metalLayer.isHidden = false
         CATransaction.commit()
-        return drawableSize
+		return drawableSize
     }
 
     /// Remote decoders may allocate surfaces larger than the active frame.
@@ -1423,7 +1545,7 @@ private final class SurfaceView: NSView {
         sceneLayer.position = .zero
         sceneLayer.setAffineTransform(.identity)
         surfaceLayer.bounds = logical
-        surfaceLayer.frame.origin = .zero
+		alignToTopLeft(surfaceLayer)
         surfaceLayer.contentsScale = frame.pixelDensity(for: logical)
         surfaceLayer.contentsRect = contentsRect
         surfaceLayer.contents = surface
@@ -1468,20 +1590,27 @@ private final class SurfaceView: NSView {
         sceneLayer.bounds = CGRect(origin: .zero, size: bounds.size)
         sceneLayer.position = .zero
         sceneLayer.setAffineTransform(.identity)
+		alignToTopLeft(surfaceLayer)
 		_ = layoutMetalLayer()
         CATransaction.commit()
     }
 
-	/// Keep drawable allocation coupled to the physical NSWindow, never to an
-	/// older Wayland buffer. The renderer clips that older buffer at the drawable
-	/// origin, so live resize can always latch it and release FIFO/buffer waits.
+	/// AppKit owns the provisional live-resize frame. Keep the Metal drawable
+	/// coupled to that frame as Apple recommends. HostSceneRenderer uses the
+	/// committed scene extent as its drawing limit, so this does not stretch an
+	/// older Wayland scene: extra pixels remain transparent and shrinking clips.
 	private func layoutMetalLayer() -> CGSize {
 		metalLayer.bounds = CGRect(origin: .zero, size: bounds.size)
-		metalLayer.position = .zero
+		alignToTopLeft(metalLayer)
 		metalLayer.contentsScale = metalScale
 		return CGSize(
 			width: max(1, (bounds.width * metalScale).rounded()),
 			height: max(1, (bounds.height * metalScale).rounded()))
+	}
+
+	private func alignToTopLeft(_ child: CALayer) {
+		child.position = SurfaceLayerPlacement.topLeftPosition(
+			container: sceneLayer.bounds.size, child: child.bounds.size)
 	}
 }
 

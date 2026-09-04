@@ -309,14 +309,6 @@ void np_host_session_attach(struct np_server *server, struct wl_event_loop *loop
 		wl_event_source_timer_update(server->remote_pair_timeout_source, 1000);
 }
 
-void np_host_session_pump(struct np_server *server)
-{
-	np_host_pump(&server->host, np_input_handle_host_binary, server);
-	np_media_pump(&server->media);
-	np_media_accept(&server->media);
-	handle_media_attachment(server);
-}
-
 void np_host_session_finish(struct np_server *server)
 {
 	if (server->remote_pair_timeout_source) {
