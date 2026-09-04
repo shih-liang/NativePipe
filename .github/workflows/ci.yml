@@ -23,8 +23,8 @@ jobs:
       - name: Build and test
         run: make test
 
-  transport-and-package:
-    name: Transport and package policy
+  transport:
+    name: Transport and licenses
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
@@ -42,7 +42,3 @@ jobs:
         run: make -C guest/compositor test-remote-transport
       - name: Verify source and license inventory
         run: python3 scripts/check-license-inventory.py
-      - name: Test deterministic package builder
-        env:
-          OPENSSL: openssl
-        run: python3 -m unittest discover -s Tests/PackagingTests -v

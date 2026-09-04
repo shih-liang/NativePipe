@@ -3,10 +3,10 @@
 #include "hostlink.h"
 
 #include <errno.h>
-#include <linux/vm_sockets.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <linux/vm_sockets.h>
 #include <unistd.h>
 
 bool np_host_transport_listen(struct np_host *host)

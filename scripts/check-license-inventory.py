@@ -127,8 +127,7 @@ def main() -> None:
         fail("xwayland-satellite upstream commit must be a lowercase full Git hash")
 
     for required_policy_path in (
-        ".github/workflows/release-nativepipe-runtime.yml",
-        ".github/workflows/sign-nativepipe-runtime.yml",
+        ".github/workflows/build-linux.yml",
         "scripts/generate-xwayland-license-notice.py",
     ):
         matches = [entry["id"] for entry in entries if matched(required_policy_path, entry)]

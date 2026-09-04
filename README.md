@@ -124,130 +124,39 @@ also needs EGL/GLES, GBM, DRM, and FFmpeg development packages. The session
 helpers need DRM and Vulkan headers. xwayland-satellite fetches only its pinned
 commit and builds with Cargo's checked-in lock file.
 
-## Signed NativePipe runtime releases
+## Linux Actions artifacts and releases
 
-A release tag is exactly:
-
-```text
-nativepipe-runtime-v<VERSION>-<positive releaseSequence>
-```
-
-`releaseSequence` is the positive generation number of the complete guest
-runtime set. It must be larger than every previous display release, and a
-publish operation must use the same value `G` for all three identities:
-
-- the display manifest's `releaseSequence`
-- the matching platform manifest's `releaseSequence`
-- the FluxWindow baseline lock's `setGeneration`
-
-This repository does not contact or coordinate with the platform repository.
-The release operator assigns the shared generation, and the FluxWindow host
-accepts a platform/display pair only when both signed manifests have the same
-sequence as the lock generation. `setGeneration` is deliberately not another
-display-manifest field; the manifest schema remains frozen. Each architecture
-is one atomic runtime archive that contains both GNU and musl variants. The
-current FluxWindow application selects `aarch64`; `x86_64` is published under
-the same contract for future consumers.
-
-The authoritative aarch64 assets are:
+`.github/workflows/build-linux.yml` builds the VM compositor, session helpers,
+and xwayland-satellite for aarch64/x86_64 and GNU/musl. Every successful run
+uploads four checkout-shaped artifacts:
 
 ```text
-nativepipe-runtime-aarch64.tar
-nativepipe-runtime-aarch64.runtime-manifest.json
-nativepipe-runtime-aarch64.runtime-manifest.sig
+nativepipe-linux-aarch64-gnu
+nativepipe-linux-aarch64-musl
+nativepipe-linux-x86_64-gnu
+nativepipe-linux-x86_64-musl
 ```
 
-The x86_64 names replace `aarch64` with `x86_64`. The uncompressed archive is a
-deterministic USTAR containing only files used by the guest runtime:
+Downloading one of these artifacts at the repository root restores its files
+under the ordinary `guest/**/dist` paths. FluxWindow uses the artifacts from
+the run for the NativePipe checkout commit; it does not build Linux binaries on
+the Mac and it does not use a runtime lock, manifest, or release archive.
 
-- `guest/session/dist/**` plus service, profile, and Vulkan-layer configuration
-- `guest/xwayland-satellite/dist/**` plus `VERSION`
-- `Packages/NativePipe/guest/compositor/dist/**` plus
-  `COMPOSITOR_SOURCE.sha256`
-- the release license inventory and required third-party license text under
-  `LICENSES/nativepipe-runtime/`
-
-Each shipped xwayland-satellite binary has a sibling
-`*.third-party-licenses.txt`. Release CI derives it from the pinned upstream
-`Cargo.lock`, traverses the non-dev normal/build dependency closure, rejects a
-crate without a declared license, and bundles package-local notices together
-with the exact Rust 1.89.0 distribution COPYRIGHT, Apache-2.0, and MIT texts.
-It also verifies and attributes the embedded Open Sans font by its pinned
-SHA-256 and extracts the MIT notice from the bundled `wl_drm` protocol XML.
-The file is part of the signed runtime manifest, not an unsigned build log.
-
-Source, tests, SBOM, and provenance stay in the public repository or separate
-release assets; they are not expanded into `NativePipeRuntime`.
-
-The canonical JSON manifest has exactly the frozen top-level fields
-`schemaVersion`, `component`, `version`, `releaseTag`, `releaseSequence`,
-`sourceRepository`, `sourceCommit`, `architecture`, `guestRuntimeABI`,
-`archive`, and `files`. It uses schema version 1, component
-`nativepipe-runtime`, guest runtime ABI 1, the owner/repository source slug,
-source commit, architecture, release identity, archive size/hash, and every
-runtime file's relative path, size, SHA-256, and integer mode (`420` or `493`).
-It deliberately has neither `setGeneration` nor a libc subtarget because the
-sequence is the set generation and both libc variants activate as a unit.
-
-The tag commit must be reachable from protected `main` and must descend from
-the commit named by the greatest earlier release sequence. A higher sequence
-therefore cannot re-sign an older vulnerable source ancestor. Signing is delegated to
-`.github/workflows/sign-nativepipe-runtime.yml@main`, so the key-bearing policy
-does not come from the tag. That job has only `contents: read`, verifies the
-unsigned artifacts, signs the exact canonical manifest bytes with Ed25519, and
-passes the result through an immutable Actions artifact. A separate publisher
-has `contents: write` but no private key and cryptographically verifies the
-artifact, including an independent comparison of its public key with the
-repository variable, before creating the release. The signer derives the raw
-public key
-from the protected private key and requires an exact match with the repository variable
-`LIGHTHOUSE_RUNTIME_ED25519_PUBLIC_KEY_BASE64`; a missing or mismatched value
-fails the release. `SHA256SUMS` and its signature are extra supply-chain
-evidence, not an indirect substitute for the manifest signature. No private key
-is generated or stored in this repository. The protected
-`LIGHTHOUSE_RUNTIME_ED25519_PRIVATE_KEY_BASE64` secret is the base64 encoding of
-an unencrypted PKCS#8 Ed25519 private-key PEM; the public repository variable
-is the canonical base64 encoding of the corresponding 32 raw public-key bytes.
-These checks rely on repository controls and fail closed when those controls
-are absent. Configure a branch ruleset for `main` that blocks force-push and
-deletion, requires pull-request review and required CI, and requires code-owner
-review for `.github/workflows/**`, `scripts/package_nativepipe_runtime.py`,
-`scripts/verify_nativepipe_runtime.py`, and `scripts/check-license-inventory.py`.
-Configure a tag ruleset for `nativepipe-runtime-v*` that restricts creation to
-the release operators and prohibits every update, force-update, and deletion;
-also reserve the exact tag name `main`. The monotonic sequence and source-lineage
-checks use those immutable tags as their high-water mark. The
-`lighthouse-runtime-release` environment must require an independent reviewer,
-disallow administrator bypass, and expose the signing secret only to the
-protected release-tag deployment rule. The fixed public-key repository variable
-must be changed only through the same reviewed release-key rotation procedure.
-
-FluxWindow release builds vendor a complete platform+display runtime set using
-their lock file. The lock pins each repository, public key, guest ABI, manifest,
-signature, and archive, and its `setGeneration` equals both manifests'
-`releaseSequence`. Runtime updates verify both signed manifests, reject mixed
-sequences, stage the complete set in a new directory, and atomically promote it
-only when no VM host is running. Activation is forward-only; a failed candidate
-never replaces the active set.
+Tags matching `nativepipe-v*` additionally create normal GitHub Release
+archives for both architectures. The release contains `SHA256SUMS`, its
+Ed25519 signature, and the matching public key. Signing runs without repository
+write permission; a separate job verifies the digest and signature before
+publishing the release.
 
 ## Source and license policy
 
-`LICENSES/source-inventory.json` is authoritative for checked-in source origin;
-the release archive carries it as
-`LICENSES/nativepipe-runtime/source-inventory.json` to avoid collisions with
-other runtime components.
-The release workflow fails closed if a source file is uncovered, ambiguously
-covered, or a required license text is absent. Wayland XML and generated
-protocol sources retain their embedded MIT notices. xwayland-satellite and its
-derivative patch retain MPL-2.0 and ship its complete license text. Its locked
-Cargo dependencies and the statically linked Rust standard library are audited
-during every target build; their deterministic inventory and notices ship next
-to each binary, together with the embedded Open Sans and `wl_drm` notices. SPDX
-file records use explicit path-derived license conclusions, and the
-verifier/signing boundary rejects `NOASSERTION` for every packaged file.
+`LICENSES/source-inventory.json` records checked-in source origins. Wayland XML
+and generated protocol sources retain their embedded MIT notices.
+xwayland-satellite and its derivative patch retain MPL-2.0. Each Actions-built
+xwayland-satellite binary has a sibling `*.third-party-licenses.txt` generated
+from the pinned Cargo dependency graph, Rust distribution notices, Open Sans,
+and the bundled `wl_drm` protocol.
 
-The project-original and generated integration files are intentionally marked
-`LicenseRef-NativePipe-Original`: publishing the repository does not silently
-infer or grant an open-source license for those files. The copyright owner must
-choose and add an explicit project license before describing NativePipe itself
-as open source.
+Project-original integration files remain
+`LicenseRef-NativePipe-Original`: publishing the repository does not itself
+infer or grant an open-source license for those files.
