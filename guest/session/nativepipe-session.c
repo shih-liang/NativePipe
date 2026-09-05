@@ -85,17 +85,12 @@ static void apply_desktop_preferences(void) {
     const char *program = first_executable(paths);
     if (!program)
         return;
-    pid_t pid = fork();
-    if (pid == 0) {
-        char *argv[] = {(char *)program, "set", "org.gnome.desktop.interface",
-                        "color-scheme", dark ? "prefer-dark" : "prefer-light", NULL};
-        execv(program, argv);
-        _exit(127);
-    }
-    if (pid > 0) {
-        int status;
-        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
-    }
+    char *scheme[] = {(char *)program, "set", "org.gnome.desktop.interface",
+                      "color-scheme", dark ? "prefer-dark" : "prefer-light", NULL};
+    char *theme[] = {(char *)program, "set", "org.gnome.desktop.interface",
+                     "gtk-theme", dark ? "Adwaita-dark" : "Adwaita", NULL};
+    if (np_run(scheme) != 0 || np_run(theme) != 0)
+        fprintf(stderr, "[session] could not apply desktop appearance\n");
 }
 
 /* Runs inside dbus-run-session after privileges have already been dropped.

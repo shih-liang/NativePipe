@@ -678,6 +678,7 @@ final class NativeWindow: NSObject {
     }
 
 	func close() {
+        releasePressedKeys()
         pendingConfigure = nil
         contentView.clearDisplayedSurface()
         let pending = pendingPresentations
@@ -817,15 +818,28 @@ final class NativeWindow: NSObject {
         bridge?.send(.pointerScroll(window: windowID, dx: dx, dy: dy, isPrecise: precise))
     }
 
+    func pointerScroll(with event: NSEvent) {
+        guard let bridge else { return }
+        let delta = bridge.scrollDeltas(for: event)
+        pointerScroll(dx: delta.dx, dy: delta.dy, precise: event.hasPreciseScrollingDeltas)
+    }
+
     func key(_ macKeyCode: UInt16, pressed: Bool, flags: NSEvent.ModifierFlags) {
-        guard let code = KeyTranslation.evdevCode(for: macKeyCode) else {
+        let swap = bridge?.swapsCommandAndControl ?? false
+        guard let code = KeyTranslation.evdevCode(for: macKeyCode, swapCommandAndControl: swap) else {
             Self.note("no evdev code for macOS key \(macKeyCode); dropped")
             return
         }
         bridge?.send(
             .key(window: windowID, keycode: code, pressed: pressed,
-                 modifiers: KeyTranslation.modifiers(from: flags)))
+                 modifiers: KeyTranslation.modifiers(from: flags, swapCommandAndControl: swap)))
     }
+
+    var acceptsKeyboardInput: Bool { bridge?.acceptsKeyboardInput == true }
+
+    func releasePressedKeys() { contentView.releasePressedKeys() }
+
+    func handleKeyUp(_ event: NSEvent) -> Bool { contentView.handleKeyUp(event) }
 
 }
 
@@ -896,6 +910,7 @@ extension NativeWindow: NSWindowDelegate {
 
     func windowDidResignKey(_ notification: Notification) {
         Self.note("window \(windowID) resigned key")
+        releasePressedKeys()
         guard !isPopup else { return }
         // A menu whose owner lost focus has no reason to stay up.
         bridge?.dismissPopups(ownedBy: windowID)
@@ -1276,7 +1291,7 @@ private final class SurfaceView: NSView {
     weak var input: NativeWindow?
 
     private var trackingArea: NSTrackingArea?
-    private var lastModifiers: NSEvent.ModifierFlags = []
+    private var keyboard = KeyboardState()
 
     // MARK: Text input state
     //
@@ -1292,9 +1307,6 @@ private final class SurfaceView: NSView {
     /// NSTextInputClient callback consumes it. If it survives, nothing did, and
     /// the key goes to the guest as an ordinary key press.
     private var unconsumedKeyEvent: NSEvent?
-    /// Keycodes whose press was actually forwarded. A release for a press the
-    /// IME swallowed would leave the guest's xkb state holding a phantom key.
-    private var forwardedPresses: Set<UInt16> = []
     /// The legacy CPU/remote surface currently on screen, held for exactly as
     /// long as it is installed in the layer. GPU windows use `metalLayer`.
     private var displayed: IOSurfaceRef?
@@ -1454,14 +1466,7 @@ private final class SurfaceView: NSView {
 
     override func scrollWheel(with event: NSEvent) {
         input?.pointerMoved(to: location(of: event))
-        // macOS scrolls in points and inverts by default; Wayland's axis is a
-        // downward-positive distance, so both are undone here rather than in the
-        // guest, which cannot know about "natural" scrolling.
-        let sign: Double = event.isDirectionInvertedFromDevice ? -1 : 1
-        input?.pointerScroll(
-            dx: -Double(event.scrollingDeltaX) * sign,
-            dy: -Double(event.scrollingDeltaY) * sign,
-            precise: event.hasPreciseScrollingDeltas)
+        input?.pointerScroll(with: event)
     }
 
     // MARK: Keyboard
@@ -1469,15 +1474,18 @@ private final class SurfaceView: NSView {
     override func keyDown(with event: NSEvent) {
         // Not calling super: NSResponder's default is to beep at anything it does
         // not recognise, and the client is the one deciding what a key means.
-        guard !event.isARepeat else { return }
-        if textInputEnabled {
+        guard input?.acceptsKeyboardInput == true else { return }
+        if keyboard.shouldInterpret(event, textInputEnabled: textInputEnabled) {
             // The input method gets first refusal. What it takes comes back as
             // text; what it declines — Return, Escape, the arrow keys, anything
             // it routes through doCommandBySelector — is an editing command and
             // still belongs on the raw key path.
             unconsumedKeyEvent = event
             _ = inputContext?.handleEvent(event)
-            guard let survived = unconsumedKeyEvent else { return }
+            guard let survived = unconsumedKeyEvent else {
+                keyboard.textHandled(event)
+                return
+            }
             unconsumedKeyEvent = nil
             forwardPress(survived)
             return
@@ -1486,24 +1494,41 @@ private final class SurfaceView: NSView {
     }
 
     private func forwardPress(_ event: NSEvent) {
-        forwardedPresses.insert(event.keyCode)
-        input?.key(event.keyCode, pressed: true, flags: event.modifierFlags)
+        guard let key = keyboard.press(event) else { return }
+        input?.key(key.code, pressed: key.pressed, flags: key.flags)
     }
 
     override func keyUp(with event: NSEvent) {
-        guard forwardedPresses.remove(event.keyCode) != nil else { return }
-        input?.key(event.keyCode, pressed: false, flags: event.modifierFlags)
+        _ = handleKeyUp(event)
+    }
+
+    /// Called both by normal responder dispatch and by the bridge's local
+    /// monitor: NSApplication can swallow keyUp while Command is held.
+    func handleKeyUp(_ event: NSEvent) -> Bool {
+        guard let key = keyboard.release(event) else { return false }
+        input?.key(key.code, pressed: key.pressed, flags: key.flags)
+        return true
     }
 
     /// Modifiers arrive as a flags snapshot rather than as key events, so the
     /// press and release edges have to be recovered by comparing with the last.
     override func flagsChanged(with event: NSEvent) {
-        defer { lastModifiers = event.modifierFlags }
-        guard let flag = KeyTranslation.modifierKeyCode(for: event.keyCode) else { return }
-        let nowDown = event.modifierFlags.contains(flag)
-        let wasDown = lastModifiers.contains(flag)
-        guard nowDown != wasDown else { return }
-        input?.key(event.keyCode, pressed: nowDown, flags: event.modifierFlags)
+        guard input?.acceptsKeyboardInput == true,
+              let key = keyboard.modifiersChanged(event) else { return }
+        input?.key(key.code, pressed: key.pressed, flags: key.flags)
+    }
+
+    override func resignFirstResponder() -> Bool {
+        releasePressedKeys()
+        return super.resignFirstResponder()
+    }
+
+    func releasePressedKeys() {
+        unconsumedKeyEvent = nil
+        for key in keyboard.releaseAll() {
+            input?.key(key.code, pressed: key.pressed, flags: key.flags)
+        }
+        abandonComposition()
     }
 
     func configureMetalLayer(scene: Windowing.SceneSnapshot) -> CGSize? {

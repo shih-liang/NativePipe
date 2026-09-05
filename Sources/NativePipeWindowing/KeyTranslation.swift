@@ -1,4 +1,5 @@
 import AppKit
+import IOKit.hidsystem
 import NativePipeProtocol
 
 /// macOS virtual key codes to Linux evdev codes.
@@ -62,8 +63,17 @@ enum KeyTranslation {
         0x62: 65, 0x64: 66, 0x65: 67, 0x6D: 68, 0x67: 87, 0x6F: 88,
     ]
 
-    static func evdevCode(for macKeyCode: UInt16) -> UInt32? {
-        evdev[macKeyCode]
+    static func evdevCode(for macKeyCode: UInt16, swapCommandAndControl: Bool = false) -> UInt32? {
+        if swapCommandAndControl {
+            switch macKeyCode {
+            case 0x37: return 29
+            case 0x36: return 97
+            case 0x3B: return 125
+            case 0x3E: return 126
+            default: break
+            }
+        }
+        return evdev[macKeyCode]
     }
 
     /// Modifier keys report state through `flagsChanged` rather than key events,
@@ -79,12 +89,40 @@ enum KeyTranslation {
         }
     }
 
-    static func modifiers(from flags: NSEvent.ModifierFlags) -> Windowing.Modifiers {
+    /// The aggregate Shift/Control/etc. flag cannot distinguish releasing one
+    /// side while the other remains held. AppKit also supplies device-side bits.
+    static func modifierIsPressed(
+        _ macKeyCode: UInt16, flags: NSEvent.ModifierFlags, wasPressed: Bool
+    ) -> Bool? {
+        guard let flag = modifierKeyCode(for: macKeyCode) else { return nil }
+        if flag == .capsLock { return flags.contains(flag) }
+        let left: Int32, right: Int32, isLeft: Bool
+        switch macKeyCode {
+        case 0x38, 0x3C:
+            (left, right, isLeft) = (NX_DEVICELSHIFTKEYMASK, NX_DEVICERSHIFTKEYMASK, macKeyCode == 0x38)
+        case 0x3B, 0x3E:
+            (left, right, isLeft) = (NX_DEVICELCTLKEYMASK, NX_DEVICERCTLKEYMASK, macKeyCode == 0x3B)
+        case 0x3A, 0x3D:
+            (left, right, isLeft) = (NX_DEVICELALTKEYMASK, NX_DEVICERALTKEYMASK, macKeyCode == 0x3A)
+        default:
+            (left, right, isLeft) = (NX_DEVICELCMDKEYMASK, NX_DEVICERCMDKEYMASK, macKeyCode == 0x37)
+        }
+        if flags.rawValue & UInt(left | right) != 0 {
+            return flags.rawValue & UInt(isLeft ? left : right) != 0
+        }
+        // Events constructed without device-side bits still identify the key
+        // that changed; toggle that key, not the aggregate modifier state.
+        return flags.contains(flag) && !wasPressed
+    }
+
+    static func modifiers(
+        from flags: NSEvent.ModifierFlags, swapCommandAndControl: Bool = false
+    ) -> Windowing.Modifiers {
         var result: Windowing.Modifiers = []
         if flags.contains(.shift) { result.insert(.shift) }
-        if flags.contains(.control) { result.insert(.control) }
+        if flags.contains(.control) { result.insert(swapCommandAndControl ? .logo : .control) }
         if flags.contains(.option) { result.insert(.alt) }
-        if flags.contains(.command) { result.insert(.logo) }
+        if flags.contains(.command) { result.insert(swapCommandAndControl ? .control : .logo) }
         if flags.contains(.capsLock) { result.insert(.capsLock) }
         return result
     }

@@ -401,6 +401,7 @@ public final class WindowBridge: NSObject {
     private var suspendedKeyWindow: UInt32?
     private var computerPointerWindow: UInt32?
     private var integrationPreferences = WindowIntegrationPreferences()
+    private var keyUpMonitor: Any?
 
     /// Strong on purpose. There is no cycle to break — a frame source refers to
     /// the VM controller weakly, if at all — and a weak reference here silently
@@ -422,23 +423,55 @@ public final class WindowBridge: NSObject {
 		super.init()
         clipboard.output = { [weak self] command in self?.send(command) }
         clipboard.start()
+        // Keep AppKit's normal shortcut/menu dispatch. Only rescue releases
+        // for presses sent by our own guest views; never monitor other apps.
+        keyUpMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyUp) { [weak self] event in
+            let handled = MainActor.assumeIsolated { self?.handleKeyUp(event) == true }
+            return handled ? nil : event
+        }
 		NotificationCenter.default.addObserver(
 			self, selector: #selector(screenParametersChanged(_:)),
 			name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(applicationDidResignActive(_:)),
+            name: NSApplication.didResignActiveNotification, object: nil)
     }
 
 	deinit {
+		if let keyUpMonitor { NSEvent.removeMonitor(keyUpMonitor) }
 		NotificationCenter.default.removeObserver(self)
 	}
+
+    func handleKeyUp(_ event: NSEvent) -> Bool {
+        guard event.type == .keyUp,
+              let window = event.window ?? NSApp.keyWindow,
+              let native = windows.values.first(where: { $0.window === window }) else { return false }
+        return native.handleKeyUp(event)
+    }
+
+    var acceptsKeyboardInput: Bool { !presentationSuspended }
+
+    @objc private func applicationDidResignActive(_ notification: Notification) {
+        for native in windows.values { native.releasePressedKeys() }
+    }
 
     public var windowCount: Int { windows.count }
 
     public func setIntegrationPreferences(_ value: WindowIntegrationPreferences) {
+        guard value != integrationPreferences else { return }
+        let keyboardChanged = value.keyboardLayout != integrationPreferences.keyboardLayout
+            || value.keyRepeatRate != integrationPreferences.keyRepeatRate
+            || value.keyRepeatDelay != integrationPreferences.keyRepeatDelay
+        if value.swapCommandAndControl != integrationPreferences.swapCommandAndControl
+            || value.keyboardLayout != integrationPreferences.keyboardLayout {
+            // Release using the old mapping before installing the new one.
+            for native in windows.values { native.releasePressedKeys() }
+        }
         integrationPreferences = value
         clipboard.setPolicy(
             hostToGuest: value.clipboardHostToGuest,
             guestToHost: value.clipboardGuestToHost)
-        sendInputPreferences()
+        if keyboardChanged { sendInputPreferences() }
     }
 
     func scrollDeltas(for event: NSEvent) -> (dx: Double, dy: Double) {
@@ -469,6 +502,9 @@ public final class WindowBridge: NSObject {
     /// and sees the same xdg_toplevels after VZ resumes.
     public func setSuspended(_ suspended: Bool, hideWindows: Bool = false) {
         guard presentationSuspended != suspended else { return }
+        if suspended {
+            for native in windows.values { native.releasePressedKeys() }
+        }
         presentationSuspended = suspended
         if suspended {
             for native in windows.values { unregisterDisplayClock(native) }
