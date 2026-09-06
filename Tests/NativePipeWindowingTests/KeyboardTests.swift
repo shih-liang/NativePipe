@@ -23,13 +23,13 @@ final class KeyboardTests: XCTestCase {
     func testRawRepeatHasExactlyOnePressAndRelease() {
         var state = KeyboardState()
         let down = event(.keyDown)
-        XCTAssertNotNil(state.press(down))
-        XCTAssertNil(state.press(down))
-        XCTAssertNil(state.press(event(.keyDown, repeat: true)))
+        XCTAssertFalse(state.press(down).isEmpty)
+        XCTAssertTrue(state.press(down).isEmpty)
+        XCTAssertTrue(state.press(event(.keyDown, repeat: true)).isEmpty)
         XCTAssertFalse(state.shouldInterpret(
             event(.keyDown, repeat: true), textInputEnabled: true))
-        XCTAssertNotNil(state.release(event(.keyUp)))
-        XCTAssertNil(state.release(event(.keyUp)))
+        XCTAssertFalse(state.release(event(.keyUp)).isEmpty)
+        XCTAssertTrue(state.release(event(.keyUp)).isEmpty)
         XCTAssertTrue(state.releaseAll().isEmpty)
     }
 
@@ -42,9 +42,9 @@ final class KeyboardTests: XCTestCase {
             let repeated = event(.keyDown, repeat: true)
             XCTAssertTrue(state.shouldInterpret(repeated, textInputEnabled: true))
             state.textHandled(repeated)
-            XCTAssertNil(state.press(repeated))
+            XCTAssertTrue(state.press(repeated).isEmpty)
         }
-        XCTAssertNil(state.release(event(.keyUp)))
+        XCTAssertTrue(state.release(event(.keyUp)).isEmpty)
         XCTAssertFalse(state.shouldInterpret(
             event(.keyDown, repeat: true), textInputEnabled: true))
         XCTAssertTrue(state.releaseAll().isEmpty)
@@ -64,13 +64,13 @@ final class KeyboardTests: XCTestCase {
         let left = NSEvent.ModifierFlags(rawValue: UInt(NX_DEVICELSHIFTKEYMASK))
         let right = NSEvent.ModifierFlags(rawValue: UInt(NX_DEVICERSHIFTKEYMASK))
         XCTAssertTrue(try XCTUnwrap(state.modifiersChanged(
-            event(.flagsChanged, code: 0x38, flags: [.shift, left]))).pressed)
+            event(.flagsChanged, code: 0x38, flags: [.shift, left])).first).pressed)
         XCTAssertTrue(try XCTUnwrap(state.modifiersChanged(
-            event(.flagsChanged, code: 0x3C, flags: [.shift, left, right]))).pressed)
+            event(.flagsChanged, code: 0x3C, flags: [.shift, left, right])).first).pressed)
         XCTAssertFalse(try XCTUnwrap(state.modifiersChanged(
-            event(.flagsChanged, code: 0x38, flags: [.shift, right]))).pressed)
+            event(.flagsChanged, code: 0x38, flags: [.shift, right])).first).pressed)
         XCTAssertFalse(try XCTUnwrap(state.modifiersChanged(
-            event(.flagsChanged, code: 0x3C))).pressed)
+            event(.flagsChanged, code: 0x3C)).first).pressed)
         XCTAssertTrue(state.releaseAll().isEmpty)
     }
 
@@ -82,7 +82,7 @@ final class KeyboardTests: XCTestCase {
         let releases = state.releaseAll()
         XCTAssertEqual(releases.map(\.code), [0x08, 0x37])
         XCTAssertTrue(releases.allSatisfy { !$0.pressed && $0.flags.isEmpty })
-        XCTAssertNil(state.release(event(.keyUp)))
+        XCTAssertTrue(state.release(event(.keyUp)).isEmpty)
         XCTAssertFalse(state.shouldInterpret(
             event(.keyDown, code: 0x00, repeat: true), textInputEnabled: true))
         XCTAssertTrue(state.releaseAll().isEmpty)
@@ -93,19 +93,16 @@ final class KeyboardTests: XCTestCase {
         // The Shift press happened before the view had focus. Its state was
         // nevertheless advertised with C, and must not remain depressed.
         _ = state.press(event(.keyDown, flags: .shift))
-        let released = try XCTUnwrap(state.modifiersChanged(event(.flagsChanged, code: 0x38)))
+        let released = try XCTUnwrap(state.modifiersChanged(event(.flagsChanged, code: 0x38)).first)
         XCTAssertFalse(released.pressed)
         XCTAssertTrue(released.flags.isEmpty)
         XCTAssertEqual(state.releaseAll().map(\.code), [0x08])
     }
 
-    func testCommandControlMappingChangesCodesAndMasksTogether() {
-        XCTAssertEqual(KeyTranslation.evdevCode(for: 0x37, swapCommandAndControl: true), 29)
-        XCTAssertEqual(KeyTranslation.evdevCode(for: 0x36, swapCommandAndControl: true), 97)
-        XCTAssertEqual(KeyTranslation.evdevCode(for: 0x3B, swapCommandAndControl: true), 125)
-        XCTAssertEqual(KeyTranslation.evdevCode(for: 0x3E, swapCommandAndControl: true), 126)
-        XCTAssertEqual(KeyTranslation.modifiers(from: [.command, .shift], swapCommandAndControl: true), [.control, .shift])
-        XCTAssertEqual(KeyTranslation.modifiers(from: .control, swapCommandAndControl: true), .logo)
+    func testPhysicalModifiersAreNeverGloballySwapped() {
+        XCTAssertEqual(KeyTranslation.evdevCode(for: 0x3B), 29)
+        XCTAssertEqual(KeyTranslation.evdevCode(for: 0x3E), 97)
+        XCTAssertEqual(KeyTranslation.modifiers(from: .control), .control)
         XCTAssertEqual(KeyTranslation.evdevCode(for: 0x37), 125)
         XCTAssertEqual(KeyTranslation.modifiers(from: .command), .logo)
     }
@@ -129,6 +126,7 @@ final class KeyboardTests: XCTestCase {
     private func fixture() throws -> (WindowBridge, NativeWindow, NSView, Output) {
         _ = NSApplication.shared
         let bridge = WindowBridge(frameSource: nil)
+        bridge.setIntegrationPreferences(.init(shortcuts: .init(enabled: false)))
         bridge.apply(.surfaceCreated(surface: 1))
         bridge.apply(.toplevelCreated(window: 1, surface: 1))
         let native = try XCTUnwrap(bridge.window(1))
@@ -149,11 +147,12 @@ final class KeyboardTests: XCTestCase {
         }
         NSApp.sendEvent(up)
         XCTAssertEqual(output.keys, [
+            SentKey(code: 125, pressed: true, modifiers: .logo),
             SentKey(code: 46, pressed: true, modifiers: .logo),
             SentKey(code: 46, pressed: false, modifiers: .logo),
         ])
         view.keyUp(with: up)
-        XCTAssertEqual(output.keys.count, 2, "normal dispatch must not duplicate the rescued release")
+        XCTAssertEqual(output.keys.count, 3, "normal dispatch must not duplicate the rescued release")
         XCTAssertFalse(bridge.handleKeyUp(event(.keyUp, code: 0x00, flags: .command, window: native.window)))
     }
 
@@ -214,15 +213,19 @@ final class KeyboardTests: XCTestCase {
         XCTAssertEqual(output.keys.count, 2)
     }
 
-    func testChangingMappingReleasesUsingOldCodes() throws {
+    func testChangingRulesPreservesAnOutstandingPress() throws {
         let (bridge, _, view, output) = try fixture()
         defer { bridge.closeAll() }
+        bridge.setIntegrationPreferences(.init())
         view.flagsChanged(with: event(.flagsChanged, code: 0x37, flags: .command))
-        bridge.setIntegrationPreferences(.init(swapCommandAndControl: true))
-        XCTAssertEqual(output.keys.map(\.code), [125, 125])
-        XCTAssertEqual(output.keys.map(\.pressed), [true, false])
-        view.flagsChanged(with: event(.flagsChanged, code: 0x37, flags: .command))
-        XCTAssertEqual(output.keys.last, SentKey(code: 29, pressed: true, modifiers: .control))
+        view.keyDown(with: event(.keyDown, flags: .command))
+        let count = output.keys.count
+        bridge.setIntegrationPreferences(.init(shortcuts: .init(enabled: false)))
+        XCTAssertEqual(output.keys.count, count, "editing a rule must not release a held shortcut early")
+        view.keyUp(with: event(.keyUp, flags: .command))
+        XCTAssertTrue(output.keys.contains(SentKey(code: 46, pressed: false, modifiers: .control)))
+        view.flagsChanged(with: event(.flagsChanged, code: 0x37))
+        XCTAssertEqual(output.keys.last, SentKey(code: 125, pressed: false, modifiers: []))
     }
 
     func testSuspensionReleasesAndDoesNotQueueNewPresses() throws {

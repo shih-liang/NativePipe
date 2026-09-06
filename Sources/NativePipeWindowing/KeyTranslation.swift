@@ -63,18 +63,7 @@ enum KeyTranslation {
         0x62: 65, 0x64: 66, 0x65: 67, 0x6D: 68, 0x67: 87, 0x6F: 88,
     ]
 
-    static func evdevCode(for macKeyCode: UInt16, swapCommandAndControl: Bool = false) -> UInt32? {
-        if swapCommandAndControl {
-            switch macKeyCode {
-            case 0x37: return 29
-            case 0x36: return 97
-            case 0x3B: return 125
-            case 0x3E: return 126
-            default: break
-            }
-        }
-        return evdev[macKeyCode]
-    }
+    static func evdevCode(for macKeyCode: UInt16) -> UInt32? { evdev[macKeyCode] }
 
     /// Modifier keys report state through `flagsChanged` rather than key events,
     /// so the pressed/released edge has to be inferred from the flags.
@@ -115,14 +104,12 @@ enum KeyTranslation {
         return flags.contains(flag) && !wasPressed
     }
 
-    static func modifiers(
-        from flags: NSEvent.ModifierFlags, swapCommandAndControl: Bool = false
-    ) -> Windowing.Modifiers {
+    static func modifiers(from flags: NSEvent.ModifierFlags) -> Windowing.Modifiers {
         var result: Windowing.Modifiers = []
         if flags.contains(.shift) { result.insert(.shift) }
-        if flags.contains(.control) { result.insert(swapCommandAndControl ? .logo : .control) }
+        if flags.contains(.control) { result.insert(.control) }
         if flags.contains(.option) { result.insert(.alt) }
-        if flags.contains(.command) { result.insert(swapCommandAndControl ? .control : .logo) }
+        if flags.contains(.command) { result.insert(.logo) }
         if flags.contains(.capsLock) { result.insert(.capsLock) }
         return result
     }

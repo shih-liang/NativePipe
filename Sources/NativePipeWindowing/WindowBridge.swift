@@ -16,7 +16,7 @@ public enum FrameTextureStatus: Sendable {
 public struct WindowIntegrationPreferences: Sendable, Equatable {
     /// Nil follows AppKit's already-applied system direction.
     public var naturalScrolling: Bool?
-    public var swapCommandAndControl: Bool
+    public var shortcuts: KeyboardShortcutPreferences
     public var clipboardHostToGuest: Bool
     public var clipboardGuestToHost: Bool
     public var keyboardLayout: String
@@ -25,7 +25,7 @@ public struct WindowIntegrationPreferences: Sendable, Equatable {
 
     public init(
         naturalScrolling: Bool? = nil,
-        swapCommandAndControl: Bool = false,
+        shortcuts: KeyboardShortcutPreferences = .init(),
         clipboardHostToGuest: Bool = true,
         clipboardGuestToHost: Bool = true,
         keyboardLayout: String = "us",
@@ -33,7 +33,7 @@ public struct WindowIntegrationPreferences: Sendable, Equatable {
         keyRepeatDelay: Int = 600
     ) {
         self.naturalScrolling = naturalScrolling
-        self.swapCommandAndControl = swapCommandAndControl
+        self.shortcuts = shortcuts
         self.clipboardHostToGuest = clipboardHostToGuest
         self.clipboardGuestToHost = clipboardGuestToHost
         self.keyboardLayout = keyboardLayout
@@ -462,9 +462,8 @@ public final class WindowBridge: NSObject {
         let keyboardChanged = value.keyboardLayout != integrationPreferences.keyboardLayout
             || value.keyRepeatRate != integrationPreferences.keyRepeatRate
             || value.keyRepeatDelay != integrationPreferences.keyRepeatDelay
-        if value.swapCommandAndControl != integrationPreferences.swapCommandAndControl
-            || value.keyboardLayout != integrationPreferences.keyboardLayout {
-            // Release using the old mapping before installing the new one.
+        if value.keyboardLayout != integrationPreferences.keyboardLayout {
+            // A new XKB layout cannot reinterpret keys still held in the old one.
             for native in windows.values { native.releasePressedKeys() }
         }
         integrationPreferences = value
@@ -486,8 +485,8 @@ public final class WindowBridge: NSObject {
             -Double(event.scrollingDeltaY) * multiplier)
     }
 
-    var swapsCommandAndControl: Bool {
-        integrationPreferences.swapCommandAndControl
+    var shortcutPreferences: KeyboardShortcutPreferences {
+        integrationPreferences.shortcuts
     }
 
     private func sendInputPreferences() {

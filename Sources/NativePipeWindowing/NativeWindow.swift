@@ -203,7 +203,7 @@ final class NativeWindow: NSObject {
     }
 
     var isPopup: Bool { popup != nil }
-    var applicationID: String? { appID }
+    var applicationID: String? { appID ?? popup.flatMap { bridge?.window($0.parent)?.applicationID } }
     var dockIcon: NSImage? { applicationIcon }
     var isMiniaturized: Bool { window?.isMiniaturized == true }
     var isZoomed: Bool { window?.isZoomed == true }
@@ -825,14 +825,18 @@ final class NativeWindow: NSObject {
     }
 
     func key(_ macKeyCode: UInt16, pressed: Bool, flags: NSEvent.ModifierFlags) {
-        let swap = bridge?.swapsCommandAndControl ?? false
-        guard let code = KeyTranslation.evdevCode(for: macKeyCode, swapCommandAndControl: swap) else {
+        guard let code = KeyTranslation.evdevCode(for: macKeyCode) else {
             Self.note("no evdev code for macOS key \(macKeyCode); dropped")
             return
         }
         bridge?.send(
             .key(window: windowID, keycode: code, pressed: pressed,
-                 modifiers: KeyTranslation.modifiers(from: flags, swapCommandAndControl: swap)))
+                 modifiers: KeyTranslation.modifiers(from: flags)))
+    }
+
+    func shortcutRule(for event: NSEvent) -> KeyboardShortcutRule? {
+        guard let chord = ShortcutTranslation.chord(for: event) else { return nil }
+        return bridge?.shortcutPreferences.rule(for: chord, applicationID: applicationID)
     }
 
     var acceptsKeyboardInput: Bool { bridge?.acceptsKeyboardInput == true }
@@ -1471,10 +1475,30 @@ private final class SurfaceView: NSView {
 
     // MARK: Keyboard
 
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // Only the guest content responder may consume the host menu shortcut;
+        // native sheets and controls must retain their usual AppKit behavior.
+        guard window?.firstResponder === self else { return false }
+        let quit = ShortcutTranslation.chord(for: event) == ShortcutChord(.q, .logo)
+        guard quit || keyboard.ownsPress(event.keyCode) || input?.shortcutRule(for: event) != nil else {
+            return false
+        }
+        // Cmd+Q is reserved for this guest even with remapping disabled, while
+        // paused, or when its rule has been deleted. Never fall through to Quit
+        // VMHost. Explicitly choosing Quit from the host menu still works.
+        keyDown(with: event)
+        return true
+    }
+
     override func keyDown(with event: NSEvent) {
         // Not calling super: NSResponder's default is to beep at anything it does
         // not recognise, and the client is the one deciding what a key means.
         guard input?.acceptsKeyboardInput == true else { return }
+        if keyboard.ownsPress(event.keyCode) ||
+            (!keyboard.ownsTextPress(event.keyCode) && input?.shortcutRule(for: event)?.target != nil) {
+            forwardPress(event)
+            return
+        }
         if keyboard.shouldInterpret(event, textInputEnabled: textInputEnabled) {
             // The input method gets first refusal. What it takes comes back as
             // text; what it declines — Return, Escape, the arrow keys, anything
@@ -1494,8 +1518,17 @@ private final class SurfaceView: NSView {
     }
 
     private func forwardPress(_ event: NSEvent) {
-        guard let key = keyboard.press(event) else { return }
-        input?.key(key.code, pressed: key.pressed, flags: key.flags)
+        guard !event.isARepeat else { return }
+        let target = input?.shortcutRule(for: event)?.target
+        let code = target.flatMap { ShortcutTranslation.keyCode(for: $0.key, source: event) }
+        // An unavailable target layout key must not be replaced by a different
+        // physical key. Pass through instead; rule editing remains reversible.
+        sendKeys(keyboard.press(event, mappedCode: code,
+                               mappedFlags: code == nil ? nil : target.map { ShortcutTranslation.flags(from: $0.modifiers) }))
+    }
+
+    private func sendKeys(_ keys: [KeyboardState.Key]) {
+        for key in keys { input?.key(key.code, pressed: key.pressed, flags: key.flags) }
     }
 
     override func keyUp(with event: NSEvent) {
@@ -1505,17 +1538,16 @@ private final class SurfaceView: NSView {
     /// Called both by normal responder dispatch and by the bridge's local
     /// monitor: NSApplication can swallow keyUp while Command is held.
     func handleKeyUp(_ event: NSEvent) -> Bool {
-        guard let key = keyboard.release(event) else { return false }
-        input?.key(key.code, pressed: key.pressed, flags: key.flags)
-        return true
+        let owned = keyboard.ownsPress(event.keyCode)
+        sendKeys(keyboard.release(event))
+        return owned
     }
 
     /// Modifiers arrive as a flags snapshot rather than as key events, so the
     /// press and release edges have to be recovered by comparing with the last.
     override func flagsChanged(with event: NSEvent) {
-        guard input?.acceptsKeyboardInput == true,
-              let key = keyboard.modifiersChanged(event) else { return }
-        input?.key(key.code, pressed: key.pressed, flags: key.flags)
+        guard input?.acceptsKeyboardInput == true else { return }
+        sendKeys(keyboard.modifiersChanged(event))
     }
 
     override func resignFirstResponder() -> Bool {
@@ -1525,9 +1557,7 @@ private final class SurfaceView: NSView {
 
     func releasePressedKeys() {
         unconsumedKeyEvent = nil
-        for key in keyboard.releaseAll() {
-            input?.key(key.code, pressed: key.pressed, flags: key.flags)
-        }
+        sendKeys(keyboard.releaseAll())
         abandonComposition()
     }
 
