@@ -74,6 +74,9 @@ public struct Request: Sendable {
         /// settings service. Repeated updates are latest-wins on the host.
         case desktopPreferences(DesktopPreferences)
 
+        /// Mount or normally unmount the fixed host shared-folder device.
+        case setSharedFoldersMounted(Bool)
+
         /// Create `username` if missing. If `oldUsername` is set, rename that
         /// account to `username` instead (usermod). Does not set a password.
         case setUser(username: String, oldUsername: String?)
@@ -394,4 +397,5 @@ public enum GuestCapability {
     public static let environmentCatalog = "environment.catalog"
     public static let resourceSync = "resource.sync.v1"
     public static let desktopPreferences = "integration.desktop-preferences"
+    public static let sharedFolders = "fs.shared-folders"
 }

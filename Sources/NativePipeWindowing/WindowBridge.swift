@@ -452,7 +452,10 @@ public final class WindowBridge: NSObject {
     var acceptsKeyboardInput: Bool { !presentationSuspended }
 
     @objc private func applicationDidResignActive(_ notification: Notification) {
-        for native in windows.values { native.releasePressedKeys() }
+        for native in windows.values {
+            native.endScrollGesture()
+            native.releasePressedKeys()
+        }
     }
 
     public var windowCount: Int { windows.count }
@@ -502,7 +505,10 @@ public final class WindowBridge: NSObject {
     public func setSuspended(_ suspended: Bool, hideWindows: Bool = false) {
         guard presentationSuspended != suspended else { return }
         if suspended {
-            for native in windows.values { native.releasePressedKeys() }
+            for native in windows.values {
+                native.endScrollGesture()
+                native.releasePressedKeys()
+            }
         }
         presentationSuspended = suspended
         if suspended {

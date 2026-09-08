@@ -93,11 +93,11 @@ static void apply_desktop_preferences(void) {
         fprintf(stderr, "[session] could not apply desktop appearance\n");
 }
 
-/* Runs inside dbus-run-session after privileges have already been dropped.
- * Prefer distro user services when they have created pipewire-0. Otherwise
- * own the three ordinary user processes for exactly this graphical session. */
-static int user_session_main(void) {
-    apply_desktop_preferences();
+static void start_audio_services(void) {
+    /* The installer enables the packaged user services on systemd guests.
+     * Leave both startup and lifetime management to the user manager. */
+    if (np_path_exists("/run/systemd/system"))
+        return;
     const char *runtime = getenv("XDG_RUNTIME_DIR");
     char pipewire_socket[256];
     pipewire_socket[0] = '\0';
@@ -117,6 +117,13 @@ static int user_session_main(void) {
             session_services[2] = spawn_service(wireplumber);
         }
     }
+}
+
+/* Runs inside dbus-run-session after privileges have already been dropped.
+ * On non-systemd guests, own the ordinary audio processes for this session. */
+static int user_session_main(void) {
+    start_audio_services();
+    apply_desktop_preferences();
 
     child_pid = fork();
     if (child_pid == 0) {

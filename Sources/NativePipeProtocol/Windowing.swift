@@ -529,6 +529,8 @@ extension Windowing {
         case pointerMoved(window: UInt32, x: Double, y: Double)
         case pointerLeft(window: UInt32)
         case pointerButton(window: UInt32, button: PointerButton, pressed: Bool)
+        /// Precise displacement is in logical points. A precise (0, 0) record
+        /// explicitly ends the gesture; it is not an idle motion sample.
         case pointerScroll(window: UInt32, dx: Double, dy: Double, isPrecise: Bool)
 
         /// The frame reached the host display clock. This completes Wayland
@@ -565,6 +567,26 @@ extension Windowing {
         /// Bytes the IME wants removed around the caret before its commit —
         /// what replacing a reconverted word requires.
         case textDeleteSurrounding(window: UInt32, beforeLength: UInt32, afterLength: UInt32)
+
+        /// Coalesce only adjacent motion, never a stop or a direction reversal.
+        /// Shared by the VM and remote transports so neither can lose a gesture
+        /// boundary or manufacture a stop by cancelling opposite displacements.
+        public func coalescingScroll(with next: Self) -> Self? {
+            guard case .pointerScroll(let window, let dx, let dy, let precise) = self,
+                  case .pointerScroll(let nextWindow, let nextDX, let nextDY,
+                                      let nextPrecise) = next,
+                  window == nextWindow, precise == nextPrecise,
+                  dx.isFinite, dy.isFinite, nextDX.isFinite, nextDY.isFinite,
+                  (dx != 0 || dy != 0), (nextDX != 0 || nextDY != 0)
+            else { return nil }
+            func sameDirection(_ a: Double, _ b: Double) -> Bool {
+                a == 0 || b == 0 || (a < 0) == (b < 0)
+            }
+            let x = dx + nextDX, y = dy + nextDY
+            guard sameDirection(dx, nextDX), sameDirection(dy, nextDY),
+                  x.isFinite, y.isFinite else { return nil }
+            return .pointerScroll(window: window, dx: x, dy: y, isPrecise: precise)
+        }
     }
 
     public enum ToplevelState: String, Codable, Sendable, Equatable {

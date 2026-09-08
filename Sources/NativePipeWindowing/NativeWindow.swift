@@ -130,6 +130,7 @@ final class NativeWindow: NSObject {
 
     private var appID: String?
     private var applicationIcon: NSImage?
+    private var scrollGestureActive = false
     /// This is a value supplied by the guest compositor, not a host policy.
     /// Client-side is the safe construction default: it prevents an NSWindow
     /// titlebar from flashing around the first CSD frame before the protocol
@@ -678,6 +679,7 @@ final class NativeWindow: NSObject {
     }
 
 	func close() {
+        endScrollGesture()
         releasePressedKeys()
         pendingConfigure = nil
         contentView.clearDisplayedSurface()
@@ -804,6 +806,7 @@ final class NativeWindow: NSObject {
     }
 
     func pointerLeft() {
+        endScrollGesture()
         bridge?.send(.pointerLeft(window: windowID))
     }
 
@@ -815,13 +818,41 @@ final class NativeWindow: NSObject {
     }
 
     func pointerScroll(dx: Double, dy: Double, precise: Bool) {
+        scrollGestureActive = precise && (dx != 0 || dy != 0)
         bridge?.send(.pointerScroll(window: windowID, dx: dx, dy: dy, isPrecise: precise))
     }
 
-    func pointerScroll(with event: NSEvent) {
-        guard let bridge else { return }
+    func endScrollGesture() {
+        guard scrollGestureActive else { return }
+        // A precise zero record is the existing wire representation of axis_stop.
+        pointerScroll(dx: 0, dy: 0, precise: true)
+    }
+
+    func pointerScroll(with event: NSEvent, at point: CGPoint) {
+        guard let bridge, bridge.acceptsKeyboardInput else { return }
+        // Wayland reports finger motion and axis_stop at finger lift. Clients
+        // may implement inertia; there is no inertia capability negotiation.
+        // AppKit's synthesized momentum is not another finger gesture.
+        guard event.momentumPhase.isEmpty else {
+            endScrollGesture()
+            return
+        }
+        let phase = event.phase
+        if phase.contains(.began) || !event.hasPreciseScrollingDeltas {
+            endScrollGesture()
+        }
+        if phase.contains(.cancelled) {
+            endScrollGesture()
+            return
+        }
         let delta = bridge.scrollDeltas(for: event)
-        pointerScroll(dx: delta.dx, dy: delta.dy, precise: event.hasPreciseScrollingDeltas)
+        if delta.dx != 0 || delta.dy != 0 {
+            pointerMoved(to: point)
+            pointerScroll(dx: delta.dx, dy: delta.dy, precise: event.hasPreciseScrollingDeltas)
+        }
+        // Zero-delta began/changed/stationary events are not gesture boundaries.
+        // Preserve a final nonzero displacement before sending a separate stop.
+        if phase.contains(.ended) { endScrollGesture() }
     }
 
     func key(_ macKeyCode: UInt16, pressed: Bool, flags: NSEvent.ModifierFlags) {
@@ -1469,8 +1500,7 @@ private final class SurfaceView: NSView {
     }
 
     override func scrollWheel(with event: NSEvent) {
-        input?.pointerMoved(to: location(of: event))
-        input?.pointerScroll(with: event)
+        input?.pointerScroll(with: event, at: location(of: event))
     }
 
     // MARK: Keyboard

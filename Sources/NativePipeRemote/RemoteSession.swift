@@ -423,14 +423,11 @@ public final class RemoteSession: @unchecked Sendable {
                   .configure(let previousWindow, _, _, _)) where window == previousWindow:
                 pendingWrites[pendingWrites.count - 1] = command
                 replaced = true
-            case (.pointerScroll(let window, let dx, let dy, let precise),
-                  .pointerScroll(let previousWindow, let previousDX, let previousDY,
-                                 let previousPrecise))
-                where window == previousWindow && precise == previousPrecise:
-                pendingWrites[pendingWrites.count - 1] = .pointerScroll(
-                    window: window, dx: previousDX + dx, dy: previousDY + dy,
-                    isPrecise: precise)
-                replaced = true
+            case (.pointerScroll, .pointerScroll):
+                if let merged = previous.coalescingScroll(with: command) {
+                    pendingWrites[pendingWrites.count - 1] = merged
+                    replaced = true
+                }
             default:
                 break
             }
