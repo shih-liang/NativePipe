@@ -127,7 +127,7 @@ public enum MediaWire {
         }
     }
 
-    /// Incremental demultiplexer for a TCP byte stream of NPEN frames.
+    /// Incremental demultiplexer for a byte stream of NPEN frames.
     public final class Demuxer: @unchecked Sendable {
         private var buffer = Data()
 

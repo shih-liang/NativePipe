@@ -1,166 +1,51 @@
 import Foundation
-import NativePipeProtocol
+import NativePipeRemote
 
-/// Manual argv split so ssh flags (`-i`, `-p`, `-o`, …) pass through untouched.
 struct RemotePipeCLI {
-    var destination: String?
-    var compositor: String = "nativepipe-wayland"
-    var host: String = "127.0.0.1"
-    var surfacePort: UInt16 = UInt16(NativePipePort.surface)
-    var mediaPort: UInt16 = UInt16(NativePipePort.media)
-    var sshArguments: [String] = []
+    var command: SSHCommand?
     var wantHelp = false
-
     static let usage = """
-        Usage:
-          nativepipe user@host [ssh-args…] [--compositor PATH]
-          nativepipe --host 127.0.0.1 [--surface-port N] [--media-port N]
+    Usage: nativepipe [options] user@host application [arguments...]
 
-        One-shot SSH session (recommended):
-          Opens local forwards for ports 1025/1026, starts the remote compositor
-          if needed, runs the NativePipe display client, then drops you into a
-          remote login shell with WAYLAND_DISPLAY set. Exit the shell to tear down.
+    Launch a Linux application directly; its windows appear on this Mac.
+    SSH handles authentication and communication without port forwarding.
 
-          nativepipe lfs@172.16.0.34
-          nativepipe user@host --compositor ~/bin/nativepipe-wayland
-          nativepipe user@host -i ~/.ssh/id_ed25519 -p 2222
-          nativepipe user@host -- -o ProxyJump=bastion
+      nativepipe user@host firefox --no-remote
+      nativepipe -p 2222 --install-compositor user@host gtk4-demo
 
-        Local-only (manual ssh -L already set up):
-          nativepipe --host 127.0.0.1
+    Options (before user@host):
+      --compositor PATH      Remote compositor executable
+      --install-compositor   Download missing compositor from GitHub Release
+      -i FILE, -F FILE, -J HOST, -p PORT, -o OPTION
+                             Pass an authentication/connection option to SSH
+      -h, --help             Show help
+    """
 
-        Options:
-          --compositor PATH   Remote compositor binary (default: nativepipe-wayland)
-          --host ADDR         Local mode: connect to ADDR (default 127.0.0.1)
-          --surface-port N    Local mode / override local forward port (default 1025)
-          --media-port N      Local mode / override local forward port (default 1026)
-          -h, --help          Show this help
-        """
-
-    static func parse(_ arguments: [String] = Array(CommandLine.arguments.dropFirst())) throws -> RemotePipeCLI {
-        var cli = RemotePipeCLI()
-        var i = arguments.startIndex
-        while i < arguments.endIndex {
-            let arg = arguments[i]
-            if arg == "--" {
-                cli.sshArguments.append(contentsOf: arguments[arguments.index(after: i)...])
-                break
-            }
-            if arg == "-h" || arg == "--help" {
-                cli.wantHelp = true
-                i = arguments.index(after: i)
-                continue
-            }
-            if arg == "--compositor" {
-                i = arguments.index(after: i)
-                guard i < arguments.endIndex else {
-                    throw CLIError.missingValue("--compositor")
+    static func parse(_ arguments: [String]) throws -> Self {
+        var result = Self(), index = 0
+        var ssh: [String] = [], compositor = "nativepipe-wayland", install = false
+        while index < arguments.count {
+            let value = arguments[index]
+            if value == "-h" || value == "--help" { result.wantHelp = true; return result }
+            if value == "--install-compositor" { install = true; index += 1; continue }
+            if value == "--compositor" || ["-i", "-F", "-J", "-p", "-o"].contains(value) {
+                guard index + 1 < arguments.count else {
+                    throw RemoteError.message("Missing value for \(value).")
                 }
-                cli.compositor = arguments[i]
-                i = arguments.index(after: i)
+                if value == "--compositor" { compositor = arguments[index + 1] }
+                else { ssh += [value, arguments[index + 1]] }
+                index += 2
                 continue
             }
-            if arg.hasPrefix("--compositor=") {
-                cli.compositor = String(arg.dropFirst("--compositor=".count))
-                i = arguments.index(after: i)
-                continue
+            guard !value.hasPrefix("-") else {
+                throw RemoteError.message("Unknown option: \(value). Options must precede the SSH destination.")
             }
-            if arg == "--host" {
-                i = arguments.index(after: i)
-                guard i < arguments.endIndex else {
-                    throw CLIError.missingValue("--host")
-                }
-                cli.host = arguments[i]
-                i = arguments.index(after: i)
-                continue
-            }
-            if arg.hasPrefix("--host=") {
-                cli.host = String(arg.dropFirst("--host=".count))
-                i = arguments.index(after: i)
-                continue
-            }
-            if arg == "--surface-port" {
-                i = arguments.index(after: i)
-                guard i < arguments.endIndex, let port = UInt16(arguments[i]) else {
-                    throw CLIError.missingValue("--surface-port")
-                }
-                cli.surfacePort = port
-                i = arguments.index(after: i)
-                continue
-            }
-            if arg.hasPrefix("--surface-port=") {
-                guard let port = UInt16(arg.dropFirst("--surface-port=".count)) else {
-                    throw CLIError.missingValue("--surface-port")
-                }
-                cli.surfacePort = port
-                i = arguments.index(after: i)
-                continue
-            }
-            if arg == "--media-port" {
-                i = arguments.index(after: i)
-                guard i < arguments.endIndex, let port = UInt16(arguments[i]) else {
-                    throw CLIError.missingValue("--media-port")
-                }
-                cli.mediaPort = port
-                i = arguments.index(after: i)
-                continue
-            }
-            if arg.hasPrefix("--media-port=") {
-                guard let port = UInt16(arg.dropFirst("--media-port=".count)) else {
-                    throw CLIError.missingValue("--media-port")
-                }
-                cli.mediaPort = port
-                i = arguments.index(after: i)
-                continue
-            }
-            if !arg.hasPrefix("-"), cli.destination == nil {
-                cli.destination = arg
-                i = arguments.index(after: i)
-                continue
-            }
-            cli.sshArguments.append(arg)
-            if Self.sshOptionTakesValue(arg),
-               arguments.index(after: i) < arguments.endIndex
-            {
-                let next = arguments[arguments.index(after: i)]
-                if cli.destination == nil, !next.hasPrefix("-"), looksLikeDestination(next) {
-                    // leave next for destination parsing
-                } else {
-                    cli.sshArguments.append(next)
-                    i = arguments.index(after: i)
-                }
-            }
-            i = arguments.index(after: i)
+            result.command = SSHCommand(destination: value, application: Array(arguments.dropFirst(index + 1)),
+                                        sshArguments: ssh, compositor: compositor,
+                                        installCompositor: install)
+            try result.command?.validate()
+            return result
         }
-        return cli
-    }
-
-    private static func looksLikeDestination(_ value: String) -> Bool {
-        value.contains("@") || (!value.contains("/") && value.contains("."))
-    }
-
-    private static func sshOptionTakesValue(_ arg: String) -> Bool {
-        let singles: Set<Character> = [
-            "b", "c", "D", "E", "e", "F", "I", "i", "J", "L", "l",
-            "m", "O", "o", "p", "Q", "R", "S", "W", "w",
-        ]
-        if arg.hasPrefix("--") { return false }
-        guard arg.hasPrefix("-"), arg.count >= 2 else { return false }
-        if arg.count > 2 { return false }
-        return singles.contains(arg[arg.index(after: arg.startIndex)])
-    }
-}
-
-enum CLIError: Error, CustomStringConvertible {
-    case missingValue(String)
-    case invalidUsage(String)
-
-    var description: String {
-        switch self {
-        case .missingValue(let option):
-            return "missing value for \(option)"
-        case .invalidUsage(let message):
-            return message
-        }
+        throw RemoteError.message("Specify an SSH destination and an application.\n\(usage)")
     }
 }

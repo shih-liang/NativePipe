@@ -259,7 +259,8 @@ final class MediaWireSmokeTests: XCTestCase {
         append(UInt32(42), to: &data)
         append(WindowWire.windowProtocolVersion + 1, to: &data)
         XCTAssertThrowsError(try WindowWire.guestEvent(from: data)) {
-            XCTAssertEqual($0 as? WindowWire.DecodeError, .malformed)
+            XCTAssertEqual($0 as? WindowWire.DecodeError,
+                           .unsupportedWindowVersion(WindowWire.windowProtocolVersion + 1))
         }
     }
 
@@ -274,6 +275,22 @@ final class MediaWireSmokeTests: XCTestCase {
             token: 7, mimeType: "application/octet-stream", data: bytes))
         XCTAssertFalse(String(decoding: selection, as: UTF8.self).contains("base64"))
         XCTAssertTrue(selection.suffix(bytes.count).elementsEqual(bytes))
+    }
+
+    func testFileDragControlDoesNotEmbedFileContents() throws {
+        let urls = Data("file:///tmp/drop/hello%20world.txt\r\n".utf8)
+        var data = try WindowWire.commandPayload(for: .fileDrag(.init(.payload,
+            token: 7, window: 9, x: 1.5, y: 2.5, data: urls)))
+        XCTAssertEqual(data[5], 28)
+        XCTAssertLessThan(data.count, 100)
+        // Both directions use the same fixed fields; sourceData is guest opcode 37.
+        data[4] = 1; data[5] = 37; data[8] = UInt8(FileDragMessage.Action.sourceData.rawValue)
+        guard case .fileDrag(let message) = try WindowWire.guestEvent(from: data) else {
+            return XCTFail("not a file drag")
+        }
+        XCTAssertEqual(message, .init(.sourceData, token: 7, window: 9, x: 1.5, y: 2.5, data: urls))
+        data.append(0)
+        XCTAssertThrowsError(try WindowWire.guestEvent(from: data))
     }
 
     func testMediaDemuxerRejectsOversizedFrameAndResynchronizes() {

@@ -35,10 +35,15 @@ jobs:
           sudo apt-get install --yes --no-install-recommends \
             libavcodec-dev libavutil-dev libdrm-dev libegl1-mesa-dev \
             libgbm-dev libgles2-mesa-dev libswscale-dev libvulkan-dev \
-            libwayland-dev libxkbcommon-dev wayland-protocols
+            libwayland-dev libxkbcommon-dev wayland-protocols libglib2.0-dev \
+            libgdk-pixbuf-2.0-dev librsvg2-dev dbus
       - name: Build the complete remote compositor
         run: make -C guest/compositor remote
       - name: Test remote transport
         run: make -C guest/compositor test-remote-transport
+      - name: Test ordinary-user application service
+        run: make -C guest/compositor test-applications
+      - name: Test file drag lifecycle
+        run: make -C guest/compositor test-file-drag
       - name: Verify source and license inventory
         run: python3 scripts/check-license-inventory.py

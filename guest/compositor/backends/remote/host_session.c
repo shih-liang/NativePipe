@@ -1,337 +1,138 @@
-// Host transport lanes, reconnect replay and session readiness.
-
 #define _GNU_SOURCE
-
+#include "applications.h"
 #include "backend.h"
 #include "backend_internal.h"
 #include "compositor_internal.h"
-#include "data_device.h"
-#include "host_session_common.h"
-#include "scene.h"
-#include "session_pair.h"
-#include "surface_internal.h"
 #include "window_events.h"
 #include "windowwire.h"
-#include "xwayland.h"
-
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <sys/syscall.h>
 #include <unistd.h>
+extern char **environ;
 
-static const char *session_environment_name(void)
+static int host_readable(int fd, uint32_t mask, void *data)
 {
-	return "nativepipe-wayland.env";
+    (void)fd; (void)mask;
+    struct np_server *server = data;
+    np_host_pump(&np_remote_backend(server)->host, np_applications_handle_command, server);
+    np_backend_session_sync(server);
+    return 0;
 }
-
-static bool session_environment_path(char *path, size_t size)
+static int stop_session(int signal_number, void *data)
 {
-	const char *runtime = getenv("XDG_RUNTIME_DIR");
-	if (!runtime || !runtime[0]) return false;
-	int written = snprintf(path, size, "%s/%s", runtime,
-	                       session_environment_name());
-	return written > 0 && (size_t)written < size;
+    (void)signal_number;
+    struct np_server *server = data;
+    server->terminate = true;
+    return 0;
 }
-
-static bool publish_session_environment(struct np_server *server)
+static int application_exited(int fd, uint32_t mask, void *data)
 {
-	const char *runtime = getenv("XDG_RUNTIME_DIR");
-	const char *socket = server->session_socket;
-	if (!runtime || !runtime[0] || !socket[0]) return false;
-
-	char path[1024];
-	char temporary[1088];
-	if (!session_environment_path(path, sizeof(path))) return false;
-	snprintf(temporary, sizeof(temporary), "%s.tmp.%ld", path, (long)getpid());
-
-	int fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-	if (fd < 0) {
-		unlink(temporary);
-		fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-	}
-	if (fd < 0) return false;
-
-	FILE *env = fdopen(fd, "w");
-	if (!env) {
-		close(fd);
-		unlink(temporary);
-		return false;
-	}
-	bool ok = fprintf(env, "WAYLAND_DISPLAY=%s\nXDG_RUNTIME_DIR=%s\n",
-	                  socket, runtime) > 0;
-	const char *bus = getenv("DBUS_SESSION_BUS_ADDRESS");
-	if (ok && bus && bus[0])
-		ok = fprintf(env, "DBUS_SESSION_BUS_ADDRESS=%s\n", bus) > 0;
-	if (ok && server->xwayland_display[0])
-		ok = fprintf(env, "DISPLAY=%s\n", server->xwayland_display) > 0;
-	if (ok && server->xwayland_auth[0])
-		ok = fprintf(env, "XAUTHORITY=%s\n", server->xwayland_auth) > 0;
-	if (ok) ok = fflush(env) == 0;
-	if (ok) ok = fsync(fd) == 0;
-	if (fclose(env) != 0) ok = false;
-	if (ok) ok = rename(temporary, path) == 0;
-	if (!ok) unlink(temporary);
-	return ok;
+    (void)fd; (void)mask;
+    struct np_server *server = data;
+    struct np_remote_backend *b = np_remote_backend(server);
+    int status = 0;
+    pid_t result;
+    do { result = waitpid(b->application_pid, &status, 0); } while (result < 0 && errno == EINTR);
+    b->exit_status = result < 0 ? 1 : WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+    server->terminate = true;
+    return 0;
 }
-
-static void unpublish_session_environment(void)
+static int output_failed(int fd, uint32_t mask, void *data)
 {
-	char path[1024];
-	if (!session_environment_path(path, sizeof(path))) return;
-	if (unlink(path) < 0 && errno != ENOENT)
-		fprintf(stderr, "[wayland] could not remove session readiness: %s\n",
-		        strerror(errno));
+    (void)fd; (void)mask;
+    struct np_server *server = data;
+    server->terminate = true;
+    np_remote_backend(server)->exit_status = 1;
+    return 0;
 }
-
-static int host_channel_readable(int fd, uint32_t mask, void *data) {
-	struct np_server *server = data;
-	(void)fd;
-	if (mask & WL_EVENT_WRITABLE) np_host_flush(&np_remote_backend(server)->host);
-	np_host_pump(&np_remote_backend(server)->host, np_input_handle_host_binary, server);
-	np_presentation_flush(server);
-	np_backend_session_sync(server);
-	wl_display_flush_clients(server->display);
-	return 0;
-}
-
-
-/// Re-announces every live surface to a host that has just attached.
-///
-/// The host keeps no window state across a disconnect, and a client that is
-/// merely idle will not commit again to prompt one. Without this the redial
-/// succeeds and the windows still never come back, which makes the reconnect
-/// path look like recovery without being it.
-static void republish_state(struct np_server *server) {
-	struct np_surface *surface;
-	np_host_session_replay_metadata(server);
-	if (!np_host_connected(&np_remote_backend(server)->host)) return;
-
-	/* A new host has no decoder history or media resources. Re-encode every
-	 * current surface as an IDR and rebuild the same window scene graph used by
-	 * the VM transport. Sending stale resource ids would leave the host waiting
-	 * forever for frames that belonged to the previous TCP connection. */
-	wl_list_for_each_reverse(surface, &server->surfaces, link) {
-		(void)np_remote_republish_surface(surface);
-		if (!np_host_connected(&np_remote_backend(server)->host)) break;
-	}
-}
-
-static void discard_disconnected_host_reads(struct np_server *server) {
-	np_data_host_disconnected(server);
-}
-
-static void close_host_session(struct np_server *server);
-
-static bool all_host_channels_connected(struct np_server *server)
-{
-	if (!np_host_connected(&np_remote_backend(server)->host)) return false;
-	if (!np_media_connected(&np_remote_backend(server)->media)) return false;
-	uint64_t surface_token = np_host_session_token(&np_remote_backend(server)->host);
-	uint64_t media_token = np_media_session_token(&np_remote_backend(server)->media);
-	enum np_remote_pair_state pair = np_remote_pair_tokens(
-		surface_token, media_token);
-	if (pair == NP_REMOTE_PAIR_MISMATCHED) {
-		fprintf(stderr, "[wayland] remote channel session tokens do not match\n");
-		/* Surface is the admission lane. Keep its candidate token and reject only
-		 * the mismatched media follower; a queued matching media lane can then
-		 * attach without two simultaneous clients knocking each other out. */
-		np_media_disconnect(&np_remote_backend(server)->media);
-		return false;
-	}
-	return pair == NP_REMOTE_PAIR_MATCHED;
-}
-
-static void close_host_session(struct np_server *server)
-{
-	np_host_set_output_enabled(&np_remote_backend(server)->host, false);
-	np_host_set_input_enabled(&np_remote_backend(server)->host, false);
-	np_media_set_session_ready(&np_remote_backend(server)->media, false);
-	np_host_disconnect(&np_remote_backend(server)->host);
-	np_media_disconnect(&np_remote_backend(server)->media);
-}
-
-static void handle_media_attachment(struct np_server *server)
-{
-	if (!np_media_take_just_attached(&np_remote_backend(server)->media)) return;
-	struct np_surface *surface;
-	wl_list_for_each(surface, &server->surfaces, link)
-		np_remote_force_keyframe(surface);
-	fprintf(stderr, "[media] requested IDR on all encoders\n");
-}
-
-static int media_connection_readable(int fd, uint32_t mask, void *data)
-{
-	(void)fd;
-	(void)mask;
-	struct np_server *server = data;
-	np_media_pump(&np_remote_backend(server)->media);
-	handle_media_attachment(server);
-	np_backend_session_sync(server);
-	return 0;
-}
-
-static void sync_media_source(struct np_server *server)
-{
-	int fd;
-	uint64_t generation;
-	np_media_connection_identity(&np_remote_backend(server)->media, &fd, &generation);
-	if (np_remote_backend(server)->watched_media_fd == fd &&
-	    np_remote_backend(server)->watched_media_generation == generation) return;
-	if (np_remote_backend(server)->media_connection_source) {
-		wl_event_source_remove(np_remote_backend(server)->media_connection_source);
-		np_remote_backend(server)->media_connection_source = NULL;
-	}
-	np_remote_backend(server)->watched_media_fd = fd;
-	np_remote_backend(server)->watched_media_generation = generation;
-	if (fd >= 0) {
-		struct wl_event_loop *loop = wl_display_get_event_loop(server->display);
-		np_remote_backend(server)->media_connection_source = wl_event_loop_add_fd(
-			loop, fd, WL_EVENT_READABLE | WL_EVENT_HANGUP | WL_EVENT_ERROR,
-			media_connection_readable, server);
-	}
-}
-
-void np_backend_session_sync(struct np_server *server) {
-	bool connected = all_host_channels_connected(server);
-	if (server->host_session_ready && !connected) {
-		server->host_session_ready = false;
-		discard_disconnected_host_reads(server);
-		/* Do not pair a newly dialled lane with sockets from the old generation. */
-		close_host_session(server);
-		connected = false;
-	}
-
-	if (!server->host_session_ready && connected) {
-		/* channelReady is the host launch gate. The environment must be visible
-		 * before the event because the host may launch immediately on receipt. */
-		if (!publish_session_environment(server))
-			fprintf(stderr, "[wayland] could not publish the session environment\n");
-		uint32_t ready[] = {
-			(uint32_t)getpid(), NP_WINDOW_PROTOCOL_VERSION,
-		};
-		/* Open the surface gate only for channelReady.  Everything emitted while
-		 * the two TCP lanes were unpaired was deliberately discarded and will be
-		 * reconstructed by republish_state below. */
-		np_host_set_output_enabled(&np_remote_backend(server)->host, true);
-		server->host_session_ready = true;
-		if (!np_window_event_send(server, NP_GUEST_SESSION_STARTED, ready, 2)) {
-			server->host_session_ready = false;
-			close_host_session(server);
-			return;
-		}
-		np_host_set_input_enabled(&np_remote_backend(server)->host, true);
-		np_media_set_session_ready(&np_remote_backend(server)->media, true);
-		republish_state(server);
-		/* Replay is ordinary ordered output and may itself discover a closed or
-		 * backlogged surface lane. Fail both lanes in this same synchronization
-		 * turn instead of leaving media enabled for a session that never received
-		 * its authoritative snapshot. */
-		if (!all_host_channels_connected(server)) {
-			server->host_session_ready = false;
-			discard_disconnected_host_reads(server);
-			close_host_session(server);
-		}
-	}
-
-	np_host_session_watch(
-		server, &np_remote_backend(server)->host, &np_remote_backend(server)->host_connection_source,
-		&np_remote_backend(server)->watched_host_fd, &np_remote_backend(server)->watched_host_mask,
-		host_channel_readable);
-	sync_media_source(server);
-}
-
-static int host_listener_readable(int fd, uint32_t mask, void *data) {
-	struct np_server *server = data;
-	(void)fd;
-	(void)mask;
-	np_host_pump(&np_remote_backend(server)->host, np_input_handle_host_binary, server);
-	np_presentation_flush(server);
-	np_backend_session_sync(server);
-	wl_display_flush_clients(server->display);
-	return 0;
-}
-
-
-static int media_listener_readable(int fd, uint32_t mask, void *data) {
-	(void)fd;
-	(void)mask;
-	struct np_server *server = data;
-	np_media_accept(&np_remote_backend(server)->media);
-	handle_media_attachment(server);
-	np_backend_session_sync(server);
-	return 0;
-}
-
-static int remote_pair_timeout(void *data)
-{
-	struct np_server *server = data;
-	if (!server->host_session_ready &&
-	    np_host_unpaired_expired(&np_remote_backend(server)->host, 10000)) {
-		fprintf(stderr, "[wayland] remote lane pairing timed out\n");
-		close_host_session(server);
-		discard_disconnected_host_reads(server);
-		np_backend_session_sync(server);
-	}
-	if (np_remote_backend(server)->remote_pair_timeout_source)
-		wl_event_source_timer_update(np_remote_backend(server)->remote_pair_timeout_source, 1000);
-	return 0;
-}
-void np_backend_session_reset_readiness(void)
-{
-	unpublish_session_environment();
-}
-
+void np_backend_session_reset_readiness(void) {}
 bool np_backend_session_listen(struct np_server *server)
 {
-	return np_host_listen(&np_remote_backend(server)->host, NP_SURFACE_PORT) &&
-	       np_media_listen(&np_remote_backend(server)->media);
+    struct np_remote_backend *b = np_remote_backend(server);
+    return np_host_listen(&b->host, 0) && np_media_open(&b->media, b->output_fd);
 }
-
 bool np_backend_session_set_socket(struct np_server *server, const char *socket)
 {
-	if (!socket) return false;
-	if (strlen(socket) >= sizeof(server->session_socket)) return false;
-	strcpy(server->session_socket, socket);
-	/* SSH launches applications before either transport channel attaches. */
-	if (!publish_session_environment(server)) return false;
-	return true;
+    if (!socket || strlen(socket) >= sizeof(server->session_socket)) return false;
+    strcpy(server->session_socket, socket);
+    return true;
 }
-
 void np_backend_session_attach(struct np_server *server, struct wl_event_loop *loop)
 {
-	wl_event_loop_add_fd(loop, np_remote_backend(server)->host.listen_fd, WL_EVENT_READABLE,
-	                     host_listener_readable, server);
-	if (np_remote_backend(server)->media.listen_fd >= 0)
-		wl_event_loop_add_fd(loop, np_remote_backend(server)->media.listen_fd, WL_EVENT_READABLE,
-		                     media_listener_readable, server);
-	np_remote_backend(server)->remote_pair_timeout_source = wl_event_loop_add_timer(
-		loop, remote_pair_timeout, server);
-	if (np_remote_backend(server)->remote_pair_timeout_source)
-		wl_event_source_timer_update(np_remote_backend(server)->remote_pair_timeout_source, 1000);
-}
+    struct np_remote_backend *b = np_remote_backend(server);
+    b->host_connection_source = wl_event_loop_add_fd(
+        loop, b->host.conn_fd, WL_EVENT_READABLE, host_readable, server);
+    wl_event_loop_add_fd(loop, b->media.error_fd, WL_EVENT_READABLE, output_failed, server);
+    wl_event_loop_add_signal(loop, SIGTERM, stop_session, server);
+    wl_event_loop_add_signal(loop, SIGHUP, stop_session, server);
+    wl_event_loop_add_signal(loop, SIGINT, stop_session, server);
+    uint32_t ready[] = {(uint32_t)getpid(), NP_WINDOW_PROTOCOL_VERSION};
+    server->host_session_ready = true;
+    if (!np_window_event_send(server, NP_GUEST_SESSION_STARTED, ready, 2)) {
+        server->terminate = true; return;
+    }
 
+    if (!b->command) return;
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attr;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    posix_spawnattr_init(&attr);
+    sigset_t empty;
+    sigemptyset(&empty);
+    posix_spawnattr_setsigmask(&attr, &empty);
+    posix_spawnattr_setpgroup(&attr, 0);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK);
+    int error = posix_spawnp(&b->application_pid, b->command[0], &actions, &attr,
+                            b->command, environ);
+    posix_spawnattr_destroy(&attr);
+    posix_spawn_file_actions_destroy(&actions);
+    if (error) {
+        fprintf(stderr, "[wayland] cannot launch %s: %s\n", b->command[0], strerror(error));
+        b->application_pid = 0;
+        b->exit_status = error == ENOENT ? 127 : 126;
+        server->terminate = true;
+    } else {
+        /* A process-specific exit fd cannot lose SIGCHLD to Xwayland's
+         * independent signalfd or a library worker thread. */
+        b->application_fd = syscall(SYS_pidfd_open, b->application_pid, 0);
+        if (b->application_fd < 0 || !wl_event_loop_add_fd(loop, b->application_fd,
+                WL_EVENT_READABLE, application_exited, server)) {
+            fprintf(stderr, "[wayland] cannot watch application exit: %s\n", strerror(errno));
+            b->exit_status = 1;
+            server->terminate = true;
+        }
+    }
+}
+void np_backend_session_sync(struct np_server *server)
+{
+    if (!np_backend_connected(server)) server->terminate = true;
+}
 void np_backend_session_finish(struct np_server *server)
 {
-	if (np_remote_backend(server)->remote_pair_timeout_source) {
-		wl_event_source_remove(np_remote_backend(server)->remote_pair_timeout_source);
-		np_remote_backend(server)->remote_pair_timeout_source = NULL;
-	}
-	np_media_finish(&np_remote_backend(server)->media);
-	np_host_finish(&np_remote_backend(server)->host);
-	unpublish_session_environment();
+    struct np_remote_backend *b = np_remote_backend(server);
+    if (b->application_pid > 0) {
+        kill(-b->application_pid, SIGHUP);
+        /* Disconnecting the display below also disconnects Wayland clients. */
+        (void)waitpid(b->application_pid, NULL, WNOHANG);
+    }
+    np_media_finish(&b->media);
+    if (b->application_fd >= 0) { close(b->application_fd); b->application_fd = -1; }
+    np_host_finish(&b->host);
 }
-
 bool np_backend_connected(const struct np_server *server)
 {
-	struct np_remote_backend *backend = np_remote_backend(server);
-	return backend && np_host_connected(&backend->host);
+    struct np_remote_backend *b = np_remote_backend(server);
+    return b && np_host_connected(&b->host) && np_media_connected(&b->media);
 }
-
-bool np_backend_send_binary(
-	struct np_server *server, const void *payload, size_t length)
+bool np_backend_send_binary(struct np_server *server, const void *payload, size_t length)
 {
-	struct np_remote_backend *backend = np_remote_backend(server);
-	return backend && np_host_send_binary(&backend->host, payload, length);
+    return np_media_send_binary(&np_remote_backend(server)->media, payload, length);
 }

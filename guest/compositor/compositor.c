@@ -5,6 +5,7 @@
 
 #define _GNU_SOURCE
 
+#include "applications.h"
 #include "compositor.h"
 #include "compositor_internal.h"
 #include "cursor_shape.h"
@@ -129,21 +130,39 @@ int np_frontend_run(int argc, char **argv, void *backend_state)
 	if (!np_input_create_keymap(&server))
 		fprintf(stderr, "[wayland] no keymap; keyboard input will not work\n");
 
-	struct wl_event_loop *loop = wl_display_get_event_loop(server.display);
-	np_backend_session_attach(&server, loop);
-
-	for (;;) {
+    setenv("WAYLAND_DISPLAY", server.session_socket, 1);
+    setenv("XDG_SESSION_TYPE", "wayland", 1);
+    setenv("XDG_CURRENT_DESKTOP", "NativePipe", 1);
+    setenv("GDK_BACKEND", "wayland", 0);
+    setenv("QT_QPA_PLATFORM", "wayland", 0);
+    setenv("MOZ_ENABLE_WAYLAND", "1", 0);
+    unsetenv("WAYLAND_SOCKET");
+    if (server.xwayland_display[0]) {
+        setenv("DISPLAY", server.xwayland_display, 1);
+        setenv("XAUTHORITY", server.xwayland_auth, 1);
+    } else { unsetenv("DISPLAY"); unsetenv("XAUTHORITY"); }
+    struct wl_event_loop *loop = wl_display_get_event_loop(server.display);
+    server.application_generation = 1;
+    bool applications_started = np_applications_init(&server);
+    if (!applications_started) {
+        fprintf(stderr, "[wayland] cannot start ordinary-user application service\n");
+        server.terminate = true;
+    } else np_backend_session_attach(&server, loop);
+	while (!server.terminate) {
 		np_presentation_flush(&server);
 		np_backend_session_sync(&server);
 		wl_display_flush_clients(server.display);
+        if (server.terminate) break;
 		wl_event_loop_dispatch(loop, -1);
 		np_presentation_flush(&server);
 		np_backend_session_sync(&server);
 	}
 
+    np_applications_finish(&server);
+	wl_display_destroy_clients(server.display);
 	np_backend_session_finish(&server);
 	np_xwayland_finish(&server);
 	wl_display_destroy(server.display);
 	np_backend_finish(&server);
-	return 0;
+	return applications_started ? 0 : 1;
 }

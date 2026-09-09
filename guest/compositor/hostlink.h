@@ -1,4 +1,4 @@
-// Shared NPIP binary framing for RemotePipe TCP and VMPipe vsock transports.
+// Shared NPIP binary framing for SSH pipes and VMPipe vsock transports.
 
 #ifndef NATIVEPIPE_HOSTLINK_H
 #define NATIVEPIPE_HOSTLINK_H
@@ -7,7 +7,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define NP_SURFACE_PORT 1025
 #define NP_WINDOW_EVENT_PORT 4096
 #define NP_WINDOW_CONTROL_PORT 4097
 #define NP_WINDOW_INPUT_PORT 4098
@@ -27,15 +26,8 @@ struct np_host {
 	size_t out_head;
 	size_t out_len;
 	size_t out_cap;
-	unsigned char remote_hello[16];
-	size_t remote_hello_len;
-	uint64_t remote_session_token;
-	bool remote_handshake_ready;
-	bool requires_handshake;
-	bool replace_unready_peer;
 	bool output_enabled;
 	bool input_enabled;
-	uint64_t remote_accept_millis;
 };
 
 bool np_host_listen(struct np_host *host, uint32_t port);
@@ -52,12 +44,6 @@ static inline bool np_host_has_backlog(const struct np_host *host)
 }
 
 void np_host_flush(struct np_host *host);
-uint64_t np_host_session_token(const struct np_host *host);
-/// Gate normal NPIP output until both RemotePipe lanes belong to one session.
-/// VMPipe does not use this gate.
-void np_host_set_output_enabled(struct np_host *host, bool enabled);
-void np_host_set_input_enabled(struct np_host *host, bool enabled);
-bool np_host_unpaired_expired(const struct np_host *host, uint64_t timeout_millis);
 
 bool np_host_connected(const struct np_host *host);
 

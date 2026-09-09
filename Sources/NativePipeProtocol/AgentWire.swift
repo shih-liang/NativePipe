@@ -3,14 +3,14 @@ import Foundation
 /// Named file transfer over vsock (bootstrap, provision extras, self-update).
 ///
 /// Guest → host request:
-///   `"NPAG"` | wire(u8=1) | flags(u8=0)
+///   `"NPAG"` | wire(u8=1) | flags(u8; bit 0 requests NPFR)
 ///          | name_len(u16 LE) | name bytes
 ///          | ver_len(u16 LE) | ver bytes
 ///
 /// Host → guest response:
 ///   `"NPAG"` | wire(u8=1) | status(u8: 0=file, 1=uptodate, 2=notfound, 3=force)
 ///          | ver_len(u16 LE) | ver bytes
-///          | if status==0 or 3: payload_len(u64 LE) + file bytes
+///          | if status==0 or 3: payload_len(u64 LE) + negotiated payload stream
 ///
 /// `force` is retained only for migrating guests predating `NPSY`. Current
 /// guests receive desired-state notifications on control and use NPAG solely
@@ -31,10 +31,12 @@ public enum AgentWire {
     public struct Request: Equatable {
         public var name: String
         public var guestVersion: String
+        public var framedPayload: Bool
 
-        public init(name: String, guestVersion: String = "") {
+        public init(name: String, guestVersion: String = "", framedPayload: Bool = true) {
             self.name = name
             self.guestVersion = guestVersion
+            self.framedPayload = framedPayload
         }
     }
 
@@ -92,7 +94,7 @@ public enum AgentWire {
         var out = Data()
         out.append(magic)
         out.append(version)
-        out.append(0) // flags
+        out.append(request.framedPayload ? 1 : 0)
         out.append(contentsOf: u16le(UInt16(name.count)))
         out.append(name)
         out.append(contentsOf: u16le(UInt16(ver.count)))
@@ -103,7 +105,7 @@ public enum AgentWire {
     public static func decodeRequest(from data: Data) throws -> Request {
         guard data.count >= 8 else { throw Failure.truncated }
         guard data.prefix(4) == magic else { throw Failure.badMagic }
-        guard data[4] == version else { throw Failure.unsupportedWire }
+        guard data[4] == version, data[5] & ~1 == 0 else { throw Failure.unsupportedWire }
         let nameLen = Int(u16le(data, at: 6))
         guard nameLen <= maxNameLength else { throw Failure.nameTooLong }
         guard data.count >= 8 + nameLen + 2 else { throw Failure.truncated }
@@ -115,7 +117,7 @@ public enum AgentWire {
         let ver = String(
             data: data.subdata(in: (verOff + 2)..<(verOff + 2 + verLen)),
             encoding: .utf8) ?? ""
-        return Request(name: name, guestVersion: ver)
+        return Request(name: name, guestVersion: ver, framedPayload: data[5] & 1 != 0)
     }
 
     public static func encodeResponseHeader(_ response: Response) throws -> Data {
@@ -174,13 +176,6 @@ public enum AgentWire {
         return out
     }
 
-    public static func encodeFullResponse(_ response: Response) throws -> Data {
-        var out = try encodeResponseHeader(response)
-        if let payload = response.payload {
-            out.append(payload)
-        }
-        return out
-    }
 
     /// Compare dotted numeric versions; non-numeric tails compare lexicographically.
     public static func isNewer(host: String, than guest: String) -> Bool {

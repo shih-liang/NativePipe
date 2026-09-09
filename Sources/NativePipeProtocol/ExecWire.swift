@@ -20,6 +20,8 @@ public enum ExecWire {
         /// The client has no more terminal input. This is directional: the
         /// guest keeps the session open for output and the final exit record.
         case endInput = 4
+        /// Non-PTY stderr; never mix diagnostics into binary stdout.
+        case stderr = 5
     }
 
     public struct Record: Sendable {

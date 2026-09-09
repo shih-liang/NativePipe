@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <math.h>
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
 
@@ -32,6 +33,17 @@ static wl_fixed_t fixed_from(double value) {
 // ---------------------------------------------------------------------------
 
 #define NP_MAX_MIME_TYPES 24
+
+static void file_drag_event(struct np_server *server, uint32_t action, uint32_t token,
+                           uint32_t window, const void *data, size_t length, bool present) {
+    if (!token) return;
+    struct np_window_message m;
+    np_window_message_init(&m, NP_WINDOW_GUEST_TO_HOST, NP_GUEST_FILE_DRAG);
+    np_window_put_u32(&m, action); np_window_put_u32(&m, token); np_window_put_u32(&m, window);
+    np_window_put_f64(&m, 0); np_window_put_f64(&m, 0);
+    np_window_put_optional_bytes(&m, data, length, present);
+    np_window_event_send_message(server, &m); np_window_message_clear(&m);
+}
 
 static void send_drag_icon(struct np_server *server, struct wl_resource *icon) {
 	struct np_surface *surface = icon ? wl_resource_get_user_data(icon) : NULL;
@@ -64,7 +76,29 @@ struct np_data_offer {
 	uint32_t actions;
 	uint32_t preferred_action;
 	uint32_t chosen_action;
+	uint32_t host_drag;
+	unsigned char *host_data;
+	size_t host_data_length;
 };
+
+static void host_drag_receive(struct np_data_offer *offer, int fd);
+static void host_drag_offer_destroyed(struct np_data_offer *offer);
+static void host_drag_finished(struct np_data_offer *offer, bool success) {
+    if (offer->finished) return;
+    struct np_data_offer *other;
+    wl_list_for_each(other, &offer->server->data_offers, link) {
+        if (other->host_drag != offer->host_drag) continue;
+        other->finished = true;
+        host_drag_offer_destroyed(other);
+    }
+    unsigned char result = success;
+    file_drag_event(offer->server, 104, offer->host_drag, 0, &result, 1, true);
+}
+static void host_drag_status(struct np_data_offer *offer) {
+    if (!offer->host_drag || !offer->active) return;
+    unsigned char accepted = offer->accepted_mime && offer->chosen_action == WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
+    file_drag_event(offer->server, 103, offer->host_drag, 0, &accepted, 1, true);
+}
 
 static void detach_offers_for_source(struct np_server *server,
 	                                  struct wl_resource *source,
@@ -124,6 +158,7 @@ static void data_source_resource_destroy(struct wl_resource *resource) {
 		announce_selection_to_host(server);
 	}
 	if (server && server->drag_source == resource) {
+		server->drag_exported = false;
 		if (server->drag_icon) send_drag_icon(server, NULL);
 		server->drag_source = NULL;
 		server->drag_origin = NULL;
@@ -142,6 +177,12 @@ static void data_offer_receive(struct wl_client *client, struct wl_resource *res
                                const char *mime_type, int32_t fd) {
 	struct np_data_offer *offer = wl_resource_get_user_data(resource);
 	if (offer && offer->from_host) {
+		if (offer->host_drag) {
+			if (!strcmp(mime_type, "text/uri-list") && !offer->finished &&
+			    (offer->active || offer->dropped)) host_drag_receive(offer, fd);
+			else close(fd);
+			return;
+		}
 		clip_request_from_host(offer->server, mime_type, fd);
 		return;
 	}
@@ -156,6 +197,9 @@ static void data_offer_destroy_handler(struct wl_client *client, struct wl_resou
 static void data_offer_resource_destroy(struct wl_resource *resource) {
 	struct np_data_offer *offer = wl_resource_get_user_data(resource);
 	if (!offer) return;
+	if (offer->host_drag && offer->dropped && !offer->finished)
+		host_drag_finished(offer, wl_resource_get_version(resource) < 3 && offer->host_data != NULL);
+	host_drag_offer_destroyed(offer);
 	if (offer->dnd && offer->source && !offer->finished &&
 	    (offer->active || offer->dropped) &&
 	    offer->server->drag_source == offer->source) {
@@ -176,6 +220,7 @@ static void data_offer_resource_destroy(struct wl_resource *resource) {
 	}
 	wl_list_remove(&offer->link);
 	free(offer->accepted_mime);
+	free(offer->host_data);
 	free(offer);
 }
 
@@ -187,6 +232,7 @@ static bool nullable_string_equal(const char *a, const char *b) {
 static void data_offer_accept(struct wl_client *client, struct wl_resource *resource,
                               uint32_t serial, const char *mime_type) {
 	struct np_data_offer *offer = wl_resource_get_user_data(resource);
+	if (offer && offer->host_drag && mime_type && strcmp(mime_type, "text/uri-list")) mime_type = NULL;
 	if (!offer || nullable_string_equal(offer->accepted_mime, mime_type)) return;
 	char *accepted = mime_type ? strdup(mime_type) : NULL;
 	if (mime_type && !accepted) {
@@ -195,10 +241,15 @@ static void data_offer_accept(struct wl_client *client, struct wl_resource *reso
 	}
 	free(offer->accepted_mime);
 	offer->accepted_mime = accepted;
+	host_drag_status(offer);
 	if (offer->source) wl_data_source_send_target(offer->source, mime_type);
 }
 static void data_offer_finish(struct wl_client *client, struct wl_resource *resource) {
 	struct np_data_offer *offer = wl_resource_get_user_data(resource);
+	if (offer && offer->host_drag && offer->dropped && offer->accepted_mime && offer->chosen_action && !offer->finished) {
+		host_drag_finished(offer, true);
+		return;
+	}
 	if (!offer || !offer->dnd || !offer->source || !offer->dropped ||
 	    !offer->accepted_mime || !offer->chosen_action || offer->finished)
 		return;
@@ -218,12 +269,12 @@ static void data_offer_finish(struct wl_client *client, struct wl_resource *reso
 static void data_offer_set_actions(struct wl_client *client, struct wl_resource *resource,
                                    uint32_t actions, uint32_t preferred) {
 	struct np_data_offer *offer = wl_resource_get_user_data(resource);
-	if (!offer || !offer->dnd || !offer->source || offer->dropped) return;
-	struct np_data_source *source = wl_resource_get_user_data(offer->source);
-	if (!source) return;
+	if (!offer || !offer->dnd || (!offer->source && !offer->host_drag) || offer->dropped) return;
+	struct np_data_source *source = offer->source ? wl_resource_get_user_data(offer->source) : NULL;
+	if (!source && !offer->host_drag) return;
 	offer->actions = actions;
 	offer->preferred_action = preferred;
-	uint32_t available = actions & source->actions;
+	uint32_t available = actions & (source ? source->actions : WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
 	uint32_t chosen = (preferred && (available & preferred)) ? preferred : 0;
 	if (!chosen && (available & WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY))
 		chosen = WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
@@ -237,8 +288,9 @@ static void data_offer_set_actions(struct wl_client *client, struct wl_resource 
 	 * change notification, so silence is required when negotiation is stable. */
 	if (chosen == offer->chosen_action) return;
 	offer->chosen_action = chosen;
+	host_drag_status(offer);
 	wl_data_offer_send_action(resource, chosen);
-	if (wl_resource_get_version(offer->source) >= 3) {
+	if (offer->source && wl_resource_get_version(offer->source) >= 3) {
 		wl_data_source_send_action(offer->source, chosen);
 	}
 }
@@ -308,6 +360,7 @@ struct np_clip_read {
 	struct wl_list link;
 	struct np_server *server;
 	uint32_t token;
+	bool file_drag;
 	char *mime;
 	int fd;
 	struct wl_event_source *source;
@@ -325,6 +378,10 @@ struct np_clip_write {
 };
 
 static void clip_read_finish(struct np_clip_read *read_state, bool ok) {
+	if (read_state->file_drag) {
+		file_drag_event(read_state->server, 102, read_state->token, 0,
+		    read_state->data, read_state->len, ok);
+	} else {
 	struct np_window_message message;
 	np_window_message_init(&message, NP_WINDOW_GUEST_TO_HOST,
 	                       NP_GUEST_SELECTION_DATA);
@@ -333,6 +390,7 @@ static void clip_read_finish(struct np_clip_read *read_state, bool ok) {
 	np_window_put_optional_bytes(&message, read_state->data, read_state->len, ok);
 	(void)np_window_event_send_message(read_state->server, &message);
 	np_window_message_clear(&message);
+	}
 
 	if (read_state->source) wl_event_source_remove(read_state->source);
 	close(read_state->fd);
@@ -356,7 +414,7 @@ static int clip_read_ready(int fd, uint32_t mask, void *data) {
 	for (;;) {
 		if (read_state->len == read_state->cap) {
 			size_t cap = read_state->cap ? read_state->cap * 2 : 8192;
-			if (cap > NP_CLIP_MAX) {
+			if (cap > (read_state->file_drag ? 1024u * 1024u : NP_CLIP_MAX)) {
 				fprintf(stderr, "[wayland] selection exceeds %u bytes; refusing\n",
 				        NP_CLIP_MAX);
 				clip_read_finish(read_state, false);
@@ -387,14 +445,18 @@ static int clip_read_ready(int fd, uint32_t mask, void *data) {
 
 /// Asks the guest's current selection owner for `mime_type` and reports the
 /// bytes back to the host under `token`.
-void np_data_serve_host_request(struct np_server *server, uint32_t token,
-                                    const char *mime_type) {
+static void serve_source(struct np_server *server, uint32_t token,
+                         const char *mime_type, struct wl_resource *source, bool file_drag) {
 	int pipe_fds[2];
-	bool failed = !server->selection_source || pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK) < 0;
+	bool failed = !source || pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK) < 0;
 
 	struct np_clip_read *read_state = failed ? NULL : calloc(1, sizeof(*read_state));
 	if (failed || !read_state) {
 		if (!failed) { close(pipe_fds[0]); close(pipe_fds[1]); }
+		if (file_drag) {
+			file_drag_event(server, 102, token, 0, NULL, 0, false);
+			free(read_state); return;
+		}
 		struct np_window_message message;
 		np_window_message_init(&message, NP_WINDOW_GUEST_TO_HOST,
 		                       NP_GUEST_SELECTION_DATA);
@@ -409,6 +471,7 @@ void np_data_serve_host_request(struct np_server *server, uint32_t token,
 
 	read_state->server = server;
 	read_state->token = token;
+	read_state->file_drag = file_drag;
 	read_state->mime = strdup(mime_type);
 	read_state->fd = pipe_fds[0];
 	wl_list_insert(&server->clip_reads, &read_state->link);
@@ -420,9 +483,13 @@ void np_data_serve_host_request(struct np_server *server, uint32_t token,
 
 	// The source writes into the far end and closes it; the compositor must let
 	// go of its copy or the read would never see EOF.
-	wl_data_source_send_send(server->selection_source, mime_type, pipe_fds[1]);
+	wl_data_source_send_send(source, mime_type, pipe_fds[1]);
 	close(pipe_fds[1]);
 	wl_display_flush_clients(server->display);
+}
+
+void np_data_serve_host_request(struct np_server *server, uint32_t token, const char *mime_type) {
+    serve_source(server, token, mime_type, server->selection_source, false);
 }
 
 static void clip_write_finish(struct np_clip_write *write_state) {
@@ -456,6 +523,7 @@ struct np_clip_pending {
 	struct wl_list link;
 	uint32_t token;
 	int fd;
+	struct np_data_offer *offer;
 };
 
 static void clip_request_from_host(struct np_server *server, const char *mime_type, int fd) {
@@ -526,10 +594,168 @@ void np_data_deliver_host_data(struct np_server *server, uint32_t token,
 	clip_write_ready(fd, WL_EVENT_WRITABLE, write_state);
 }
 
+static void host_drag_receive(struct np_data_offer *offer, int fd) {
+    struct np_clip_pending *p = calloc(1, sizeof(*p));
+    if (!p) { close(fd); return; }
+    p->fd = fd; p->token = ++offer->server->next_clip_token; p->offer = offer;
+    wl_list_insert(&offer->server->clip_pending, &p->link);
+    if (offer->host_data) np_data_deliver_host_data(offer->server, p->token,
+        offer->host_data, offer->host_data_length, true);
+    else file_drag_event(offer->server, 105, offer->host_drag, 0, NULL, 0, false);
+}
+
+static void host_drag_offer_destroyed(struct np_data_offer *offer) {
+    struct np_clip_pending *p, *next;
+    wl_list_for_each_safe(p, next, &offer->server->clip_pending, link) {
+        if (p->offer != offer) continue;
+        close(p->fd); wl_list_remove(&p->link); free(p);
+    }
+}
+
+static void host_drag_leave(struct np_server *s) {
+    struct np_data_offer *offer;
+    wl_list_for_each(offer, &s->data_offers, link) {
+        if (!offer->host_drag || !offer->active) continue;
+        wl_data_device_send_leave(offer->device);
+        offer->active = false; offer->finished = true;
+        host_drag_offer_destroyed(offer);
+    }
+}
+
+bool np_data_handle_file_drag(struct np_server *s, struct np_window_reader *r) {
+    uint32_t action = np_window_read_u32(r), token = np_window_read_u32(r);
+    uint32_t window = np_window_read_u32(r);
+    double x = np_window_read_f64(r), y = np_window_read_f64(r);
+    size_t length = 0; bool present = false;
+    const unsigned char *data = NULL;
+    if (!np_window_read_bytes(r, &data, &length, true, &present) ||
+        !np_window_reader_finished(r) || !token || !isfinite(x) || !isfinite(y) ||
+        length > 1024 * 1024 || action < 1 || action > 9) return false;
+    if (action >= 6) {
+        if (token != s->file_drag_serial || !s->drag_source) return true;
+        if (action == 6) { serve_source(s, token, "text/uri-list", s->drag_source, true); return true; }
+        if (action == 7) {
+            np_data_drag_leave(s, s->drag_focus_window);
+            s->drag_focus_window = 0; s->drag_exported = true;
+            wl_data_source_send_target(s->drag_source, "text/uri-list");
+            if (wl_resource_get_version(s->drag_source) >= 3)
+                wl_data_source_send_action(s->drag_source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
+            send_drag_icon(s, NULL);
+        } else if (action == 9) {
+            if (!s->drag_dropped && wl_resource_get_version(s->drag_source) >= 3)
+                wl_data_source_send_dnd_drop_performed(s->drag_source);
+            s->drag_dropped = true;
+        } else if (action == 8) {
+            bool ok = present && length == 1 && data[0] && s->drag_dropped;
+            if (ok && wl_resource_get_version(s->drag_source) >= 3)
+                wl_data_source_send_dnd_finished(s->drag_source);
+            else if (!ok) wl_data_source_send_cancelled(s->drag_source);
+            detach_offers_for_source(s, s->drag_source, ok);
+            s->drag_source = NULL; s->drag_origin = NULL; s->drag_icon = NULL;
+            s->drag_dropped = false; s->drag_exported = false;
+            s->pointer_buttons = 0;
+        }
+        return true;
+    }
+    if (action == 5) {
+        struct np_data_offer *offer;
+        wl_list_for_each(offer, &s->data_offers, link) {
+            if (offer->host_drag != token || offer->finished) continue;
+            free(offer->host_data); offer->host_data = NULL;
+            offer->host_data_length = length;
+            if (present && length) {
+                offer->host_data = malloc(length);
+                if (offer->host_data) memcpy(offer->host_data, data, length);
+            }
+            struct np_clip_pending *p, *next;
+            wl_list_for_each_safe(p, next, &s->clip_pending, link) {
+                if (p->offer == offer) np_data_deliver_host_data(s, p->token,
+                    offer->host_data, length, offer->host_data != NULL);
+            }
+            if (!offer->host_data) host_drag_finished(offer, false);
+        }
+        return true;
+    }
+    if (action == 3) {
+        if (s->host_file_drag == token) { host_drag_leave(s); s->host_file_drag = 0; }
+        return true;
+    }
+    if (action == 4) {
+        struct np_data_offer *offer;
+        wl_list_for_each(offer, &s->data_offers, link) {
+            if (offer->host_drag != token || !offer->active) continue;
+            offer->active = false;
+            if (offer->accepted_mime && offer->chosen_action == WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY) {
+                offer->dropped = true;
+                wl_data_device_send_drop(offer->device);
+            } else {
+                wl_data_device_send_leave(offer->device);
+                offer->finished = true;
+                host_drag_offer_destroyed(offer);
+            }
+        }
+        s->host_file_drag = 0;
+        np_input_restore_pointer_focus_after_drag(s, np_surface_by_id(s, s->drag_focus_surface));
+        return true;
+    }
+    struct np_surface *root = np_surface_by_window(s, window);
+    double sx = x, sy = y;
+    struct np_surface *surface = root ? np_scene_hit_test(root,
+        x + (root->geometry_set ? root->geometry_x : 0),
+        y + (root->geometry_set ? root->geometry_y : 0), &sx, &sy) : NULL;
+    if (!surface) { host_drag_leave(s); return true; }
+    s->pointer_x = x + (root->geometry_set ? root->geometry_x : 0);
+    s->pointer_y = y + (root->geometry_set ? root->geometry_y : 0);
+    bool entered = false;
+    struct np_data_offer *offer;
+    wl_list_for_each(offer, &s->data_offers, link) {
+        if (offer->host_drag == token && offer->active && s->drag_focus_surface == surface->id) {
+            wl_data_device_send_motion(offer->device, 0, fixed_from(sx), fixed_from(sy));
+            entered = true;
+        }
+    }
+    if (entered) return true;
+    host_drag_leave(s);
+    np_input_clear_pointer_focus_for_drag(s);
+    s->host_file_drag = token; s->drag_focus_surface = surface->id;
+    struct np_input *device;
+    wl_list_for_each(device, &s->data_devices, link) {
+        if (wl_resource_get_client(device->resource) != wl_resource_get_client(surface->resource)) continue;
+        struct wl_resource *resource = create_data_offer(s, device->resource, NULL, true);
+        if (!resource) continue;
+        offer = wl_resource_get_user_data(resource);
+        offer->from_host = true; offer->host_drag = token; offer->active = true;
+        wl_data_device_send_data_offer(device->resource, resource);
+        wl_data_offer_send_offer(resource, "text/uri-list");
+        if (wl_resource_get_version(resource) >= 3) {
+            wl_data_offer_send_source_actions(resource, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
+            wl_data_offer_send_action(resource, 0);
+        } else offer->chosen_action = WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
+        wl_data_device_send_enter(device->resource, wl_display_next_serial(s->display),
+            surface->resource, fixed_from(sx), fixed_from(sy), resource);
+    }
+    return true;
+}
+
 void np_data_host_disconnected(struct np_server *server) {
+    host_drag_leave(server);
+    server->host_file_drag = 0;
+    if (server->drag_source && server->drag_exported) {
+        wl_data_source_send_cancelled(server->drag_source);
+        detach_offers_for_source(server, server->drag_source, false);
+        server->drag_source = NULL; server->drag_origin = NULL; server->drag_icon = NULL;
+        server->drag_dropped = false; server->drag_exported = false;
+        server->pointer_buttons = 0;
+    }
+    struct np_data_offer *offer;
+    wl_list_for_each(offer, &server->data_offers, link)
+        if (offer->from_host) offer->finished = true;
 	struct np_clip_read *read_state, *read_tmp;
 	wl_list_for_each_safe(read_state, read_tmp, &server->clip_reads, link)
 		clip_read_cancel(read_state);
+	struct np_clip_write *write_state, *write_tmp;
+	wl_list_for_each_safe(write_state, write_tmp, &server->clip_writes, link)
+		clip_write_finish(write_state);
 
 	struct np_clip_pending *pending, *pending_tmp;
 	wl_list_for_each_safe(pending, pending_tmp, &server->clip_pending, link) {
@@ -682,6 +908,7 @@ void np_data_drag_motion(struct np_server *server, struct np_surface *surface,
 }
 
 void np_data_drag_finish(struct np_server *server) {
+	if (server->drag_exported) return;
 	if (!server->drag_source) return;
 	struct np_surface *surface = np_surface_by_id(server, server->drag_focus_surface);
 	if (!surface) surface = np_surface_by_window(server, server->drag_focus_window);
@@ -773,6 +1000,8 @@ static void data_device_start_drag(struct wl_client *client, struct wl_resource 
 	server->drag_origin = origin;
 	server->drag_icon = icon;
 	server->drag_dropped = false;
+	server->drag_exported = false;
+	if (++server->file_drag_serial == 0) ++server->file_drag_serial;
 	/* A data-device drag replaces the default pointer grab. The ordinary
 	 * wl_pointer focus must leave before wl_data_device.enter takes ownership of
 	 * the same physical pointer. GDK relies on this ordering: its DnD enter
@@ -787,6 +1016,15 @@ static void data_device_start_drag(struct wl_client *client, struct wl_resource 
 	np_input_clear_pointer_focus_for_drag(server);
 	send_drag_icon(server, icon);
 	np_data_drag_enter(server, surface, fixed_from(server->pointer_x), fixed_from(server->pointer_y));
+	struct np_data_source *offered = wl_resource_get_user_data(source);
+	if (offered && (offered->actions & WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY)) {
+		for (int i = 0; i < offered->mime_count; ++i) {
+			if (!strcmp(offered->mime_types[i], "text/uri-list")) {
+				file_drag_event(server, 101, server->file_drag_serial, root ? root->window_id : 0, NULL, 0, false);
+				break;
+			}
+		}
+	}
 }
 
 static void data_device_set_selection(struct wl_client *client, struct wl_resource *resource,

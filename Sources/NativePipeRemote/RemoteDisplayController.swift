@@ -9,38 +9,47 @@ public final class RemoteDisplayController {
     public let session: RemoteSession
     public let frames: RemoteFrameSource
     public let bridge: WindowBridge
+    public var onApplicationsChanged: (() -> Void)?
     public var onStateChange: ((RemoteSession.State) -> Void)?
+    public var applications: [GuestApplication] { session.applicationClient.cached ?? [] }
 
-    public init(
-        host: String = "127.0.0.1",
-        surfacePort: UInt16 = UInt16(NativePipePort.surface),
-        mediaPort: UInt16 = UInt16(NativePipePort.media)
-    ) {
-        session = RemoteSession(host: host, surfacePort: surfacePort, mediaPort: mediaPort)
+    public init(command: SSHCommand, environment: [String: String]? = nil) {
+        session = RemoteSession(command: command, environment: environment)
         frames = RemoteFrameSource()
         bridge = WindowBridge(frameSource: frames)
+        bridge.fileAccess = RemoteUserFileAccess(command: command, environment: environment)
+        bridge.applicationIconProvider = { [weak self] id in
+            self?.applications.first(where: { $0.matches(applicationID: id) })
+                .flatMap { $0.iconData.flatMap(NSImage.init(data:)) }
+        }
         bridge.output = { [weak self] command in
             self?.session.send(command)
+        }
+        bridge.onApplicationWindowMapped = { [weak self] _ in
+            Task { @MainActor [weak self] in _ = try? await self?.refreshApplications() }
         }
         frames.setFrameAvailableHandler { [weak self] _ in
             self?.bridge.retryPendingFrames()
         }
-        session.onEvent = { [weak self] event in
-            Task { @MainActor in
-                self?.handle(event)
+        session.applicationClient.onChanged = { [weak self] in
+            self?.bridge.refreshApplicationIcons()
+            self?.onApplicationsChanged?()
+            if self?.bridge.dockWindows.isEmpty == false {
+                Task { @MainActor [weak self] in _ = try? await self?.refreshApplications() }
             }
+        }
+        session.onEvent = { [weak self] event in
+            self?.handle(event)
         }
         session.onMediaFrame = { [weak self] header, payload in
             self?.frames.ingest(header: header, payload: payload)
         }
         session.onStateChange = { [weak self] state in
-            Task { @MainActor in
-                if state == .disconnected {
-                    self?.bridge.closeAll()
-                    self?.frames.removeAll()
-                }
-                self?.onStateChange?(state)
+            if state == .disconnected {
+                self?.bridge.closeAll()
+                self?.frames.removeAll()
             }
+            self?.onStateChange?(state)
         }
     }
 
@@ -59,18 +68,16 @@ public final class RemoteDisplayController {
         frames.removeAll()
     }
 
+    @discardableResult
+    public func refreshApplications(refresh: Bool = false) async throws -> [GuestApplication] {
+        let applications = try await session.applications(refresh: refresh)
+        bridge.refreshApplicationIcons()
+        return applications
+    }
+
     private func handle(_ event: Windowing.GuestEvent) {
         if case .surfaceDestroyed(let surface) = event {
             frames.removeSurface(surface)
-        }
-        if case .committed(let surface, let frame) = event {
-            fputs(
-                "nativepipe-remote: committed surface=\(surface) res=\(frame.resourceID) "
-                    + "\(frame.width)x\(frame.height) source=\(frame.source)\n",
-                stderr)
-        }
-        if case .toplevelCreated(let window, let surface) = event {
-            fputs("nativepipe-remote: toplevel window=\(window) surface=\(surface)\n", stderr)
         }
         bridge.apply(event)
     }

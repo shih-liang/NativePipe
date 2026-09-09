@@ -31,17 +31,6 @@ public struct Request: Sendable {
         /// use a byte-clean socket so EOF and arbitrary binary stdin survive.
         case exec(spec: LaunchSpec, cols: Int, rows: Int, terminal: Bool)
 
-        /// Read a guest file (raw bytes) or list one directory level.
-        case readPath(path: String)
-
-        /// `lstat` a guest path: type, permissions, owner, size, mtime.
-        case statPath(path: String)
-
-        /// Atomically replace a guest file. The initramfs resolves this path
-        /// beneath the explicitly mounted target root; guestd resolves it in
-        /// the running root. Both endpoints use identical wire semantics.
-        case writePath(path: String, mode: UInt32, data: Data)
-
         /// Initramfs-only: enumerate disks so the host can choose explicitly.
         case initInventory
 
@@ -222,19 +211,9 @@ public struct DirEntry: Sendable {
     public var name: String
     /// Linux `dirent.d_type`; `.unknown` if the filesystem did not fill it.
     public var fileType: DirEntryType
-    /// This name continues the previous entry (split inside a name).
-    public var continuesName: Bool
-    /// This name is incomplete; the next chunk continues it.
-    public var nameIncomplete: Bool
-
-    public init(
-        name: String, fileType: DirEntryType = .unknown, continuesName: Bool = false,
-        nameIncomplete: Bool = false
-    ) {
+    public init(name: String, fileType: DirEntryType = .unknown) {
         self.name = name
         self.fileType = fileType
-        self.continuesName = continuesName
-        self.nameIncomplete = nameIncomplete
     }
 
     public var isDirectory: Bool { fileType == .directory }
@@ -272,9 +251,8 @@ public struct PathStat: Sendable {
 ///
 /// A file fills `data` with the raw bytes. A directory fills `entries` with
 /// the immediate children (one level, no recursion) — name + `d_type`. Large
-/// directories arrive in chunks split between names when possible;
-/// `GuestControlChannel.readPath` continues until the listing is complete,
-/// or sends `NPCL` if the caller cancels. Use `statPath` for permissions.
+/// directories arrive in bounded chunks with complete names. FileRPC closes
+/// the operation's connection on cancellation. Use `stat` for permissions.
 public struct PathContents: Sendable {
     public var path: String
     public var isDirectory: Bool

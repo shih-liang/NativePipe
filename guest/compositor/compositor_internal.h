@@ -35,6 +35,10 @@ struct np_server {
 	 * protocol state. */
 	void *backend_state;
 	bool host_session_ready;
+    struct np_apps *applications;
+    struct wl_event_source *application_source;
+    uint64_t application_generation;
+    bool terminate;
 	uint32_t next_id;
 	uint32_t next_presentation_id;
 	int output_scale;
@@ -63,6 +67,8 @@ struct np_server {
 	struct wl_resource *drag_icon;
 	uint32_t drag_focus_window;
 	bool drag_dropped;
+	uint32_t file_drag_serial, host_file_drag;
+	bool drag_exported;
 	double pointer_x, pointer_y;
 	size_t keymap_size;
 	uint32_t focused_window;

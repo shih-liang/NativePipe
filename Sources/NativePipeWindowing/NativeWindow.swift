@@ -805,6 +805,15 @@ final class NativeWindow: NSObject {
         SurfaceCoordinateSpace(windowGeometry).windowPoint(fromContent: contentPoint)
     }
 
+    func fileDragUpdated(_ info: NSDraggingInfo, at point: CGPoint, entering: Bool) -> NSDragOperation {
+        bridge?.fileDrag.destination(info, window: windowID, point: windowPoint(from: point), entering: entering) ?? []
+    }
+    func fileDragLeft() { bridge?.fileDrag.leave() }
+    func fileDrop(_ info: NSDraggingInfo) -> Bool { bridge?.fileDrag.perform(info) ?? false }
+    func beginFileDrag(view: NSView, event: NSEvent) -> Bool {
+        bridge?.fileDrag.beginExportIfNeeded(view: view, event: event) ?? false
+    }
+
     func pointerLeft() {
         endScrollGesture()
         bridge?.send(.pointerLeft(window: windowID))
@@ -1363,6 +1372,8 @@ private final class SurfaceView: NSView {
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
+        let promisedTypes = NSFilePromiseReceiver.readableDraggedTypes.map { NSPasteboard.PasteboardType($0) }
+        registerForDraggedTypes([.fileURL] + promisedTypes)
         sceneLayer.anchorPoint = .zero
         sceneLayer.isGeometryFlipped = true
         surfaceLayer.contentsGravity = .resize
@@ -1458,8 +1469,19 @@ private final class SurfaceView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if input?.beginFileDrag(view: self, event: event) == true { return }
         input?.pointerMoved(to: location(of: event))
     }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        input?.fileDragUpdated(sender, at: convert(sender.draggingLocation, from: nil), entering: true) ?? []
+    }
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        input?.fileDragUpdated(sender, at: convert(sender.draggingLocation, from: nil), entering: false) ?? []
+    }
+    override func draggingExited(_ sender: NSDraggingInfo?) { input?.fileDragLeft() }
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool { true }
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool { input?.fileDrop(sender) ?? false }
 
     override func rightMouseDragged(with event: NSEvent) {
         input?.pointerMoved(to: location(of: event))

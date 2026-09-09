@@ -122,6 +122,7 @@ static void start_audio_services(void) {
 /* Runs inside dbus-run-session after privileges have already been dropped.
  * On non-systemd guests, own the ordinary audio processes for this session. */
 static int user_session_main(void) {
+    setenv("NP_PRIVATE_APPLICATION_BUS", "1", 1);
     start_audio_services();
     apply_desktop_preferences();
 

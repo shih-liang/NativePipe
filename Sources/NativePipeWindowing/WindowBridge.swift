@@ -417,6 +417,16 @@ public final class WindowBridge: NSObject {
     public var applicationIconProvider: ((String) -> NSImage?)?
 
     let clipboard = ClipboardBridge()
+    public var fileAccess: (any UserFileAccess)? {
+        didSet { clipboard.fileAccess = fileAccess }
+    }
+    lazy var fileDrag = FileDragBridge(bridge: self)
+
+    func containsGuestWindow(at point: NSPoint) -> Bool {
+        windows.values.contains { $0.window.map { $0.isVisible && $0.frame.contains(point) } ?? false }
+    }
+    func hideDragIcon() { dragIcon.hide() }
+    func reportFileTransferError(_ error: Error) { NSApp.presentError(error) }
 
     public init(frameSource: FrameSource?) {
         self.frameSource = frameSource
@@ -853,6 +863,7 @@ public final class WindowBridge: NSObject {
 	}
 
     public func send(_ command: Windowing.HostCommand) {
+        if case .pointerButton(_, _, false) = command { fileDrag.pointerReleased() }
         // Outgoing commands were the one direction with no trace, which made
         // "input does not work" impossible to localise from the logs alone.
         switch command {
@@ -875,6 +886,7 @@ public final class WindowBridge: NSObject {
     // MARK: - Event application
 
     public func apply(_ event: Windowing.GuestEvent) {
+        if case .fileDrag(let message) = event { fileDrag.receive(message); return }
         if case .sceneCommitted(let scene) = event {
             Self.note(
                 "scene surface=\(scene.surface) present=\(scene.presentationID) " +
@@ -894,6 +906,7 @@ public final class WindowBridge: NSObject {
         }
 
         switch event {
+        case .fileDrag: break // handled above, before rendering
         case .channelReady:
             // Consumed by WindowChannel as the transport generation boundary.
 			lastDisplays.removeAll(keepingCapacity: true)
@@ -1662,6 +1675,8 @@ public final class WindowBridge: NSObject {
     }
 
     public func closeAll() {
+        fileDrag.disconnect()
+        clipboard.disconnect()
         for (surface, frame) in pendingSurfaceFrames {
             completeCopiedPresentation(
                 surface: surface, presentationID: frame.presentationID)

@@ -12,6 +12,7 @@
         "Sources/**",
         "Tests/**",
         "scripts/**",
+        "common/**",
         ".github/**",
         "guest/common/**",
         "guest/encoder/**",

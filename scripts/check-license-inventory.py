@@ -28,13 +28,13 @@ def matched(path: str, entry: dict[str, object]) -> bool:
 
 
 def source_files() -> list[str]:
-    roots = [ROOT / "Sources", ROOT / "Tests", ROOT / "guest", ROOT / "scripts"]
+    roots = [ROOT / "Sources", ROOT / "Tests", ROOT / "guest", ROOT / "scripts", ROOT / "common"]
     paths = ["Package.swift", "README.md"]
     for base in roots:
         if not base.exists():
             continue
         for item in base.rglob("*"):
-            if not item.is_file() or any(part in {".build", "dist", "__pycache__"} for part in item.parts):
+            if not item.is_file() or any(part in {".build", "build", "dist", "__pycache__"} for part in item.parts):
                 continue
             paths.append(item.relative_to(ROOT).as_posix())
     workflow = ROOT / ".github/workflows"

@@ -9,7 +9,15 @@ let products: [Product] = [
 ]
 let targets: [Target] = [
         .target(
+            name: "CNativePipeFileRPC",
+            path: "common/file_rpc",
+            exclude: ["Makefile", "README.md", "tests.c", "build"],
+            sources: ["np_file_wire.c", "np_file_server.c", "np_file_service.c"],
+            publicHeadersPath: "."
+        ),
+        .target(
             name: "NativePipeProtocol",
+            dependencies: ["CNativePipeFileRPC"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         // Wayland guest events ↔ NSWindow / clipboard / key codes.
@@ -18,7 +26,7 @@ let targets: [Target] = [
             dependencies: ["NativePipeProtocol"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
-        // Remote Linux: TCP NPIP + NPEN, VideoToolbox decode, WindowBridge.
+        // Remote Linux: SSH stdio NPIP + NPEN, VideoToolbox decode, WindowBridge.
         .target(
             name: "NativePipeRemote",
             dependencies: ["NativePipeProtocol", "NativePipeWindowing"],
@@ -41,7 +49,7 @@ let targets: [Target] = [
         ),
         .testTarget(
             name: "NativePipeProtocolTests",
-            dependencies: ["NativePipeProtocol"],
+            dependencies: ["NativePipeProtocol", "CNativePipeFileRPC"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .testTarget(

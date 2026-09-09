@@ -62,18 +62,27 @@ jobs:
                 export DEBIAN_FRONTEND=noninteractive
                 apt-get update
                 apt-get install -y --no-install-recommends \
-                  build-essential pkg-config \
+                  build-essential pkg-config patchelf \
                   libwayland-dev wayland-protocols libxkbcommon-dev \
-                  libvulkan-dev libdrm-dev
+                  libvulkan-dev libdrm-dev libegl1-mesa-dev libgles2-mesa-dev \
+                  libgbm-dev libavcodec-dev libavutil-dev libswscale-dev libglib2.0-dev \
+                  libgdk-pixbuf-2.0-dev librsvg2-dev dbus dconf-gsettings-backend
               else
                 apk add --no-cache \
-                  build-base pkgconf linux-headers \
+                  build-base pkgconf linux-headers patchelf \
                   wayland-dev wayland-protocols libxkbcommon-dev \
-                  vulkan-loader-dev vulkan-headers libdrm-dev
+                  vulkan-loader-dev vulkan-headers libdrm-dev mesa-dev ffmpeg-dev glib-dev \
+                  gdk-pixbuf-dev librsvg-dev dbus dconf
               fi
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-remote-transport
+              make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-applications
+              make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-file-drag
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" dist-vmpipe
+              make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" dist-remote
               make -C guest/session ARCH="$ARCH" LIBC="$LIBC" dist-target
+              sh scripts/package-remote-compositor.sh "$ARCH" "$LIBC" remote-release
+              sh scripts/test-remote-package.sh remote-release
+              tar -C remote-release -czf "nativepipe-compositor-$ARCH-$LIBC.tar.gz" .
             '
 
       - name: Collect checkout-shaped output
@@ -84,6 +93,8 @@ jobs:
         run: |
           set -euo pipefail
           root=artifact-root
+          install -Dm0644 "nativepipe-compositor-$ARCHITECTURE-$LIBC.tar.gz" \
+            "$root/nativepipe-compositor-$ARCHITECTURE-$LIBC.tar.gz"
           install -Dm0755 \
             "guest/session/dist/nativepipe-session-$ARCHITECTURE-$LIBC" \
             "$root/guest/session/dist/nativepipe-session-$ARCHITECTURE-$LIBC"
@@ -96,6 +107,9 @@ jobs:
           install -Dm0755 \
             "guest/compositor/dist/vmpipe-wayland-$ARCHITECTURE-$LIBC" \
             "$root/guest/compositor/dist/vmpipe-wayland-$ARCHITECTURE-$LIBC"
+          install -Dm0755 \
+            "guest/compositor/dist/nativepipe-wayland-$ARCHITECTURE-$LIBC" \
+            "$root/guest/compositor/dist/nativepipe-wayland-$ARCHITECTURE-$LIBC"
 
       - name: Upload Linux binaries
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
@@ -131,6 +145,7 @@ jobs:
             mkdir -p "$root"
             cp -R ".release-input/nativepipe-linux-$architecture-gnu/." "$root/"
             cp -R ".release-input/nativepipe-linux-$architecture-musl/." "$root/"
+            mv "$root"/nativepipe-compositor-*.tar.gz release/
             mkdir -p "$root/guest/session"
             cp -R guest/session/implicit_layer guest/session/openrc \
               guest/session/profile.d guest/session/systemd "$root/guest/session/"

@@ -18,11 +18,6 @@ import Foundation
 ///     NPLN  launch        id(u64) LaunchSpec
 ///     NPRU  run           id(u64) LaunchSpec
 ///     NPXC  exec          id(u64) cols(u32) rows(u32) terminal(u32) LaunchSpec
-///     NPRE  read path     id(u64) path_len(u16) path
-///     NPWR  write path    id(u64) path(str) mode(u32) size(u64) bytes
-///     NPCT  list continue id(u64)
-///     NPCL  list cancel   id(u64)
-///     NPMS  stat path     id(u64) path_len(u16) path
 ///     NPSH  shutdown      id(u64)
 ///     NPUS  setUser       id(u64) user_len(u16) user flags(u8) [old_len(u16) old]
 ///     NPWP  setPassword   id(u64) user_len(u16) user pass_len(u16) pass
@@ -37,9 +32,6 @@ import Foundation
 ///     NPLP  launched      id(u64) pid(i32)
 ///     NPRX  ran           id(u64) status(i32) out_len(u32) out err_len(u32) err
 ///     NPXS  exec session  id(u64) pid(i32) port(u32)
-///     NPFL  file bytes    id(u64) path_len(u16) path size(u64) bytes
-///     NPLS  dir listing   id(u64) path_len(u16) path flags(u32) count(u32) entries
-///     NPFS  path stat     id(u64) path_len(u16) path mode(u32) uid(u32) gid(u32) size(u64) mtime(i64)
 ///     NPIB  block devices id(u64) count(u16) entries
 ///     NPER  error         id(u64) code(u32) msg_len(u16) msg
 ///
@@ -75,11 +67,6 @@ public enum ControlWire {
     public static let launchMagic: [UInt8] = Array("NPLN".utf8)
     public static let runMagic: [UInt8] = Array("NPRU".utf8)
     public static let execMagic: [UInt8] = Array("NPXC".utf8)
-    public static let readMagic: [UInt8] = Array("NPRE".utf8)
-    public static let writeMagic: [UInt8] = Array("NPWR".utf8)
-    public static let continueMagic: [UInt8] = Array("NPCT".utf8)
-    public static let cancelMagic: [UInt8] = Array("NPCL".utf8)
-    public static let statMagic: [UInt8] = Array("NPMS".utf8)
     public static let shutdownMagic: [UInt8] = Array("NPSH".utf8)
     public static let setUserMagic: [UInt8] = Array("NPUS".utf8)
     public static let setPasswordMagic: [UInt8] = Array("NPWP".utf8)
@@ -94,9 +81,6 @@ public enum ControlWire {
     public static let launchedMagic: [UInt8] = Array("NPLP".utf8)
     public static let ranMagic: [UInt8] = Array("NPRX".utf8)
     public static let execSessionMagic: [UInt8] = Array("NPXS".utf8)
-    public static let fileMagic: [UInt8] = Array("NPFL".utf8)
-    public static let listMagic: [UInt8] = Array("NPLS".utf8)
-    public static let pathStatMagic: [UInt8] = Array("NPFS".utf8)
     public static let initInventoryResultMagic: [UInt8] = Array("NPIB".utf8)
     public static let errorMagic: [UInt8] = Array("NPER".utf8)
 
@@ -105,17 +89,11 @@ public enum ControlWire {
     public static let processExitedMagic: [UInt8] = Array("NPEX".utf8)
     public static let logMagic: [UInt8] = Array("NPLG".utf8)
 
-    public static let listNameBudget = 64 * 1024
-    public static let listHasMore: UInt32 = 1
-    public static let listNameTruncated: UInt32 = 2
-    public static let entryContinuesName: UInt8 = 1
-    public static let entryNameIncomplete: UInt8 = 2
     public static let setUserHasOld: UInt8 = 1
 
     public enum Decoded: Sendable {
         case response(id: UInt64, result: Response.Result)
         case event(Event)
-        case listing(id: UInt64, contents: PathContents, hasMore: Bool, nameTruncated: Bool)
     }
 
     public static func magic(of payload: Data) -> [UInt8]? {
@@ -132,10 +110,10 @@ public enum ControlWire {
         helloMagic, pingMagic, getVersionMagic, refreshEnvironmentMagic, reconcileResourcesMagic,
         desktopPreferencesMagic, sharedFoldersMagic,
         resizeMagic, launchMagic, runMagic,
-        execMagic, readMagic, writeMagic, continueMagic, cancelMagic, statMagic, shutdownMagic,
+        execMagic, shutdownMagic,
         setUserMagic, setPasswordMagic, initInventoryMagic, initMountMagic, initExecuteMagic,
         okMagic, versionMagic, infoMagic, launchedMagic, ranMagic,
-        execSessionMagic, fileMagic, listMagic, pathStatMagic, errorMagic, runtimeReadyMagic,
+        execSessionMagic, errorMagic, runtimeReadyMagic,
         initInventoryResultMagic, processExitedMagic, logMagic,
     ]
 
@@ -201,21 +179,6 @@ public enum ControlWire {
             append(terminal ? UInt32(1) : UInt32(0), to: &payload)
             appendLaunchSpec(spec, to: &payload)
             return payload
-        case .readPath(let path):
-            return encodeRead(id: id, path: path)
-        case .statPath(let path):
-            var payload = Data(statMagic)
-            append(id, to: &payload)
-            appendString(path, to: &payload)
-            return payload
-        case .writePath(let path, let mode, let data):
-            var payload = Data(writeMagic)
-            append(id, to: &payload)
-            appendString(path, to: &payload)
-            append(mode, to: &payload)
-            append(UInt64(data.count), to: &payload)
-            payload.append(data)
-            return payload
         case .initInventory:
             var payload = Data(initInventoryMagic)
             append(id, to: &payload)
@@ -264,24 +227,6 @@ public enum ControlWire {
         }
     }
 
-    public static func encodeRead(id: UInt64, path: String) -> Data {
-        var payload = Data(readMagic)
-        append(id, to: &payload)
-        appendString(path, to: &payload)
-        return payload
-    }
-
-    public static func encodeContinue(id: UInt64) -> Data {
-        var payload = Data(continueMagic)
-        append(id, to: &payload)
-        return payload
-    }
-
-    public static func encodeCancel(id: UInt64) -> Data {
-        var payload = Data(cancelMagic)
-        append(id, to: &payload)
-        return payload
-    }
 
     // MARK: - Decode guest → host
 
@@ -341,44 +286,6 @@ public enum ControlWire {
             guard let pid: Int32 = take(&offset, from: payload),
                   let port: UInt32 = take(&offset, from: payload) else { return nil }
             return .response(id: id, result: .execSession(pid: pid, port: port))
-        }
-        if magic == fileMagic {
-            guard let path = takeString(&offset, from: payload),
-                  let size: UInt64 = take(&offset, from: payload) else { return nil }
-            let remaining = payload.count - offset
-            guard size <= UInt64(remaining) else { return nil }
-            let data = payload.subdata(in: offset..<(offset + Int(size)))
-            return .response(
-                id: id,
-                result: .pathContents(PathContents(path: path, isDirectory: false, data: data)))
-        }
-        if magic == listMagic {
-            guard let path = takeString(&offset, from: payload),
-                  let flags: UInt32 = take(&offset, from: payload),
-                  let count: UInt32 = take(&offset, from: payload) else { return nil }
-            var entries: [DirEntry] = []
-            entries.reserveCapacity(Int(count))
-            for _ in 0..<count {
-                guard let entry = takeEntry(&offset, from: payload) else { return nil }
-                entries.append(entry)
-            }
-            return .listing(
-                id: id,
-                contents: PathContents(path: path, isDirectory: true, entries: entries),
-                hasMore: (flags & listHasMore) != 0,
-                nameTruncated: (flags & listNameTruncated) != 0)
-        }
-        if magic == pathStatMagic {
-            guard let path = takeString(&offset, from: payload),
-                  let mode: UInt32 = take(&offset, from: payload),
-                  let uid: UInt32 = take(&offset, from: payload),
-                  let gid: UInt32 = take(&offset, from: payload),
-                  let size: UInt64 = take(&offset, from: payload),
-                  let mtime: Int64 = take(&offset, from: payload) else { return nil }
-            return .response(
-                id: id,
-                result: .pathStat(
-                    PathStat(path: path, mode: mode, uid: uid, gid: gid, size: size, mtime: mtime)))
         }
         if magic == initInventoryResultMagic {
             guard let count: UInt16 = take(&offset, from: payload) else { return nil }
@@ -487,18 +394,6 @@ public enum ControlWire {
             architecture: architecture)
     }
 
-    private static func takeEntry(_ offset: inout Int, from data: Data) -> DirEntry? {
-        guard offset + 1 < data.count else { return nil }
-        let dtype = data[offset]
-        let eflags = data[offset + 1]
-        offset += 2
-        guard let name = takeString(&offset, from: data) else { return nil }
-        return DirEntry(
-            name: name,
-            fileType: DirEntryType(rawValue: dtype) ?? .unknown,
-            continuesName: (eflags & entryContinuesName) != 0,
-            nameIncomplete: (eflags & entryNameIncomplete) != 0)
-    }
 
     private static func take<T: FixedWidthInteger>(_ offset: inout Int, from data: Data) -> T? {
         let size = MemoryLayout<T>.size

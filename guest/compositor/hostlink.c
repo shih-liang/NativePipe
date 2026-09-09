@@ -10,7 +10,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
 
 #define NP_MAGIC "NPIP"
@@ -23,12 +22,6 @@ void np_host_set_nonblocking(int fd) {
 	if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 	flags = fcntl(fd, F_GETFD, 0);
 	if (flags >= 0) fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
-}
-
-static uint64_t monotonic_millis(void) {
-	struct timespec now;
-	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
-	return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
 }
 
 bool np_host_listen(struct np_host *host, uint32_t port) {
@@ -52,31 +45,16 @@ void np_host_finish(struct np_host *host) {
 
 void np_host_accept(struct np_host *host) {
 	if (host->listen_fd < 0) return;
-	int fd = accept(host->listen_fd, NULL, NULL);
+    int fd = np_host_transport_accept(host);
 	if (fd < 0) return;
-	if (host->conn_fd >= 0) {
-		/* The surface lane is the admission lane. Replace a peer that has not
-		 * completed NPRH, but once it has presented a valid token retain it while
-		 * the matching media lane arrives. This prevents two simultaneous clients
-		 * from continually crossing their surface/media sockets. Extra dials are
-		 * still accepted and closed so the listener cannot spin. */
-		if (!host->replace_unready_peer || host->remote_handshake_ready) {
-			close(fd);
-			return;
-		}
-		close(host->conn_fd);
-	}
+	if (host->conn_fd >= 0) { close(fd); return; }
 	np_host_set_nonblocking(fd);
 	host->conn_fd = fd;
 	host->buffer_len = 0;
 	host->out_head = 0;
 	host->out_len = 0;
-	host->remote_hello_len = 0;
-	host->remote_session_token = 0;
-	host->remote_handshake_ready = !host->requires_handshake;
-	host->input_enabled = !host->requires_handshake;
-	host->remote_accept_millis = monotonic_millis();
-	host->output_enabled = !host->requires_handshake;
+	host->input_enabled = true;
+	host->output_enabled = true;
 	fprintf(stderr, "[wayland] host attached on port %u\n", host->port);
 }
 
@@ -89,12 +67,8 @@ void np_host_disconnect(struct np_host *host) {
 	host->buffer_len = 0;
 	host->out_head = 0;
 	host->out_len = 0;
-	host->remote_hello_len = 0;
-	host->remote_session_token = 0;
-	host->remote_handshake_ready = false;
 	host->output_enabled = false;
 	host->input_enabled = false;
-	host->remote_accept_millis = 0;
 	if (was_connected)
 		fprintf(stderr, "[wayland] host detached from port %u\n", host->port);
 }
@@ -144,9 +118,6 @@ bool np_host_send_binary(struct np_host *host, const void *payload, size_t lengt
 	if (!host || !payload || !length || length > NP_MAX_PAYLOAD ||
 	    host->conn_fd < 0 || !host->output_enabled)
 		return false;
-	/* Until the surface and media sockets have presented the same nonce there
-	 * is no session.  Discard live state here; the paired-session replay is the
-	 * sole authoritative snapshot and channelReady must be its first frame. */
 	size_t frame_size = NP_HEADER + length;
 	if (!reserve_outbound(host, frame_size)) {
 		/* Structural and presentation messages are ordered state.  Dropping one
@@ -176,38 +147,9 @@ void np_host_flush(struct np_host *host) {
 	flush_outbound(host);
 }
 
-void np_host_set_output_enabled(struct np_host *host, bool enabled) {
-	if (!host) return;
-	host->output_enabled = enabled;
-	if (!enabled) {
-		host->out_head = 0;
-		host->out_len = 0;
-	}
-}
-
-void np_host_set_input_enabled(struct np_host *host, bool enabled) {
-	if (!host) return;
-	host->input_enabled = enabled;
-}
-
-bool np_host_unpaired_expired(const struct np_host *host,
-                              uint64_t timeout_millis) {
-	if (!host || host->conn_fd < 0 || host->output_enabled ||
-	    host->remote_accept_millis == 0)
-		return false;
-	uint64_t now = monotonic_millis();
-	return now >= host->remote_accept_millis &&
-	       now - host->remote_accept_millis >= timeout_millis;
-}
-
 bool np_host_connected(const struct np_host *host)
 {
 	return np_host_transport_connected(host);
-}
-
-uint64_t np_host_session_token(const struct np_host *host) {
-	return host && host->remote_handshake_ready
-		? host->remote_session_token : 0;
 }
 
 void np_host_pump(struct np_host *host,
@@ -236,13 +178,13 @@ void np_host_pump(struct np_host *host,
 		size_t available = host->buffer_cap - host->buffer_len;
 		if (available > NP_MAX_OUTBOUND - host->buffer_len)
 			available = NP_MAX_OUTBOUND - host->buffer_len;
-		ssize_t got = recv(host->conn_fd, host->buffer + host->buffer_len,
-		                   available, 0);
+		ssize_t got = read(host->conn_fd, host->buffer + host->buffer_len, available);
 		if (got == 0) {
 			np_host_disconnect(host);
 			return;
 		}
 		if (got < 0) {
+			if (errno == EINTR) continue;
 			if (errno == EAGAIN || errno == EWOULDBLOCK) break;
 			np_host_disconnect(host);
 			return;

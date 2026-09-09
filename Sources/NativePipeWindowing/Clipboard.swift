@@ -14,6 +14,11 @@ import NativePipeProtocol
 final class ClipboardBridge {
     /// Sends a host command to the guest.
     var output: ((Windowing.HostCommand) -> Void)?
+    var fileAccess: (any UserFileAccess)?
+    private var filePromises: [LinuxFilePromise] = []
+    private var selectionGeneration: UInt64 = 0
+    private var connectionGeneration: UInt64 = 0
+    private var hostTransfers: [UInt32: Task<Void, Never>] = [:]
 
     private let pasteboard = NSPasteboard.general
     private var nextToken: UInt32 = 0
@@ -31,6 +36,7 @@ final class ClipboardBridge {
     /// resolved eagerly: fetching all of them would copy an image across the
     /// channel to satisfy a paste that only ever wanted the text.
     private static let guestToNative: [(mime: String, native: NSPasteboard.PasteboardType)] = [
+        ("text/uri-list", .fileURL),
         ("text/plain;charset=utf-8", .string),
         ("UTF8_STRING", .string),
         ("text/plain", .string),
@@ -39,7 +45,6 @@ final class ClipboardBridge {
         ("text/html", .html),
         ("image/png", .png),
         ("image/tiff", .tiff),
-        ("text/uri-list", .fileURL),
     ]
 
     private static func note(_ message: @autoclosure () -> String) {
@@ -67,6 +72,15 @@ final class ClipboardBridge {
         poll?.invalidate()
         poll = nil
         pendingGuestReads.removeAll()
+        disconnect()
+    }
+
+    func disconnect() {
+        connectionGeneration &+= 1
+        selectionGeneration &+= 1
+        for task in hostTransfers.values { task.cancel() }
+        hostTransfers.removeAll()
+        pendingGuestReads.removeAll()
     }
 
     func setPolicy(hostToGuest: Bool, guestToHost: Bool) {
@@ -79,6 +93,7 @@ final class ClipboardBridge {
             poll?.invalidate()
             poll = nil
             if hostChanged { output?(.hostSelectionOffered(mimeTypes: [])) }
+            for task in hostTransfers.values { task.cancel() }
         }
         if !guestToHost {
             let pending = Array(pendingGuestReads.values)
@@ -92,6 +107,9 @@ final class ClipboardBridge {
     /// A guest client took the selection. Fetch the best type it offers and put
     /// it on the Mac's pasteboard.
     func guestOffered(mimeTypes: [String]) {
+        selectionGeneration &+= 1
+        let generation = selectionGeneration
+        let changeCount = pasteboard.changeCount
         guard allowsGuestToHost else { return }
         guard !mimeTypes.isEmpty else { return }
         let offered = Set(mimeTypes)
@@ -99,17 +117,14 @@ final class ClipboardBridge {
             return
         }
         requestFromGuest(mime: match.mime) { [weak self] data in
-            guard let self, let data, !data.isEmpty else { return }
+            guard let self, self.selectionGeneration == generation,
+                  self.pasteboard.changeCount == changeCount,
+                  let data, !data.isEmpty else { return }
             if match.native == .fileURL {
+                guard let access = self.fileAccess, let urls = try? FileTransferURLs.decode(data) else { return }
+                self.filePromises = urls.map { LinuxFilePromise(remote: $0, access: access) }
                 self.pasteboard.clearContents()
-                // text/uri-list is a newline-separated list with #-comments; the
-                // Mac wants real URL items.
-                let urls = String(decoding: data, as: UTF8.self)
-                    .split(whereSeparator: \.isNewline)
-                    .filter { !$0.hasPrefix("#") }
-                    .compactMap { URL(string: String($0)) }
-                if urls.isEmpty { return }
-                self.pasteboard.writeObjects(urls as [NSURL])
+                self.pasteboard.writeObjects(self.filePromises.map(\.provider))
             } else {
                 // declareTypes, not clearContents: setData refuses to write a
                 // type the pasteboard was never told to expect, and it reports
@@ -148,13 +163,14 @@ final class ClipboardBridge {
         let current = pasteboard.changeCount
         guard current != lastSeenChangeCount else { return }
         lastSeenChangeCount = current
+        selectionGeneration &+= 1
+        filePromises.removeAll()
 
         var mimeTypes: [String] = []
         let available = Set(pasteboard.types ?? [])
         for entry in Self.guestToNative where available.contains(entry.native) {
             if !mimeTypes.contains(entry.mime) { mimeTypes.append(entry.mime) }
         }
-        guard !mimeTypes.isEmpty else { return }
         output?(.hostSelectionOffered(mimeTypes: mimeTypes))
     }
 
@@ -165,16 +181,27 @@ final class ClipboardBridge {
             return
         }
         let native = Self.guestToNative.first { $0.mime == mimeType }?.native
+        if native == .fileURL {
+            let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+            let access = fileAccess
+            let connection = connectionGeneration
+            hostTransfers[token] = Task { @MainActor [weak self] in
+                var bytes: Data?
+                do {
+                    if let access, !urls.isEmpty {
+                        bytes = FileTransferURLs.encode(try await access.importFiles(urls))
+                    }
+                } catch { Self.note("file paste: \(error.localizedDescription)") }
+                guard let self, self.connectionGeneration == connection else { return }
+                self.hostTransfers[token] = nil
+                self.output?(.hostSelectionData(token: token, mimeType: mimeType,
+                    data: self.allowsHostToGuest ? bytes : nil))
+            }
+            return
+        }
         var data: Data?
         if let native {
-            if native == .fileURL {
-                let urls = pasteboard.readObjects(forClasses: [NSURL.self]) as? [URL] ?? []
-                if !urls.isEmpty {
-                    data = Data((urls.map(\.absoluteString).joined(separator: "\r\n") + "\r\n").utf8)
-                }
-            } else {
-                data = pasteboard.data(forType: native)
-            }
+            data = pasteboard.data(forType: native)
         }
         if let bytes = data, bytes.count > WindowWire.maximumClipboardDataSize {
             Self.note("refusing \(bytes.count)-byte host selection")

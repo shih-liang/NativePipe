@@ -25,7 +25,7 @@ hash_file()
 
 (
 	cd "$ROOT"
-	find . ../encoder -type f \( -name '*.c' -o -name '*.h' -o -name '*.xml' \
+	find . ../encoder ../../common/file_rpc -type f \( -name '*.c' -o -name '*.h' -o -name '*.xml' \
 		-o -name Makefile -o -name source-hash.sh \) \
 		! -path './.build/*' ! -path './dist/*' | LC_ALL=C sort |
 	while IFS= read -r file; do

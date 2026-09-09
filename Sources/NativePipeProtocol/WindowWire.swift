@@ -5,7 +5,7 @@ import Foundation
 /// NPIP supplies only bounded length framing. Integer fields are explicitly
 /// little endian; this is a wire format, never a Swift struct memory dump.
 public enum WindowWire {
-    public static let windowProtocolVersion: UInt32 = 7
+    public static let windowProtocolVersion: UInt32 = 9
     public static let motionMagic: [UInt8] = Array("NPMO".utf8)
     public static let motionPayloadSize = 16
     public static let scrollMagic: [UInt8] = Array("NPSC".utf8)
@@ -25,11 +25,23 @@ public enum WindowWire {
     public static let maximumCollectionCount = 4096
     public static let maximumMIMETypes = 24
 
-    public enum DecodeError: Error, Equatable {
+    public enum DecodeError: LocalizedError, Equatable {
         case notBinaryScene
         case truncated
         case unsupportedVersion(UInt16)
+        case unsupportedWindowVersion(UInt32)
         case malformed
+
+        public var errorDescription: String? {
+            switch self {
+            case .unsupportedWindowVersion:
+                "The Linux window service is not compatible with this version. Update NativePipe on the Linux computer and reconnect."
+            case .unsupportedVersion:
+                "The Linux window service sent an unsupported scene version."
+            case .notBinaryScene, .truncated, .malformed:
+                "The Linux window service sent an invalid display message."
+            }
+        }
     }
 
     public enum EncodeError: Error, Equatable {
@@ -157,8 +169,9 @@ public enum WindowWire {
         case 1:
             let sessionID: UInt32 = try reader.integer()
             let protocolVersion: UInt32 = try reader.integer()
-            guard sessionID != 0, protocolVersion == windowProtocolVersion else {
-                throw DecodeError.malformed
+            guard sessionID != 0 else { throw DecodeError.malformed }
+            guard protocolVersion == windowProtocolVersion else {
+                throw DecodeError.unsupportedWindowVersion(protocolVersion)
             }
             return try finished(.channelReady(
                 sessionID: sessionID, protocolVersion: protocolVersion))
@@ -327,6 +340,15 @@ public enum WindowWire {
                   placement.height > 0, placement.adjustment & ~0x3f == 0
             else { throw DecodeError.malformed }
             return try finished(.popupPlacementRequested(placement))
+        case 37:
+            let raw: UInt32 = try reader.integer()
+            guard let action = FileDragMessage.Action(rawValue: raw), raw >= 101 else { throw DecodeError.malformed }
+            let token: UInt32 = try reader.integer(), window: UInt32 = try reader.integer()
+            let x = Double(bitPattern: try reader.integer() as UInt64)
+            let y = Double(bitPattern: try reader.integer() as UInt64)
+            let data = try reader.optionalData()
+            guard token != 0, x.isFinite, y.isFinite, (data?.count ?? 0) <= 1024 * 1024 else { throw DecodeError.malformed }
+            return try finished(.fileDrag(.init(action, token: token, window: window, x: x, y: y, data: data)))
         case 36:
             return try finished(.forceQuitCapabilityChanged(
                 window: reader.integer(), supported: reader.boolean()))
@@ -342,6 +364,7 @@ public enum WindowWire {
 
         let opcode: UInt8
         switch command {
+        case .fileDrag: opcode = 28
         case .configure: opcode = 1
         case .close: opcode = 2
         case .dismissPopup: opcode = 3
@@ -367,6 +390,7 @@ public enum WindowWire {
         case .windowOutputChanged: opcode = 24
         case .inputPreferences: opcode = 25
         case .captureFrame: opcode = 26
+        case .applicationRequest: opcode = 27
         }
         var payload = Data(lifecycleMagic)
         payload.append(2)
@@ -374,6 +398,18 @@ public enum WindowWire {
         append(UInt16(0), to: &payload)
 
         switch command {
+        case .fileDrag(let message):
+            guard message.action.rawValue < 101, message.token != 0,
+                  message.x.isFinite, message.y.isFinite, (message.data?.count ?? 0) <= 1024 * 1024 else { throw EncodeError.invalidValue }
+            append(message.action.rawValue, to: &payload)
+            append(message.token, to: &payload); append(message.window, to: &payload)
+            append(message.x.bitPattern, to: &payload); append(message.y.bitPattern, to: &payload)
+            try append(message.data, to: &payload)
+        case .applicationRequest(let token, let action, let application):
+            guard token != 0, application.utf8.count <= 4096 else { throw EncodeError.invalidValue }
+            append(token, to: &payload)
+            append(action.rawValue, to: &payload)
+            try append(application, to: &payload)
         case .close(let window), .forceQuit(let window),
              .dismissPopup(let window), .pointerLeft(let window):
             append(window, to: &payload)

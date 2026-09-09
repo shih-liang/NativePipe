@@ -249,6 +249,9 @@ static int start_satellite(int fd, uint32_t mask, void *data)
 
 	pid_t pid = fork();
 	if (pid == 0) {
+		sigset_t signals;
+		sigemptyset(&signals);
+		sigprocmask(SIG_SETMASK, &signals, NULL);
 		for (size_t i = 0; i < 2; i++)
 			if (fcntl(xw->listen_fd[i], F_SETFD, 0) < 0) _exit(126);
 

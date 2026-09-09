@@ -5,8 +5,8 @@ display, input and transport technology used by FluxWindow. There is one
 Wayland protocol and surface-state implementation in `guest/compositor`; two
 concrete backends select how frames and events cross the machine boundary:
 
-- `nativepipe-wayland` uses loopback TCP and H.264/alpha media resources for an
-  SSH-forwarded remote Linux machine.
+- `nativepipe-wayland` uses SSH stdin/stdout and H.264/alpha media resources
+  for a remote Linux machine.
 - `vmpipe-wayland` uses the FluxWindow vsock window channel and Venus/
   virtio-gpu resources inside a VM.
 
@@ -37,7 +37,7 @@ compositor finds `xwayland-satellite` through the session `PATH`, starts it only
 when an X11 client connects, and leaves X11 disabled when the package is absent.
 
 For NativePipe, one immutable media resource represents each committed frame.
-The SSH channels carry binary NPIP window/scene messages and NPEN H.264 frames
+The SSH stream carries binary NPIP window/scene messages and NPEN H.264 frames
 with optional alpha sidecars. Encoder backpressure keeps the newest
 not-yet-encoded image, and a Wayland frame callback completes only after its
 scene is latched by the macOS display clock.
@@ -70,42 +70,74 @@ same atomic layer snapshots used by FluxWindow.
 Use it over SSH:
 
 ```sh
-nativepipe user@linux-host
-nativepipe user@linux-host --compositor ~/bin/nativepipe-wayland
-nativepipe user@linux-host -i ~/.ssh/id_ed25519 -p 2222
+nativepipe user@linux-host firefox --no-remote
+nativepipe --compositor /home/user/bin/nativepipe-wayland user@linux-host gtk4-demo
+nativepipe -i ~/.ssh/id_ed25519 -p 2222 user@linux-host qterminal
+nativepipe --install-compositor user@linux-host gtk4-demo
 ```
 
-The CLI starts or reuses one compositor owned by the remote user, opens local
-SSH forwards, connects both binary channels, and opens a login shell with
-`WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, `DISPLAY`, and `XAUTHORITY` set. Runtime
-state is private to that UID under `/tmp/nativepipe-xdg-$UID`.
+Options before the destination configure SSH/NativePipe. Everything after it
+is the target application's argument vector, not a login shell. The command
+starts a dedicated compositor and exits when that command ends. Each invocation
+has a private temporary Wayland runtime directory.
 
-For an existing manual tunnel:
+The system `/usr/bin/ssh -T` owns authentication, host-key checks, encryption,
+and transport. No libssh, local listener, port forwarding, or lane-pairing nonce
+is used. NPIP control/scene packets and NPEN media frames share stdout, with
+their existing magic and lengths distinguishing complete frames. Host commands
+travel over stdin; diagnostics and child application output go to stderr.
+The bounded output writer never waits for SSH on the Wayland input event loop.
 
-```sh
-nativepipe --host 127.0.0.1 --surface-port 1025 --media-port 1026
-```
+If the compositor is missing, NativePipe explains how to install it.
+`--install-compositor` downloads the architecture/libc-specific GitHub Release,
+checks its published SHA-256 digest, and installs it under
+`~/.local/share/nativepipe/compositor` on the remote computer. No root access is
+used. FFmpeg/VA-API, GLib/GIO, EGL/GL/GBM/DRM and libc come from the Linux
+distribution; they are not bundled or replaced. Image libraries and matching
+GdkPixbuf PNG/XPM loaders are bundled without exporting LD_LIBRARY_PATH.
 
-The remote compositor listens only on loopback. Port 1025 carries NPIP window
-events, host commands, and scenes; port 1026 carries NPEN media frames. Each
-connection begins with a 16-byte `NPRH` hello containing a random session token
-and lane kind. The compositor pairs only equal-token surface/media lanes,
-emits `channelReady` as the first NPIP frame, and opens media output afterward.
-The client temporarily holds current-token media that wins the TCP race against
-`channelReady`, so the initial IDR is not lost.
+The remote encoder links the system `libavcodec`, `libavutil` and `libswscale`
+libraries, not the `ffmpeg` command. It uses FFmpeg's VA-API H.264 encoder when
+available and its software H.264 encoder otherwise. Installing libva alone
+does not replace these FFmpeg dependencies. The target must supply the library
+major versions named by the binary's `DT_NEEDED`; GNU/musl and CPU architecture
+alone do not guarantee compatibility. If the distribution no longer supplies
+those versions, build the compositor against that distribution's development
+packages. Never symlink incompatible FFmpeg major versions. The launcher checks
+runtime linking before starting the session and reports missing libraries.
 
-`NPRH` is a lane-correlation nonce, not an authentication credential. NativePipe
-trusts every process running as the selected remote Unix account; the compositor
-ports must remain loopback-only and be reached through the authenticated SSH
-tunnel. Isolating mutually untrusted processes that share one Unix account would
-require carrying both streams inside SSH-owned file descriptors instead of
-publishing shared loopback listeners.
+OpenSSH can use its normal keys, config and agent. Passwords and encrypted-key
+passphrases can be remembered in macOS Keychain by the askpass dialog; host-key
+confirmation and one-time codes are never replayed as passwords.
+
+## FluxWindow integration
+
+The manager stores each remote computer alongside virtual machines and starts
+one sandboxed `FluxWindowRemoteHost.app` per connection. The helper runs
+`nativepipe-wayland --stdio --session` through the same SSH implementation,
+holding multiple applications on one display. GIO supplies the installed
+desktop application catalogue and launches desktop entries on that display.
+The manager and FluxWindow Apps both browse that catalogue and raise the same
+windows rather than spawning additional SSH sessions.
+
+VMHost and RemoteHost share `WindowBridge`, the Dock window switcher, and VMHost's
+appearance/input-source observers and preference resolution, now extracted into
+`HostIntegrationController`. Command coalescing/writing and local helper socket
+ownership are shared too. File drag and file clipboard use one AppKit bridge;
+only the user-vsock versus SFTP transfer adapter differs.
+The remote transport/codec remains separate from VZ and virtio-gpu resources.
+SSH file access uses user-selected security-scoped bookmarks; passwords stay in
+the app group's Keychain, not in the connection plist.
+
+The remote compositor requires Linux 5.3 or later. Direct command sessions use
+`pidfd` to observe the exact child process independently of Xwayland's signals.
 
 ## Guest builds
 
 Builds are native to their target architecture and libc. The release workflow
-uses aarch64 and x86_64 runners with glibc and musl containers and records the
-resolved builder-image digest and installed tool versions.
+uses aarch64 and x86_64 runners with glibc and musl containers. The FFmpeg
+development packages are build dependencies only and are not copied into
+remote release bundles, nor are their codec-only transitive dependencies.
 
 The important targets are:
 
@@ -115,15 +147,19 @@ make -C guest/compositor vmpipe
 make -C guest/session dist-target
 ```
 
-The compositor needs Wayland, xkbcommon, and Vulkan headers. The remote backend
-also needs EGL/GLES, GBM, DRM, and FFmpeg development packages. The session
+The compositor needs Wayland, xkbcommon, Vulkan, GIO (including gio-unix),
+GdkPixbuf, and librsvg development packages. Both backends use the same
+[application discovery and launch worker](guest/compositor/APPLICATIONS.md).
+The remote backend also needs EGL/GLES, GBM, DRM, and FFmpeg. The session
 helpers need DRM and Vulkan headers. Rootless X11 additionally requires the
-distribution packages `xwayland-satellite` and Xwayland at runtime.
+distribution packages `xwayland-satellite` and Xwayland at runtime. Remote
+sessions require `dbus-run-session` to isolate application activation from the
+remote machine's physical desktop session.
 
 ## Linux Actions artifacts and releases
 
 `.github/workflows/build-linux.yml` builds the VM compositor and session helpers
-for aarch64/x86_64 and GNU/musl. Every successful run uploads four
+plus the remote compositor for aarch64/x86_64 and GNU/musl. Every successful run uploads four
 checkout-shaped artifacts:
 
 ```text
@@ -139,7 +175,8 @@ the run for the NativePipe checkout commit; it does not build Linux binaries on
 the Mac and it does not use a runtime lock, manifest, or release archive.
 
 Tags matching `nativepipe-v*` additionally create normal GitHub Release
-archives for both architectures. The release contains `SHA256SUMS`, its
+archives for both architectures, plus four standalone remote compositor bundles.
+The release contains `SHA256SUMS`, its
 Ed25519 signature, and the matching public key. Signing runs without repository
 write permission; a separate job verifies the digest and signature before
 publishing the release.

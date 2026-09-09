@@ -49,6 +49,7 @@ extension Windowing {
 
     /// Things the guest's translator reports upward.
     public enum GuestEvent: Sendable {
+        case fileDrag(FileDragMessage)
         /// The compositor sends this before replaying its authoritative state
         /// on every new transport connection. A connected vsock alone is not
         /// evidence that the guest event loop owns and can write the channel.
@@ -491,6 +492,7 @@ extension Windowing {
     /// Instructions the host sends down. Geometry, focus and lifetime are macOS
     /// decisions; the guest applies them to the Wayland objects.
     public enum HostCommand: Sendable {
+        case fileDrag(FileDragMessage)
         /// The window changed size or state. `size` is in logical window-
         /// geometry coordinates (AppKit points), never backing pixels. The
         /// client's wl_surface buffer scale determines pixel density separately.
@@ -500,6 +502,8 @@ extension Windowing {
         /// The user explicitly confirmed Force Quit. The guest compositor kills
         /// only the process that owns this Wayland connection.
         case forceQuit(window: UInt32)
+        /// Ordinary-user application service shared by VM and remote backends.
+        case applicationRequest(token: UInt32, action: ApplicationAction, application: String)
 
         /// Dismiss a popup: the click went elsewhere, or the parent lost focus.
         /// Like close, this is a request; the client tears the popup down.

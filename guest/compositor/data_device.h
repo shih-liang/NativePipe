@@ -10,6 +10,8 @@ struct np_server;
 struct np_surface;
 struct wl_client;
 struct wl_resource;
+struct np_window_reader;
+bool np_data_handle_file_drag(struct np_server *server, struct np_window_reader *reader);
 
 void np_data_device_manager_bind(struct wl_client *client, void *data,
                                  uint32_t version, uint32_t id);

@@ -460,6 +460,7 @@ static bool surface_local_position(struct np_surface *surface,
 
 static void handle_pointer_position(struct np_server *server, uint32_t window_id,
                                     wl_fixed_t x, wl_fixed_t y) {
+	if (server->drag_exported || server->host_file_drag) return;
 	struct np_surface *root = np_surface_by_window(server, window_id);
 	if (!root) return;
 	server->pointer_x = wl_fixed_to_double(x);
@@ -973,6 +974,10 @@ bool np_input_handle_host_binary(const unsigned char *payload, size_t length,
 		free(mime);
 		break;
 	}
+	case NP_HOST_FILE_DRAG:
+		if (!np_data_handle_file_drag(server, &reader)) return false;
+		wl_display_flush_clients(server->display);
+		break;
 	case NP_HOST_SELECTION_OFFERED: {
 		uint32_t count = np_window_read_u32(&reader);
 		if (count > sizeof(server->host_mime) / sizeof(server->host_mime[0]))
