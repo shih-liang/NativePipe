@@ -64,14 +64,17 @@ public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
     }
     public func connect() {
         connectionTask?.cancel()
+        stopping = false
         connectionTask = Task {
             do {
                 try await display.connect()
+                try Task.checkCancellation()
+                guard display.session.isConnected else { return }
                 if let onConnected { onConnected() }
                 else { hostIntegration.sync() }
                 if loadsApplicationIcons { _ = try? await display.refreshApplications() }
             } catch is CancellationError { }
-            catch { failed(error) }
+            catch { if !Task.isCancelled { failed(error) } }
         }
     }
 
@@ -91,16 +94,40 @@ public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
     }
     private func failed(_ error: Error) {
         guard !stopping else { return }
+        // Failure owns shutdown. Suppress the resulting disconnected callback
+        // before releasing windows, pixels and SSH, then present the log once.
+        stopping = true
+        display.disconnect()
         onFailure?(error)
-        stopping = exitOnDisconnect
         fputs("nativepipe: \(error.localizedDescription)\n", stderr)
         if showErrors {
-            let alert = NSAlert()
-            alert.messageText = "Couldn’t Connect to \(name)"
-            alert.informativeText = error.localizedDescription
+            let alert = Self.failureAlert(name: name, log: error.localizedDescription)
+            NSApp.activate()
             alert.runModal()
         }
         if exitOnDisconnect { NSApp.terminate(nil) }
+    }
+
+    static func failureAlert(name: String, log: String) -> NSAlert {
+        let alert = NSAlert()
+        alert.messageText = "Couldn’t Connect to \(name)"
+        alert.informativeText = "The connection has closed. You can try connecting again."
+        alert.addButton(withTitle: "Close")
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 520, height: 240))
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        let text = NSTextView(frame: scroll.bounds)
+        text.isEditable = false
+        text.isSelectable = true
+        text.isVerticallyResizable = true
+        text.autoresizingMask = [.width]
+        text.textContainer?.widthTracksTextView = true
+        text.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        text.string = log
+        text.setAccessibilityLabel("Connection log")
+        scroll.documentView = text
+        alert.accessoryView = scroll
+        return alert
     }
     private func makeMenu() -> NSMenu {
         let menu = NSMenu()

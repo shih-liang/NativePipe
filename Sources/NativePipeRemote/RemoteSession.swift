@@ -8,7 +8,8 @@ import Darwin
 public final class RemoteSession {
     public enum State: Sendable, Equatable { case disconnected, connected }
     public var onEvent: ((Windowing.GuestEvent) -> Void)?
-    public var onMediaFrame: ((MediaWire.Header, Data) -> Void)?
+    /// Called on the connection reader, never AppKit's main actor.
+    public var onMediaFrame: (@Sendable (MediaWire.Header, Data) -> Bool)?
     public var onStateChange: ((State) -> Void)?
     public var onDiagnostic: ((String) -> Void)?
     public var onError: ((Error) -> Void)?
@@ -25,7 +26,8 @@ public final class RemoteSession {
     public var isConnected: Bool { isReady }
     private var diagnostics = ""
     private var authenticationDirectory: URL?
-    private let writer = WindowCommandWriter(write: RemoteSession.writeAll)
+    private var writer: WindowCommandWriter?
+    private var inbound: RemoteInbound?
 
     public init(command: SSHCommand, environment: [String: String]? = nil) {
         self.command = command
@@ -48,9 +50,37 @@ public final class RemoteSession {
         let token = generation
         diagnostics = ""
         exitStatus = nil
+        do { try await establishConnection(token: token) }
+        catch {
+            if generation == token {
+                if !Task.isCancelled && !(error is CancellationError) { exitStatus = 1 }
+                disconnect()
+            }
+            throw error
+        }
+    }
+
+    private func establishConnection(token: Int) async throws {
+        let arguments: [String]
+        if let argumentsOverride { arguments = argumentsOverride }
+        else { arguments = try await command.arguments() }
+        try Task.checkCancellation()
+        guard generation == token else { throw CancellationError() }
+        let writer = WindowCommandWriter(remote: true, write: Self.writeAll)
+        self.writer = writer
+        let inbound = RemoteInbound(writer: writer, media: onMediaFrame) { [weak self] event in
+            guard let self, self.generation == token else { return }
+            switch event {
+            case .packet(let packet): self.receive(packet, token: token)
+            case .diagnostic(let text): self.diagnostic(text, token: token)
+            case .ended(let status): self.ended(status, token: token)
+            case .failed(let error): self.fail(error, token: token)
+            }
+        }
+        self.inbound = inbound
         let child = Process()
         child.executableURL = URL(fileURLWithPath: executable)
-        child.arguments = try argumentsOverride ?? command.arguments()
+        child.arguments = arguments
         var childEnvironment = environment ?? SSHAuthentication.environment(
             askpassExecutable: URL(fileURLWithPath: CommandLine.arguments[0]))
         childEnvironment["NATIVEPIPE_SSH_CONNECTION"] = command.credentialID
@@ -83,7 +113,14 @@ public final class RemoteSession {
                         throw POSIXError(.EIO)
                     }
                     writer.install(input.fileHandleForWriting)
-                    Task.detached { [weak self] in
+                    let diagnosticsTask = Task.detached {
+                        while let bytes = try? Self.readChunk(errors.fileHandleForReading, capacity: 4096),
+                              !bytes.isEmpty {
+                            inbound.enqueue(.diagnostic(String(decoding: bytes, as: UTF8.self)), bytes: bytes.count)
+                        }
+                        try? errors.fileHandleForReading.close()
+                    }
+                    Task.detached {
                         var decoder = RemoteStreamDecoder()
                         do {
                             while true {
@@ -91,23 +128,23 @@ public final class RemoteSession {
                                 if bytes.isEmpty { break }
                                 decoder.append(bytes)
                                 while let packet = try decoder.next() {
-                                    await self?.receive(packet, token: token)
+                                    guard inbound.receive(packet, bytes: decoder.packetBytes) else {
+                                        try? output.fileHandleForReading.close()
+                                        return
+                                    }
                                 }
                             }
                             try decoder.finish()
                             child.waitUntilExit()
-                            await self?.ended(child.terminationStatus, token: token)
+                            // stderr and stdout are independent pipes. Deliver
+                            // the final SSH/installer error before its exit can
+                            // stop inbound delivery and discard that diagnostic.
+                            await diagnosticsTask.value
+                            inbound.enqueue(.ended(child.terminationStatus))
                         } catch {
-                            await self?.fail(error, token: token)
+                            inbound.enqueue(.failed(error))
                         }
                         try? output.fileHandleForReading.close()
-                    }
-                    Task.detached { [weak self] in
-                        while let bytes = try? Self.readChunk(errors.fileHandleForReading, capacity: 4096),
-                              !bytes.isEmpty {
-                            await self?.diagnostic(String(decoding: bytes, as: UTF8.self), token: token)
-                        }
-                        try? errors.fileHandleForReading.close()
                     }
                 } catch { fail(error, token: token) }
             }
@@ -121,7 +158,11 @@ public final class RemoteSession {
 
     public func send(_ command: Windowing.HostCommand) {
         guard isReady else { return }
-        writer.send(command)
+        writer?.send(command)
+    }
+    public func sceneCompleted(surface: UInt32, presentationID: UInt32, displayed: Bool, intervalNanoseconds: UInt32) {
+        guard isReady else { return }
+        writer?.remotePresentation(surface: surface, presentationID: presentationID, displayed: displayed, intervalNanoseconds: intervalNanoseconds)
     }
     public func applications(refresh: Bool = false) async throws -> [GuestApplication] {
         try await applicationClient.applications(refresh: refresh)
@@ -134,7 +175,10 @@ public final class RemoteSession {
         generation += 1
         continuation?.resume(throwing: CancellationError())
         continuation = nil
-        writer.disconnect()
+        inbound?.stop()
+        inbound = nil
+        writer?.disconnect()
+        writer = nil
         applicationClient.setConnected(false)
         if process?.isRunning == true { process?.terminate() }
         process = nil
@@ -159,8 +203,8 @@ public final class RemoteSession {
                 onStateChange?(.connected)
             }
             onEvent?(event)
-        case .media(let header, let bytes):
-            onMediaFrame?(header, bytes)
+        case .media, .acknowledge, .credit:
+            break // Handled by this connection's reader, before UI delivery.
         case .applications(let reply):
             applicationClient.receive(reply)
         }
@@ -168,7 +212,7 @@ public final class RemoteSession {
 
     private func diagnostic(_ text: String, token: Int) {
         guard token == generation else { return }
-        diagnostics = String((diagnostics + text).suffix(8192))
+        diagnostics = String((diagnostics + text).suffix(65_536))
         onDiagnostic?(text)
     }
 
@@ -189,6 +233,10 @@ public final class RemoteSession {
         continuation = nil
         if !connecting { onError?(error) }
         disconnect()
+    }
+
+    func decodingFailed(_ message: String) {
+        fail(RemoteError.message(message), token: generation)
     }
 
     nonisolated private static func writeAll(_ handle: FileHandle, _ data: Data) throws {

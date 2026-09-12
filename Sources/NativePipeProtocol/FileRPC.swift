@@ -14,6 +14,49 @@ public struct FileRPC: Sendable {
 
     public init(connect: @escaping Connector) { self.connect = connect }
 
+    public static func sendRecord(_ data: Data, to connection: SocketConnection,
+                                  deadline: DispatchTime) async throws {
+        func frame(_ type: np_file_type, _ body: Data) -> Data {
+            var result = Data([78, 80, 70, 82, UInt8(NP_FILE_VERSION), UInt8(type.rawValue), 0, 0])
+            result.append(Socket.encode(UInt32(body.count)))
+            result.append(Socket.encode(UInt32(0)))
+            result.append(body)
+            return result
+        }
+        var offset = 0
+        while offset < data.count {
+            let end = min(offset + Int(NP_FILE_CHUNK), data.count)
+            try await connection.write(frame(NP_FILE_DATA, data.subdata(in: offset..<end)), deadline: deadline)
+            offset = end
+        }
+        try await connection.write(frame(NP_FILE_END, Socket.encode(UInt64(data.count))), deadline: deadline)
+    }
+
+    public static func receiveRecord(from connection: SocketConnection, maximum: Int,
+                                     deadline: DispatchTime) async throws -> Data {
+        guard maximum >= 0 else { throw Failure.protocolError }
+        var result = Data()
+        while true {
+            let header = try await connection.readExactly(Int(NP_FILE_HEADER), deadline: deadline)
+            guard header.prefix(5) == Data([78, 80, 70, 82, UInt8(NP_FILE_VERSION)]),
+                  header[6] == 0, header[7] == 0 else { throw Failure.protocolError }
+            let length = header.withUnsafeBytes { Int(UInt32(littleEndian: $0.loadUnaligned(fromByteOffset: 8, as: UInt32.self))) }
+            let status = header.withUnsafeBytes { UInt32(littleEndian: $0.loadUnaligned(fromByteOffset: 12, as: UInt32.self)) }
+            guard status == 0 else { throw Failure.remote(Int32(clamping: status)) }
+            guard length <= Int(NP_FILE_CHUNK) else { throw Failure.protocolError }
+            let body = try await connection.readExactly(length, deadline: deadline)
+            if header[5] == UInt8(NP_FILE_END.rawValue) {
+                guard length == 8,
+                      body.withUnsafeBytes({ UInt64(littleEndian: $0.loadUnaligned(as: UInt64.self)) }) == result.count
+                else { throw Failure.protocolError }
+                return result
+            }
+            guard header[5] == UInt8(NP_FILE_DATA.rawValue), length > 0,
+                  length <= maximum - result.count else { throw Failure.protocolError }
+            result.append(body)
+        }
+    }
+
     /// An in-memory record over the same DATA/END wire used by file streams.
     /// The receiver chooses a record bound; file upload/download have no such
     /// aggregate bound and never collect a whole file in memory.

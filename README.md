@@ -36,11 +36,14 @@ packages. NativePipe neither fetches nor builds that Rust project. The
 compositor finds `xwayland-satellite` through the session `PATH`, starts it only
 when an X11 client connects, and leaves X11 disabled when the package is absent.
 
-For NativePipe, one immutable media resource represents each committed frame.
-The SSH stream carries binary NPIP window/scene messages and NPEN H.264 frames
-with optional alpha sidecars. Encoder backpressure keeps the newest
-not-yet-encoded image, and a Wayland frame callback completes only after its
-scene is latched by the macOS display clock.
+For NativePipe, a scene and its encoded resources are published as one ordered
+unit: metadata follows the images it references. Pending, unencoded updates
+coalesce to the newest state; encoded H.264 reference frames are never dropped.
+Unchanged alpha planes are reused explicitly within the same encoder epoch.
+The remote virtual output grants Wayland frame/FIFO callbacks at its refresh
+deadline only when transport and display capacity remain. Actual macOS
+presentation separately controls admission; network latency is not imposed as
+one stop-and-wait roundtrip per frame. The VM's display-clock pacing is unchanged.
 
 For FluxWindow, the same scene state names guest-created GPU resources. The VM
 backend receives host events over vsock and presents the compositor's
@@ -81,17 +84,43 @@ is the target application's argument vector, not a login shell. The command
 starts a dedicated compositor and exits when that command ends. Each invocation
 has a private temporary Wayland runtime directory.
 
-The system `/usr/bin/ssh -T` owns authentication, host-key checks, encryption,
+The system `/usr/bin/ssh -T -C` owns authentication, host-key checks, encryption,
 and transport. No libssh, local listener, port forwarding, or lane-pairing nonce
-is used. NPIP control/scene packets and NPEN media frames share stdout, with
-their existing magic and lengths distinguishing complete frames. Host commands
-travel over stdin; diagnostics and child application output go to stderr.
-The bounded output writer never waits for SSH on the Wayland input event loop.
+is used. Short NPIP control records bypass credit-paced bulk records. Images,
+scenes and large replies are wrapped in NPRF fragments (at most 16 KiB), inside
+NPIP; display and background lanes preserve their own order.
+Window lifecycle events stay ordered with scenes, and catalog end markers stay
+behind their batches; only independent transactions may overtake these records.
+NPRA acknowledges
+received bytes, independently of decoding and display. Each sender starts with
+4 KiB of credit and adapts between 1–64 KiB from measured acknowledgement delay.
+It pauses admission when the receiver falls behind, instead of queueing more
+frames in SSH. One latest unencoded scene and a per-window limit of 8 pending
+presentations also bound encode/decode work. NPRP distinguishes actual drawable
+presentation from supersession/cancellation; ordinary frame/FIFO acknowledgements
+are not treated as proof that a scene was displayed. It also carries the window's
+current CADisplayLink interval, so encoding follows the actual display cadence,
+not the screen's advertised maximum rate. A zero Metal presented-time
+is not counted as display. Occluded windows retain their unused display credits
+until visible again, so a hidden animation stops encoding instead of cycling
+through discard acknowledgements. This does not stop input or other windows.
+
+Host commands travel over stdin; diagnostics and child output go to stderr.
+The writer never waits for SSH on the Wayland input event loop. OpenSSH
+compression covers every stream, including metadata, alpha, clipboard and SFTP;
+H.264 is already compressed and has no additional application-level compressor.
+Display and SFTP disable ControlMaster reuse so a file transfer does not share
+the display's TCP queue. A single TCP stream still cannot bypass bytes already
+sent or a lost TCP packet; bounded adaptive admission reduces that unavoidable
+head-of-line delay, not the physical network RTT.
 
 If the compositor is missing, NativePipe explains how to install it.
-`--install-compositor` downloads the architecture/libc-specific GitHub Release,
-checks its published SHA-256 digest, and installs it under
-`~/.local/share/nativepipe/compositor` on the remote computer. No root access is
+`--install-compositor` checks GitHub on each connection and downloads the
+architecture/libc-specific release only when its published SHA-256 digest changes.
+Verified bundles live under `~/.local/share/nativepipe/compositor/releases/<digest>`;
+an atomic `current` link selects the completed installation. Running connections
+keep their own immutable directory, including libraries loaded later. Explicit
+`--compositor` paths bypass this installer. No root access is
 used. FFmpeg/VA-API, GLib/GIO, EGL/GL/GBM/DRM and libc come from the Linux
 distribution; they are not bundled or replaced. Image libraries and matching
 GdkPixbuf PNG/XPM loaders are bundled without exporting LD_LIBRARY_PATH.
@@ -156,7 +185,7 @@ distribution packages `xwayland-satellite` and Xwayland at runtime. Remote
 sessions require `dbus-run-session` to isolate application activation from the
 remote machine's physical desktop session.
 
-## Linux Actions artifacts and releases
+## Builds and releases
 
 `.github/workflows/build-linux.yml` builds the VM compositor and session helpers
 plus the remote compositor for aarch64/x86_64 and GNU/musl. Every successful run uploads four
@@ -174,12 +203,28 @@ under the ordinary `guest/**/dist` paths. FluxWindow uses the artifacts from
 the run for the NativePipe checkout commit; it does not build Linux binaries on
 the Mac and it does not use a runtime lock, manifest, or release archive.
 
-Tags matching `nativepipe-v*` additionally create normal GitHub Release
-archives for both architectures, plus four standalone remote compositor bundles.
-The release contains `SHA256SUMS`, its
-Ed25519 signature, and the matching public key. Signing runs without repository
-write permission; a separate job verifies the digest and signature before
-publishing the release.
+Only an explicitly pushed `nativepipe-v*` version tag publishes a GitHub Release.
+Ordinary commits run CI and build artifacts; manual workflow runs build and
+validate the complete product set without publishing. The tag workflow builds
+all three products from the same commit and publishes them together after tests:
+
+| Product | Release archives |
+| --- | --- |
+| VM compositor and session helpers | `nativepipe-vm-compositor-{aarch64,x86_64}.tar.gz` (GNU and musl in each) |
+| Remote compositor with private image libraries | `nativepipe-compositor-{aarch64,x86_64}-{gnu,musl}.tar.gz` |
+| macOS `nativepipe` CLI | `nativepipe-macos-universal.tar.gz` (Apple Silicon and Intel, macOS 14+) |
+
+There are seven product archives and three shared verification files:
+`SHA256SUMS`, its Ed25519 signature, and the public key. Reports, provenance,
+test results and intermediate build files stay in CI artifacts. License notices
+remain inside the corresponding archives. VM archives exclude the remote binary.
+The CLI is ad-hoc signed; it is not Apple Developer ID notarized.
+
+The signer has no repository write permission. A separate publisher verifies
+the complete product set, executable modes, digests and signature before creating
+the release. A missing product prevents publication. Remote clients select a
+stable release containing compositor assets, so older VM-runtime-only releases
+cannot be mistaken for an installable remote bundle.
 
 ## Source and license policy
 

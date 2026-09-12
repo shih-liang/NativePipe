@@ -8,12 +8,17 @@
 
 struct np_remote_surface {
 	struct np_encoder *encoder;
+	struct np_remote_scene_job *job;
 	uint16_t last_epoch;
+	unsigned char *pixels;
+	uint64_t pts_ns;
+	uint8_t flags;
+    struct { uint32_t id; bool scene; } flight[8];
+    unsigned flight_count;
+    uint64_t next_refresh_ns;
+    uint32_t display_interval_ns;
 };
 
 struct np_surface;
-
-bool np_remote_republish_surface(struct np_surface *surface);
-void np_remote_force_keyframe(struct np_surface *surface);
 
 #endif

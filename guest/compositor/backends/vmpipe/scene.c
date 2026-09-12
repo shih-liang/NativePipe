@@ -1,5 +1,16 @@
 #include "backend.h"
 
+bool np_backend_scene_ready(const struct np_surface *surface)
+{
+    (void)surface;
+    return true;
+}
+
+void np_backend_host_presented(struct np_server *server, uint32_t surface, uint32_t presentation)
+{
+    (void)server; (void)surface; (void)presentation;
+}
+
 #include "compositor_internal.h"
 #include "dmabuf.h"
 #include "shm_texture.h"

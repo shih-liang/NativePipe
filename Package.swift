@@ -60,6 +60,7 @@ let targets: [Target] = [
         .testTarget(
             name: "NativePipeRemoteTests",
             dependencies: ["NativePipeRemote", "NativePipeProtocol"],
+            resources: [.copy("Resources")],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .testTarget(

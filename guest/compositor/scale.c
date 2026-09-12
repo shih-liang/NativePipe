@@ -429,6 +429,13 @@ static bool output_state_has_resources(const struct np_output_state *state)
 	return false;
 }
 
+int32_t np_scale_surface_refresh_millihz(const struct np_surface *surface)
+{
+    struct np_output_state *state = output_state_by_id(surface->server, surface->output_id);
+    if (!state) state = first_output_state(surface->server);
+    return state && state->refresh_millihz > 0 ? state->refresh_millihz : 60000;
+}
+
 static void output_state_maybe_destroy(struct np_output_state *state)
 {
 	if (!state || state->global || output_state_has_resources(state)) return;

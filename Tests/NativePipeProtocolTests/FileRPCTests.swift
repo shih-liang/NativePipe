@@ -4,6 +4,40 @@ import CNativePipeFileRPC
 @testable import NativePipeProtocol
 
 final class FileRPCTests: XCTestCase {
+    func testAsyncRecordDecoderRejectsMalformedAndTruncatedFrames() async throws {
+        func header(type: UInt8 = UInt8(NP_FILE_DATA.rawValue), length: UInt32, flags: UInt8 = 0) -> Data {
+            var bytes = Data([78, 80, 70, 82, UInt8(NP_FILE_VERSION), type, flags, 0])
+            var length = length.littleEndian
+            withUnsafeBytes(of: &length) { bytes.append(contentsOf: $0) }
+            bytes.append(Data(repeating: 0, count: 4))
+            return bytes
+        }
+        let invalid = [
+            header(length: 1, flags: 1) + Data([0]),
+            header(type: 255, length: 1) + Data([0]),
+            header(length: UInt32(NP_FILE_CHUNK) + 1),
+            header(length: 9) + Data(repeating: 0, count: 9), // Record limit is 8.
+            header(type: UInt8(NP_FILE_END.rawValue), length: 8) + Data([1, 0, 0, 0, 0, 0, 0, 0]),
+            header(length: 1), // EOF in payload.
+            Data([78, 80, 70]) // EOF in header.
+        ]
+        for bytes in invalid {
+            var descriptors: [Int32] = [-1, -1]
+            XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors), 0)
+            let receiver = try SocketConnection(owning: descriptors[0])
+            let sender = try SocketConnection(owning: descriptors[1])
+            defer { receiver.close(); sender.close() }
+            try await sender.write(bytes)
+            sender.finishWriting()
+            do {
+                _ = try await FileRPC.receiveRecord(from: receiver, maximum: 8, deadline: .now() + .seconds(1))
+                XCTFail("Malformed record was accepted")
+            } catch is FileRPC.Failure {
+            } catch is SocketConnection.Failure {
+            } catch { XCTFail("Unexpected failure: \(error)") }
+        }
+    }
+
     private final class Server: @unchecked Sendable {
         let root: URL
         let workers = DispatchGroup()

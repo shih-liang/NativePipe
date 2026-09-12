@@ -86,6 +86,17 @@ private final class FrameCaptureWaiter {
     }
 }
 
+@MainActor
+private final class ScenePresentationCompletion {
+    private var callback: ((Bool) -> Void)?
+    init(_ callback: @escaping (Bool) -> Void) { self.callback = callback }
+    func finish(_ displayed: Bool) {
+        let callback = self.callback
+        self.callback = nil
+        callback?(displayed)
+    }
+}
+
 /// One `xdg_toplevel`, one `NSWindow`.
 ///
 /// This class is a translator and nothing else. There is no scene graph, no
@@ -105,6 +116,7 @@ final class NativeWindow: NSObject {
     private static let frameTrace = ProcessInfo.processInfo.environment["NATIVEPIPE_FRAME_TRACE"] != nil
     private static let trace = frameTrace
         || ProcessInfo.processInfo.environment["NATIVEPIPE_WINDOW_TRACE"] != nil
+    private static let inputTrace = ProcessInfo.processInfo.environment["NATIVEPIPE_INPUT_TRACE"] != nil
 
     private static func note(_ message: @autoclosure () -> String) {
         guard trace else { return }
@@ -113,6 +125,7 @@ final class NativeWindow: NSObject {
 
     let windowID: UInt32
     let surfaceID: UInt32
+    private(set) var displayIntervalNanoseconds: UInt32 = 0
 
     /// A popup is a menu, dropdown or tooltip: borderless, anchored to a parent,
     /// and dismissed rather than closed. `origin` is where the client asked for
@@ -131,6 +144,10 @@ final class NativeWindow: NSObject {
     private var appID: String?
     private var applicationIcon: NSImage?
     private var scrollGestureActive = false
+    private var leftButtonPressed = false
+    private var moveMouseDown: NSEvent?
+    private var nativeMoveInProgress = false
+    private var moveHandoffTime: Double?
     /// This is a value supplied by the guest compositor, not a host policy.
     /// Client-side is the safe construction default: it prevents an NSWindow
     /// titlebar from flashing around the first CSD frame before the protocol
@@ -187,11 +204,7 @@ final class NativeWindow: NSObject {
         return AsyncMetalScenePresenter(
             layer: contentView.metalLayer, device: metalDevice, renderer: renderer,
             requestDisplayRetry: {
-                RunLoop.main.perform(
-                    inModes: [.common, RunLoop.Mode("NSEventTrackingRunLoopMode")]
-                ) {
-                    MainActor.assumeIsolated { markRetry() }
-                }
+                MainRunLoop.perform { markRetry() }
             })
     }()
 
@@ -333,12 +346,12 @@ final class NativeWindow: NSObject {
             bytesPerRow: width * 4, format: .bgra8888, scale: 1))
     }
 
-    func present(frame: Windowing.Frame, surface: IOSurfaceRef) {
+    func present(frame: Windowing.Frame, surface: IOSurfaceRef, owner: AnyObject? = nil) {
         prepareWindow(for: frame)
         let incoming = frame.presentationID == 0 ? nil : Presentation(
             surface: surfaceID, id: frame.presentationID)
         contentView.displayCPU(
-            surface, frame: frame, geometry: windowGeometry)
+            surface, frame: frame, geometry: windowGeometry, owner: owner)
         if let incoming {
             bridge?.send(.frameReleased(
                 surface: incoming.surface, presentationID: incoming.id))
@@ -372,15 +385,34 @@ final class NativeWindow: NSObject {
             Self.note("could not configure Metal scene window=\(windowID)")
             return false
         }
+        let completion: ScenePresentationCompletion?
+        let generation = bridge?.connectionGeneration
+        if bridge?.onScenePresentation != nil {
+            // A drawable can finish after its NSWindow has been destroyed.
+            // Return its remote credit for as long as the session is alive.
+            completion = ScenePresentationCompletion { [weak bridge = bridge] displayed in
+                guard bridge?.connectionGeneration == generation else { return }
+                bridge?.scenePresented(surface: scene.surface,
+                    presentationID: scene.presentationID, displayed: displayed)
+            }
+        } else { completion = nil }
+        let onPresented: (@MainActor @Sendable (Bool) -> Void)?
+        if let completion { onPresented = { displayed in completion.finish(displayed) } }
+        else { onPresented = nil }
         presenter.enqueue(
             scene: scene, layers: layers, drawableSize: drawableSize,
-            readComplete: readComplete,
+            readComplete: { success in
+                readComplete(success)
+                if !success { completion?.finish(false) }
+            },
             latched: { [weak self] in
+                guard self?.bridge?.connectionGeneration == generation else { return }
                 for presentationID in latchIDs {
                     self?.awaitPresentation(
                         surface: scene.surface, presentationID: presentationID)
                 }
-            })
+            },
+            presented: onPresented)
         return true
     }
 
@@ -403,6 +435,9 @@ final class NativeWindow: NSObject {
         return try await withCheckedThrowingContinuation { continuation in
             let waiter = FrameCaptureWaiter(continuation)
             let requestID = presenter.captureNextFrame { result in waiter.finish(result) }
+            // An explicit screenshot may target an occluded window. Allow its
+            // capture scene through without continuously enabling rendering.
+            bridge?.flushSceneFeedback(surface: surfaceID)
             bridge?.send(.captureFrame(surface: surfaceID))
             Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -578,6 +613,7 @@ final class NativeWindow: NSObject {
         // on the first frame, so replay the cached complete constraint state
         // before the user can begin an interactive resize.
         self.window = window
+        bridge?.updateWindowPresence()
         applyConstraints()
         applyParent()
 
@@ -679,6 +715,7 @@ final class NativeWindow: NSObject {
     }
 
 	func close() {
+        pointerButton(.left, pressed: false)
         endScrollGesture()
         releasePressedKeys()
         pendingConfigure = nil
@@ -692,6 +729,7 @@ final class NativeWindow: NSObject {
 		bridge?.windowClosed(windowID)
 		bridge?.unregisterDisplayClock(self)
         asyncScenePresenter?.cancelPending()
+		bridge?.flushSceneFeedback(surface: surfaceID)
 		asyncScenePresenter?.invalidateDrawableAges()
         // `orderOut` only hides a window; it does not terminate its AppKit
         // lifetime.  In particular a popup remains retained by its parent as a
@@ -710,6 +748,7 @@ final class NativeWindow: NSObject {
             window.close()
         }
         window = nil
+        bridge?.updateWindowPresence()
     }
 
     // MARK: - Geometry
@@ -738,6 +777,12 @@ final class NativeWindow: NSObject {
     }
 
 	func displayClockFired(_ displayLink: CADisplayLink) {
+        if nativeMoveInProgress { finishWindowMoveIfReleased(pressedMouseButtons: NSEvent.pressedMouseButtons) }
+        let period = displayLink.targetTimestamp - displayLink.timestamp
+        if period.isFinite && period >= 0.001 && period <= 1 {
+            displayIntervalNanoseconds = UInt32((period * 1_000_000_000).rounded())
+        }
+        if canPresent { bridge?.flushSceneFeedback(surface: surfaceID) }
         // Deliver the newest resize before waking a frame-throttled client, so
         // the draw started by this tick targets the newest logical size.
         flushConfigure()
@@ -797,6 +842,8 @@ final class NativeWindow: NSObject {
     }
 
     func pointerMoved(to point: CGPoint) {
+        if nativeMoveInProgress { finishWindowMoveIfReleased(pressedMouseButtons: NSEvent.pressedMouseButtons) }
+        guard !nativeMoveInProgress else { return }
         let point = windowPoint(from: point)
         bridge?.send(.pointerMoved(window: windowID, x: point.x, y: point.y))
     }
@@ -819,11 +866,59 @@ final class NativeWindow: NSObject {
         bridge?.send(.pointerLeft(window: windowID))
     }
 
-    func pointerButton(_ button: Windowing.PointerButton, pressed: Bool) {
+    func pointerButton(_ button: Windowing.PointerButton, pressed: Bool, event: NSEvent? = nil) {
+        if button == .left {
+            // WindowServer may consume mouse-up after performDrag. A later
+            // press must never inherit the previous guest-side pointer grab.
+            if pressed && leftButtonPressed {
+                bridge?.send(.pointerButton(window: windowID, button: .left, pressed: false))
+            }
+            moveMouseDown = pressed && event?.type == .leftMouseDown ? event : nil
+            nativeMoveInProgress = false
+            moveHandoffTime = nil
+            guard pressed || leftButtonPressed else { return }
+            leftButtonPressed = pressed
+        }
         // A click anywhere but inside a menu closes it, which is what makes a
         // grab feel like a grab.
         if pressed, !isPopup { bridge?.dismissPopups(ownedBy: windowID) }
         bridge?.send(.pointerButton(window: windowID, button: button, pressed: pressed))
+    }
+
+    func beginInteractiveMove() {
+        guard let event = takeWindowMoveEvent(pressedMouseButtons: NSEvent.pressedMouseButtons),
+              let window else { return }
+        Self.note("move window=\(windowID) input_age_ms=\((ProcessInfo.processInfo.systemUptime - event.timestamp) * 1000)")
+        if Self.inputTrace {
+            let now = ProcessInfo.processInfo.systemUptime
+            moveHandoffTime = now
+            FileHandle.standardError.write(Data("[input] move window=\(windowID) down_to_handoff_ms=\((now - event.timestamp) * 1000)\n".utf8))
+        }
+        // This returns immediately; WindowServer owns movement, independent
+        // of SSH, decoding and presentation. AppKit requires the ORIGINAL down.
+        window.performDrag(with: event)
+    }
+
+    func takeWindowMoveEvent(pressedMouseButtons: Int) -> NSEvent? {
+        guard !isPopup, !nativeMoveInProgress, leftButtonPressed,
+              let event = moveMouseDown, event.windowNumber == window?.windowNumber else { return nil }
+        moveMouseDown = nil
+        guard pressedMouseButtons & 1 != 0 else {
+            pointerButton(.left, pressed: false)
+            return nil
+        }
+        nativeMoveInProgress = true
+        return event
+    }
+
+    func finishWindowMoveIfReleased(pressedMouseButtons: Int) {
+        guard nativeMoveInProgress, pressedMouseButtons & 1 == 0 else { return }
+        // The existing local display clock observes release even if AppKit
+        // sends no mouse-up. This never waits for another remote video frame.
+        pointerButton(.left, pressed: false)
+        if let window {
+            pointerMoved(to: contentView.convert(window.mouseLocationOutsideOfEventStream, from: nil))
+        }
     }
 
     func pointerScroll(dx: Double, dy: Double, precise: Bool) {
@@ -900,6 +995,16 @@ extension NativeWindow: NSWindowDelegate {
         bridge?.parentGeometryChanged(windowID)
     }
 
+    var canPresent: Bool {
+        guard let window, window.isVisible, window.occlusionState.contains(.visible),
+              let id = window.screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return false }
+        return CGDisplayIsActive(id.uint32Value) != 0
+    }
+
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        if canPresent { bridge?.flushSceneFeedback(surface: surfaceID) }
+    }
+
 	func windowWillStartLiveResize(_ notification: Notification) {
 		guard !isPopup, let window else { return }
 		liveResizeStartFrame = window.frame
@@ -909,6 +1014,10 @@ extension NativeWindow: NSWindowDelegate {
 	}
 
     func windowDidMove(_ notification: Notification) {
+        if let start = moveHandoffTime {
+            moveHandoffTime = nil
+            FileHandle.standardError.write(Data("[input] move window=\(windowID) handoff_to_did_move_ms=\((ProcessInfo.processInfo.systemUptime - start) * 1000)\n".utf8))
+        }
         bridge?.parentGeometryChanged(windowID)
     }
 
@@ -998,7 +1107,13 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         let drawableSize: CGSize
         let readComplete: @MainActor @Sendable (Bool) -> Void
         let latches: [@MainActor @Sendable () -> Void]
-        let presented: (@MainActor @Sendable () -> Void)?
+        let presented: (@MainActor @Sendable (Bool) -> Void)?
+
+        func superseding(_ older: Work) -> Work {
+            Work(epoch: epoch, scene: scene.includingUnrenderedDamage(from: older.scene),
+                 layers: layers, drawableSize: drawableSize, readComplete: readComplete,
+                 latches: older.latches + latches, presented: presented)
+        }
     }
 
     private struct CaptureRequest: @unchecked Sendable {
@@ -1077,7 +1192,7 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         drawableSize: CGSize,
         readComplete: @escaping @MainActor @Sendable (Bool) -> Void,
         latched: @escaping @MainActor @Sendable () -> Void,
-        presented: (@MainActor @Sendable () -> Void)? = nil
+        presented: (@MainActor @Sendable (Bool) -> Void)? = nil
     ) {
         lock.lock()
         let superseded = pending
@@ -1154,7 +1269,8 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         }
     }
 
-    private func process(_ work: Work) -> ProcessResult {
+    private func process(_ original: Work) -> ProcessResult {
+        var work = original
         guard isCurrent(work) else {
             finish(work, success: false)
             latch(work)
@@ -1174,7 +1290,6 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
                 FileHandle.standardError.write(Data(message.utf8))
             }
         }
-        let scene = work.scene
         let drawableStart = ProcessInfo.processInfo.systemUptime
         guard let drawable = layer.nextDrawable() else {
             if Self.frameTrace {
@@ -1195,14 +1310,34 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
                 FileHandle.standardError.write(Data(message.utf8))
             }
         }
-        guard isCurrent(work) else {
+        lock.lock()
+        guard work.epoch == epoch else {
+            lock.unlock()
             finish(work, success: false)
             latch(work)
             return .handled
         }
+        if let newer = pending {
+            // Resize needs a drawable from the new pool; the existing retry
+            // path transfers damage and latch obligations to the newer work.
+            guard newer.drawableSize == work.drawableSize else {
+                lock.unlock()
+                return .retryAfterDisplay
+            }
+            pending = nil
+            let previous = work
+            work = newer.superseding(previous)
+            lock.unlock()
+            finish(previous, success: false)
+        } else {
+            lock.unlock()
+        }
+        let selected = work
+        let scene = selected.scene
         if let presented = work.presented {
-            drawable.addPresentedHandler { _ in
-                DispatchQueue.main.async { presented() }
+            drawable.addPresentedHandler { drawable in
+                let displayed = drawable.presentedTime > 0
+                MainRunLoop.perform { presented(displayed) }
             }
         }
 		let captures = takeCaptureRequests()
@@ -1229,7 +1364,7 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
                     } ?? .failure(ComputerUseWindowError.captureFailed)
                     self.completeCaptures(captures, result: result)
                 }
-                self.finish(work, success: command.status == .completed)
+                self.finish(selected, success: command.status == .completed)
             }
 			drawableAges.commit(plan)
             // A drawable has accepted this scene in FIFO order. Queue its
@@ -1266,12 +1401,8 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         result: Result<RenderedFrameCapture, Error>
     ) {
         guard !requests.isEmpty else { return }
-        RunLoop.main.perform(
-            inModes: [.common, RunLoop.Mode("NSEventTrackingRunLoopMode")]
-        ) {
-            MainActor.assumeIsolated {
-                for request in requests { request.completion(result) }
-            }
+        MainRunLoop.perform {
+            for request in requests { request.completion(result) }
         }
     }
 
@@ -1309,20 +1440,14 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
     }
 
     private func finish(_ work: Work, success: Bool) {
-        RunLoop.main.perform(
-            inModes: [.common, RunLoop.Mode("NSEventTrackingRunLoopMode")]
-        ) {
-            MainActor.assumeIsolated { work.readComplete(success) }
-        }
+        let readComplete = work.readComplete
+        MainRunLoop.perform { readComplete(success) }
     }
 
     private func latch(_ work: Work) {
-        RunLoop.main.perform(
-            inModes: [.common, RunLoop.Mode("NSEventTrackingRunLoopMode")]
-        ) {
-            MainActor.assumeIsolated {
-                for latch in work.latches { latch() }
-            }
+        let latches = work.latches
+        MainRunLoop.perform {
+            for latch in latches { latch() }
         }
     }
 }
@@ -1354,6 +1479,7 @@ private final class SurfaceView: NSView {
     /// The legacy CPU/remote surface currently on screen, held for exactly as
     /// long as it is installed in the layer. GPU windows use `metalLayer`.
     private var displayed: IOSurfaceRef?
+    private var displayedOwner: AnyObject?
     /// Pixel density of the most recently committed Wayland scene. The Metal
     /// layer follows the AppKit view, while HostSceneRenderer keeps older scene
     /// pixels 1:1 at the drawable's top-left and clips them to the current view.
@@ -1493,7 +1619,7 @@ private final class SurfaceView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         input?.pointerMoved(to: location(of: event))
-        input?.pointerButton(.left, pressed: true)
+        input?.pointerButton(.left, pressed: true, event: event)
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -1615,6 +1741,7 @@ private final class SurfaceView: NSView {
 
     func configureMetalLayer(scene: Windowing.SceneSnapshot) -> CGSize? {
         displayed = nil
+        displayedOwner = nil
         guard layer != nil, scene.width > 0, scene.height > 0 else { return nil }
 		metalScale = CGFloat(max(scene.scale, 1))
 
@@ -1625,6 +1752,7 @@ private final class SurfaceView: NSView {
         sceneLayer.setAffineTransform(.identity)
 		let drawableSize = layoutMetalLayer()
         surfaceLayer.isHidden = true
+        surfaceLayer.contents = nil
         metalLayer.isHidden = false
         CATransaction.commit()
 		return drawableSize
@@ -1634,9 +1762,10 @@ private final class SurfaceView: NSView {
     /// Normalize against the allocation so unused capacity is never stretched.
     func displayCPU(
         _ surface: IOSurfaceRef, frame: Windowing.Frame,
-        geometry: Windowing.Rect
+        geometry: Windowing.Rect, owner: AnyObject?
     ) {
         displayed = surface
+        displayedOwner = owner
         guard layer != nil else { return }
 
         let logical = CGRect(origin: .zero, size: frame.appKitPointSize)
@@ -1663,6 +1792,7 @@ private final class SurfaceView: NSView {
 
     func clearDisplayedSurface() {
         displayed = nil
+        displayedOwner = nil
         guard layer != nil else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)

@@ -58,7 +58,7 @@ public final class SFTPTransfer {
         if address.contains(":"), !address.hasPrefix("[") {
             destination = String(destination.dropLast(address.count)) + "[" + address + "]"
         }
-        child.arguments = ["-b", "-", "-o", "BatchMode=no", "-o", "ClearAllForwardings=yes",
+        child.arguments = ["-C", "-b", "-", "-o", "ControlPath=none", "-o", "BatchMode=no", "-o", "ClearAllForwardings=yes",
                            "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30",
                            "-o", "ServerAliveCountMax=3"] + arguments + ["--", destination]
         let auth = try SSHCredentialStore.makeAttemptDirectory(environment: environment)

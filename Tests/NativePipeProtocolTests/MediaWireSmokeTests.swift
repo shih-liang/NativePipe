@@ -227,6 +227,12 @@ final class MediaWireSmokeTests: XCTestCase {
         XCTAssertEqual(alpha, Data([0, 1, 2, 7, 7, 7, 7, 9]))
         XCTAssertNil(MediaWire.decodeAlphaRLE(payload, pixelCount: 7))
         XCTAssertNil(MediaWire.decodeAlphaRLE(Data([128]), pixelCount: 1))
+        XCTAssertNil(MediaWire.decodeAlphaRLE(Data([2, 0, 1]), pixelCount: 3))
+        XCTAssertNil(MediaWire.decodeAlphaRLE(Data([129]), pixelCount: 128))
+        XCTAssertNil(MediaWire.decodeAlphaRLE(Data([0, 9, 0]), pixelCount: 1))
+        XCTAssertNil(MediaWire.decodeAlphaRLE(Data(), pixelCount: 1))
+        XCTAssertNil(MediaWire.decodeAlphaRLE(payload, pixelCount: 0))
+        XCTAssertEqual(MediaWire.decodeAlphaRLE(Data([99, 129, 7]).dropFirst(), pixelCount: 128), Data(repeating: 7, count: 128))
     }
 
     func testEncodedFrameSourceKind() throws {

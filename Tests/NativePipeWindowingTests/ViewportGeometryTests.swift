@@ -5,6 +5,21 @@ import XCTest
 
 @MainActor
 final class ViewportGeometryTests: XCTestCase {
+	func testPublishedOutputScalePreservesScreenLogicalSize() throws {
+		let bridge = WindowBridge(frameSource: nil)
+		defer { bridge.closeAll() }
+		var displays: [Windowing.Display] = []
+		bridge.output = { if case .outputsChanged(let values) = $0 { displays = values } }
+		bridge.apply(.channelReady(sessionID: 1, protocolVersion: WindowWire.windowProtocolVersion))
+		guard !NSScreen.screens.isEmpty else { throw XCTSkip("No display is available") }
+		XCTAssertEqual(displays.count, NSScreen.screens.count)
+		for output in displays {
+			// A Wayland client divides mode pixels by the advertised scale.
+			XCTAssertEqual(Double(output.pixelWidth) / Double(output.scale), Double(output.width), accuracy: 1)
+			XCTAssertEqual(Double(output.pixelHeight) / Double(output.scale), Double(output.height), accuracy: 1)
+		}
+	}
+
 	func testCommittedLayerStaysAtVisualTopLeftOfFlippedContainer() {
 		XCTAssertEqual(
 			SurfaceLayerPlacement.topLeftPosition(
@@ -639,6 +654,30 @@ final class ViewportGeometryTests: XCTestCase {
             if case .framePresented(surface: 8, presentationID: 18) = $0 { return true }
             return false
         })
+        bridge.closeAll()
+    }
+
+    func testReadySceneIsNotStarvedByNewerUndecodedMetadata() throws {
+        final class DeferredSource: FrameSource {
+            var completions: [@MainActor ([FrameTextureResolution]) -> Void] = []
+            func surface(forResource resourceID: UInt32) -> IOSurfaceRef? { nil }
+            func isResourcePublished(_ resourceID: UInt32) -> Bool { false }
+            func metalTextures(for layers: [Windowing.SceneLayer], completion: @escaping @MainActor ([FrameTextureResolution]) -> Void) {
+                completions.append(completion)
+            }
+        }
+        guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal unavailable") }
+        let source = DeferredSource()
+        let bridge = WindowBridge(frameSource: source)
+        bridge.apply(.surfaceCreated(surface: 8))
+        bridge.apply(.toplevelCreated(window: 3, surface: 8))
+        bridge.apply(.sceneCommitted(scene: scene(presentationID: 1)))
+        bridge.apply(.sceneCommitted(scene: scene(presentationID: 2)))
+        XCTAssertEqual(source.completions.count, 1)
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: 64, height: 48, mipmapped: false)
+        source.completions[0]([.init(status: .ready, texture: try XCTUnwrap(device.makeTexture(descriptor: desc)))])
+        XCTAssertNotNil(bridge.window(3)?.window, "Ready pixels must create the window even while a newer scene is undecoded")
+        XCTAssertEqual(source.completions.count, 2, "Resolve the newer scene after submitting the ready one")
         bridge.closeAll()
     }
 

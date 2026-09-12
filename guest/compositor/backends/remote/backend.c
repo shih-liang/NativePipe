@@ -73,7 +73,6 @@ int np_backend_run(int argc, char **argv)
 }
 bool np_backend_prepare(struct np_server *server)
 {
-    (void)server;
     fprintf(stderr, "[wayland] remote backend: SSH stdio, H.264/alpha resources\n");
     return true;
 }
@@ -81,4 +80,14 @@ void np_backend_advertise_globals(struct np_server *server)
 {
     np_dmabuf_advertise(server->display, -1);
 }
-void np_backend_finish(struct np_server *server) { (void)server; }
+void np_backend_finish(struct np_server *server)
+{
+    struct np_remote_backend *b = np_remote_backend(server);
+    fprintf(stderr, "[remote] frames captured=%llu coalesced-before-encode=%llu encoded=%llu scenes=%llu displayed=%llu discarded=%llu\n",
+        (unsigned long long)b->captured_frames, (unsigned long long)b->coalesced_frames,
+        (unsigned long long)b->encoded_frames, (unsigned long long)b->sent_scenes,
+        (unsigned long long)b->displayed_scenes, (unsigned long long)b->discarded_scenes);
+    fprintf(stderr, "[remote] transport pending-display=%zu pending-all=%zu flight=%zu budget=%zu\n",
+        b->media.display_bytes, b->media.queued_bytes, b->media.flow.bytes, b->media.flow.window);
+    free(b->input_record);
+}

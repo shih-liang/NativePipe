@@ -110,7 +110,13 @@ test-remote-transport: | $(BUILD_DIR)
 		backends/remote/host_transport.c backends/remote/medialink.c -pthread
 	$(BUILD_DIR)/remote-transport-test
 
-.PHONY: test-applications test-file-drag
+.PHONY: test-applications test-file-drag test-remote-encoder
+test-remote-encoder: | $(BUILD_DIR) check-deps-remote
+	$(CC) -O2 -Wall -Wextra -Werror -std=gnu11 $(REMOTE_CFLAGS) \
+		tests/remote_encoder_test.c ../encoder/encoder.c ../encoder/alpha.c \
+		$(REMOTE_LIBS) -o $(BUILD_DIR)/remote-encoder-test
+	$(BUILD_DIR)/remote-encoder-test
+
 test-file-drag: | $(BUILD_DIR)
 	$(CC) -O0 -g -Wall -Wextra -Werror -Wno-unused-parameter -std=gnu11 -I. \
 		$$(pkg-config --cflags wayland-server xkbcommon) \
@@ -186,7 +192,7 @@ linux-drm-syncobj-v1-server-protocol.h: $(SYNCOBJ_XML)
 linux-drm-syncobj-v1-protocol.c: $(SYNCOBJ_XML)
 	wayland-scanner private-code $(SYNCOBJ_XML) $@
 
-$(REMOTE_BINARY): $(GENERATED) $(COMMON_SOURCES) $(REMOTE_SOURCES) \
+$(REMOTE_BINARY): $(GENERATED) $(COMMON_SOURCES) $(REMOTE_SOURCES) $(wildcard *.h backends/remote/*.h ../encoder/*.h) \
 	$(SOURCE_HASH) Makefile | $(BUILD_DIR) check-deps-remote
 	$(CC) $(BASE_CFLAGS) $(COMMON_CFLAGS) $(REMOTE_CFLAGS) \
 		-Ibackends/remote $(SOURCE_DEFINE) -o $@ \
@@ -195,7 +201,7 @@ $(REMOTE_BINARY): $(GENERATED) $(COMMON_SOURCES) $(REMOTE_SOURCES) \
 $(FILE_RPC_LIB): $(FILE_RPC_SOURCES) $(FILE_RPC_DIR)/np_file_rpc.h $(FILE_RPC_DIR)/Makefile
 	$(MAKE) -C $(FILE_RPC_DIR) CC="$(CC)" AR="$(AR)" BUILD="$(CURDIR)/$(BUILD_DIR)/file-rpc"
 
-$(VM_BINARY): $(GENERATED) $(COMMON_SOURCES) $(VM_SOURCES) $(FILE_RPC_LIB) \
+$(VM_BINARY): $(GENERATED) $(COMMON_SOURCES) $(VM_SOURCES) $(FILE_RPC_LIB) $(wildcard *.h backends/vmpipe/*.h) \
 	$(SOURCE_HASH) Makefile | $(BUILD_DIR) check-deps-vmpipe
 	$(CC) $(BASE_CFLAGS) $(COMMON_CFLAGS) $(VM_CFLAGS) $(VULKAN_CFLAGS) \
 		-Ibackends/vmpipe -I$(FILE_RPC_DIR) $(SOURCE_DEFINE) -o $@ \
@@ -229,3 +235,9 @@ install-remote: $(REMOTE_BINARY)
 
 clean:
 	rm -rf .build dist
+
+.PHONY: test-remote-scheduler
+test-remote-scheduler: | $(BUILD_DIR) check-deps-remote
+	$(CC) -O0 -g -Wall -Wextra -Werror -Wno-unused-parameter -std=gnu11 -ffunction-sections -fdata-sections -I. $(COMMON_CFLAGS) $(REMOTE_CFLAGS) \
+		tests/remote_scheduler_test.c -Wl,--gc-sections $(COMMON_LIBS) $(REMOTE_LIBS) -o $(BUILD_DIR)/remote-scheduler-test
+	$(BUILD_DIR)/remote-scheduler-test

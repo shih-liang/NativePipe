@@ -14,7 +14,7 @@ final class NativePipeRemoteTests: XCTestCase {
     func testMixedStreamOneByteAtATime() throws {
         let header = MediaWire.Header(surfaceID: 1, resourceID: 2,
             width: 4, height: 4, ptsNanos: 0, payloadLength: 3)
-        let stream = try ready() + header.encoded() + Data([1, 2, 3])
+        let stream = try ready() + RemoteWire.fragment(header.encoded() + Data([1, 2, 3]), offset: 0, lane: 1)
         var decoder = RemoteStreamDecoder(), events = 0, media = 0
         for byte in stream {
             decoder.append(Data([byte]))
@@ -24,12 +24,38 @@ final class NativePipeRemoteTests: XCTestCase {
                 case .media(let frame, let data):
                     XCTAssertEqual(frame.resourceID, 2)
                     XCTAssertEqual(data, Data([1, 2, 3])); media += 1
+                case .acknowledge(let count): XCTAssertEqual(count, MediaWire.headerSize + 3)
                 default: XCTFail("Unexpected packet")
                 }
             }
         }
         try decoder.finish()
         XCTAssertEqual(events, 1); XCTAssertEqual(media, 1)
+    }
+    func testControlBypassesIncompleteBulkRecord() throws {
+        let header = MediaWire.Header(surfaceID: 1, resourceID: 2,
+            width: 4, height: 4, ptsNanos: 0, payloadLength: 50_000)
+        let record = header.encoded() + Data(repeating: 42, count: 50_000)
+        var decoder = RemoteStreamDecoder()
+        decoder.append(try ready())
+        _ = try decoder.next()
+        decoder.append(RemoteWire.fragment(record, offset: 0, lane: 1))
+        guard case .acknowledge(RemoteWire.fragmentSize) = try decoder.next() else { return XCTFail("Missing credit") }
+        XCTAssertNil(try decoder.next())
+        // Credit and interaction replies must be visible while a large video
+        // record is still incomplete, without corrupting that record.
+        decoder.append(try WireFormat.frame(payload: RemoteWire.acknowledgement(123)))
+        guard case .credit(123) = try decoder.next() else { return XCTFail("Control blocked by video") }
+        for offset in stride(from: RemoteWire.fragmentSize, to: record.count, by: RemoteWire.fragmentSize) {
+            decoder.append(RemoteWire.fragment(record, offset: offset, lane: 1))
+            guard case .acknowledge = try decoder.next() else { return XCTFail("Missing credit") }
+        }
+        guard case .media(_, let bytes) = try decoder.next() else { return XCTFail("Missing completed record") }
+        XCTAssertEqual(bytes, Data(repeating: 42, count: 50_000))
+        try decoder.finish()
+        var fragments = RemoteWire.Reassembler()
+        let packet = RemoteWire.fragment(record, offset: RemoteWire.fragmentSize, lane: 1)
+        XCTAssertThrowsError(try fragments.receive(Data(packet.dropFirst(WireFormat.headerSize)), maximumSize: 60_000))
     }
     func testRejectsWrongHandshakeTruncationAndOversizedMedia() throws {
         var invalid = RemoteStreamDecoder()
@@ -59,10 +85,12 @@ final class NativePipeRemoteTests: XCTestCase {
             XCTAssertTrue(error.localizedDescription.contains("Update NativePipe"))
         }
     }
-    func testShellQuotingAndNoForwarding() throws {
+    func testShellQuotingAndNoForwarding() async throws {
         let command = SSHCommand(destination: "user@host", application: ["echo", "a'b", "$(touch /tmp/no)"])
-        let arguments = try command.arguments()
+        let arguments = try await command.arguments()
         XCTAssertTrue(arguments.contains("ClearAllForwardings=yes"))
+        XCTAssertTrue(arguments.contains("-C"))
+        XCTAssertTrue(arguments.contains("ControlPath=none"))
         XCTAssertFalse(arguments.contains("-L"))
         XCTAssertFalse(arguments.contains("-R"))
         XCTAssertTrue(command.remoteScript.contains("exec"))
@@ -112,5 +140,20 @@ final class NativePipeRemoteTests: XCTestCase {
         do { try await task.value; XCTFail("Cancellation succeeded") }
         catch is CancellationError { }
         waiting.disconnect()
+    }
+
+    @MainActor func testFailureDrainsFinalDiagnosticAndAllowsImmediateReconnect() async throws {
+        // Repeated immediate exits expose the race between stdout EOF and the
+        // last stderr read, without introducing a timing sleep into the child.
+        let message = "SSH authentication failed: final diagnostic"
+        let session = RemoteSession(testExecutable: "/bin/sh", arguments: [
+            "-c", "printf '%s' " + SSHCommand.quote(message) + " >&2; exit 255"
+        ])
+        for _ in 0..<20 {
+            do { try await session.connect(); XCTFail("Expected failure") }
+            catch { XCTAssertEqual(error.localizedDescription, message) }
+            XCTAssertFalse(session.isConnected)
+            XCTAssertEqual(session.exitStatus, 255)
+        }
     }
 }

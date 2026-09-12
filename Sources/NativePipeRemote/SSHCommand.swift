@@ -35,59 +35,43 @@ public struct SSHCommand: Codable, Sendable, Equatable {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
-    public func arguments() throws -> [String] {
+    public func arguments() async throws -> [String] {
         try validate()
-        return ["-T", "-o", "ClearAllForwardings=yes", "-o", "ExitOnForwardFailure=yes",
-                "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3"]
-            + sshArguments + ["--", destination, "sh -c " + Self.quote(remoteScript)]
+        var script = remoteScript
+        if installCompositor && compositor == "nativepipe-wayland" {
+            let release = try await RemoteCompositorRelease.latest()
+            script = "release=" + Self.quote(release.absoluteString) + "\n" + script
+        }
+        return ["-T", "-C", "-o", "ControlPath=none", "-o", "ClearAllForwardings=yes", "-o", "ExitOnForwardFailure=yes",
+                "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3"]
+            + sshArguments + ["--", destination, "sh -c " + Self.quote(script)]
     }
 
     public var remoteScript: String {
         let invocation = persistentSession ? "--stdio --session" :
             "--stdio -- " + application.map(Self.quote).joined(separator: " ")
-        let install = installCompositor ? Self.installScript : """
-        echo 'NativePipe compositor is not installed. Install it on the remote computer, or reconnect with --install-compositor.' >&2
-        exit 127
+        let prepare = installCompositor ? RemoteCompositorInstaller.script : """
+        if command -v nativepipe-wayland >/dev/null 2>&1; then
+          compositor=$(command -v nativepipe-wayland)
+        elif [ -x "$HOME/.local/share/nativepipe/compositor/current/nativepipe-wayland" ]; then
+          compositor="$HOME/.local/share/nativepipe/compositor/current/nativepipe-wayland"
+        elif [ -x "$HOME/.local/share/nativepipe/compositor/nativepipe-wayland" ]; then
+          compositor="$HOME/.local/share/nativepipe/compositor/nativepipe-wayland"
+        else
+          echo 'NativePipe compositor is not installed. Reconnect with --install-compositor.' >&2
+          exit 127
+        fi
         """
         return """
         set -eu
         compositor=\(Self.quote(compositor))
         if [ "$compositor" = nativepipe-wayland ]; then
-          if command -v nativepipe-wayland >/dev/null 2>&1; then
-            compositor=$(command -v nativepipe-wayland)
-          elif [ -x "$HOME/.local/share/nativepipe/compositor/nativepipe-wayland" ]; then
-            compositor="$HOME/.local/share/nativepipe/compositor/nativepipe-wayland"
-          else
-            \(install)
-          fi
+          \(prepare)
         fi
         exec "$compositor" \(invocation)
         """
     }
 
-    // No sudo or distribution modification. Image libraries are private;
-    // FFmpeg/VA-API, GLib/GIO and graphics drivers come from the system.
-    private static let installScript = """
-    arch=$(uname -m)
-    case "$arch" in aarch64|x86_64) ;; *) echo "Unsupported architecture: $arch" >&2; exit 1;; esac
-    libc=gnu
-    if ldd --version 2>&1 | head -1 | grep -qi musl; then libc=musl; fi
-    command -v curl >/dev/null || { echo 'Install curl to download NativePipe.' >&2; exit 1; }
-    tmp=$(mktemp -d)
-    trap 'rm -rf "$tmp"' EXIT HUP INT TERM
-    asset="nativepipe-compositor-$arch-$libc.tar.gz"
-    base=https://github.com/shih-liang/nativepipe/releases/latest/download
-    echo "Downloading NativePipe compositor for $arch ($libc)…" >&2
-    curl --fail --location --proto '=https' --tlsv1.2 "$base/$asset" -o "$tmp/$asset" >&2
-    curl --fail --location --proto '=https' --tlsv1.2 "$base/SHA256SUMS" -o "$tmp/SHA256SUMS" >&2
-    (cd "$tmp" && grep "  $asset$" SHA256SUMS | sha256sum -c - >&2)
-    mkdir "$tmp/unpacked"
-    tar -xzf "$tmp/$asset" -C "$tmp/unpacked"
-    mkdir -p "$HOME/.local/share/nativepipe/compositor"
-    cp -R "$tmp/unpacked/." "$HOME/.local/share/nativepipe/compositor/"
-    compositor="$HOME/.local/share/nativepipe/compositor/nativepipe-wayland"
-    [ -x "$compositor" ] || { echo 'Release is missing nativepipe-wayland.' >&2; exit 1; }
-    """
 }
 
 public enum RemoteError: LocalizedError {

@@ -47,10 +47,16 @@ public struct WindowIntegrationPreferences: Sendable, Equatable {
 public struct FrameTextureResolution: @unchecked Sendable {
     public let status: FrameTextureStatus
     public let texture: AnyObject?
+    public let surface: IOSurfaceRef?
+    /// Keeps pooled pixels occupied independently of the provider's cache.
+    public let owner: AnyObject?
 
-    public init(status: FrameTextureStatus, texture: AnyObject? = nil) {
+    public init(status: FrameTextureStatus, texture: AnyObject? = nil,
+                surface: IOSurfaceRef? = nil, owner: AnyObject? = nil) {
         self.status = status
         self.texture = texture
+        self.surface = surface
+        self.owner = owner
     }
 }
 
@@ -133,6 +139,10 @@ public protocol FrameSource: AnyObject {
         forResource resourceID: UInt32,
         width: Int, height: Int, bytesPerRow: Int, format: UInt32
     ) -> AnyObject?
+    func resolveFrame(
+        forResource resourceID: UInt32,
+        width: Int, height: Int, bytesPerRow: Int, format: UInt32
+    ) -> FrameTextureResolution
     func metalTextures(
         for layers: [Windowing.SceneLayer],
         completion: @escaping @MainActor ([FrameTextureResolution]) -> Void)
@@ -146,22 +156,29 @@ extension FrameSource {
         width: Int, height: Int, bytesPerRow: Int, format: UInt32
     ) -> AnyObject? { nil }
 
+    public func resolveFrame(
+        forResource resourceID: UInt32,
+        width: Int, height: Int, bytesPerRow: Int, format: UInt32
+    ) -> FrameTextureResolution {
+        let texture = metalTexture(forResource: resourceID, width: width,
+            height: height, bytesPerRow: bytesPerRow, format: format)
+        let surface = surface(forResource: resourceID)
+        return FrameTextureResolution(
+            status: texture != nil || surface != nil ? .ready :
+                (isResourcePublished(resourceID) ? .unavailable : .unpublished),
+            texture: texture, surface: surface)
+    }
+
     public func metalTextures(
         for layers: [Windowing.SceneLayer],
         completion: @escaping @MainActor ([FrameTextureResolution]) -> Void
     ) {
         completion(layers.map {
-            let texture = metalTexture(
+            resolveFrame(
                 forResource: $0.resourceID,
                 width: $0.width, height: $0.height,
                 bytesPerRow: $0.bytesPerRow,
                 format: $0.format == .rgba8888 ? 67 : 1)
-            if let texture {
-                return FrameTextureResolution(status: .ready, texture: texture)
-            }
-            return FrameTextureResolution(
-                status: isResourcePublished($0.resourceID)
-                    ? .unavailable : .unpublished)
         })
     }
 }
@@ -270,7 +287,7 @@ public final class WindowBridge: NSObject {
         }
 
         func display(
-            _ texture: MTLTexture, frame: Windowing.Frame,
+            _ texture: MTLTexture, owner: AnyObject?, frame: Windowing.Frame,
 			renderer: HostSceneRenderer,
             readComplete: @escaping @MainActor @Sendable (Bool) -> Void,
             presented: @escaping @MainActor @Sendable () -> Void
@@ -312,11 +329,11 @@ public final class WindowBridge: NSObject {
                 layers: [layer])
             presenter.enqueue(
                 scene: scene,
-                layers: [ResolvedSceneLayer(state: layer, texture: texture)],
+                layers: [ResolvedSceneLayer(state: layer, texture: texture, owner: owner)],
                 drawableSize: CGSize(width: frame.width, height: frame.height),
                 readComplete: readComplete,
                 latched: {},
-                presented: presented)
+                presented: { _ in presented() })
             return true
         }
 
@@ -376,6 +393,35 @@ public final class WindowBridge: NSObject {
     private var pendingScenes: [UInt32: SceneWork] = [:]
     private var resolvingScenes: [UInt32: ResolvingScene] = [:]
     private var nextSceneLookupToken: UInt64 = 0
+    /// Optional transport feedback: true comes from the drawable's actual
+    /// presentation handler; superseded/cancelled scenes report false.
+    /// This is separate from Wayland frame/FIFO latch completion.
+    public var onScenePresentation: ((UInt32, UInt32, Bool, UInt32) -> Void)?
+    private var deferredSceneFeedback: [UInt32: [UInt32]] = [:]
+
+    func scenePresented(surface: UInt32, presentationID: UInt32, displayed: Bool) {
+        guard onScenePresentation != nil else { return }
+        if !displayed, let id = surfaceToWindow[surface],
+           let native = windows[id], native.window != nil, !native.canPresent {
+            // Returning discard credits continuously while occluded would let
+            // the remote encode an invisible animation forever. Retire these
+            // on visibility restoration; the remote's per-window limit bounds
+            // this list and does not block input or other windows.
+            deferredSceneFeedback[surface, default: []].append(presentationID)
+        } else {
+            onScenePresentation?(surface, presentationID, displayed, displayInterval(for: surface))
+        }
+    }
+
+    func flushSceneFeedback(surface: UInt32) {
+        for id in deferredSceneFeedback.removeValue(forKey: surface) ?? [] {
+            onScenePresentation?(surface, id, false, displayInterval(for: surface))
+        }
+    }
+
+    private func displayInterval(for surface: UInt32) -> UInt32 {
+        surfaceToWindow[surface].flatMap { windows[$0]?.displayIntervalNanoseconds } ?? 0
+    }
     private var pointerCursor = NSCursor.arrow
     private var cursorSurface: UInt32?
     private var cursorHotSpot = CGPoint.zero
@@ -411,9 +457,26 @@ public final class WindowBridge: NSObject {
     /// Sends a command down to the guest translator. Wired to the vsock channel
     /// in the real path; the demo driver substitutes its own sink.
     public var output: ((Windowing.HostCommand) -> Void)?
+    private(set) var connectionGeneration: UInt64 = 0
     /// Fired once when a toplevel has both an app id and a materialized
     /// NSWindow. This is the launcher's end-to-end success signal.
     public var onApplicationWindowMapped: ((String) -> Void)?
+    /// Mapped toplevel presence, independent of app IDs, occlusion and
+    /// minimization. Hosts use this to own their Dock activation policy.
+    public var onWindowPresenceChanged: ((Bool) -> Void)? {
+        didSet { onWindowPresenceChanged?(hasApplicationWindows) }
+    }
+    private var reportedWindowPresence = false
+    public var hasApplicationWindows: Bool {
+        windows.values.contains { !$0.isPopup && $0.window != nil }
+    }
+
+    func updateWindowPresence() {
+        let present = hasApplicationWindows
+        guard present != reportedWindowPresence else { return }
+        reportedWindowPresence = present
+        onWindowPresenceChanged?(present)
+    }
     public var applicationIconProvider: ((String) -> NSImage?)?
 
     let clipboard = ClipboardBridge()
@@ -844,8 +907,11 @@ public final class WindowBridge: NSObject {
 			let scale = max(1, Int(screen.backingScaleFactor.rounded()))
 			let directID = CGDirectDisplayID(id)
 			let physical = CGDisplayScreenSize(directID)
-			let pixelWidth = CGDisplayPixelsWide(directID)
-			let pixelHeight = CGDisplayPixelsHigh(directID)
+			// CGDisplayPixelsWide/High report mode points on a HiDPI display.
+			// wl_output.mode needs backing pixels before wl_output.scale divides it.
+			let mode = CGDisplayCopyDisplayMode(directID)
+			let pixelWidth = mode?.pixelWidth ?? Int((frame.width * CGFloat(scale)).rounded())
+			let pixelHeight = mode?.pixelHeight ?? Int((frame.height * CGFloat(scale)).rounded())
 			return Windowing.Display(
 				id: id, name: screen.localizedName,
 				x: Int(frame.minX.rounded()), y: Int((top - frame.maxY).rounded()),
@@ -908,6 +974,7 @@ public final class WindowBridge: NSObject {
         switch event {
         case .fileDrag: break // handled above, before rendering
         case .channelReady:
+            connectionGeneration &+= 1
             // Consumed by WindowChannel as the transport generation boundary.
 			lastDisplays.removeAll(keepingCapacity: true)
 			publishDisplayTopology(force: true)
@@ -1103,10 +1170,7 @@ public final class WindowBridge: NSObject {
         case .interactiveMoveRequested(let window, _):
             // Client-side decorations report title-bar drags this way, which is
             // why the host never has to infer a draggable region.
-            guard let nsWindow = windows[window]?.window,
-                  let event = NSApp.currentEvent
-            else { return }
-            nsWindow.performDrag(with: event)
+            windows[window]?.beginInteractiveMove()
 
         case .interactiveResizeRequested:
             // Both server-decorated and borderless CSD windows carry AppKit's
@@ -1169,6 +1233,7 @@ public final class WindowBridge: NSObject {
         if let older = pendingScenes[scene.surface] {
             work = work.superseding(older)
             releaseScene(older.scene)
+            scenePresented(surface: older.scene.surface, presentationID: older.scene.presentationID, displayed: false)
         }
         pendingScenes[scene.surface] = work
     }
@@ -1199,12 +1264,15 @@ public final class WindowBridge: NSObject {
         resolvingScenes.removeValue(forKey: surface)
         let work = resolving.work
 
-        // A scene committed while this lookup was in flight is authoritative.
-        // The older source was never read by Metal, so release it and carry its
-        // output-latch obligations into the newer work.
-        if var newer = pendingScenes.removeValue(forKey: surface) {
+        // Prefer the newest complete scene. New metadata may precede decode;
+        // continually discarding ready pixels for that metadata starves display.
+        let ready = results.count == work.scene.layers.count && results.allSatisfy { $0.status == .ready }
+        if var newer = pendingScenes[surface], !ready || presentationSuspended ||
+            newer.scene.layers.allSatisfy({ frameSource?.isResourcePublished($0.resourceID) == true }) {
+            pendingScenes.removeValue(forKey: surface)
             newer = newer.superseding(work)
             releaseScene(work.scene)
+            scenePresented(surface: work.scene.surface, presentationID: work.scene.presentationID, displayed: false)
             pendingScenes[surface] = newer
             startPendingScene(for: surface)
             return
@@ -1234,7 +1302,7 @@ public final class WindowBridge: NSObject {
                     unavailable.append(state.resourceID)
                     continue
                 }
-                layers.append(ResolvedSceneLayer(state: state, texture: texture))
+                layers.append(ResolvedSceneLayer(state: state, texture: texture, owner: result.owner))
             case .unpublished:
                 unpublished.append(state.resourceID)
             case .unavailable:
@@ -1253,11 +1321,13 @@ public final class WindowBridge: NSObject {
             return
         }
 
+        let generation = connectionGeneration
         guard let windowID = surfaceToWindow[surface],
               let native = windows[windowID],
               native.present(
                 scene: work.scene, layers: layers, latchIDs: work.latchIDs,
                 readComplete: { [weak self] _ in
+                    guard self?.connectionGeneration == generation else { return }
                     self?.releaseScene(work.scene)
                 })
         else {
@@ -1265,6 +1335,7 @@ public final class WindowBridge: NSObject {
             return
         }
 
+        startPendingScene(for: surface)
         notifyApplicationWindowMapped(windowID)
         native.traceLayerGeometry()
         injectTestInput(windowID)
@@ -1279,6 +1350,7 @@ public final class WindowBridge: NSObject {
 
     private func complete(_ work: SceneWork) {
         releaseScene(work.scene)
+        scenePresented(surface: work.scene.surface, presentationID: work.scene.presentationID, displayed: false)
         for presentationID in work.latchIDs where presentationID != 0 {
             send(.framePresented(
                 surface: work.scene.surface, presentationID: presentationID))
@@ -1298,6 +1370,7 @@ public final class WindowBridge: NSObject {
     private func discardScene(_ work: SceneWork, reason: String) {
         nativeWindowOwningSurface(work.scene.surface)?.invalidateSceneHistory()
         releaseScene(work.scene)
+        scenePresented(surface: work.scene.surface, presentationID: work.scene.presentationID, displayed: false)
         for presentationID in work.latchIDs where presentationID != 0 {
             if let native = nativeWindowOwningSurface(work.scene.surface) {
                 native.awaitPresentation(
@@ -1311,19 +1384,27 @@ public final class WindowBridge: NSObject {
             "discarded presentation \(work.scene.presentationID): \(reason)")
     }
 
-    private func texture(for frame: Windowing.Frame) -> MTLTexture? {
+    private func resolveFrame(_ frame: Windowing.Frame) -> FrameTextureResolution? {
         let format: UInt32 = frame.format == .rgba8888 ? 67 : 1
-        return frameSource?.metalTexture(
+        return frameSource?.resolveFrame(
             forResource: frame.resourceID,
             width: frame.width, height: frame.height,
-            bytesPerRow: frame.bytesPerRow, format: format) as? MTLTexture
+            bytesPerRow: frame.bytesPerRow, format: format)
+    }
+
+    private func texture(for frame: Windowing.Frame) -> (texture: MTLTexture, owner: AnyObject?)? {
+        guard let resolved = resolveFrame(frame),
+              let texture = resolved.texture as? MTLTexture else { return nil }
+        return (texture, resolved.owner)
     }
 
     private func installCustomCursor(_ frame: Windowing.Frame, surface: UInt32) {
-        guard let texture = texture(for: frame) else {
+        guard let resolved = texture(for: frame) else {
             retainUnroled(frame, for: surface)
             return
         }
+        let texture = resolved.texture
+        defer { withExtendedLifetime(resolved.owner) {} }
         let geometry = Self.customCursorGeometry(
             frame: frame, hotSpot: cursorHotSpot)
         let source = geometry.sourcePixels.intersection(
@@ -1360,17 +1441,19 @@ public final class WindowBridge: NSObject {
     }
 
     private func presentDragIcon(
-        _ texture: MTLTexture, frame: Windowing.Frame, surface: UInt32
+        _ resolved: (texture: MTLTexture, owner: AnyObject?), frame: Windowing.Frame, surface: UInt32
     ) {
+        let texture = resolved.texture
+        let generation = connectionGeneration
 		guard let renderer = sceneRenderer(for: texture.device) else {
 			completeCopiedPresentation(
 				surface: surface, presentationID: frame.presentationID)
 			return
 		}
         let queued = dragIcon.display(
-			texture, frame: frame, renderer: renderer,
+			texture, owner: resolved.owner, frame: frame, renderer: renderer,
             readComplete: { [weak self] success in
-                guard let self else { return }
+                guard let self, self.connectionGeneration == generation else { return }
                 self.send(.frameReleased(
                     surface: surface, presentationID: frame.presentationID))
                 if !success {
@@ -1379,6 +1462,7 @@ public final class WindowBridge: NSObject {
                 }
             },
             presented: { [weak self] in
+                guard self?.connectionGeneration == generation else { return }
                 self?.send(.framePresented(
                     surface: surface, presentationID: frame.presentationID))
             })
@@ -1424,13 +1508,13 @@ public final class WindowBridge: NSObject {
             return
         }
 
-        guard let ioSurface = frameSource?.surface(forResource: frame.resourceID) else {
+        guard let resolved = resolveFrame(frame), let ioSurface = resolved.surface else {
             retainDeferred(frame, for: surface)
             Self.note("remote frame deferred: no decoded IOSurface for resource \(frame.resourceID)")
             return
         }
         pendingFrames.removeValue(forKey: surface)
-        native.present(frame: frame, surface: ioSurface)
+        native.present(frame: frame, surface: ioSurface, owner: resolved.owner)
         notifyApplicationWindowMapped(windowID)
         dumpFrameIfRequested(frame, surfaceID: surface, surface: ioSurface)
         if Self.frameTrace {
@@ -1675,6 +1759,7 @@ public final class WindowBridge: NSObject {
     }
 
     public func closeAll() {
+        connectionGeneration &+= 1
         fileDrag.disconnect()
         clipboard.disconnect()
         for (surface, frame) in pendingSurfaceFrames {
@@ -1696,6 +1781,7 @@ public final class WindowBridge: NSObject {
         pointerCursor = .arrow
         for (_, window) in windows { window.close() }
         windows.removeAll()
+        deferredSceneFeedback.removeAll()
 		forceQuitCapabilities.removeAll(keepingCapacity: true)
 		windowDisplayStates.removeAll(keepingCapacity: true)
         popupPlacements.removeAll()

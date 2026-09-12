@@ -54,6 +54,10 @@ struct np_backend_scene_source {
 };
 
 bool np_backend_surface_has_current(const struct np_surface *surface);
+/* Admission is backend-specific: VM resources and remote network credits
+ * have different lifetimes. A false result leaves the latest scene dirty. */
+bool np_backend_scene_ready(const struct np_surface *surface);
+void np_backend_host_presented(struct np_server *server, uint32_t surface, uint32_t presentation);
 bool np_backend_describe_scene_source(
 	const struct np_surface *surface, struct np_backend_scene_source *source);
 

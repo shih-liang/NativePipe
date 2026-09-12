@@ -849,6 +849,7 @@ bool np_input_handle_host_binary(const unsigned char *payload, size_t length,
 				        kind == 2 ? "released" : "unknown",
 				        surface_id, presentation_id);
 			if (kind == 1) {
+				np_backend_host_presented(server, surface_id, presentation_id);
 				/* A configure record can precede this feedback in the same host
 				 * transport drain. Emit that newest configure before waking the
 				 * client's frame callback; otherwise the idle coalescer reverses
@@ -958,6 +959,7 @@ bool np_input_handle_host_binary(const unsigned char *payload, size_t length,
 		uint32_t surface = np_window_read_u32(&reader);
 		uint32_t presentation = np_window_read_u32(&reader);
 		if (reader.opcode == NP_HOST_FRAME_PRESENTED) {
+			np_backend_host_presented(server, surface, presentation);
 			np_xdg_flush_pending_toplevel_configure(
 				np_surface_by_id(server, surface));
 			np_presentation_process_presented(server, surface, presentation);

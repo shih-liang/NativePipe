@@ -15,7 +15,7 @@ struct RemotePipeCLI {
 
     Options (before user@host):
       --compositor PATH      Remote compositor executable
-      --install-compositor   Download missing compositor from GitHub Release
+      --install-compositor   Install/update compositor from GitHub Release
       -i FILE, -F FILE, -J HOST, -p PORT, -o OPTION
                              Pass an authentication/connection option to SSH
       -h, --help             Show help

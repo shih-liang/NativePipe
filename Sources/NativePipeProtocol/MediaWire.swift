@@ -10,6 +10,7 @@ public enum MediaWire {
     public static let maximumPayloadSize = 32 * 1024 * 1024
     public static let magic = Data("NPEN".utf8)
     public static let flagHasAlpha: UInt8 = 1 << 0
+    public static let flagReuseAlpha: UInt8 = 1 << 1
 
     public enum Codec: UInt8, Sendable {
         case h264 = 1
@@ -21,29 +22,33 @@ public enum MediaWire {
     /// network data cannot overrun the destination or silently truncate.
     public static func decodeAlphaRLE(_ payload: Data, pixelCount: Int) -> Data? {
         guard pixelCount > 0, pixelCount <= maximumPayloadSize else { return nil }
-        var output = Data(capacity: pixelCount)
-        var input = payload.startIndex
-        while input < payload.endIndex, output.count < pixelCount {
-            let tag = payload[input]
-            input += 1
-            if tag <= 127 {
-                let count = Int(tag) + 1
-                guard input + count <= payload.endIndex,
-                      output.count + count <= pixelCount else { return nil }
-                output.append(payload[input..<(input + count)])
-                input += count
-            } else if tag >= 129 {
-                let count = 257 - Int(tag)
-                guard input < payload.endIndex,
-                      output.count + count <= pixelCount else { return nil }
-                output.append(contentsOf: repeatElement(payload[input], count: count))
-                input += 1
-            } else {
-                return nil
+        var output = Data(count: pixelCount)
+        let valid = output.withUnsafeMutableBytes { destination in
+            payload.withUnsafeBytes { source in
+                guard let src = source.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                      let dst = destination.baseAddress else { return false }
+                var input = 0, written = 0
+                while input < source.count, written < pixelCount {
+                    let tag = src[input]
+                    input += 1
+                    if tag <= 127 {
+                        let count = Int(tag) + 1
+                        guard count <= source.count - input, count <= pixelCount - written else { return false }
+                        memcpy(dst.advanced(by: written), src.advanced(by: input), count)
+                        input += count
+                        written += count
+                    } else if tag >= 129 {
+                        let count = 257 - Int(tag)
+                        guard input < source.count, count <= pixelCount - written else { return false }
+                        memset(dst.advanced(by: written), Int32(src[input]), count)
+                        input += 1
+                        written += count
+                    } else { return false }
+                }
+                return input == source.count && written == pixelCount
             }
         }
-        guard input == payload.endIndex, output.count == pixelCount else { return nil }
-        return output
+        return valid ? output : nil
     }
 
     public struct Header: Sendable {

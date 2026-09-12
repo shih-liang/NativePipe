@@ -12,6 +12,7 @@ extern "C" {
 struct np_encoder;
 
 #define NP_ENCODER_FLAG_HAS_ALPHA 1
+#define NP_ENCODER_FLAG_REUSE_ALPHA 2
 
 typedef void (*np_encoder_output_fn)(void *user, const uint8_t *data, size_t size,
                                      uint64_t pts_ns, uint32_t resource_id,
@@ -20,25 +21,20 @@ typedef void (*np_encoder_output_fn)(void *user, const uint8_t *data, size_t siz
                                      uint16_t bitstream_epoch,
                                      uint16_t width, uint16_t height);
 
-struct np_encoder *np_encoder_create(int width, int height, np_encoder_output_fn out, void *user);
+typedef void (*np_encoder_done_fn)(void *user, bool ok);
+struct np_encoder *np_encoder_create(int width, int height, np_encoder_output_fn out,
+                                    np_encoder_done_fn done, void *user);
 void np_encoder_destroy(struct np_encoder *enc);
-
-/// Reconfigure when size changes. Bumps bitstream_epoch.
-bool np_encoder_resize(struct np_encoder *enc, int width, int height);
-
-/// Ask the next encoded frame to be an IDR (for late media-client attach).
-void np_encoder_force_keyframe(struct np_encoder *enc);
-
-/// Re-submit the newest queued/encoding/encoded image as an IDR after a host
-/// reconnect. `active_resource_id` is the resource that the replay will emit.
-bool np_encoder_replay_last(
-    struct np_encoder *enc, uint64_t pts_ns, uint32_t replacement_resource_id,
-    uint32_t *active_resource_id);
 
 /// Upload a tightly packed BGRA8888 frame (row stride == width * 4) and encode.
 bool np_encoder_push_bgra(struct np_encoder *enc, const uint8_t *bgra, int width, int height,
                           int stride, uint64_t pts_ns, uint32_t resource_id,
                           uint8_t flags);
+
+/// Accept malloc-owned BGRA, already padded to even dimensions. Ownership moves
+/// only on success; worker frees it before done(). Codec setup also runs there.
+bool np_encoder_take_bgra(struct np_encoder *enc, uint8_t *pixels, int width, int height,
+                         int stride, uint64_t pts_ns, uint32_t resource_id, uint8_t flags);
 
 uint16_t np_encoder_epoch(const struct np_encoder *enc);
 

@@ -15,22 +15,42 @@ final class ApplicationClientTests: XCTestCase {
         let encoder = PropertyListEncoder()
         encoder.outputFormat = .binary
         XCTAssertGreaterThan(try encoder.encode(apps).count, 16 * 1024 * 1024)
-        var fds: [Int32] = [-1, -1]
-        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds), 0)
-        let writer = FileHandle(fileDescriptor: fds[0], closeOnDealloc: true)
-        let reader = FileHandle(fileDescriptor: fds[1], closeOnDealloc: true)
-        defer { try? writer.close(); try? reader.close() }
-        let sending = Task.detached {
-            try ApplicationCatalogStream.write(apps, to: writer)
-            try ApplicationCatalogStream.write([], to: writer)
-            // EOF without the next catalog's terminator is not an empty list.
-            try writer.close()
+        // Exercise both directions against the existing C-backed codec. This
+        // also keeps the >16 MiB catalogue regression on the new async path.
+        for asyncWriter in [false, true] {
+            var fds: [Int32] = [-1, -1]
+            XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds), 0)
+            let connection = try SocketConnection(owning: fds[0])
+            let legacy = FileHandle(fileDescriptor: fds[1], closeOnDealloc: true)
+            defer { connection.close(); try? legacy.close() }
+            if asyncWriter {
+                let receiving = Task.detached {
+                    let received = try ApplicationCatalogStream.read(from: legacy)
+                    XCTAssertEqual(received, apps)
+                    XCTAssertTrue(try ApplicationCatalogStream.read(from: legacy).isEmpty)
+                    XCTAssertThrowsError(try ApplicationCatalogStream.read(from: legacy))
+                }
+                try await ApplicationCatalogStream.write(apps, to: connection)
+                try await ApplicationCatalogStream.write([], to: connection)
+                connection.finishWriting()
+                try await receiving.value
+            } else {
+                let sending = Task.detached {
+                    try ApplicationCatalogStream.write(apps, to: legacy)
+                    try ApplicationCatalogStream.write([], to: legacy)
+                    try legacy.close()
+                }
+                let received = try await ApplicationCatalogStream.read(from: connection)
+                XCTAssertEqual(received, apps)
+                let empty = try await ApplicationCatalogStream.read(from: connection)
+                XCTAssertTrue(empty.isEmpty)
+                do {
+                    _ = try await ApplicationCatalogStream.read(from: connection)
+                    XCTFail("EOF without a catalogue terminator must not become an empty list")
+                } catch { }
+                try await sending.value
+            }
         }
-        let received = try await Task.detached { try ApplicationCatalogStream.read(from: reader) }.value
-        XCTAssertEqual(received, apps)
-        XCTAssertTrue(try ApplicationCatalogStream.read(from: reader).isEmpty)
-        XCTAssertThrowsError(try ApplicationCatalogStream.read(from: reader))
-        try await sending.value
     }
 
     func testCatalogCoalescingBeyond512IconsAndInvalidation() async throws {

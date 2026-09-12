@@ -23,6 +23,7 @@ struct np_encoder {
 	int height;
 	uint16_t epoch;
 	np_encoder_output_fn out;
+	np_encoder_done_fn done;
 	void *user;
 
 	bool use_vaapi;
@@ -35,6 +36,10 @@ struct np_encoder {
 	AVPacket *packet;
 	struct SwsContext *sws;
 	bool force_keyframe;
+	uint8_t *last_alpha;
+	uint32_t last_alpha_size;
+	uint16_t last_alpha_epoch;
+	int64_t frame_number;
 
 	/* Wayland submits only the newest frame; encoding runs off its event loop. */
 	pthread_t worker;
@@ -49,13 +54,7 @@ struct np_encoder {
 	uint8_t pending_flags;
 	uint16_t pending_epoch;
 	bool pending_force;
-	uint8_t *encoding_bgra;
-	int encoding_width, encoding_height, encoding_stride;
-	uint32_t encoding_resource_id;
-	uint8_t encoding_flags;
-	uint8_t *last_bgra;
-	int last_width, last_height, last_stride;
-	uint8_t last_flags;
+	bool encoding;
 	int requested_width, requested_height;
 	uint16_t advertised_epoch;
 };
@@ -73,13 +72,16 @@ static bool setup_libx264(struct np_encoder *enc) {
 	enc->ctx->height = enc->height;
 	enc->ctx->time_base = (AVRational){1, 60};
 	enc->ctx->framerate = (AVRational){60, 1};
-	enc->ctx->bit_rate = 8 * 1000 * 1000;
+	enc->ctx->bit_rate = 4 * 1000 * 1000;
+	enc->ctx->rc_max_rate = enc->ctx->bit_rate;
+	enc->ctx->rc_buffer_size = (int)(enc->ctx->bit_rate / 4);
 	enc->ctx->gop_size = 60;
 	enc->ctx->max_b_frames = 0;
 	enc->ctx->pix_fmt = AV_PIX_FMT_YUV420P;
 	if (enc->codec->id == AV_CODEC_ID_H264) {
 		av_opt_set(enc->ctx->priv_data, "preset", "veryfast", 0);
 		av_opt_set(enc->ctx->priv_data, "tune", "zerolatency", 0);
+		av_opt_set(enc->ctx->priv_data, "crf", "23", 0);
 		/* Prefer Annex-B start codes so the macOS demuxer can split NALs. */
 		av_opt_set(enc->ctx->priv_data, "annexb", "1", 0);
 		av_opt_set(enc->ctx->priv_data, "repeat-headers", "1", 0);
@@ -118,7 +120,9 @@ static bool setup_vaapi(struct np_encoder *enc) {
 	enc->ctx->height = enc->height;
 	enc->ctx->time_base = (AVRational){1, 60};
 	enc->ctx->framerate = (AVRational){60, 1};
-	enc->ctx->bit_rate = 8 * 1000 * 1000;
+	enc->ctx->bit_rate = 4 * 1000 * 1000;
+	enc->ctx->rc_max_rate = enc->ctx->bit_rate;
+	enc->ctx->rc_buffer_size = (int)(enc->ctx->bit_rate / 4);
 	enc->ctx->gop_size = 60;
 	enc->ctx->max_b_frames = 0;
 	enc->ctx->pix_fmt = AV_PIX_FMT_VAAPI;
@@ -134,6 +138,7 @@ static bool setup_vaapi(struct np_encoder *enc) {
 	frames->initial_pool_size = 4;
 	if (av_hwframe_ctx_init(enc->hw_frames_ctx) < 0) return false;
 	enc->ctx->hw_frames_ctx = av_buffer_ref(enc->hw_frames_ctx);
+	av_opt_set_int(enc->ctx->priv_data, "async_depth", 1, 0);
 
 	if (avcodec_open2(enc->ctx, enc->codec, NULL) < 0) return false;
 
@@ -206,48 +211,45 @@ static void *encoder_worker(void *arg) {
 		bool force = enc->pending_force;
 		enc->pending_force = false;
 		enc->pending_bgra = NULL;
-		enc->encoding_bgra = pixels;
-		enc->encoding_width = width;
-		enc->encoding_height = height;
-		enc->encoding_stride = stride;
-		enc->encoding_resource_id = resource_id;
-		enc->encoding_flags = flags;
+		enc->encoding = true;
 		pthread_mutex_unlock(&enc->lock);
 
 		uint8_t *alpha = NULL;
 		uint32_t alpha_size = 0;
 		bool alpha_ok = !(flags & NP_ENCODER_FLAG_HAS_ALPHA) || np_alpha_pack_bgra(
 			pixels, width, height, stride, &alpha, &alpha_size);
+		bool reuse_alpha = alpha && epoch == enc->last_alpha_epoch &&
+			alpha_size == enc->last_alpha_size && enc->last_alpha &&
+			!memcmp(alpha, enc->last_alpha, alpha_size);
+		if (reuse_alpha) flags |= NP_ENCODER_FLAG_REUSE_ALPHA;
 		bool encoded = alpha_ok && encode_bgra_now(
 			enc, pixels, width, height, stride, pts, resource_id, flags,
-			alpha, alpha_size, epoch, force);
+			reuse_alpha ? NULL : alpha, reuse_alpha ? 0 : alpha_size, epoch, force);
 		if (!encoded)
 			fprintf(stderr, "[encoder] frame encode failed\n");
+		if (encoded && alpha && !reuse_alpha) {
+			free(enc->last_alpha); enc->last_alpha = alpha; alpha = NULL;
+			enc->last_alpha_size = alpha_size; enc->last_alpha_epoch = epoch;
+		}
 		free(alpha);
 		pthread_mutex_lock(&enc->lock);
-		enc->encoding_bgra = NULL;
-		if (encoded) {
-			free(enc->last_bgra);
-			enc->last_bgra = pixels;
-			enc->last_width = width;
-			enc->last_height = height;
-			enc->last_stride = stride;
-			enc->last_flags = flags;
-			pixels = NULL;
-		}
+		enc->encoding = false;
 		pthread_mutex_unlock(&enc->lock);
 		free(pixels);
+		enc->done(enc->user, encoded);
 	}
 	return NULL;
 }
 
-struct np_encoder *np_encoder_create(int width, int height, np_encoder_output_fn out, void *user) {
-	if (width < 2 || height < 2 || !out) return NULL;
+struct np_encoder *np_encoder_create(int width, int height, np_encoder_output_fn out,
+                                    np_encoder_done_fn done, void *user) {
+	if (width < 2 || height < 2 || !out || !done) return NULL;
 	struct np_encoder *enc = calloc(1, sizeof(*enc));
 	if (!enc) return NULL;
 	enc->width = width & ~1;
 	enc->height = height & ~1;
 	enc->out = out;
+	enc->done = done;
 	enc->user = user;
 	enc->epoch = 1;
 	enc->advertised_epoch = 1;
@@ -256,10 +258,6 @@ struct np_encoder *np_encoder_create(int width, int height, np_encoder_output_fn
 	enc->force_keyframe = true;
 	pthread_mutex_init(&enc->lock, NULL);
 	pthread_cond_init(&enc->ready, NULL);
-	if (!setup(enc)) {
-		np_encoder_destroy(enc);
-		return NULL;
-	}
 	if (pthread_create(&enc->worker, NULL, encoder_worker, enc) != 0) {
 		np_encoder_destroy(enc);
 		return NULL;
@@ -276,14 +274,14 @@ void np_encoder_destroy(struct np_encoder *enc) {
 	pthread_mutex_unlock(&enc->lock);
 	if (enc->worker_started) pthread_join(enc->worker, NULL);
 	free(enc->pending_bgra);
-	free(enc->last_bgra);
+	free(enc->last_alpha);
 	teardown_codec(enc);
 	pthread_cond_destroy(&enc->ready);
 	pthread_mutex_destroy(&enc->lock);
 	free(enc);
 }
 
-bool np_encoder_resize(struct np_encoder *enc, int width, int height) {
+static bool np_encoder_resize(struct np_encoder *enc, int width, int height) {
 	if (!enc) return false;
 	width &= ~1;
 	height &= ~1;
@@ -307,66 +305,13 @@ uint16_t np_encoder_epoch(const struct np_encoder *enc) {
 	return epoch;
 }
 
-void np_encoder_force_keyframe(struct np_encoder *enc) {
-	if (!enc) return;
-	pthread_mutex_lock(&enc->lock);
-	enc->pending_force = true;
-	pthread_mutex_unlock(&enc->lock);
-}
-
-bool np_encoder_replay_last(
-	struct np_encoder *enc, uint64_t pts_ns, uint32_t replacement_resource_id,
-	uint32_t *active_resource_id)
-{
-	if (active_resource_id) *active_resource_id = 0;
-	if (!enc || !replacement_resource_id || !active_resource_id) return false;
-	pthread_mutex_lock(&enc->lock);
-	enc->pending_force = true;
-	if (enc->pending_bgra) {
-		*active_resource_id = enc->pending_resource_id;
-		pthread_cond_signal(&enc->ready);
-		pthread_mutex_unlock(&enc->lock);
-		return true;
-	}
-	const uint8_t *source = enc->encoding_bgra
-		? enc->encoding_bgra : enc->last_bgra;
-	int width = enc->encoding_bgra ? enc->encoding_width : enc->last_width;
-	int height = enc->encoding_bgra ? enc->encoding_height : enc->last_height;
-	int stride = enc->encoding_bgra ? enc->encoding_stride : enc->last_stride;
-	uint8_t flags = enc->encoding_bgra ? enc->encoding_flags : enc->last_flags;
-	if (!source || width <= 0 || height <= 0 || stride <= 0 ||
-	    (size_t)height > SIZE_MAX / (size_t)stride) {
-		pthread_mutex_unlock(&enc->lock);
-		return false;
-	}
-	size_t size = (size_t)height * (size_t)stride;
-	uint8_t *copy = malloc(size);
-	if (!copy) {
-		pthread_mutex_unlock(&enc->lock);
-		return false;
-	}
-	memcpy(copy, source, size);
-	enc->pending_bgra = copy;
-	enc->pending_width = width;
-	enc->pending_height = height;
-	enc->pending_stride = stride;
-	enc->pending_pts = pts_ns;
-	enc->pending_resource_id = replacement_resource_id;
-	enc->pending_flags = flags;
-	enc->pending_epoch = enc->advertised_epoch;
-	*active_resource_id = replacement_resource_id;
-	pthread_cond_signal(&enc->ready);
-	pthread_mutex_unlock(&enc->lock);
-	return true;
-}
-
 static bool drain_packets(struct np_encoder *enc, uint64_t pts_ns,
 	                          uint32_t resource_id, uint8_t flags,
 	                          const uint8_t *alpha, uint32_t alpha_size) {
 	bool first = true;
 	for (;;) {
 		int ret = avcodec_receive_packet(enc->ctx, enc->packet);
-		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) return true;
+		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) return !first;
 		if (ret < 0) return false;
 		enc->out(enc->user, enc->packet->data, (size_t)enc->packet->size,
 		         pts_ns, resource_id, flags,
@@ -386,12 +331,13 @@ static bool encode_bgra_now(struct np_encoder *enc, const uint8_t *bgra, int wid
 		if (!np_encoder_resize(enc, width, height)) return false;
 	}
 	enc->epoch = epoch;
+	if (!enc->ctx && !setup(enc)) return false;
 	if (av_frame_make_writable(enc->sw_frame) < 0) return false;
 	const uint8_t *src_slices[4] = {bgra, NULL, NULL, NULL};
 	int src_stride[4] = {stride, 0, 0, 0};
 	sws_scale(enc->sws, src_slices, src_stride, 0, enc->height,
 	          enc->sw_frame->data, enc->sw_frame->linesize);
-	enc->sw_frame->pts++;
+	enc->sw_frame->pts = enc->frame_number++;
 	if (force || enc->force_keyframe) {
 		enc->sw_frame->pict_type = AV_PICTURE_TYPE_I;
 		enc->force_keyframe = false;
@@ -401,9 +347,11 @@ static bool encode_bgra_now(struct np_encoder *enc, const uint8_t *bgra, int wid
 
 	AVFrame *to_send = enc->sw_frame;
 	if (enc->use_vaapi) {
+		av_frame_unref(enc->hw_frame);
 		if (av_hwframe_get_buffer(enc->hw_frames_ctx, enc->hw_frame, 0) < 0) return false;
 		if (av_hwframe_transfer_data(enc->hw_frame, enc->sw_frame, 0) < 0) return false;
 		enc->hw_frame->pts = enc->sw_frame->pts;
+		enc->hw_frame->pict_type = enc->sw_frame->pict_type;
 		to_send = enc->hw_frame;
 	}
 
@@ -414,7 +362,8 @@ static bool encode_bgra_now(struct np_encoder *enc, const uint8_t *bgra, int wid
 bool np_encoder_push_bgra(struct np_encoder *enc, const uint8_t *bgra, int width, int height,
 	                          int stride, uint64_t pts_ns, uint32_t resource_id,
 	                          uint8_t flags) {
-	if (!enc || !bgra || !resource_id || width < 2 || height < 2 || stride < width * 4)
+	if (!enc || !bgra || !resource_id || width < 2 || height < 2 ||
+	    width >= UINT16_MAX || height >= UINT16_MAX || stride < width * 4)
 		return false;
 	int even_width = (width + 1) & ~1;
 	int even_height = (height + 1) & ~1;
@@ -431,18 +380,32 @@ bool np_encoder_push_bgra(struct np_encoder *enc, const uint8_t *bgra, int width
 		memcpy(copy + (size_t)height * packed_stride,
 		       copy + (size_t)(height - 1) * packed_stride, packed_stride);
 
+	bool accepted = np_encoder_take_bgra(enc, copy, even_width, even_height,
+	    (int)packed_stride, pts_ns, resource_id, flags);
+	if (!accepted) free(copy);
+	return accepted;
+}
+
+bool np_encoder_take_bgra(struct np_encoder *enc, uint8_t *pixels, int width, int height,
+                         int stride, uint64_t pts_ns, uint32_t resource_id, uint8_t flags) {
+	if (!enc || !pixels || !resource_id || width < 2 || height < 2 ||
+	    width >= UINT16_MAX || height >= UINT16_MAX || (width & 1) || (height & 1) ||
+	    stride < width * 4) return false;
 	pthread_mutex_lock(&enc->lock);
-	if (even_width != enc->requested_width || even_height != enc->requested_height) {
-		enc->requested_width = even_width;
-		enc->requested_height = even_height;
+	if (enc->pending_bgra || enc->encoding || enc->stopping) {
+		pthread_mutex_unlock(&enc->lock);
+		return false;
+	}
+	if (width != enc->requested_width || height != enc->requested_height) {
+		enc->requested_width = width;
+		enc->requested_height = height;
 		enc->advertised_epoch++;
 		enc->pending_force = true;
 	}
-	free(enc->pending_bgra); /* latest frame wins under encoder backpressure */
-	enc->pending_bgra = copy;
-	enc->pending_width = even_width;
-	enc->pending_height = even_height;
-	enc->pending_stride = (int)packed_stride;
+	enc->pending_bgra = pixels;
+	enc->pending_width = width;
+	enc->pending_height = height;
+	enc->pending_stride = stride;
 	enc->pending_pts = pts_ns;
 	enc->pending_resource_id = resource_id;
 	enc->pending_flags = flags;

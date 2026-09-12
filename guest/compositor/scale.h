@@ -65,5 +65,6 @@ bool np_scale_update_outputs(struct np_server *server,
 	                         size_t count);
 void np_scale_window_output_changed(struct np_server *server,
 	                                uint32_t window_id, uint32_t output_id);
+int32_t np_scale_surface_refresh_millihz(const struct np_surface *surface);
 
 #endif

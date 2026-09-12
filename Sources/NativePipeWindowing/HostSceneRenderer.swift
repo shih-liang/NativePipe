@@ -7,6 +7,13 @@ import QuartzCore
 struct ResolvedSceneLayer {
     let state: Windowing.SceneLayer
     let texture: MTLTexture
+    let owner: AnyObject?
+
+    init(state: Windowing.SceneLayer, texture: MTLTexture, owner: AnyObject? = nil) {
+        self.state = state
+        self.texture = texture
+        self.owner = owner
+    }
 }
 
 /// CPU-owned copy of one fully composed drawable. It is produced only for an

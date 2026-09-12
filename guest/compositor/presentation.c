@@ -172,6 +172,7 @@ void np_presentation_flush(struct np_server *server) {
 		if (!surface->scene_dirty || np_scene_root(surface) != surface)
 			continue;
 		if (!np_backend_connected(server)) continue;
+		if (!np_backend_scene_ready(surface)) continue;
 		/* A root detach has no pixels to publish. Older queued state can
 		 * still reach this point (or the client can detach while a scene is
 		 * dirty), so retire the impossible scene rather than retrying it on
@@ -222,6 +223,7 @@ void np_presentation_flush(struct np_server *server) {
 	wl_list_for_each(surface, &server->surfaces, link) {
 		if (!surface->pending_frame) continue;
 		if (np_scene_root(surface)) continue;
+		if (!np_backend_scene_ready(surface)) continue;
 		unsigned char *body = surface->pending_frame;
 		size_t body_size = surface->pending_frame_size;
 		uint32_t presentation_id = surface->pending_presentation_id;

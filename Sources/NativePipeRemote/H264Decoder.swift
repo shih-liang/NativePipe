@@ -19,6 +19,7 @@ final class H264Decoder {
     private var epoch: UInt16 = 0
 
     var onFrame: ((UInt32, CVPixelBuffer) -> Void)?
+    var onFailure: ((UInt32) -> Void)?
 
     func reset() {
         if let session {
@@ -49,6 +50,7 @@ final class H264Decoder {
         guard !nals.isEmpty else {
             fputs("nativepipe-remote: H264: 0 NALs in \(annexB.count) bytes\n", stderr)
             fflush(stderr)
+            onFailure?(resourceID)
             return
         }
 
@@ -70,13 +72,14 @@ final class H264Decoder {
             }
         }
         if formatChanged { rebuildFormatIfPossible() }
-        guard !vcl.isEmpty else { return }
+        guard !vcl.isEmpty else { onFailure?(resourceID); return }
         guard session != nil else {
             fputs("nativepipe-remote: H264: VCL without VT session\n", stderr)
             fflush(stderr)
+            onFailure?(resourceID)
             return
         }
-        decodeAccessUnit(vcl, resourceID: resourceID)
+        if !decodeAccessUnit(vcl, resourceID: resourceID) { onFailure?(resourceID) }
     }
 
     private func rebuildFormatIfPossible() {
@@ -126,8 +129,9 @@ final class H264Decoder {
                 }
                 if status == noErr, let imageBuffer {
                     if let resourceID { decoder.onFrame?(resourceID, imageBuffer) }
-                } else if status != noErr {
-                    fputs("nativepipe-remote: VT callback status=\(status)\n", stderr)
+                } else {
+                    if status != noErr { fputs("nativepipe-remote: VT callback status=\(status)\n", stderr) }
+                    if let resourceID { decoder.onFailure?(resourceID) }
                 }
             },
             decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque()
@@ -155,8 +159,8 @@ final class H264Decoder {
     }
 
     /// One access unit: all VCL NALs length-prefixed (AVCC) in a single sample.
-    private func decodeAccessUnit(_ nals: [Data], resourceID: UInt32) {
-        guard let session, let formatDescription else { return }
+    private func decodeAccessUnit(_ nals: [Data], resourceID: UInt32) -> Bool {
+        guard let session, let formatDescription else { return false }
         var packet = Data()
         for nal in nals {
             var length = UInt32(nal.count).bigEndian
@@ -176,14 +180,14 @@ final class H264Decoder {
             dataLength: packetCount,
             flags: 0,
             blockBufferOut: &blockBuffer)
-        guard createStatus == noErr, let blockBuffer else { return }
+        guard createStatus == noErr, let blockBuffer else { return false }
         let copyStatus = packet.withUnsafeBytes { raw -> OSStatus in
             guard let base = raw.baseAddress else { return -1 }
             return CMBlockBufferReplaceDataBytes(
                 with: base, blockBuffer: blockBuffer, offsetIntoDestination: 0,
                 dataLength: packetCount)
         }
-        guard copyStatus == noErr else { return }
+        guard copyStatus == noErr else { return false }
 
         var sampleSize = packetCount
         var sampleBuffer: CMSampleBuffer?
@@ -201,7 +205,7 @@ final class H264Decoder {
             sampleSizeEntryCount: 1,
             sampleSizeArray: &sampleSize,
             sampleBufferOut: &sampleBuffer)
-        guard sampleStatus == noErr, let sampleBuffer else { return }
+        guard sampleStatus == noErr, let sampleBuffer else { return false }
 
         var flagsOut: VTDecodeInfoFlags = []
         let asynchronous = VTDecodeFrameFlags(rawValue: 1 << 0)
@@ -214,6 +218,7 @@ final class H264Decoder {
             fputs("nativepipe-remote: VTDecode status=\(decodeStatus)\n", stderr)
             fflush(stderr)
         }
+        return decodeStatus == noErr
     }
 
     private static func splitAnnexB(_ data: Data) -> [Data] {

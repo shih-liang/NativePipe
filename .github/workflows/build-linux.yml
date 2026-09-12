@@ -1,4 +1,4 @@
-name: Build NativePipe Linux binaries
+name: Build and release NativePipe
 
 on:
   push:
@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: nativepipe-linux-${{ github.ref }}
-  cancel-in-progress: true
+  group: nativepipe-release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   build:
@@ -74,7 +74,7 @@ jobs:
                   vulkan-loader-dev vulkan-headers libdrm-dev mesa-dev ffmpeg-dev glib-dev \
                   gdk-pixbuf-dev librsvg-dev dbus dconf
               fi
-              make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-remote-transport
+              make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-remote-transport test-remote-encoder
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-applications
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-file-drag
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" dist-vmpipe
@@ -119,10 +119,31 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  macos-cli:
+    name: macOS universal nativepipe
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+      - name: Test Swift package
+        run: make test
+      - name: Build and package universal command
+        run: |
+          swift build --disable-sandbox -c release --product nativepipe --arch arm64 --arch x86_64
+          binary="$(swift build --disable-sandbox -c release --arch arm64 --arch x86_64 --show-bin-path)/nativepipe"
+          sh scripts/package-macos-cli.sh "$binary" macos-release
+      - name: Upload command archive
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: nativepipe-macos-cli
+          path: macos-release
+          if-no-files-found: error
+
   package-release:
     name: Package GitHub release
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: build
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: [build, macos-cli]
     runs-on: ubuntu-24.04
 
     steps:
@@ -135,25 +156,19 @@ jobs:
           pattern: nativepipe-linux-*
           path: .release-input
 
+      - name: Download macOS command
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: nativepipe-macos-cli
+          path: .macos-input
+
       - name: Create release archives
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p release
-          for architecture in aarch64 x86_64; do
-            root=".release-$architecture"
-            mkdir -p "$root"
-            cp -R ".release-input/nativepipe-linux-$architecture-gnu/." "$root/"
-            cp -R ".release-input/nativepipe-linux-$architecture-musl/." "$root/"
-            mv "$root"/nativepipe-compositor-*.tar.gz release/
-            mkdir -p "$root/guest/session"
-            cp -R guest/session/implicit_layer guest/session/openrc \
-              guest/session/profile.d guest/session/systemd "$root/guest/session/"
-            cp -R LICENSES "$root/LICENSES"
-            tar -C "$root" -czf "release/nativepipe-linux-$architecture.tar.gz" .
-          done
-
-          (cd release && sha256sum *.tar.gz > SHA256SUMS)
+          python3 scripts/test-release-packaging.py
+          sh scripts/package-release.sh .release-input .macos-input release
+          python3 scripts/verify-release.py release
 
       - name: Upload release files
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
@@ -188,6 +203,7 @@ jobs:
           test -n "${PRIVATE_KEY_BASE64:-}"
           test -n "${EXPECTED_PUBLIC_KEY_BASE64:-}"
           umask 077
+          trap 'rm -f private.pem public.der' EXIT
           printf '%s' "$PRIVATE_KEY_BASE64" | base64 --decode > private.pem
           openssl pkey -in private.pem -pubout -out release/nativepipe-ed25519-public-key.pem
           openssl pkey -in private.pem -pubout -outform DER -out public.der
@@ -211,6 +227,8 @@ jobs:
       contents: write
 
     steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
       - name: Download signed release files
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
@@ -219,6 +237,7 @@ jobs:
 
       - name: Verify digest and signature
         run: |
+          python3 scripts/verify-release.py release
           (cd release && sha256sum --check SHA256SUMS)
           openssl pkeyutl -verify -rawin -pubin \
             -inkey release/nativepipe-ed25519-public-key.pem \
@@ -229,4 +248,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" release/* \
-            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+            --title "NativePipe ${GITHUB_REF_NAME#nativepipe-v}"
