@@ -1,14 +1,34 @@
 #!/bin/sh
 # Run in the Linux build environment against a newly packaged compositor.
 set -eu
+step='bundle path'
+temporary=
+finish() {
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "Remote package check failed: $step (status $status)" >&2
+    fi
+    [ -z "$temporary" ] || rm -rf "$temporary"
+    exit "$status"
+}
+trap finish EXIT
+trap 'exit 1' HUP INT TERM
 root=$(CDPATH= cd -- "${1:?bundle directory}" && pwd)
 binary="$root/libexec/nativepipe-wayland"
 # Compiler "used" alone does not protect unreferenced data from --gc-sections.
-grep -aq "NPCS:$(sh guest/compositor/source-hash.sh)" "$binary"
+step='embedded source stamp'
+expected="NPCS:$(sh guest/compositor/source-hash.sh)"
+if ! grep -aq "$expected" "$binary"; then
+    echo "Expected $expected" >&2
+    strings "$binary" | grep 'NPCS:' >&2 || :
+    exit 1
+fi
+step='embedded runtime probe'
 grep -aq 'NP_RUNTIME_PROBE:1' "$binary"
 
 # Notices belong only to objects in this bundle. All links must have been
 # materialized so the archive does not depend on the builder's filesystem.
+step='bundled license inventory'
 test ! -e "$root/LICENSES/distribution"
 test -z "$(find "$root/LICENSES" -type l -print)"
 while IFS="$(printf '\t')" read -r object package version; do
@@ -23,25 +43,29 @@ done
 
 # Checking only libav* would miss the old ldd closure's codec dependencies.
 for library in "$root"/lib/*.so*; do
+    step="bundled library: ${library##*/}"
     case "${library##*/}" in
         libav*.so*|libswscale.so*|libswresample.so*|libpostproc.so*|libva*.so*|libvdpau.so*|libvpl.so*|libcuda.so*|libnvidia-*.so*|libx264.so*|libx265.so*|libvpx.so*|libSvtAv1Enc.so*|libmp3lame.so*|libopus.so*)
             echo "Unexpected bundled codec library: $library" >&2; exit 1 ;;
     esac
 done
+step='ELF dependency resolution'
 needed=$(patchelf --print-needed "$binary")
 resolved=$(ldd "$binary")
 if printf '%s\n' "$needed" | grep -Eq '^lib(avcodec|avutil|swscale|va|aom|yuv|cuda|nvidia)[.-]'; then
     echo 'Unexpected required system codec ABI' >&2; exit 1
 fi
 for notice in aom/LICENSE aom/PATENTS libyuv/LICENSE libyuv/PATENTS NVIDIA-NVENC-header.txt; do
+    step="codec notice: $notice"
     test -s "$root/LICENSES/$notice"
 done
+step='runtime preflight'
 output=$("$root/nativepipe-wayland" --check-runtime)
 test -z "$output"
 
 # A missing/incompatible system ABI must fail before any SSH protocol output.
 temporary=$(mktemp -d)
-trap 'rm -rf "$temporary"' EXIT HUP INT TERM
+step='missing-library fault injection'
 mkdir "$temporary/libexec"
 cp "$root/nativepipe-wayland" "$temporary/nativepipe-wayland"
 cp "$binary" "$temporary/libexec/nativepipe-wayland"
@@ -51,7 +75,9 @@ patchelf --replace-needed "$codec" libnativepipe-missing-test.so "$temporary/lib
 if "$temporary/nativepipe-wayland" --stdio --session > "$temporary/stdout" 2> "$temporary/stderr"; then
     echo 'A compositor with a missing runtime library unexpectedly started.' >&2; exit 1
 fi
+step='missing-library stdout remains empty'
 test ! -s "$temporary/stdout"
+step='missing-library actionable diagnostic'
 grep -q 'NativePipe cannot load its Linux runtime libraries' "$temporary/stderr"
 grep -q 'AV1 software encoding is bundled' "$temporary/stderr"
 echo 'Remote package: static AV1, optional NVENC/VA-API, runtime diagnostics PASS'
