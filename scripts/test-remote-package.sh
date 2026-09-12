@@ -16,15 +16,16 @@ trap 'exit 1' HUP INT TERM
 root=$(CDPATH= cd -- "${1:?bundle directory}" && pwd)
 binary="$root/libexec/nativepipe-wayland"
 # Compiler "used" alone does not protect unreferenced data from --gc-sections.
-step='embedded source stamp'
-expected="NPCS:$(sh guest/compositor/source-hash.sh)"
-if ! grep -aq "$expected" "$binary"; then
-    echo "Expected $expected" >&2
-    strings "$binary" | grep 'NPCS:' >&2 || :
-    exit 1
-fi
-step='embedded runtime probe'
-grep -aq 'NP_RUNTIME_PROBE:1' "$binary"
+step='embedded binary stamps'
+# ELF data is not locale-dependent text. In particular, the ARM64/musl
+# checker returned no match for a stamp that strings extracted verbatim.
+python3 - "$binary" "NPCS:$(sh guest/compositor/source-hash.sh)" <<'PYTHON'
+import pathlib, sys
+binary = pathlib.Path(sys.argv[1]).read_bytes()
+for stamp in (sys.argv[2].encode('ascii'), b'NP_RUNTIME_PROBE:1'):
+    if stamp not in binary:
+        raise SystemExit(f'Missing binary stamp: {stamp.decode("ascii")}')
+PYTHON
 
 # Notices belong only to objects in this bundle. All links must have been
 # materialized so the archive does not depend on the builder's filesystem.
