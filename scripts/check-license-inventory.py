@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -57,7 +58,7 @@ def main() -> None:
     if not isinstance(entries, list):
         fail("entries must be an array")
     by_id = {entry.get("id"): entry for entry in entries if isinstance(entry, dict)}
-    required = {"nativepipe-original", "wayland-generated-protocols"}
+    required = {"nativepipe-original", "wayland-generated-protocols", "nvidia-nvenc-header"}
     if set(by_id) != required:
         fail(f"expected exactly {sorted(required)}, found {sorted(str(key) for key in by_id)}")
 
@@ -66,6 +67,11 @@ def main() -> None:
         fail("original sources must not be assigned an inferred third-party license")
     if "does not infer" not in str(original.get("licenseNotice", "")):
         fail("original-source rights notice is missing")
+
+    nvenc = by_id["nvidia-nvenc-header"]
+    header = ROOT / "guest/encoder/vendor/nvEncodeAPI.h"
+    if nvenc.get("licenseExpression") != "MIT" or nvenc.get("sha256") != hashlib.sha256(header.read_bytes()).hexdigest():
+        fail("NVENC header license or pinned source hash does not match")
 
     protocols = by_id["wayland-generated-protocols"]
     if protocols.get("licenseExpression") != "MIT":

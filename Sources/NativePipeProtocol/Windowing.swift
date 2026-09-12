@@ -339,9 +339,9 @@ extension Windowing {
         /// How this frame was produced. CPU is a guest wl_shm upload into one
         /// Vulkan texture. GPU already lives in MoltenVK on the host — the
         /// resource id is only a name, not a copy.
-        /// Encoded means a remote H.264 (etc.) stream keyed by resourceID.
+        /// Encoded means a remote AV1/H.264 stream keyed by resourceID.
         public var source: FrameSourceKind
-        /// Codec id for `.encoded` frames (`h264`, …). Nil for cpu/gpu.
+        /// Codec id for `.encoded` frames (`av1`, `h264`). Nil for cpu/gpu.
         public var codec: String?
         /// Bumped when the remote encoder is reset so the host rebuilds its
         /// decompression session.

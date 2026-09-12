@@ -22,10 +22,20 @@
         "guest/compositor/**"
       ],
       "excludedPaths": [
+        "guest/encoder/vendor/nvEncodeAPI.h",
         "guest/compositor/*-protocol.c",
         "guest/compositor/*-protocol.h",
         "guest/compositor/*.xml"
       ]
+    },
+    {
+      "id": "nvidia-nvenc-header",
+      "origin": "NVIDIA Corporation; unmodified NVENC 12.1 interface header",
+      "source": "https://raw.githubusercontent.com/FFmpeg/nv-codec-headers/n12.1.14.0/include/ffnvcodec/nvEncodeAPI.h",
+      "sha256": "dbdaa8bcbc2b9325bd24bc68b36170a8432411518040e8d4c8421608cf217425",
+      "licenseExpression": "MIT",
+      "licenseLocation": "guest/encoder/vendor/nvEncodeAPI.h; copied to LICENSES/NVIDIA-NVENC-header.txt in remote packages",
+      "coveredPaths": ["guest/encoder/vendor/nvEncodeAPI.h"]
     },
     {
       "id": "wayland-generated-protocols",

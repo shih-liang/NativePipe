@@ -103,8 +103,8 @@ void np_backend_configure_frame(
 	const struct np_surface *surface, struct np_window_frame *frame)
 {
 	if (!surface || !frame) return;
-	const struct np_remote_surface *state = surface->backend_surface_state;
 	frame->source = NP_WINDOW_FRAME_ENCODED;
-	frame->bitstream_epoch = state ? state->last_epoch : 0;
-	frame->codec = "h264";
+	/* Metadata precedes encoding; NPEN carries the actual codec and epoch. */
+	frame->bitstream_epoch = 0;
+	frame->codec = NULL;
 }

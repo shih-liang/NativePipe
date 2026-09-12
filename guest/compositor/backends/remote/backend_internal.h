@@ -14,8 +14,9 @@ struct np_remote_backend {
     pid_t application_pid;
     int application_fd;
     int exit_status;
+    bool host_h264_hardware;
     /* At most two independent windows encode concurrently. Sources are reserved
-     * until their immutable scene completes, preserving each H.264 chain. */
+     * until their immutable scene completes, preserving each AV1 reference chain. */
     struct np_remote_scene_job *jobs[2];
     uint32_t previous_owner;
     unsigned char *input_record;

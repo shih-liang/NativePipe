@@ -1,6 +1,6 @@
 #!/bin/sh
 # Package the remote compositor with its non-system userspace libraries.
-# Keep the target's FFmpeg/VA-API, driver stack, libc and GLib/GIO authoritative.
+# Keep the target's NVIDIA/VA-API driver stack, libc and GLib/GIO authoritative.
 set -eu
 arch=${1:?architecture}
 libc=${2:?libc}
@@ -78,16 +78,15 @@ copy_library() (
     dependencies "$library"
 )
 dependencies() (
-    # ldd lists the entire closure, including codecs used only by system
-    # FFmpeg. Follow DT_NEEDED edges ourselves so excluded libraries also stop
-    # traversal; dependencies shared with our image decoder remain included.
+    # Follow direct DT_NEEDED edges; system driver/GLib dependencies remain
+    # authoritative and are not pulled into the private image-decoder closure.
     needed=$(patchelf --print-needed "$1")
     resolved=$(ldd "$1")
     printf '%s\n' "$needed" | while IFS= read -r name; do
         [ -n "$name" ] || continue
         case "$name" in
             libc.so*|libc.musl-*.so*|libm.so*|libpthread.so*|libdl.so*|librt.so*|ld-*|libgcc_s.so*|libstdc++.so*|libEGL.so*|libGL*.so*|libgbm.so*|libdrm*.so*|libglib-2.0.so*|libgobject-2.0.so*|libgio-2.0.so*|libgmodule-2.0.so*|libgthread-2.0.so*) continue ;;
-            libavcodec.so*|libavdevice.so*|libavfilter.so*|libavformat.so*|libavutil.so*|libswresample.so*|libswscale.so*|libpostproc.so*|libva.so*|libva-*.so*|libvdpau.so*|libvpl.so*) continue ;;
+            libavcodec.so*|libavdevice.so*|libavfilter.so*|libavformat.so*|libavutil.so*|libswresample.so*|libswscale.so*|libpostproc.so*|libva.so*|libva-*.so*|libvdpau.so*|libvpl.so*|libcuda.so*|libnvidia-*.so*) continue ;;
         esac
         library=$(printf '%s\n' "$resolved" | awk -v name="$name" '$1 == name && $2 == "=>" && $3 ~ /^\// {print $3; exit}')
         [ -f "$library" ] || { echo "Cannot resolve $name required by $1" >&2; exit 1; }
@@ -115,3 +114,10 @@ for loader in "$loaders/libpixbufloader-png.so" "$loaders/libpixbufloader-xpm.so
 done
 install -m0755 guest/compositor/remote-launcher.sh "$out/nativepipe-wayland"
 cp LICENSES/* "$out/LICENSES/"
+
+# AV1 encoder and pixel conversion are statically linked from pinned sources.
+codec_prefix=${CODEC_PREFIX:-.build/codecs/$arch-$libc}
+test -s "$codec_prefix/LICENSES/aom/LICENSE"
+test -s "$codec_prefix/LICENSES/aom/PATENTS"
+cp -R "$codec_prefix/LICENSES/." "$out/LICENSES/"
+sed -n '1,25p' guest/encoder/vendor/nvEncodeAPI.h > "$out/LICENSES/NVIDIA-NVENC-header.txt"

@@ -1,5 +1,8 @@
 // swift-tools-version: 6.0
 import PackageDescription
+import Foundation
+
+let codecPrefix = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent(".build/codecs/macos").path
 
 let products: [Product] = [
     .library(name: "NativePipeProtocol", targets: ["NativePipeProtocol"]),
@@ -8,6 +11,11 @@ let products: [Product] = [
     .executable(name: "nativepipe", targets: ["NativePipeRemoteApp"]),
 ]
 let targets: [Target] = [
+        .target(name: "CNativePipeAV1", path: "common/av1_decoder", publicHeadersPath: ".",
+            cSettings: [.unsafeFlags(["-I" + codecPrefix + "/include"])],
+            linkerSettings: [.unsafeFlags(["-L" + codecPrefix + "/lib"]),
+                .linkedLibrary("dav1d"), .linkedLibrary("yuv"), .linkedLibrary("c++"),
+                .linkedFramework("CoreVideo")]),
         .target(
             name: "CNativePipeFileRPC",
             path: "common/file_rpc",
@@ -29,7 +37,7 @@ let targets: [Target] = [
         // Remote Linux: SSH stdio NPIP + NPEN, VideoToolbox decode, WindowBridge.
         .target(
             name: "NativePipeRemote",
-            dependencies: ["NativePipeProtocol", "NativePipeWindowing"],
+            dependencies: ["NativePipeProtocol", "NativePipeWindowing", "CNativePipeAV1"],
             swiftSettings: [.swiftLanguageMode(.v5)],
             linkerSettings: [
                 .linkedFramework("VideoToolbox"),

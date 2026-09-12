@@ -3,6 +3,9 @@
 set -eu
 root=$(CDPATH= cd -- "${1:?bundle directory}" && pwd)
 binary="$root/libexec/nativepipe-wayland"
+# Compiler "used" alone does not protect unreferenced data from --gc-sections.
+grep -aq "NPCS:$(sh guest/compositor/source-hash.sh)" "$binary"
+grep -aq 'NP_RUNTIME_PROBE:1' "$binary"
 
 # Notices belong only to objects in this bundle. All links must have been
 # materialized so the archive does not depend on the builder's filesystem.
@@ -21,20 +24,17 @@ done
 # Checking only libav* would miss the old ldd closure's codec dependencies.
 for library in "$root"/lib/*.so*; do
     case "${library##*/}" in
-        libav*.so*|libswscale.so*|libswresample.so*|libpostproc.so*|libva*.so*|libvdpau.so*|libvpl.so*|libx264.so*|libx265.so*|libvpx.so*|libSvtAv1Enc.so*|libmp3lame.so*|libopus.so*)
+        libav*.so*|libswscale.so*|libswresample.so*|libpostproc.so*|libva*.so*|libvdpau.so*|libvpl.so*|libcuda.so*|libnvidia-*.so*|libx264.so*|libx265.so*|libvpx.so*|libSvtAv1Enc.so*|libmp3lame.so*|libopus.so*)
             echo "Unexpected bundled codec library: $library" >&2; exit 1 ;;
     esac
 done
 needed=$(patchelf --print-needed "$binary")
 resolved=$(ldd "$binary")
-for library in libavcodec libavutil libswscale; do
-    printf '%s\n' "$needed" | grep -q "^$library[.]so[.]"
-    path=$(printf '%s\n' "$resolved" | awk -v prefix="$library.so." 'index($1, prefix) == 1 && $2 == "=>" {print $3; exit}')
-    case "$path" in
-        "$root"/*) echo "$library must resolve outside the bundle" >&2; exit 1 ;;
-        /*) test -f "$path" ;;
-        *) echo "System $library is unavailable: $path" >&2; exit 1 ;;
-    esac
+if printf '%s\n' "$needed" | grep -Eq '^lib(avcodec|avutil|swscale|va|aom|yuv|cuda|nvidia)[.-]'; then
+    echo 'Unexpected required system codec ABI' >&2; exit 1
+fi
+for notice in aom/LICENSE aom/PATENTS libyuv/LICENSE libyuv/PATENTS NVIDIA-NVENC-header.txt; do
+    test -s "$root/LICENSES/$notice"
 done
 output=$("$root/nativepipe-wayland" --check-runtime)
 test -z "$output"
@@ -46,12 +46,12 @@ mkdir "$temporary/libexec"
 cp "$root/nativepipe-wayland" "$temporary/nativepipe-wayland"
 cp "$binary" "$temporary/libexec/nativepipe-wayland"
 ln -s "$root/lib" "$temporary/lib"
-codec=$(printf '%s\n' "$needed" | grep '^libavcodec[.]so[.]')
-patchelf --replace-needed "$codec" libavcodec-nativepipe-missing-test.so "$temporary/libexec/nativepipe-wayland"
+codec=$(printf '%s\n' "$needed" | head -1)
+patchelf --replace-needed "$codec" libnativepipe-missing-test.so "$temporary/libexec/nativepipe-wayland"
 if "$temporary/nativepipe-wayland" --stdio --session > "$temporary/stdout" 2> "$temporary/stderr"; then
-    echo 'A compositor with missing FFmpeg unexpectedly started.' >&2; exit 1
+    echo 'A compositor with a missing runtime library unexpectedly started.' >&2; exit 1
 fi
 test ! -s "$temporary/stdout"
 grep -q 'NativePipe cannot load its Linux runtime libraries' "$temporary/stderr"
-grep -q 'library major versions must match' "$temporary/stderr"
-echo 'Remote package: system FFmpeg, no FFmpeg-only codec dependencies, runtime diagnostics PASS'
+grep -q 'AV1 software encoding is bundled' "$temporary/stderr"
+echo 'Remote package: static AV1, optional NVENC/VA-API, runtime diagnostics PASS'

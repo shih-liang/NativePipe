@@ -1,195 +1,175 @@
-/*
- * H.264 encoder for NativePipe remote display.
- *
- * Prefers h264_vaapi when a VA-API device is available; falls back to libx264
- * (software) so GTK/cairo shm clients still encode on machines without
- * working hardware encode.
- */
+/* Negotiated remote encoding. The worker owns each accepted pixel buffer through
+ * conversion/encode; codec backends never own scene or transport scheduling. */
 #include "encoder.h"
 #include "alpha.h"
-
+#include "encoder_vaapi.h"
+#include "encoder_nvenc.h"
+#include <aom/aom_encoder.h>
+#include <aom/aomcx.h>
+#include <libyuv/convert.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
-
-#include <libavcodec/avcodec.h>
-#include <libavutil/hwcontext.h>
-#include <libavutil/opt.h>
-#include <libswscale/swscale.h>
 
 struct np_encoder {
-	int width;
-	int height;
-	uint16_t epoch;
-	np_encoder_output_fn out;
-	np_encoder_done_fn done;
-	void *user;
-
-	bool use_vaapi;
-	const AVCodec *codec;
-	AVCodecContext *ctx;
-	AVBufferRef *hw_device_ctx;
-	AVBufferRef *hw_frames_ctx;
-	AVFrame *sw_frame;
-	AVFrame *hw_frame;
-	AVPacket *packet;
-	struct SwsContext *sws;
-	bool force_keyframe;
-	uint8_t *last_alpha;
-	uint32_t last_alpha_size;
-	uint16_t last_alpha_epoch;
-	int64_t frame_number;
-
-	/* Wayland submits only the newest frame; encoding runs off its event loop. */
-	pthread_t worker;
-	pthread_mutex_t lock;
-	pthread_cond_t ready;
-	bool worker_started;
-	bool stopping;
-	uint8_t *pending_bgra;
-	int pending_width, pending_height, pending_stride;
-	uint64_t pending_pts;
-	uint32_t pending_resource_id;
-	uint8_t pending_flags;
-	uint16_t pending_epoch;
-	bool pending_force;
-	bool encoding;
-	int requested_width, requested_height;
-	uint16_t advertised_epoch;
+    int width, height;
+    uint16_t epoch;
+    np_encoder_output_fn out;
+    np_encoder_done_fn done;
+    void *user;
+    struct np_av1_vaapi *hardware;
+    struct np_h264_nvenc *nvenc;
+    bool allow_h264, nvenc_failed;
+    bool hardware_failed, codec_ready;
+    aom_codec_ctx_t codec;
+    aom_image_t *image;
+    bool force_keyframe;
+    uint8_t *last_alpha;
+    uint32_t last_alpha_size;
+    uint16_t last_alpha_epoch;
+    int64_t frame_number;
+    pthread_t worker;
+    pthread_mutex_t lock;
+    pthread_cond_t ready;
+    bool worker_started, stopping;
+    uint8_t *pending_bgra;
+    int pending_width, pending_height, pending_stride;
+    uint64_t pending_pts;
+    uint32_t pending_resource_id;
+    uint8_t pending_flags;
+    uint16_t pending_epoch;
+    bool pending_force, encoding;
+    int requested_width, requested_height;
+    uint16_t advertised_epoch;
 };
 
-static bool setup_libx264(struct np_encoder *enc) {
-	enc->codec = avcodec_find_encoder_by_name("libx264");
-	if (!enc->codec) enc->codec = avcodec_find_encoder(AV_CODEC_ID_H264);
-	if (!enc->codec) {
-		fprintf(stderr, "[encoder] no H.264 encoder\n");
-		return false;
-	}
-	enc->ctx = avcodec_alloc_context3(enc->codec);
-	if (!enc->ctx) return false;
-	enc->ctx->width = enc->width;
-	enc->ctx->height = enc->height;
-	enc->ctx->time_base = (AVRational){1, 60};
-	enc->ctx->framerate = (AVRational){60, 1};
-	enc->ctx->bit_rate = 4 * 1000 * 1000;
-	enc->ctx->rc_max_rate = enc->ctx->bit_rate;
-	enc->ctx->rc_buffer_size = (int)(enc->ctx->bit_rate / 4);
-	enc->ctx->gop_size = 60;
-	enc->ctx->max_b_frames = 0;
-	enc->ctx->pix_fmt = AV_PIX_FMT_YUV420P;
-	if (enc->codec->id == AV_CODEC_ID_H264) {
-		av_opt_set(enc->ctx->priv_data, "preset", "veryfast", 0);
-		av_opt_set(enc->ctx->priv_data, "tune", "zerolatency", 0);
-		av_opt_set(enc->ctx->priv_data, "crf", "23", 0);
-		/* Prefer Annex-B start codes so the macOS demuxer can split NALs. */
-		av_opt_set(enc->ctx->priv_data, "annexb", "1", 0);
-		av_opt_set(enc->ctx->priv_data, "repeat-headers", "1", 0);
-		av_opt_set(enc->ctx->priv_data, "slices", "1", 0);
-	}
-	if (avcodec_open2(enc->ctx, enc->codec, NULL) < 0) {
-		avcodec_free_context(&enc->ctx);
-		return false;
-	}
-	enc->sw_frame = av_frame_alloc();
-	enc->packet = av_packet_alloc();
-	if (!enc->sw_frame || !enc->packet) return false;
-	enc->sw_frame->format = AV_PIX_FMT_YUV420P;
-	enc->sw_frame->width = enc->width;
-	enc->sw_frame->height = enc->height;
-	if (av_frame_get_buffer(enc->sw_frame, 32) < 0) return false;
-	enc->sws = sws_getContext(enc->width, enc->height, AV_PIX_FMT_BGRA,
-	                          enc->width, enc->height, AV_PIX_FMT_YUV420P,
-	                          SWS_BILINEAR, NULL, NULL, NULL);
-	enc->use_vaapi = false;
-	return enc->sws != NULL;
-}
-
-static bool setup_vaapi(struct np_encoder *enc) {
-	enc->codec = avcodec_find_encoder_by_name("h264_vaapi");
-	if (!enc->codec) return false;
-
-	if (av_hwdevice_ctx_create(&enc->hw_device_ctx, AV_HWDEVICE_TYPE_VAAPI,
-	                           NULL, NULL, 0) < 0) {
-		return false;
-	}
-
-	enc->ctx = avcodec_alloc_context3(enc->codec);
-	if (!enc->ctx) return false;
-	enc->ctx->width = enc->width;
-	enc->ctx->height = enc->height;
-	enc->ctx->time_base = (AVRational){1, 60};
-	enc->ctx->framerate = (AVRational){60, 1};
-	enc->ctx->bit_rate = 4 * 1000 * 1000;
-	enc->ctx->rc_max_rate = enc->ctx->bit_rate;
-	enc->ctx->rc_buffer_size = (int)(enc->ctx->bit_rate / 4);
-	enc->ctx->gop_size = 60;
-	enc->ctx->max_b_frames = 0;
-	enc->ctx->pix_fmt = AV_PIX_FMT_VAAPI;
-	enc->ctx->hw_device_ctx = av_buffer_ref(enc->hw_device_ctx);
-
-	enc->hw_frames_ctx = av_hwframe_ctx_alloc(enc->hw_device_ctx);
-	if (!enc->hw_frames_ctx) return false;
-	AVHWFramesContext *frames = (AVHWFramesContext *)enc->hw_frames_ctx->data;
-	frames->format = AV_PIX_FMT_VAAPI;
-	frames->sw_format = AV_PIX_FMT_NV12;
-	frames->width = enc->width;
-	frames->height = enc->height;
-	frames->initial_pool_size = 4;
-	if (av_hwframe_ctx_init(enc->hw_frames_ctx) < 0) return false;
-	enc->ctx->hw_frames_ctx = av_buffer_ref(enc->hw_frames_ctx);
-	av_opt_set_int(enc->ctx->priv_data, "async_depth", 1, 0);
-
-	if (avcodec_open2(enc->ctx, enc->codec, NULL) < 0) return false;
-
-	enc->sw_frame = av_frame_alloc();
-	enc->hw_frame = av_frame_alloc();
-	enc->packet = av_packet_alloc();
-	if (!enc->sw_frame || !enc->hw_frame || !enc->packet) return false;
-	enc->sw_frame->format = AV_PIX_FMT_NV12;
-	enc->sw_frame->width = enc->width;
-	enc->sw_frame->height = enc->height;
-	if (av_frame_get_buffer(enc->sw_frame, 32) < 0) return false;
-	if (av_hwframe_get_buffer(enc->hw_frames_ctx, enc->hw_frame, 0) < 0) return false;
-
-	enc->sws = sws_getContext(enc->width, enc->height, AV_PIX_FMT_BGRA,
-	                          enc->width, enc->height, AV_PIX_FMT_NV12,
-	                          SWS_BILINEAR, NULL, NULL, NULL);
-	enc->use_vaapi = true;
-	return enc->sws != NULL;
-}
-
 static void teardown_codec(struct np_encoder *enc) {
-	if (enc->sws) {
-		sws_freeContext(enc->sws);
-		enc->sws = NULL;
-	}
-	av_packet_free(&enc->packet);
-	av_frame_free(&enc->hw_frame);
-	av_frame_free(&enc->sw_frame);
-	avcodec_free_context(&enc->ctx);
-	av_buffer_unref(&enc->hw_frames_ctx);
-	av_buffer_unref(&enc->hw_device_ctx);
-	enc->use_vaapi = false;
+    np_h264_nvenc_destroy(enc->nvenc); enc->nvenc = NULL;
+    np_av1_vaapi_destroy(enc->hardware); enc->hardware = NULL;
+    if (enc->codec_ready) aom_codec_destroy(&enc->codec);
+    enc->codec_ready = false;
+    if (enc->image) aom_img_free(enc->image);
+    enc->image = NULL;
 }
 
-static bool setup(struct np_encoder *enc) {
-	if (setup_vaapi(enc)) {
-		fprintf(stderr, "[encoder] h264_vaapi %dx%d\n", enc->width, enc->height);
-		return true;
-	}
-	teardown_codec(enc);
-	if (setup_libx264(enc)) {
-		fprintf(stderr, "[encoder] libx264 %dx%d\n", enc->width, enc->height);
-		return true;
-	}
-	return false;
+static bool setup_software(struct np_encoder *enc) {
+    aom_codec_enc_cfg_t cfg;
+    if (aom_codec_enc_config_default(aom_codec_av1_cx(), &cfg, AOM_USAGE_REALTIME)) return false;
+    cfg.g_w = enc->width; cfg.g_h = enc->height;
+    cfg.g_timebase.num = 1; cfg.g_timebase.den = 60;
+    cfg.g_threads = 2;
+    cfg.g_lag_in_frames = 0;
+    cfg.rc_end_usage = AOM_CBR;
+    cfg.rc_target_bitrate = 4000;
+    cfg.rc_min_quantizer = 8; cfg.rc_max_quantizer = 52;
+    cfg.rc_dropframe_thresh = 0;
+    cfg.rc_buf_sz = 250; cfg.rc_buf_initial_sz = 125; cfg.rc_buf_optimal_sz = 125;
+    cfg.kf_min_dist = 0; cfg.kf_max_dist = 120;
+    if (aom_codec_enc_init(&enc->codec, aom_codec_av1_cx(), &cfg, 0)) return false;
+    enc->codec_ready = true;
+    if (aom_codec_control(&enc->codec, AOME_SET_CPUUSED, 10) ||
+        aom_codec_control(&enc->codec, AV1E_SET_ROW_MT, 1u) ||
+        aom_codec_control(&enc->codec, AV1E_SET_TUNE_CONTENT, AOM_CONTENT_SCREEN) ||
+        aom_codec_control(&enc->codec, AV1E_SET_ENABLE_TPL_MODEL, 0u) ||
+        aom_codec_control(&enc->codec, AV1E_SET_ENABLE_RESTORATION, 0u) ||
+        aom_codec_control(&enc->codec, AV1E_SET_COLOR_RANGE, AOM_CR_STUDIO_RANGE) ||
+        aom_codec_control(&enc->codec, AV1E_SET_MATRIX_COEFFICIENTS, AOM_CICP_MC_BT_601)) return false;
+    fprintf(stderr, "[encoder] AV1 libaom realtime %dx%d\n", enc->width, enc->height);
+    return true;
+}
+
+static bool setup_av1(struct np_encoder *enc) {
+    enc->image = aom_img_alloc(NULL, AOM_IMG_FMT_I420, enc->width, enc->height, 32);
+    if (!enc->image) return false;
+    if (!enc->hardware_failed && !getenv("NATIVEPIPE_SOFTWARE_ENCODER") &&
+        np_av1_vaapi_supports_size(enc->width, enc->height)) {
+        enc->hardware = np_av1_vaapi_create(enc->width, enc->height);
+        enc->hardware_failed = !enc->hardware;
+    }
+    return enc->hardware || setup_software(enc);
+}
+
+static void restart_epoch(struct np_encoder *enc) {
+    enc->epoch++; if (!enc->epoch) enc->epoch = 1;
+    pthread_mutex_lock(&enc->lock);
+    enc->advertised_epoch = enc->epoch;
+    pthread_mutex_unlock(&enc->lock);
 }
 
 static bool encode_bgra_now(struct np_encoder *enc, const uint8_t *bgra, int width, int height,
-	                            int stride, uint64_t pts_ns, uint32_t resource_id,
-	                            uint8_t flags, const uint8_t *alpha,
-	                            uint32_t alpha_size, uint16_t epoch, bool force);
+    int stride, uint64_t pts, uint32_t resource, uint8_t flags,
+    const uint8_t *alpha, uint32_t alpha_size, uint16_t epoch, bool force) {
+    if ((!enc->image && !enc->nvenc) || width != enc->width || height != enc->height) {
+        teardown_codec(enc);
+        enc->width = width; enc->height = height; enc->frame_number = 0;
+        if (enc->allow_h264 && !enc->nvenc_failed && !getenv("NATIVEPIPE_SOFTWARE_ENCODER") &&
+            np_h264_nvenc_supports_size(width, height)) {
+            enc->nvenc = np_h264_nvenc_create(width, height);
+            enc->nvenc_failed = !enc->nvenc;
+            if (!enc->nvenc) fprintf(stderr, "[encoder] NVENC unavailable; using AV1\n");
+        }
+        if (!enc->nvenc && !setup_av1(enc)) return false;
+        force = true;
+    }
+    enc->epoch = epoch;
+    uint8_t *packet = NULL; size_t size = 0;
+    if (enc->nvenc && !np_h264_nvenc_encode(enc->nvenc, bgra, stride,
+        force || enc->force_keyframe, &packet, &size)) {
+        np_h264_nvenc_destroy(enc->nvenc); enc->nvenc = NULL;
+        enc->nvenc_failed = true;
+        if (!setup_av1(enc)) return false;
+        restart_epoch(enc);
+        flags &= ~NP_ENCODER_FLAG_REUSE_ALPHA;
+        force = true;
+        fprintf(stderr, "[encoder] NVENC failed; reset to AV1 epoch=%u\n", enc->epoch);
+    }
+    if (enc->nvenc) goto emit;
+    if (ARGBToI420(bgra, stride, enc->image->planes[0], enc->image->stride[0],
+        enc->image->planes[1], enc->image->stride[1], enc->image->planes[2], enc->image->stride[2],
+        width, height)) return false;
+    enc->image->range = AOM_CR_STUDIO_RANGE;
+    enc->image->mc = AOM_CICP_MC_BT_601;
+    if (enc->hardware && !np_av1_vaapi_encode(enc->hardware,
+        (const uint8_t **)enc->image->planes, enc->image->stride,
+        force || enc->force_keyframe, &packet, &size)) {
+        // A new stream starts with a keyframe; no old hardware references escape.
+        np_av1_vaapi_destroy(enc->hardware); enc->hardware = NULL;
+        enc->hardware_failed = true;
+        if (!setup_software(enc)) return false;
+        restart_epoch(enc);
+        flags &= ~NP_ENCODER_FLAG_REUSE_ALPHA;
+        force = true;
+        fprintf(stderr, "[encoder] AV1 hardware failed; reset to software epoch=%u\n", enc->epoch);
+    }
+    if (!enc->hardware) {
+        if (aom_codec_encode(&enc->codec, enc->image, enc->frame_number++, 1,
+            (force || enc->force_keyframe) ? AOM_EFLAG_FORCE_KF : 0)) return false;
+        aom_codec_iter_t iter = NULL;
+        const aom_codec_cx_pkt_t *p;
+        while ((p = aom_codec_get_cx_data(&enc->codec, &iter))) {
+            if (p->kind != AOM_CODEC_CX_FRAME_PKT) continue;
+            // The protocol requires one immediately displayed frame per resource.
+            if (size || !p->data.frame.sz || p->data.frame.sz > 32u * 1024u * 1024u) {
+                free(packet); return false;
+            }
+            size = p->data.frame.sz;
+            packet = malloc(size);
+            if (!packet) return false;
+            memcpy(packet, p->data.frame.buf, size);
+        }
+    }
+emit:
+    if (!size) { free(packet); return false; }
+    if (enc->nvenc || enc->hardware) flags |= NP_ENCODER_FLAG_HARDWARE;
+    bool reuse = flags & NP_ENCODER_FLAG_REUSE_ALPHA;
+    enc->out(enc->user, packet, size, pts, resource, flags,
+        reuse ? NULL : alpha, reuse ? 0 : alpha_size, enc->epoch, width, height,
+        enc->nvenc ? NP_ENCODER_H264 : NP_ENCODER_AV1);
+    free(packet);
+    enc->force_keyframe = false;
+    return true;
+}
 
 static void *encoder_worker(void *arg) {
 	struct np_encoder *enc = arg;
@@ -224,12 +204,12 @@ static void *encoder_worker(void *arg) {
 		if (reuse_alpha) flags |= NP_ENCODER_FLAG_REUSE_ALPHA;
 		bool encoded = alpha_ok && encode_bgra_now(
 			enc, pixels, width, height, stride, pts, resource_id, flags,
-			reuse_alpha ? NULL : alpha, reuse_alpha ? 0 : alpha_size, epoch, force);
+			alpha, alpha_size, epoch, force);
 		if (!encoded)
 			fprintf(stderr, "[encoder] frame encode failed\n");
-		if (encoded && alpha && !reuse_alpha) {
+		if (encoded && alpha && (!reuse_alpha || epoch != enc->epoch)) {
 			free(enc->last_alpha); enc->last_alpha = alpha; alpha = NULL;
-			enc->last_alpha_size = alpha_size; enc->last_alpha_epoch = epoch;
+			enc->last_alpha_size = alpha_size; enc->last_alpha_epoch = enc->epoch;
 		}
 		free(alpha);
 		pthread_mutex_lock(&enc->lock);
@@ -241,9 +221,9 @@ static void *encoder_worker(void *arg) {
 	return NULL;
 }
 
-struct np_encoder *np_encoder_create(int width, int height, np_encoder_output_fn out,
+struct np_encoder *np_encoder_create(int width, int height, bool allow_h264, np_encoder_output_fn out,
                                     np_encoder_done_fn done, void *user) {
-	if (width < 2 || height < 2 || !out || !done) return NULL;
+	if (width < 2 || height < 2 || width > 8192 || height > 8192 || (uint64_t)width * height > 16777216 || !out || !done) return NULL;
 	struct np_encoder *enc = calloc(1, sizeof(*enc));
 	if (!enc) return NULL;
 	enc->width = width & ~1;
@@ -251,6 +231,7 @@ struct np_encoder *np_encoder_create(int width, int height, np_encoder_output_fn
 	enc->out = out;
 	enc->done = done;
 	enc->user = user;
+	enc->allow_h264 = allow_h264;
 	enc->epoch = 1;
 	enc->advertised_epoch = 1;
 	enc->requested_width = enc->width;
@@ -281,89 +262,20 @@ void np_encoder_destroy(struct np_encoder *enc) {
 	free(enc);
 }
 
-static bool np_encoder_resize(struct np_encoder *enc, int width, int height) {
-	if (!enc) return false;
-	width &= ~1;
-	height &= ~1;
-	if (width < 2 || height < 2) return false;
-	if (width == enc->width && height == enc->height) return true;
-	teardown_codec(enc);
-	enc->width = width;
-	enc->height = height;
-	enc->epoch++;
-	if (!setup(enc)) return false;
-	fprintf(stderr, "[encoder] resized %dx%d epoch=%u\n", enc->width, enc->height, enc->epoch);
-	return true;
-}
-
 uint16_t np_encoder_epoch(const struct np_encoder *enc) {
-	if (!enc) return 0;
-	struct np_encoder *mutable = (struct np_encoder *)enc;
-	pthread_mutex_lock(&mutable->lock);
-	uint16_t epoch = mutable->advertised_epoch;
-	pthread_mutex_unlock(&mutable->lock);
-	return epoch;
-}
-
-static bool drain_packets(struct np_encoder *enc, uint64_t pts_ns,
-	                          uint32_t resource_id, uint8_t flags,
-	                          const uint8_t *alpha, uint32_t alpha_size) {
-	bool first = true;
-	for (;;) {
-		int ret = avcodec_receive_packet(enc->ctx, enc->packet);
-		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) return !first;
-		if (ret < 0) return false;
-		enc->out(enc->user, enc->packet->data, (size_t)enc->packet->size,
-		         pts_ns, resource_id, flags,
-		         first ? alpha : NULL, first ? alpha_size : 0, enc->epoch,
-		         (uint16_t)enc->width, (uint16_t)enc->height);
-		first = false;
-		av_packet_unref(enc->packet);
-	}
-}
-
-static bool encode_bgra_now(struct np_encoder *enc, const uint8_t *bgra, int width, int height,
-	                            int stride, uint64_t pts_ns, uint32_t resource_id,
-	                            uint8_t flags, const uint8_t *alpha,
-	                            uint32_t alpha_size, uint16_t epoch, bool force) {
-	if (!enc || !bgra) return false;
-	if ((width & ~1) != enc->width || (height & ~1) != enc->height) {
-		if (!np_encoder_resize(enc, width, height)) return false;
-	}
-	enc->epoch = epoch;
-	if (!enc->ctx && !setup(enc)) return false;
-	if (av_frame_make_writable(enc->sw_frame) < 0) return false;
-	const uint8_t *src_slices[4] = {bgra, NULL, NULL, NULL};
-	int src_stride[4] = {stride, 0, 0, 0};
-	sws_scale(enc->sws, src_slices, src_stride, 0, enc->height,
-	          enc->sw_frame->data, enc->sw_frame->linesize);
-	enc->sw_frame->pts = enc->frame_number++;
-	if (force || enc->force_keyframe) {
-		enc->sw_frame->pict_type = AV_PICTURE_TYPE_I;
-		enc->force_keyframe = false;
-	} else {
-		enc->sw_frame->pict_type = AV_PICTURE_TYPE_NONE;
-	}
-
-	AVFrame *to_send = enc->sw_frame;
-	if (enc->use_vaapi) {
-		av_frame_unref(enc->hw_frame);
-		if (av_hwframe_get_buffer(enc->hw_frames_ctx, enc->hw_frame, 0) < 0) return false;
-		if (av_hwframe_transfer_data(enc->hw_frame, enc->sw_frame, 0) < 0) return false;
-		enc->hw_frame->pts = enc->sw_frame->pts;
-		enc->hw_frame->pict_type = enc->sw_frame->pict_type;
-		to_send = enc->hw_frame;
-	}
-
-	if (avcodec_send_frame(enc->ctx, to_send) < 0) return false;
-	return drain_packets(enc, pts_ns, resource_id, flags, alpha, alpha_size);
+    if (!enc) return 0;
+    struct np_encoder *e = (struct np_encoder *)enc;
+    pthread_mutex_lock(&e->lock);
+    uint16_t epoch = e->advertised_epoch;
+    pthread_mutex_unlock(&e->lock);
+    return epoch;
 }
 
 bool np_encoder_push_bgra(struct np_encoder *enc, const uint8_t *bgra, int width, int height,
 	                          int stride, uint64_t pts_ns, uint32_t resource_id,
 	                          uint8_t flags) {
 	if (!enc || !bgra || !resource_id || width < 2 || height < 2 ||
-	    width >= UINT16_MAX || height >= UINT16_MAX || stride < width * 4)
+	    width > 8192 || height > 8192 || (uint64_t)width * height > 16777216 || stride < width * 4)
 		return false;
 	int even_width = (width + 1) & ~1;
 	int even_height = (height + 1) & ~1;
@@ -389,7 +301,7 @@ bool np_encoder_push_bgra(struct np_encoder *enc, const uint8_t *bgra, int width
 bool np_encoder_take_bgra(struct np_encoder *enc, uint8_t *pixels, int width, int height,
                          int stride, uint64_t pts_ns, uint32_t resource_id, uint8_t flags) {
 	if (!enc || !pixels || !resource_id || width < 2 || height < 2 ||
-	    width >= UINT16_MAX || height >= UINT16_MAX || (width & 1) || (height & 1) ||
+	    width > 8192 || height > 8192 || (uint64_t)width * height > 16777216 || (width & 1) || (height & 1) ||
 	    stride < width * 4) return false;
 	pthread_mutex_lock(&enc->lock);
 	if (enc->pending_bgra || enc->encoding || enc->stopping) {
@@ -400,6 +312,7 @@ bool np_encoder_take_bgra(struct np_encoder *enc, uint8_t *pixels, int width, in
 		enc->requested_width = width;
 		enc->requested_height = height;
 		enc->advertised_epoch++;
+        if (!enc->advertised_epoch) enc->advertised_epoch = 1;
 		enc->pending_force = true;
 	}
 	enc->pending_bgra = pixels;

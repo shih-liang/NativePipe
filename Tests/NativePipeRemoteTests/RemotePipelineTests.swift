@@ -10,7 +10,7 @@ final class RemotePipelineTests: XCTestCase {
         defer { frames.removeAll() }
         var failures: [String] = []
         frames.onFailure = { failures.append($0) }
-        for (codec, payload) in [(MediaWire.Codec.alphaRLE, Data([128])), (.h264, Data([0, 0, 0, 1, 0x65, 0]))] {
+        for (codec, payload) in [(MediaWire.Codec.alphaRLE, Data([128])), (.h264, Data([0, 0, 0, 1, 0x65, 0])), (.av1, Data([0x32, 1, 0]))] {
             let count = failures.count
             let header = MediaWire.Header(codec: codec, surfaceID: 1, resourceID: 1,
                 width: 2, height: 2, ptsNanos: 0, payloadLength: UInt32(payload.count))
@@ -62,18 +62,31 @@ final class RemotePipelineTests: XCTestCase {
     }
 
     @MainActor func testOpaquePixelsSurviveCacheRetirementAndAlphaFramesUntilGPURead() async throws {
+        try await checkPixels(codec: .h264)
+    }
+
+    @MainActor func testAV1PixelsSurviveCacheRetirementAndAlphaFramesUntilGPURead() async throws {
+        try await checkPixels(codec: .av1)
+    }
+
+    @MainActor private func checkPixels(codec: MediaWire.Codec) async throws {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue(),
               let gate = device.makeSharedEvent() else { throw XCTSkip("Metal is unavailable") }
-        // Eight generated 128x96 testsrc2 all-I H.264 access units, with AUD.
-        let url = try XCTUnwrap(Bundle.module.url(forResource: "lifetime", withExtension: "h264", subdirectory: "Resources"))
-        let bytes = [UInt8](try Data(contentsOf: url))
-        var starts: [Int] = [], i = 0
-        while i + 4 < bytes.count {
-            let size = bytes[i...].starts(with: [0,0,0,1]) ? 4 : bytes[i...].starts(with: [0,0,1]) ? 3 : 0
-            if size > 0 { if bytes[i + size] & 31 == 9 { starts.append(i) }; i += size } else { i += 1 }
+        let packets: [Data]
+        if codec == .av1 { packets = try AV1DecoderTests.packets() }
+        else {
+            // Eight generated 128x96 testsrc2 all-I H.264 access units, with AUD.
+            let url = try XCTUnwrap(Bundle.module.url(forResource: "lifetime", withExtension: "h264", subdirectory: "Resources"))
+            let bytes = [UInt8](try Data(contentsOf: url))
+            var starts: [Int] = [], i = 0
+            while i + 4 < bytes.count {
+                let size = bytes[i...].starts(with: [0,0,0,1]) ? 4 : bytes[i...].starts(with: [0,0,1]) ? 3 : 0
+                if size > 0 { if bytes[i + size] & 31 == 9 { starts.append(i) }; i += size } else { i += 1 }
+            }
+            starts.append(bytes.count)
+            XCTAssertEqual(starts.count, 9)
+            packets = (0..<8).map { Data(bytes[starts[$0]..<starts[$0 + 1]]) }
         }
-        starts.append(bytes.count)
-        XCTAssertEqual(starts.count, 9)
         let frames = RemoteFrameSource(), reference = RemoteFrameSource()
         defer { frames.removeAll(); reference.removeAll(); gate.signaledValue = 1 }
         let readback = try XCTUnwrap(device.makeBuffer(length: 128 * 96 * 4, options: .storageModeShared))
@@ -81,8 +94,8 @@ final class RemotePipelineTests: XCTestCase {
         var expected = Data()
         for index in 0..<8 {
             let resource = UInt32(index + 1)
-            let payload = Data(bytes[starts[index]..<starts[index + 1]])
-            var header = MediaWire.Header(surfaceID: 1, resourceID: resource, width: 128, height: 96,
+            let payload = packets[index]
+            var header = MediaWire.Header(codec: codec, surfaceID: 1, resourceID: resource, width: 128, height: 96,
                 ptsNanos: UInt64(index), payloadLength: UInt32(payload.count))
             XCTAssertTrue(reference.ingest(header: header, payload: payload))
             if index > 0 {

@@ -5,8 +5,8 @@
 
 struct np_encoder { np_encoder_done_fn done; void *user; uint8_t *pixels; uint32_t id; };
 static unsigned sent[8], sent_count;
-struct np_encoder *np_encoder_create(int w, int h, np_encoder_output_fn out, np_encoder_done_fn done, void *user)
-{ (void)w; (void)h; (void)out; struct np_encoder *e = calloc(1, sizeof(*e)); e->done = done; e->user = user; return e; }
+struct np_encoder *np_encoder_create(int w, int h, bool allow_h264, np_encoder_output_fn out, np_encoder_done_fn done, void *user)
+{ (void)w; (void)h; (void)allow_h264; (void)out; struct np_encoder *e = calloc(1, sizeof(*e)); e->done = done; e->user = user; return e; }
 bool np_encoder_take_bgra(struct np_encoder *e, uint8_t *pixels, int w, int h, int stride, uint64_t pts, uint32_t id, uint8_t flags)
 { (void)w; (void)h; (void)stride; (void)pts; (void)flags; assert(!e->pixels); e->pixels = pixels; e->id = id; return true; }
 void np_encoder_destroy(struct np_encoder *e) { assert(!e->pixels); free(e); }

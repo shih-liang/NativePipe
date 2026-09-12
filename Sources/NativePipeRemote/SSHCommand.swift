@@ -36,9 +36,14 @@ public struct SSHCommand: Codable, Sendable, Equatable {
     }
 
     public func arguments() async throws -> [String] {
+        try await arguments(uploadCompositor: false)
+    }
+
+    func arguments(uploadCompositor: Bool,
+                   hardwareH264: Bool = H264Decoder.hardwareAvailable) async throws -> [String] {
         try validate()
-        var script = remoteScript
-        if installCompositor && compositor == "nativepipe-wayland" {
+        var script = makeRemoteScript(uploadCompositor: uploadCompositor, hardwareH264: hardwareH264)
+        if installCompositor && compositor == "nativepipe-wayland" && !uploadCompositor {
             let release = try await RemoteCompositorRelease.latest()
             script = "release=" + Self.quote(release.absoluteString) + "\n" + script
         }
@@ -48,9 +53,14 @@ public struct SSHCommand: Codable, Sendable, Equatable {
     }
 
     public var remoteScript: String {
+        makeRemoteScript(uploadCompositor: false)
+    }
+
+    func makeRemoteScript(uploadCompositor: Bool,
+                          hardwareH264: Bool = H264Decoder.hardwareAvailable) -> String {
         let invocation = persistentSession ? "--stdio --session" :
             "--stdio -- " + application.map(Self.quote).joined(separator: " ")
-        let prepare = installCompositor ? RemoteCompositorInstaller.script : """
+        let prepare = installCompositor ? (uploadCompositor ? RemoteCompositorInstaller.uploadScript : RemoteCompositorInstaller.script) : """
         if command -v nativepipe-wayland >/dev/null 2>&1; then
           compositor=$(command -v nativepipe-wayland)
         elif [ -x "$HOME/.local/share/nativepipe/compositor/current/nativepipe-wayland" ]; then
@@ -64,6 +74,7 @@ public struct SSHCommand: Codable, Sendable, Equatable {
         """
         return """
         set -eu
+        export NATIVEPIPE_HOST_H264_HARDWARE=\(hardwareH264 ? "1" : "0")
         compositor=\(Self.quote(compositor))
         if [ "$compositor" = nativepipe-wayland ]; then
           \(prepare)

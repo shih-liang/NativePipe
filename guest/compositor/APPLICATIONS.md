@@ -103,8 +103,8 @@ the worker. These controls do not gate rendering or resize configures.
 Runtime/build dependencies: GIO, GdkPixbuf and librsvg (plus existing compositor
 dependencies). VM install adapters include these distro packages. Remote release
 packaging includes image dependencies and matching PNG/XPM loader modules,
-but no FFmpeg, VA-API or codec-only dependencies. System FFmpeg libraries must
-match the binary's required major versions. GLib/GIO and their dconf/GVfs plugin
+with static libaom/libyuv for AV1 encoding. FFmpeg is not required; VA-API and
+its GPU drivers are optional system components. GLib/GIO and their dconf/GVfs plugin
 runtime remain the distribution's responsibility, like `dbus-run-session` and
 EGL/GBM. Private libraries resolve
 with ELF RUNPATH, not an LD_LIBRARY_PATH inherited by desktop applications.

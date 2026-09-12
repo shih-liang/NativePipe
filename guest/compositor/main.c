@@ -3,7 +3,7 @@
 
 /* Lets the updater reject an old executable without accidentally starting it
  * as a compositor: older versions ignored unknown command-line options. */
-__attribute__((used)) static const char runtime_probe[] = "NP_RUNTIME_PROBE:1";
+__attribute__((used, retain)) static const char runtime_probe[] = "NP_RUNTIME_PROBE:1";
 
 int main(int argc, char **argv)
 {

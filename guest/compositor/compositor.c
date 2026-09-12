@@ -35,8 +35,8 @@
 #error "NP_COMPOSITOR_SOURCE_HASH must be supplied by the compositor Makefile"
 #endif
 
-/* Survives strip(1), allowing the host packager to reject a stale guest ELF. */
-__attribute__((used)) static const char np_compositor_source_stamp[] =
+/* Survives strip(1) and --gc-sections, allowing stale guest ELF detection. */
+__attribute__((used, retain)) static const char np_compositor_source_stamp[] =
 	"NPCS:" NP_COMPOSITOR_SOURCE_HASH;
 
 bool np_trace_enabled(void)

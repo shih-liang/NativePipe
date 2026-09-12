@@ -6,6 +6,9 @@
 static uint8_t alpha_at(
 	const uint8_t *bgra, int stride, int width, size_t index)
 {
+	/* Encoder-owned frames are tightly packed. Avoid an integer division for
+	 * every alpha sample on the normal path; keep arbitrary-stride support. */
+	if (stride == width * 4) return bgra[index * 4 + 3];
 	size_t row = index / (size_t)width;
 	size_t column = index - row * (size_t)width;
 	return bgra[row * (size_t)stride + column * 4 + 3];

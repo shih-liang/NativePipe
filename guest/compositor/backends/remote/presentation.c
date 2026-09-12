@@ -64,7 +64,7 @@ static void encoder_emit(
 	void *user, const uint8_t *data, size_t size, uint64_t pts_ns,
 	uint32_t resource_id, uint8_t flags, const uint8_t *alpha,
 	uint32_t alpha_size, uint16_t bitstream_epoch,
-	uint16_t width, uint16_t height)
+	uint16_t width, uint16_t height, enum np_encoder_codec codec)
 {
 	struct np_surface *surface = user;
 	if (!surface || !surface->server) return;
@@ -77,7 +77,7 @@ static void encoder_emit(
 			surface->id, resource_id, width, height, pts_ns,
 			bitstream_epoch, alpha, alpha_size);
 	ok = np_media_send(
-		&backend->media, NP_MEDIA_CODEC_H264, flags,
+		&backend->media, (uint8_t)codec, flags,
 		surface->id, resource_id, width, height, pts_ns,
 		bitstream_epoch, data, (uint32_t)size) && ok;
 	struct np_remote_surface *state = remote_surface(surface, false);
@@ -338,12 +338,12 @@ void np_remote_flush_encoded(struct np_server *server)
             struct np_remote_surface *state = remote_surface(s, false);
             if (!state) { job->cancelled = true; break; }
             if (!state->encoder)
-                state->encoder = np_encoder_create(input->width, input->height, encoder_emit, encoder_finished, s);
+                state->encoder = np_encoder_create(input->width, input->height,
+                    b->host_h264_hardware, encoder_emit, encoder_finished, s);
             atomic_store(&job->encoding, true);
             if (state->encoder && np_encoder_take_bgra(state->encoder, input->pixels,
                     input->width, input->height, input->stride, input->pts_ns, input->resource_id, input->flags)) {
                 input->pixels = NULL;
-                state->last_epoch = np_encoder_epoch(state->encoder);
             } else encoder_finished(s, false);
             break;
         }

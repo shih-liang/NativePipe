@@ -6,7 +6,7 @@ import NativePipeProtocol
 
 private final class MediaStatistics: @unchecked Sendable {
     struct Snapshot {
-        var videoBytes = 0, alphaBytes = 0, videoFrames = 0
+        var videoBytes = 0, alphaBytes = 0, videoFrames = 0, av1Frames = 0
         var surfaceFrames: [UInt32: Int] = [:]
         var frameFlags: [UInt32: UInt8] = [:]
         var imageSize = CGSize.zero
@@ -18,8 +18,9 @@ private final class MediaStatistics: @unchecked Sendable {
     func reset() { lock.lock(); value = Snapshot(); lock.unlock() }
     func record(_ header: MediaWire.Header, _ payload: Data) {
         lock.lock(); defer { lock.unlock() }
-        if header.codec == .h264 {
+        if header.codec == .h264 || header.codec == .av1 {
             value.videoBytes += payload.count; value.videoFrames += 1
+            if header.codec == .av1 { value.av1Frames += 1 }
             value.surfaceFrames[header.surfaceID, default: 0] += 1
             value.frameFlags[header.resourceID] = header.flags
             value.imageSize = CGSize(width: Int(header.width), height: Int(header.height))
@@ -65,6 +66,150 @@ final class RemoteApplicationTests: XCTestCase {
         if let failure { throw failure }
     }
 
+    /// Real GTK -> compositor -> SSH -> decoded pixels, with a synthetic
+    /// consumer clock. This does not measure WindowServer/display latency.
+    @MainActor func testLiveRemoteAV1PixelsAndInput() async throws {
+        try await measureRemotePixelsAndInput(hardwareH264: false)
+    }
+
+    @MainActor func testLiveRemoteH264PixelsAndInput() async throws {
+        try await measureRemotePixelsAndInput(hardwareH264: true)
+    }
+
+    @MainActor private func measureRemotePixelsAndInput(hardwareH264: Bool) async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard env[hardwareH264 ? "NATIVEPIPE_TEST_H264_PIPELINE" : "NATIVEPIPE_TEST_AV1_PIPELINE"] == "1",
+              let destination = env["NATIVEPIPE_TEST_REMOTE"],
+              let compositor = env["NATIVEPIPE_TEST_COMPOSITOR"],
+              let animation = env["NATIVEPIPE_TEST_ANIMATION"] else {
+            throw XCTSkip("Opt-in real GTK video decode/input test without a physical display")
+        }
+        var ssh = ["-o", "BatchMode=yes"]
+        if let config = env["NATIVEPIPE_TEST_SSH_CONFIG"] { ssh += ["-F", config] }
+        if let proxy = env["NATIVEPIPE_TEST_PROXY"] { ssh += ["-o", "ProxyCommand=" + proxy] }
+        let session: RemoteSession
+        if let bundle = env["NATIVEPIPE_TEST_COMPOSITOR_DIRECTORY"],
+           let remoteHome = env["NATIVEPIPE_TEST_INSTALL_HOME"] {
+            // Exercise the real installer and transport with a disposable
+            // remote HOME, leaving the user's active installation untouched.
+            let command = SSHCommand(destination: destination, application: [animation],
+                sshArguments: ssh, installCompositor: true)
+            let script = "export HOME=" + SSHCommand.quote(remoteHome) + "\n" +
+                command.makeRemoteScript(uploadCompositor: true, hardwareH264: hardwareH264)
+            session = RemoteSession(testExecutable: "/usr/bin/ssh",
+                arguments: ["-T", "-C", "-o", "ConnectTimeout=10", "-o", "ControlPath=none"] + ssh +
+                    ["--", destination, "sh -c " + SSHCommand.quote(script)],
+                localCompositorDirectory: URL(fileURLWithPath: bundle))
+        } else {
+            session = RemoteSession(command: .init(destination: destination,
+                application: [animation], sshArguments: ssh, compositor: compositor), allowHardwareH264: hardwareH264)
+        }
+        let frames = RemoteFrameSource(), statistics = MediaStatistics()
+        var pending: [Windowing.SceneSnapshot] = [], latest: Windowing.SceneSnapshot?
+        var window: UInt32?, consumed = 0, marker = -1, faults: [String] = []
+        var images = Set<Data>(), retained: IOSurfaceRef?, original = Data()
+        func sample(_ surface: IOSurfaceRef) -> Data {
+            IOSurfaceLock(surface, .readOnly, nil)
+            defer { IOSurfaceUnlock(surface, .readOnly, nil) }
+            var bytes = Data()
+            for y in stride(from: 0, to: IOSurfaceGetHeight(surface), by: 16) {
+                let row = IOSurfaceGetBaseAddress(surface).advanced(by: y * IOSurfaceGetBytesPerRow(surface))
+                for x in stride(from: 0, to: IOSurfaceGetWidth(surface), by: 16) {
+                    bytes.append(row.advanced(by: x * 4).assumingMemoryBound(to: UInt8.self), count: 4)
+                }
+            }
+            return bytes
+        }
+        func consume() {
+            while let scene = pending.first,
+                  scene.layers.allSatisfy({ frames.isResourcePublished($0.resourceID) }) {
+                pending.removeFirst()
+                if let root = scene.layers.first(where: { $0.surface == scene.surface }),
+                   let surface = frames.surface(forResource: root.resourceID) {
+                    let bytes = sample(surface)
+                    images.insert(bytes); marker = Self.centerMarker(surface)
+                    if retained == nil { retained = surface; original = bytes }
+                    latest = scene; consumed += 1
+                }
+                // Drive Wayland's frame/FIFO callbacks at this test consumer.
+                // Report discarded to the remote display statistics: no screen
+                // has displayed these decoded pixels.
+                session.send(.framePresented(surface: scene.surface, presentationID: scene.presentationID))
+                session.send(.frameReleased(surface: scene.surface, presentationID: scene.presentationID))
+                session.sceneCompleted(surface: scene.surface, presentationID: scene.presentationID,
+                    displayed: false, intervalNanoseconds: 16_666_667)
+            }
+        }
+        frames.setFrameAvailableHandler { _ in consume() }
+        frames.onFailure = { faults.append($0) }
+        session.onError = { faults.append($0.localizedDescription) }
+        session.onDiagnostic = { fputs($0, stderr) }
+        session.onMediaFrame = { [frames] header, payload in
+            statistics.record(header, payload)
+            return frames.ingest(header: header, payload: payload)
+        }
+        session.onEvent = { event in
+            switch event {
+            case .toplevelCreated(let id, _): window = id
+            case .sceneCommitted(let scene): pending.append(scene); consume()
+            case .frameCallbackRequested(let surface, let id):
+                session.send(.framePresented(surface: surface, presentationID: id))
+            default: break
+            }
+        }
+        defer {
+            session.disconnect(); frames.removeAll()
+            session.onEvent = nil; session.onMediaFrame = nil
+            frames.setFrameAvailableHandler { _ in }
+        }
+        let connecting = Task { try await session.connect() }
+        let connectLimit = env["NATIVEPIPE_TEST_COMPOSITOR_DIRECTORY"] == nil ? 20 : 120
+        let timeout = Task { try? await Task.sleep(for: .seconds(connectLimit)); connecting.cancel() }
+        defer { timeout.cancel() }
+        try await connecting.value
+        timeout.cancel()
+        func waitFor(_ message: String, _ condition: () -> Bool) async throws {
+            let deadline = Date().addingTimeInterval(10)
+            while !condition(), faults.isEmpty, Date() < deadline {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            XCTAssertTrue(faults.isEmpty, faults.joined(separator: "\n"))
+            guard condition() else { throw RemoteError.message(message) }
+        }
+        try await waitFor("AV1 animation did not advance", { consumed >= 20 })
+        XCTAssertGreaterThan(images.count, 10, "New resource IDs must contain changing animation pixels")
+        XCTAssertEqual(sample(try XCTUnwrap(retained)), original, "Later decodes cannot overwrite a retained frame")
+        let id = try XCTUnwrap(window), scene = try XCTUnwrap(latest)
+        var latencies: [Double] = []
+        for click in 1...3 {
+            let sent = ProcessInfo.processInfo.systemUptime
+            session.send(.pointerEntered(window: id,
+                x: Double(scene.windowGeometry.x + scene.windowGeometry.width / 2),
+                y: Double(scene.windowGeometry.y + scene.windowGeometry.height / 2)))
+            session.send(.pointerButton(window: id, button: .left, pressed: true))
+            session.send(.pointerButton(window: id, button: .left, pressed: false))
+            try await waitFor("GTK click did not change the decoded marker", { marker == click })
+            latencies.append(ProcessInfo.processInfo.systemUptime - sent)
+        }
+        for (index, size) in [Windowing.Size(width: 701, height: 503), .init(width: 913, height: 617)].enumerated() {
+            let serial = UInt32(index + 1), before = consumed
+            session.send(.configure(window: id, size: size, states: [.activated], serial: serial))
+            try await waitFor("Resized AV1 stream did not resume", {
+                latest?.configureSerial == serial && consumed >= before + 2
+            })
+            XCTAssertEqual(latest?.windowGeometry.width, size.width)
+            XCTAssertEqual(latest?.windowGeometry.height, size.height)
+        }
+        XCTAssertGreaterThan(statistics.snapshot.videoFrames, 20)
+        if hardwareH264 {
+            XCTAssertEqual(statistics.snapshot.av1Frames, 0)
+            XCTAssertGreaterThan(frames.decoderFrameCounts.hardware, 20)
+            XCTAssertEqual(frames.decoderFrameCounts.software, 0)
+        } else { XCTAssertEqual(statistics.snapshot.av1Frames, statistics.snapshot.videoFrames) }
+        XCTAssertTrue(faults.isEmpty, faults.joined(separator: "\n"))
+        print("REMOTE_VIDEO_DECODE_PIPELINE codec=\(hardwareH264 ? "H264 hardware" : "AV1") hardware_decoded=\(frames.decoderFrameCounts.hardware) frames=\(consumed) distinct_images=\(images.count) input_to_decoded_ms=\(latencies.map { $0 * 1000 }) (synthetic consumer; not display latency)")
+    }
+
     @MainActor private func measureLiveRemoteAnimation() async throws {
         let env = ProcessInfo.processInfo.environment
         guard env["NATIVEPIPE_TEST_LATENCY"] == "1", let destination = env["NATIVEPIPE_TEST_REMOTE"],
@@ -73,6 +218,7 @@ final class RemoteApplicationTests: XCTestCase {
         }
         NSApp.activate()
         var ssh = ["-o", "BatchMode=yes"]
+        if let config = env["NATIVEPIPE_TEST_SSH_CONFIG"] { ssh += ["-F", config] }
         if let proxy = env["NATIVEPIPE_TEST_PROXY"] { ssh += ["-o", "ProxyCommand=" + proxy] }
         var application = env["NATIVEPIPE_TEST_ANIMATION"].map { [$0] } ?? ["gtk4-demo", "--run=fishbowl"]
         if env["NATIVEPIPE_TEST_OCCLUDED"] == "1", env["NATIVEPIPE_TEST_ANIMATION"] != nil { application.append("--two-windows") }

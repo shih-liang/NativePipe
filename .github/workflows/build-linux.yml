@@ -108,6 +108,11 @@ jobs:
         with:
           ref: ${{ needs.source.outputs.commit }}
 
+      - name: Restore private codec build cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .build/codecs
+          key: codecs-${{ matrix.architecture }}-${{ matrix.libc }}-${{ hashFiles('scripts/build-codecs.py') }}
       - name: Build and test
         shell: bash
         env:
@@ -124,18 +129,19 @@ jobs:
                 export DEBIAN_FRONTEND=noninteractive
                 apt-get update
                 apt-get install -y --no-install-recommends \
-                  build-essential pkg-config patchelf \
+                  build-essential pkg-config patchelf cmake ninja-build nasm git python3 perl ca-certificates \
                   libwayland-dev wayland-protocols libxkbcommon-dev \
                   libvulkan-dev libdrm-dev libegl1-mesa-dev libgles2-mesa-dev \
-                  libgbm-dev libavcodec-dev libavutil-dev libswscale-dev libglib2.0-dev \
+                  libgbm-dev libva-dev libdav1d-dev libglib2.0-dev \
                   libgdk-pixbuf-2.0-dev librsvg2-dev dbus dconf-gsettings-backend
               else
                 apk add --no-cache \
-                  build-base pkgconf linux-headers patchelf \
+                  build-base pkgconf linux-headers patchelf cmake ninja nasm git python3 perl ca-certificates \
                   wayland-dev wayland-protocols libxkbcommon-dev \
-                  vulkan-loader-dev vulkan-headers libdrm-dev mesa-dev ffmpeg-dev glib-dev \
+                  vulkan-loader-dev vulkan-headers libdrm-dev mesa-dev libva-dev dav1d-dev glib-dev \
                   gdk-pixbuf-dev librsvg-dev dbus dconf
               fi
+              python3 scripts/build-codecs.py "$ARCH-$LIBC"
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-remote-transport test-remote-encoder
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-applications
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-file-drag
@@ -201,6 +207,8 @@ jobs:
           key: swift-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('Package.swift', 'Package.resolved') }}-${{ needs.source.outputs.commit }}
           restore-keys: |
             swift-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('Package.swift', 'Package.resolved') }}-
+      - name: Install static codec build tools
+        run: brew install cmake meson ninja nasm
       - name: Test Swift package
         run: make test SWIFT_FLAGS='--disable-sandbox --build-system native -c release --arch arm64'
       - name: Build and package universal command

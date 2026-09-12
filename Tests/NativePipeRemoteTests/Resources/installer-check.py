@@ -16,12 +16,24 @@ import tarfile
 import tempfile
 
 tool = Path(sys.argv[0]).name
-if tool in ("curl", "uname", "ldd", "mv", "sha256sum"):
+if tool in ("curl", "uname", "ldd", "mv", "sha256sum", "head"):
     fixture = Path(os.environ["INSTALLER_FIXTURE"])
     if tool == "uname":
         print("x86_64")
     elif tool == "ldd":
         print("ldd GNU libc")
+    elif tool == "head":
+        if sys.platform != 'darwin' or sys.argv[1] != '-c':
+            os.execv('/usr/bin/head', ['head'] + sys.argv[1:])
+        # BSD head over-reads pipes and discards the excess. The installer
+        # runs on Linux, whose GNU/BusyBox head reads only the requested bytes.
+        remaining = int(sys.argv[2])
+        while remaining:
+            chunk = os.read(0, min(65536, remaining))
+            if not chunk:
+                break
+            sys.stdout.buffer.write(chunk)
+            remaining -= len(chunk)
     elif tool == "sha256sum":
         for line in Path(sys.argv[-1]).read_text().splitlines():
             digest, name = line.split("  ", 1)
@@ -56,7 +68,8 @@ if tool in ("curl", "uname", "ldd", "mv", "sha256sum"):
     sys.exit(0)
 
 script = sys.stdin.read()
-assert "Checking NativePipe" in script
+upload = "--upload" in sys.argv
+assert ("NATIVEPIPE TARGET" if upload else "Checking NativePipe") in script
 with tempfile.TemporaryDirectory(prefix="nativepipe-installer-") as directory:
     root = Path(directory)
     fixture = root / "github"
@@ -66,6 +79,8 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-installer-") as directory:
     binary = root / "bin"
     binary.mkdir()
     utilities = ["curl", "uname", "ldd", "mv"]
+    if upload and sys.platform == 'darwin':
+        utilities.append('head')
     if shutil.which("sha256sum") is None:  # Stock macOS has shasum instead.
         utilities.append("sha256sum")
     for name in utilities:
@@ -81,7 +96,12 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-installer-") as directory:
         with tarfile.open(target / asset, "w:gz") as archive:
             files = {"lib/version": version.encode()}
             if executable:
-                files["nativepipe-wayland"] = ("#!/bin/sh\nprintf '%s\\n' '" + version + "'\n").encode()
+                # The upload prelude must leave following stdin bytes intact.
+                status = 71 if version == 'bad-runtime' else 0
+                check = f'if [ "${{1:-}}" = --check-runtime ]; then exit {status}; fi\n'
+                if upload:
+                    check += 'read marker\n[ "$marker" = AFTER_ARCHIVE ] || exit 97\n'
+                files["nativepipe-wayland"] = ("#!/bin/sh\n" + check + "printf '%s\\n' '" + version + "'\n").encode()
             for name, data in files.items():
                 info = tarfile.TarInfo(name)
                 info.size = len(data)
@@ -96,9 +116,26 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-installer-") as directory:
         release_url = "https://github.com/shih-liang/nativepipe/releases/download/" + (fixture / "latest").read_text()
         return "release=" + shlex.quote(release_url) + "\n" + script
 
-    def invoke(success=True):
-        result = subprocess.run(["/bin/sh", "-c", resolved_script()], env=env,
-                                capture_output=True, text=True, timeout=20)
+    def invoke(success=True, cached=None, truncate=False):
+        if upload:
+            process = subprocess.Popen(["/bin/sh", "-c", script], env=env,
+                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            assert process.stdout.readline() == b'NATIVEPIPE TARGET x86_64 gnu\n'
+            directory = fixture / (fixture / 'latest').read_text()
+            data = (directory / asset).read_bytes()
+            digest = (directory / 'SHA256SUMS').read_text().split()[0]
+            process.stdin.write(f'{digest} {len(data)}\n'.encode())
+            process.stdin.flush()
+            response = process.stdout.readline()
+            if cached is not None:
+                assert response == (b'NATIVEPIPE CACHED\n' if cached else b'NATIVEPIPE UPLOAD\n'), response
+            payload = data if response == b'NATIVEPIPE UPLOAD\n' else b''
+            payload = payload[:len(payload)//2] if truncate else payload + b'AFTER_ARCHIVE\n'
+            out, err = process.communicate(input=payload, timeout=20)
+            result = subprocess.CompletedProcess(process.args, process.returncode, out.decode(), err.decode())
+        else:
+            result = subprocess.run(["/bin/sh", "-c", resolved_script()], env=env,
+                                    capture_output=True, text=True, timeout=20)
         assert (result.returncode == 0) == success, result.stderr
         if success:
             assert result.stdout == (fixture / "latest").read_text() + "\n", result
@@ -110,12 +147,15 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-installer-") as directory:
     (binary / "nativepipe-wayland").write_text("#!/bin/sh\nexit 99\n")
     (binary / "nativepipe-wayland").chmod(0o755)
     first = release("v1")
-    invoke()
+    invoke(cached=False)
     first_path = current.resolve()
     assert first_path.name == first
-    requests_before = (fixture / "requests").read_text().count(asset)
-    invoke()
-    assert (fixture / "requests").read_text().count(asset) == requests_before
+    requests_before = 0 if upload else (fixture / "requests").read_text().count(asset)
+    invoke(cached=True)
+    if upload:
+        assert not (fixture / 'requests').exists(), 'Bundled installation contacted GitHub'
+    else:
+        assert (fixture / "requests").read_text().count(asset) == requests_before
     second = release("v2")
     invoke()
     assert current.resolve().name == second
@@ -125,6 +165,9 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-installer-") as directory:
         archive.write(b"corruption")
     invoke(success=False)
     assert current.resolve().name == second
+    release('bad-runtime')
+    invoke(success=False)
+    assert current.resolve().name == second, 'An incompatible runtime replaced the active version'
     release("missing-executable", executable=False)
     invoke(success=False)
     assert current.resolve().name == second
@@ -132,16 +175,25 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-installer-") as directory:
     (fixture / "bad-manifest/SHA256SUMS").write_text("not-a-digest  " + asset + "\n")
     invoke(success=False)
     assert current.resolve().name == second
-    (fixture / "latest").write_text("offline")
-    assert "HTTP 404" in invoke(success=False).stderr
+    if upload:
+        release('truncated')
+        assert 'interrupted' in invoke(success=False, truncate=True).stderr
+    else:
+        (fixture / "latest").write_text("offline")
+        assert "HTTP 404" in invoke(success=False).stderr
     assert current.resolve().name == second
     third = release("v3")
-    children = [subprocess.Popen(["/bin/sh", "-c", resolved_script()], env=env,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(3)]
-    for child in children:
-        out, err = child.communicate(timeout=20)
-        assert child.returncode == 0 and out == b"v3\n", err.decode()
+    if upload:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=3) as workers:
+            list(workers.map(lambda _: invoke(), range(3)))
+    else:
+        children = [subprocess.Popen(["/bin/sh", "-c", resolved_script()], env=env,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(3)]
+        for child in children:
+            out, err = child.communicate(timeout=20)
+            assert child.returncode == 0 and out == b"v3\n", err.decode()
     assert current.resolve().name == third
     assert (current / "lib/version").read_text() == "v3"
     assert not list(installation.glob(".install-*")), "Staging directories leaked"
-    print("PASS install, cached reconnect, update, immutable running version, corrupt archive, missing executable, invalid manifest, GitHub failure, concurrent publication")
+    print("PASS", "bundled upload" if upload else "GitHub download", "install, cached reconnect, update, immutable running version, corrupt archive, missing executable, invalid manifest, interruption/offline, concurrent publication")

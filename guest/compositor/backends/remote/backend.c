@@ -73,7 +73,10 @@ int np_backend_run(int argc, char **argv)
 }
 bool np_backend_prepare(struct np_server *server)
 {
-    fprintf(stderr, "[wayland] remote backend: SSH stdio, H.264/alpha resources\n");
+    const char *capability = getenv("NATIVEPIPE_HOST_H264_HARDWARE");
+    np_remote_backend(server)->host_h264_hardware = capability && !strcmp(capability, "1");
+    fprintf(stderr, "[wayland] remote backend: SSH stdio, %s/alpha resources\n",
+        np_remote_backend(server)->host_h264_hardware ? "NVENC H.264 preferred, AV1 fallback" : "AV1");
     return true;
 }
 void np_backend_advertise_globals(struct np_server *server)

@@ -25,15 +25,25 @@ final class RemoteInstallerTests: XCTestCase {
     }
 
     func testInstallUpdateCacheIntegrityAndConcurrentPublication() throws {
+        try runInstallerFixture(upload: false)
+    }
+
+    func testBundledUploadAtomicInstallCacheAndProtocolBoundary() throws {
+        try runInstallerFixture(upload: true)
+    }
+
+    private func runInstallerFixture(upload: Bool) throws {
         let fixture = try XCTUnwrap(Bundle.module.url(forResource: "installer-check", withExtension: "py", subdirectory: "Resources"))
         let process = Process(), input = Pipe(), output = Pipe()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        process.arguments = [fixture.path]
+        process.arguments = [fixture.path] + (upload ? ["--upload"] : [])
         process.standardInput = input
         process.standardOutput = output
         process.standardError = output
         try process.run()
-        try input.fileHandleForWriting.write(contentsOf: Data(SSHCommand(destination: "test", application: ["true"], installCompositor: true).remoteScript.utf8))
+        let script = SSHCommand(destination: "test", application: ["true"], installCompositor: true)
+            .makeRemoteScript(uploadCompositor: upload)
+        try input.fileHandleForWriting.write(contentsOf: Data(script.utf8))
         try input.fileHandleForWriting.close()
         let result = output.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()

@@ -78,7 +78,7 @@ static void *writer(void *data)
     struct np_media *m = data;
     pthread_mutex_lock(&m->lock);
     while (!m->stopping && !m->failed) {
-        int lane;
+        int lane = 0;
         while (!m->stopping && !m->failed && (lane = ready_lane(m)) < 0)
             pthread_cond_wait(&m->ready, &m->lock);
         if (m->stopping || m->failed) break;

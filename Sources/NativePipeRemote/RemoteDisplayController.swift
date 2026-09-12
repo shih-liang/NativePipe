@@ -15,8 +15,10 @@ public final class RemoteDisplayController {
     public var onStateChange: ((RemoteSession.State) -> Void)?
     public var applications: [GuestApplication] { session.applicationClient.cached ?? [] }
 
-    public init(command: SSHCommand, environment: [String: String]? = nil) {
-        session = RemoteSession(command: command, environment: environment)
+    public init(command: SSHCommand, environment: [String: String]? = nil,
+                localCompositorDirectory: URL? = nil) {
+        session = RemoteSession(command: command, environment: environment,
+                                localCompositorDirectory: localCompositorDirectory)
         frames = RemoteFrameSource()
         bridge = WindowBridge(frameSource: frames)
         bridge.fileAccess = RemoteUserFileAccess(command: command, environment: environment)

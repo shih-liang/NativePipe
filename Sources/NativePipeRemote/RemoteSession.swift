@@ -19,6 +19,8 @@ public final class RemoteSession {
     private let environment: [String: String]?
     private let executable: String
     private let argumentsOverride: [String]?
+    private let localCompositorDirectory: URL?
+    private let allowHardwareH264: Bool
     private var process: Process?
     private var generation = 0
     private var continuation: CheckedContinuation<Void, Error>?
@@ -29,17 +31,22 @@ public final class RemoteSession {
     private var writer: WindowCommandWriter?
     private var inbound: RemoteInbound?
 
-    public init(command: SSHCommand, environment: [String: String]? = nil) {
+    public init(command: SSHCommand, environment: [String: String]? = nil,
+                localCompositorDirectory: URL? = nil, allowHardwareH264: Bool = true) {
         self.command = command
         self.environment = environment
+        self.localCompositorDirectory = localCompositorDirectory
+        self.allowHardwareH264 = allowHardwareH264
         executable = "/usr/bin/ssh"
         argumentsOverride = nil
     }
 
     // Uses real pipes and the same lifecycle in transport tests.
-    init(testExecutable: String, arguments: [String]) {
-        command = SSHCommand(destination: "test", application: ["true"])
+    init(testExecutable: String, arguments: [String], localCompositorDirectory: URL? = nil) {
+        command = SSHCommand(destination: "test", application: ["true"], installCompositor: localCompositorDirectory != nil)
         environment = nil
+        allowHardwareH264 = false
+        self.localCompositorDirectory = localCompositorDirectory
         executable = testExecutable
         argumentsOverride = arguments
     }
@@ -61,9 +68,12 @@ public final class RemoteSession {
     }
 
     private func establishConnection(token: Int) async throws {
+        let localCompositor = command.installCompositor && command.compositor == "nativepipe-wayland"
+            ? localCompositorDirectory : nil
         let arguments: [String]
         if let argumentsOverride { arguments = argumentsOverride }
-        else { arguments = try await command.arguments() }
+        else { arguments = try await command.arguments(uploadCompositor: localCompositor != nil,
+            hardwareH264: allowHardwareH264 && H264Decoder.hardwareAvailable) }
         try Task.checkCancellation()
         guard generation == token else { throw CancellationError() }
         let writer = WindowCommandWriter(remote: true, write: Self.writeAll)
@@ -113,6 +123,15 @@ public final class RemoteSession {
                         throw POSIXError(.EIO)
                     }
                     writer.install(input.fileHandleForWriting)
+                    // The bootstrap owns a duplicate until it hands stdin to
+                    // the protocol writer. Disconnect can close the writer's
+                    // descriptor without reusing a descriptor under this I/O.
+                    let uploadInput: FileHandle?
+                    if localCompositor != nil {
+                        let descriptor = fcntl(fd, F_DUPFD_CLOEXEC, 0)
+                        guard descriptor >= 0 else { throw POSIXError(.EMFILE) }
+                        uploadInput = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+                    } else { uploadInput = nil }
                     let diagnosticsTask = Task.detached {
                         while let bytes = try? Self.readChunk(errors.fileHandleForReading, capacity: 4096),
                               !bytes.isEmpty {
@@ -121,9 +140,16 @@ public final class RemoteSession {
                         try? errors.fileHandleForReading.close()
                     }
                     Task.detached {
+                        defer { try? uploadInput?.close() }
                         var decoder = RemoteStreamDecoder()
                         do {
-                            while true {
+                            var prepared = true
+                            if let localCompositor, let uploadInput {
+                                prepared = try RemoteCompositorUpload.prepare(directory: localCompositor,
+                                    input: uploadInput, output: output.fileHandleForReading, write: Self.writeAll)
+                                try uploadInput.close()
+                            }
+                            while prepared {
                                 let bytes = try Self.readChunk(output.fileHandleForReading, capacity: 65_536)
                                 if bytes.isEmpty { break }
                                 decoder.append(bytes)

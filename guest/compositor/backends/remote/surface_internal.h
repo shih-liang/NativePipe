@@ -9,7 +9,6 @@
 struct np_remote_surface {
 	struct np_encoder *encoder;
 	struct np_remote_scene_job *job;
-	uint16_t last_epoch;
 	unsigned char *pixels;
 	uint64_t pts_ns;
 	uint8_t flags;

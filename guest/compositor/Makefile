@@ -1,17 +1,18 @@
 # One Wayland frontend with two link-selected transport/render backends. Both
 # backends export np_backend_run; main.c contains no backend selection logic:
 #   vmpipe:    vsock + virtio-gpu/Venus resources
-#   remote: SSH stdio + immutable H.264 media resources
+#   remote: SSH stdio + immutable H.264/AV1 media resources
 
 COMMON_PKGS   := wayland-server xkbcommon gio-unix-2.0 gdk-pixbuf-2.0 librsvg-2.0
-REMOTE_PKGS   := egl glesv2 gbm libdrm libavcodec libavutil libswscale
+REMOTE_PKGS   := egl glesv2 gbm libdrm libva
 CLIENT_PKGS   := wayland-client
 BASE_CFLAGS   := -O2 -Wall -Wextra -Wno-unused-parameter -std=gnu11 -I.
 STRIP         ?= strip
 COMMON_CFLAGS := $(shell pkg-config --cflags $(COMMON_PKGS) 2>/dev/null)
 COMMON_LIBS   := $(shell pkg-config --libs $(COMMON_PKGS) 2>/dev/null) -lm
-REMOTE_CFLAGS := $(shell pkg-config --cflags $(REMOTE_PKGS) 2>/dev/null)
-REMOTE_LIBS   := $(shell pkg-config --libs $(REMOTE_PKGS) 2>/dev/null) -pthread
+CODEC_PREFIX ?= $(abspath ../../.build/codecs/$(ARCH)-$(LIBC))
+REMOTE_CFLAGS = $(shell pkg-config --cflags $(REMOTE_PKGS) 2>/dev/null) -I$(CODEC_PREFIX)/include
+REMOTE_LIBS   = $(shell pkg-config --libs egl glesv2 gbm libdrm 2>/dev/null) $(CODEC_PREFIX)/lib/libaom.a $(CODEC_PREFIX)/lib/libyuv.a -lstdc++ -lm -ldl -pthread -Wl,--gc-sections
 VM_CFLAGS     := $(shell pkg-config --cflags libdrm 2>/dev/null)
 
 PROJECT_ROOT   := $(abspath ../..)
@@ -73,7 +74,7 @@ REMOTE_SOURCES := backends/remote/backend.c backends/remote/host_session.c \
 	backends/remote/dmabuf.c backends/remote/dmabuf_egl.c \
 	backends/remote/syncobj.c backends/remote/shm_texture.c \
 	backends/remote/presentation.c backends/remote/scene.c \
-	../encoder/encoder.c ../encoder/alpha.c
+	../encoder/encoder.c ../encoder/encoder_vaapi.c ../encoder/encoder_nvenc.c ../encoder/alpha.c
 
 ARCH          ?= $(shell uname -m | sed 's/^arm64$$/aarch64/')
 LIBC          ?= $(shell ldd --version 2>&1 | grep -qi musl && echo musl || echo gnu)
@@ -112,10 +113,32 @@ test-remote-transport: | $(BUILD_DIR)
 
 .PHONY: test-applications test-file-drag test-remote-encoder
 test-remote-encoder: | $(BUILD_DIR) check-deps-remote
-	$(CC) -O2 -Wall -Wextra -Werror -std=gnu11 $(REMOTE_CFLAGS) \
-		tests/remote_encoder_test.c ../encoder/encoder.c ../encoder/alpha.c \
-		$(REMOTE_LIBS) -o $(BUILD_DIR)/remote-encoder-test
+	$(CC) -O2 -Wall -Wextra -Werror -std=gnu11 $(REMOTE_CFLAGS) $$(pkg-config --cflags dav1d) \
+		tests/remote_encoder_test.c ../encoder/encoder.c ../encoder/encoder_vaapi.c ../encoder/encoder_nvenc.c ../encoder/alpha.c \
+		$(REMOTE_LIBS) $$(pkg-config --libs dav1d) -o $(BUILD_DIR)/remote-encoder-test
 	$(BUILD_DIR)/remote-encoder-test
+	$(CC) -O2 -Wall -Wextra -Werror -std=gnu11 $(REMOTE_CFLAGS) $$(pkg-config --cflags dav1d) \
+		tests/encoder_fallback_test.c ../encoder/encoder.c ../encoder/alpha.c \
+		$(REMOTE_LIBS) $$(pkg-config --libs dav1d) -o $(BUILD_DIR)/encoder-fallback-test
+	$(BUILD_DIR)/encoder-fallback-test
+	$(CC) -O2 -Wall -Wextra -Werror -std=gnu11 $(REMOTE_CFLAGS) $$(pkg-config --cflags dav1d) \
+		tests/av1_headers_test.c $(REMOTE_LIBS) $$(pkg-config --libs dav1d) -o $(BUILD_DIR)/av1-headers-test
+	$(BUILD_DIR)/av1-headers-test
+
+.PHONY: bench-remote-encoder
+.PHONY: test-hardware-encoder
+test-hardware-encoder: | $(BUILD_DIR) check-deps-remote
+	$(CC) -O2 -Wall -Wextra -Werror -std=gnu11 $(REMOTE_CFLAGS) \
+		tests/hardware_encoder_test.c ../encoder/encoder.c ../encoder/encoder_vaapi.c ../encoder/encoder_nvenc.c ../encoder/alpha.c \
+		$(REMOTE_LIBS) -o $(BUILD_DIR)/hardware-encoder-test
+	$(BUILD_DIR)/hardware-encoder-test $(BUILD_DIR)/hardware.npen
+
+BENCH_ARGS ?= 1656 1258 90
+bench-remote-encoder: | $(BUILD_DIR) check-deps-remote
+	$(CC) -O2 -Wall -Wextra -Werror -std=gnu11 $(REMOTE_CFLAGS) $$(pkg-config --cflags dav1d) \
+		tests/remote_encoder_bench.c ../encoder/encoder.c ../encoder/encoder_vaapi.c ../encoder/encoder_nvenc.c ../encoder/alpha.c \
+		$(REMOTE_LIBS) $$(pkg-config --libs dav1d) -o $(BUILD_DIR)/remote-encoder-bench
+	$(BUILD_DIR)/remote-encoder-bench $(BENCH_ARGS)
 
 test-file-drag: | $(BUILD_DIR)
 	$(CC) -O0 -g -Wall -Wextra -Werror -Wno-unused-parameter -std=gnu11 -I. \
@@ -137,8 +160,11 @@ print-vmpipe:
 
 check-deps: check-deps-remote check-deps-vmpipe
 check-deps-remote:
+	@test -s '$(CODEC_PREFIX)/lib/libaom.a' -a -s '$(CODEC_PREFIX)/lib/libyuv.a' || { \
+		echo 'error: run python3 scripts/build-codecs.py $(ARCH)-$(LIBC) from the NativePipe root'; exit 1; \
+	}
 	@pkg-config --exists $(COMMON_PKGS) $(REMOTE_PKGS) || { \
-		echo 'error: missing RemotePipe Wayland/EGL/GBM/DRM/FFmpeg development packages'; \
+		echo 'error: missing RemotePipe Wayland/EGL/GBM/DRM/libva development packages'; \
 		exit 1; \
 	}
 check-deps-vmpipe:
@@ -192,8 +218,9 @@ linux-drm-syncobj-v1-server-protocol.h: $(SYNCOBJ_XML)
 linux-drm-syncobj-v1-protocol.c: $(SYNCOBJ_XML)
 	wayland-scanner private-code $(SYNCOBJ_XML) $@
 
-$(REMOTE_BINARY): $(GENERATED) $(COMMON_SOURCES) $(REMOTE_SOURCES) $(wildcard *.h backends/remote/*.h ../encoder/*.h) \
-	$(SOURCE_HASH) Makefile | $(BUILD_DIR) check-deps-remote
+$(REMOTE_BINARY): $(GENERATED) $(COMMON_SOURCES) $(REMOTE_SOURCES) $(wildcard *.h backends/remote/*.h ../encoder/*.h ../encoder/vendor/*.h) \
+	$(SOURCE_HASH) Makefile $(wildcard $(CODEC_PREFIX)/lib/libaom.a $(CODEC_PREFIX)/lib/libyuv.a) \
+	../../scripts/build-codecs.py | $(BUILD_DIR) check-deps-remote
 	$(CC) $(BASE_CFLAGS) $(COMMON_CFLAGS) $(REMOTE_CFLAGS) \
 		-Ibackends/remote $(SOURCE_DEFINE) -o $@ \
 		$(COMMON_SOURCES) $(REMOTE_SOURCES) $(COMMON_LIBS) $(REMOTE_LIBS)

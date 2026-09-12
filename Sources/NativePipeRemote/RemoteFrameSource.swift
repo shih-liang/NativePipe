@@ -6,14 +6,15 @@ import Metal
 import NativePipeProtocol
 import NativePipeWindowing
 
-/// Thread-safe remote frame store. H.264 parsing and VideoToolbox submission
+/// Thread-safe remote frame store. AV1/H.264 parsing and decoder submission
 /// stay on `decodeQueue`; only the finished IOSurface is observed by AppKit.
 public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
-    // The decoder callback may arrive on a VideoToolbox worker before it is
-    // serialized back onto decodeQueue.  The stream itself is only mutated on
-    // decodeQueue, so carrying its identity across that hop is safe.
+    // Both decoders finish one access unit on decodeQueue before returning.
     private final class Stream: @unchecked Sendable {
         let decoder = H264Decoder()
+        let av1 = AV1Decoder()
+        var codec: MediaWire.Codec?
+        func reset() { decoder.reset(); av1.reset() }
         let generation: UInt64
         init(generation: UInt64) { self.generation = generation }
         var epoch: UInt16 = 0
@@ -30,13 +31,6 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
         let width: Int
         let height: Int
         let bytes: Data
-    }
-
-    /// CVPixelBuffer is a reference-counted CoreVideo object that Swift does
-    /// not annotate Sendable.  We retain it only to move the decoded frame onto
-    /// decodeQueue; all subsequent access remains serialized there.
-    private struct DecodedFrame: @unchecked Sendable {
-        let pixelBuffer: CVPixelBuffer
     }
 
     private final class StoredFrame {
@@ -60,6 +54,12 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
     nonisolated(unsafe) private var destroyedSurfaces: Set<UInt32> = []
     nonisolated(unsafe) private var frameAvailable: (@MainActor (UInt32) -> Void)?
     nonisolated(unsafe) private var queuedMediaBytes = 0
+    nonisolated(unsafe) private var hardwareFrames = 0
+    nonisolated(unsafe) private var softwareFrames = 0
+    public var decoderFrameCounts: (hardware: Int, software: Int) {
+        lock.lock(); defer { lock.unlock() }
+        return (hardwareFrames, softwareFrames)
+    }
     private let device = MTLCreateSystemDefaultDevice()
     private let maximumFramesPerStream = 12
     nonisolated(unsafe) private var generation: UInt64 = 0
@@ -76,7 +76,7 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
     @MainActor private var textureRequests: [TextureRequest] = []
     @MainActor private var consumptionRequests: [(generation: UInt64, layers: [Windowing.SceneLayer], completion: @MainActor () -> Void)] = []
 
-    /// Discarding metadata does not consume its queued H.264 input. Remote
+    /// Discarding metadata does not consume its queued compressed input. Remote
     /// display credit is returned only after decode/alpha has crossed it.
     @MainActor public func whenConsumed(_ layers: [Windowing.SceneLayer], completion: @escaping @MainActor () -> Void) {
         lock.lock(); let token = generation; lock.unlock()
@@ -267,25 +267,19 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
                 self.streams[id] = stream
                 stream.decoder.onFrame = { [weak self, weak stream] resourceID, pixelBuffer in
                     guard let self, let stream else { return }
-                    let decodedFrame = DecodedFrame(pixelBuffer: pixelBuffer)
-                    self.decodeQueue.async { [weak self, weak stream] in
-                        guard let self, let stream else { return }
-                        self.receiveDecoded(
-                            decodedFrame.pixelBuffer, stream: stream,
-                            surfaceID: id, resourceID: resourceID)
-                    }
+                    self.receiveDecoded(pixelBuffer, stream: stream,
+                        surfaceID: id, resourceID: resourceID)
                 }
                 stream.decoder.onFailure = { [weak self, weak stream] resourceID in
                     guard let self, let stream else { return }
-                    self.decodeQueue.async { [weak self, weak stream] in
-                        guard let self, let stream else { return }
-                        self.lock.lock()
-                        let current = self.streams[id] === stream && stream.pendingIDs.contains(resourceID)
-                        self.lock.unlock()
-                        if current { self.fail("Could not decode remote frame \(resourceID).", generation: stream.generation) }
-                    }
+                    self.lock.lock()
+                    let current = self.streams[id] === stream && stream.pendingIDs.contains(resourceID)
+                    self.lock.unlock()
+                    if current { self.fail("Could not decode remote frame \(resourceID).", generation: stream.generation) }
                 }
             }
+            stream.av1.onFrame = stream.decoder.onFrame
+            stream.av1.onFailure = stream.decoder.onFailure
             if header.bitstreamEpoch != 0, header.bitstreamEpoch != stream.epoch {
                 for resourceID in stream.resourceIDs {
                     self.frames.removeValue(forKey: resourceID)
@@ -297,15 +291,24 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
                 stream.lastAlpha = nil
                 stream.pendingVideo.removeAll(keepingCapacity: true)
                 stream.epoch = header.bitstreamEpoch
+                stream.codec = nil
                 self.lock.unlock()
-                stream.decoder.reset()
+                stream.reset()
             } else {
                 self.lock.unlock()
             }
 
             switch header.codec {
-            case .h264:
+            case .h264, .av1:
                 self.lock.lock()
+                // A codec switch must be accompanied by a new reference epoch.
+                if let codec = stream.codec, codec != header.codec {
+                    stream.codec = header.codec
+                    self.lock.unlock()
+                    self.fail("Remote codec changed without a new epoch.", generation: token)
+                    return
+                }
+                stream.codec = header.codec
                 if header.flags & MediaWire.flagHasAlpha != 0 {
                     if header.flags & MediaWire.flagReuseAlpha != 0 {
                         guard let alpha = stream.lastAlpha, alpha.width == Int(header.width),
@@ -323,12 +326,16 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
                 }
                 self.trackPending(header.resourceID, stream: stream)
                 self.lock.unlock()
-                stream.decoder.decode(
+                if header.codec == .av1 {
+                    stream.av1.decode(obu: payload, width: Int(header.width), height: Int(header.height),
+                        bitstreamEpoch: header.bitstreamEpoch, resourceID: header.resourceID)
+                } else { stream.decoder.decode(
                     annexB: payload,
                     width: Int(header.width),
                     height: Int(header.height),
                     bitstreamEpoch: header.bitstreamEpoch,
-                    resourceID: header.resourceID)
+                    resourceID: header.resourceID,
+                    requireHardware: header.flags & MediaWire.flagHardwareEncoded != 0) }
             case .alphaRLE:
                 let width = Int(header.width)
                 let height = Int(header.height)
@@ -359,7 +366,7 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
             }
             self.scheduleNotification()
             self.lock.unlock()
-            stream?.decoder.reset()
+            stream?.reset()
         }
     }
 
@@ -367,6 +374,7 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
         lock.lock()
         generation &+= 1
         decodingFailed = false
+        hardwareFrames = 0; softwareFrames = 0
         frames.removeAll()
         newestNotification = nil
         scheduleNotification()
@@ -380,7 +388,7 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
             self.frames.removeAll()
             self.destroyedSurfaces.removeAll()
             self.lock.unlock()
-            for stream in removed { stream.decoder.reset() }
+            for stream in removed { stream.reset() }
         }
         lock.unlock()
     }
@@ -435,6 +443,9 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
             lock.unlock()
             return
         }
+        if stream.codec == .h264 ? stream.decoder.usingHardware : stream.av1.usingHardware {
+            hardwareFrames += 1
+        } else { softwareFrames += 1 }
         if stream.expectedAlpha.contains(resourceID),
            stream.alphaPlanes[resourceID] == nil {
             stream.pendingVideo[resourceID] = pixelBuffer

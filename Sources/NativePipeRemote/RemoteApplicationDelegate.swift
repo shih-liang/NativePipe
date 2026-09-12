@@ -33,11 +33,12 @@ public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
         title: name, bridge: { [weak self] in self?.display.bridge })
 
     public init(command: SSHCommand, environment: [String: String]? = nil,
-                showErrors: Bool = false) {
+                showErrors: Bool = false, localCompositorDirectory: URL? = nil) {
         name = command.destination
         self.showErrors = showErrors
         loadsApplicationIcons = !command.persistentSession
-        display = RemoteDisplayController(command: command, environment: environment)
+        display = RemoteDisplayController(command: command, environment: environment,
+                                          localCompositorDirectory: localCompositorDirectory)
         super.init()
     }
 

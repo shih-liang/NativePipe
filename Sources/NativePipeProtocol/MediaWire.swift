@@ -3,7 +3,7 @@ import Foundation
 /// Encoded media frame on the NativePipe media port (`NativePipePort.media`).
 ///
 /// Layout is little-endian, fixed 36-byte header, then `payloadLength` bytes
-/// of codec bitstream (H.264 Annex-B for codec == h264).
+/// of codec bitstream (H.264 Annex-B or AV1 low-overhead OBUs, selected by codec).
 public enum MediaWire {
     public static let version: UInt8 = 2
     public static let headerSize = 36
@@ -11,10 +11,13 @@ public enum MediaWire {
     public static let magic = Data("NPEN".utf8)
     public static let flagHasAlpha: UInt8 = 1 << 0
     public static let flagReuseAlpha: UInt8 = 1 << 1
+    /// Set only after the guest's hardware encoder produced this packet.
+    public static let flagHardwareEncoded: UInt8 = 1 << 2
 
     public enum Codec: UInt8, Sendable {
         case h264 = 1
         case alphaRLE = 2
+        case av1 = 3
     }
 
     /// Decodes the PackBits alpha sidecar used for translucent Wayland
@@ -55,7 +58,7 @@ public enum MediaWire {
         public var version: UInt8
         public var codec: Codec
         public var flags: UInt8
-        /// H.264 decoder stream. One stream exists per Wayland surface.
+        /// Decoder stream. One stream exists per Wayland surface.
         public var surfaceID: UInt32
         /// Immutable decoded frame named by a committed scene layer.
         public var resourceID: UInt32

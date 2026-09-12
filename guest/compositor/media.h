@@ -10,12 +10,14 @@
 #define NP_MEDIA_HEADER_SIZE 36
 #define NP_MEDIA_CODEC_H264 1
 #define NP_MEDIA_CODEC_ALPHA_RLE 2
+#define NP_MEDIA_CODEC_AV1 3
 #define NP_MEDIA_FLAG_HAS_ALPHA 1
+#define NP_MEDIA_FLAG_HARDWARE 4
 
 struct np_media_header {
 	char magic[4];       /* "NPEN" */
 	uint8_t version;     /* 2 */
-	uint8_t codec;       /* NP_MEDIA_CODEC_H264 */
+	uint8_t codec;       /* NP_MEDIA_CODEC_* */
 	uint8_t flags;
 	uint8_t pad;
 	uint32_t surface_id; /* little-endian on wire */

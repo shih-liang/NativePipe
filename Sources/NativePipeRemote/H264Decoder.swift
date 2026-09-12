@@ -5,10 +5,15 @@ import VideoToolbox
 
 /// Incremental H.264 Annex-B → CVPixelBuffer decoder (VideoToolbox).
 final class H264Decoder {
-    private final class FrameToken {
-        let resourceID: UInt32
-        init(_ resourceID: UInt32) { self.resourceID = resourceID }
+    // With no asynchronous flag, VT completes the output handler before
+    // DecodeFrame returns. All state and delivery stay on the decode queue.
+    private final class DecodeResult: @unchecked Sendable {
+        var pixel: CVPixelBuffer?
+        var status: OSStatus = -1
     }
+    static var hardwareAvailable: Bool { VTIsHardwareDecodeSupported(kCMVideoCodecType_H264) }
+    private(set) var usingHardware = false
+    private var requiresHardware = false
 
     private var session: VTDecompressionSession?
     private var formatDescription: CMVideoFormatDescription?
@@ -23,10 +28,10 @@ final class H264Decoder {
 
     func reset() {
         if let session {
-            VTDecompressionSessionWaitForAsynchronousFrames(session)
             VTDecompressionSessionInvalidate(session)
         }
         session = nil
+        usingHardware = false
         formatDescription = nil
         sps = nil
         pps = nil
@@ -37,12 +42,18 @@ final class H264Decoder {
 
     func decode(
         annexB: Data, width: Int, height: Int,
-        bitstreamEpoch: UInt16, resourceID: UInt32
+        bitstreamEpoch: UInt16, resourceID: UInt32, requireHardware: Bool = false
     ) {
-        if bitstreamEpoch != 0, bitstreamEpoch != epoch {
+        guard width >= 2, height >= 2, width <= 8192, height <= 8192,
+              width * height <= 16_777_216, annexB.count <= 32 * 1024 * 1024 else {
+            onFailure?(resourceID); return
+        }
+        if (bitstreamEpoch != 0 && bitstreamEpoch != epoch) ||
+           width != self.width || height != self.height || requireHardware != requiresHardware {
             reset()
             epoch = bitstreamEpoch
         }
+        requiresHardware = requireHardware
         self.width = width
         self.height = height
 
@@ -71,7 +82,7 @@ final class H264Decoder {
                 break
             }
         }
-        if formatChanged { rebuildFormatIfPossible() }
+        if formatChanged, !rebuildFormatIfPossible() { onFailure?(resourceID); return }
         guard !vcl.isEmpty else { onFailure?(resourceID); return }
         guard session != nil else {
             fputs("nativepipe-remote: H264: VCL without VT session\n", stderr)
@@ -82,8 +93,8 @@ final class H264Decoder {
         if !decodeAccessUnit(vcl, resourceID: resourceID) { onFailure?(resourceID) }
     }
 
-    private func rebuildFormatIfPossible() {
-        guard let sps, let pps else { return }
+    private func rebuildFormatIfPossible() -> Bool {
+        guard let sps, let pps else { return false }
         var description: CMVideoFormatDescription?
         let status: OSStatus = sps.withUnsafeBytes { spsRaw in
             guard let spsBase = spsRaw.bindMemory(to: UInt8.self).baseAddress else { return -1 }
@@ -107,12 +118,16 @@ final class H264Decoder {
         if status != noErr {
             fputs("nativepipe-remote: H264 format desc failed status=\(status)\n", stderr)
             fflush(stderr)
-            return
+            reset(); return false
         }
-        if let description {
-            formatDescription = description
-            recreateSession(description)
+        guard let description else { reset(); return false }
+        let dimensions = CMVideoFormatDescriptionGetDimensions(description)
+        guard dimensions.width == width, dimensions.height == height else {
+            reset(); return false
         }
+        formatDescription = description
+        recreateSession(description)
+        return session != nil
     }
 
     private func recreateSession(_ description: CMVideoFormatDescription) {
@@ -120,22 +135,7 @@ final class H264Decoder {
             VTDecompressionSessionInvalidate(session)
             self.session = nil
         }
-        var callback = VTDecompressionOutputCallbackRecord(
-            decompressionOutputCallback: { refcon, sourceFrameRefCon, status, _, imageBuffer, _, _ in
-                guard let refcon else { return }
-                let decoder = Unmanaged<H264Decoder>.fromOpaque(refcon).takeUnretainedValue()
-                let resourceID = sourceFrameRefCon.map {
-                    Unmanaged<FrameToken>.fromOpaque($0).takeRetainedValue().resourceID
-                }
-                if status == noErr, let imageBuffer {
-                    if let resourceID { decoder.onFrame?(resourceID, imageBuffer) }
-                } else {
-                    if status != noErr { fputs("nativepipe-remote: VT callback status=\(status)\n", stderr) }
-                    if let resourceID { decoder.onFailure?(resourceID) }
-                }
-            },
-            decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque()
-        )
+        usingHardware = false
         var session: VTDecompressionSession?
         let attrs: [CFString: Any] = [
             kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
@@ -144,13 +144,29 @@ final class H264Decoder {
         let status = VTDecompressionSessionCreate(
             allocator: kCFAllocatorDefault,
             formatDescription: description,
-            decoderSpecification: nil,
+            decoderSpecification: [requiresHardware
+                ? kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder
+                : kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: true] as CFDictionary,
             imageBufferAttributes: attrs as CFDictionary,
-            outputCallback: &callback,
+            outputCallback: nil,
             decompressionSessionOut: &session)
-        if status == noErr {
+        if status == noErr, let session {
+            // VTSessionCopyProperty uses an untyped out pointer and returns
+            // a retained CF object; make that ownership explicit to Swift.
+            var property: Unmanaged<CFTypeRef>?
+            let checked = VTSessionCopyProperty(session,
+                key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
+                allocator: nil, valueOut: &property)
+            let hardware = property?.takeRetainedValue() as? NSNumber
+            usingHardware = checked == noErr && hardware?.boolValue == true
+            guard !requiresHardware || usingHardware else {
+                VTDecompressionSessionInvalidate(session)
+                fputs("nativepipe-remote: H264 hardware decoder is unavailable\n", stderr)
+                return
+            }
             self.session = session
-            fputs("nativepipe-remote: H264 VT session ready\n", stderr)
+            VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+            fputs("nativepipe-remote: H264 VideoToolbox \(usingHardware ? "hardware" : "software") session ready\n", stderr)
             fflush(stderr)
         } else {
             fputs("nativepipe-remote: VT session create status=\(status)\n", stderr)
@@ -207,18 +223,17 @@ final class H264Decoder {
             sampleBufferOut: &sampleBuffer)
         guard sampleStatus == noErr, let sampleBuffer else { return false }
 
-        var flagsOut: VTDecodeInfoFlags = []
-        let asynchronous = VTDecodeFrameFlags(rawValue: 1 << 0)
-        let token = Unmanaged.passRetained(FrameToken(resourceID)).toOpaque()
-        let decodeStatus = VTDecompressionSessionDecodeFrame(
-            session, sampleBuffer: sampleBuffer, flags: asynchronous,
-            frameRefcon: token, infoFlagsOut: &flagsOut)
-        if decodeStatus != noErr {
-            Unmanaged<FrameToken>.fromOpaque(token).release()
-            fputs("nativepipe-remote: VTDecode status=\(decodeStatus)\n", stderr)
-            fflush(stderr)
+        let result = DecodeResult()
+        let status = VTDecompressionSessionDecodeFrame(session, sampleBuffer: sampleBuffer,
+            flags: [], infoFlagsOut: nil) { status, _, pixel, _, _ in
+                result.status = status; result.pixel = pixel
+            }
+        guard status == noErr, result.status == noErr, let pixel = result.pixel,
+              CVPixelBufferGetWidth(pixel) == width, CVPixelBufferGetHeight(pixel) == height else {
+            return false
         }
-        return decodeStatus == noErr
+        onFrame?(resourceID, pixel)
+        return true
     }
 
     private static func splitAnnexB(_ data: Data) -> [Data] {

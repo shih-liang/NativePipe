@@ -24,10 +24,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
-            libavcodec-dev libavutil-dev libdrm-dev libegl1-mesa-dev \
-            libgbm-dev libgles2-mesa-dev libswscale-dev libvulkan-dev \
+            build-essential pkg-config cmake ninja-build nasm git python3 perl ca-certificates \
+            libva-dev libdav1d-dev libdrm-dev libegl1-mesa-dev \
+            libgbm-dev libgles2-mesa-dev libvulkan-dev \
             libwayland-dev libxkbcommon-dev wayland-protocols libglib2.0-dev \
             libgdk-pixbuf-2.0-dev librsvg2-dev dbus
+      - name: Restore private codec build cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .build/codecs
+          key: codecs-ci-ubuntu24-x86_64-gnu-${{ hashFiles('scripts/build-codecs.py') }}
+      - name: Build static codec dependencies
+        run: python3 scripts/build-codecs.py x86_64-gnu
       - name: Build the complete remote compositor
         run: make -C guest/compositor remote
       - name: Test remote transport
