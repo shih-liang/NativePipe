@@ -27,7 +27,8 @@ jobs:
     outputs:
       commit: ${{ steps.resolve.outputs.commit }}
       tag: ${{ steps.resolve.outputs.tag }}
-      run: ${{ steps.resolve.outputs.run }}
+      linux_run: ${{ steps.resolve.outputs.linux_run }}
+      macos_run: ${{ steps.resolve.outputs.macos_run }}
     steps:
       - name: Check out requested source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
@@ -48,29 +49,33 @@ jobs:
           repo = os.environ['GITHUB_REPOSITORY']
           def api(path):
               return json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/{path}']))
-          reusable = ''
+          reusable = {'linux': '', 'macos': ''}
           if tag:
-              required = {'nativepipe-macos-cli'} | {
+              required = {'macos': {'nativepipe-macos-cli'}, 'linux': {
                   f'nativepipe-linux-{arch}-{libc}'
-                  for arch in ('aarch64', 'x86_64') for libc in ('gnu', 'musl')}
+                  for arch in ('aarch64', 'x86_64') for libc in ('gnu', 'musl')}}
               runs = api(f'actions/workflows/build-linux.yml/runs?head_sha={commit}&event=push&status=success&per_page=30')
               for run in runs['workflow_runs']:
                   if run['head_branch'] != 'main' or run['head_sha'] != commit:
                       continue
                   artifacts = api(f"actions/runs/{run['id']}/artifacts?per_page=100")['artifacts']
                   available = {a['name'] for a in artifacts if not a['expired']}
-                  if required <= available:
-                      reusable = str(run['id'])
+                  for platform, names in required.items():
+                      if not reusable[platform] and names <= available:
+                          reusable[platform] = str(run['id'])
+                  if all(reusable.values()):
                       break
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write(f'commit={commit}\ntag={tag}\nrun={reusable}\n')
-          print(f'Source: {commit}; release: {tag or "none"}; reusable build: {reusable or "none"}')
+              output.write(f'commit={commit}\ntag={tag}\n')
+              for platform, run in reusable.items():
+                  output.write(f'{platform}_run={run}\n')
+          print(f'Source: {commit}; release: {tag or "none"}; reusable builds: {reusable}')
           PY
 
   build:
     name: ${{ matrix.architecture }}-${{ matrix.libc }}
     needs: source
-    if: needs.source.outputs.run == ''
+    if: needs.source.outputs.linux_run == ''
     strategy:
       fail-fast: false
       matrix:
@@ -179,7 +184,7 @@ jobs:
   macos-cli:
     name: macOS universal nativepipe
     needs: source
-    if: needs.source.outputs.run == ''
+    if: needs.source.outputs.macos_run == ''
     runs-on: macos-15
     steps:
       - name: Check out source
@@ -222,7 +227,8 @@ jobs:
     if: >-
       always() && needs.source.result == 'success' &&
       (needs.source.outputs.tag != '' || github.event_name == 'workflow_dispatch') &&
-      (needs.source.outputs.run != '' || (needs.build.result == 'success' && needs.macos-cli.result == 'success'))
+      (needs.source.outputs.linux_run != '' || needs.build.result == 'success') &&
+      (needs.source.outputs.macos_run != '' || needs.macos-cli.result == 'success')
     needs: [source, build, macos-cli]
     runs-on: ubuntu-24.04
 
@@ -238,7 +244,7 @@ jobs:
           pattern: nativepipe-linux-*
           path: .release-input
           github-token: ${{ github.token }}
-          run-id: ${{ needs.source.outputs.run || github.run_id }}
+          run-id: ${{ needs.source.outputs.linux_run || github.run_id }}
 
       - name: Download macOS command
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
@@ -246,7 +252,7 @@ jobs:
           name: nativepipe-macos-cli
           path: .macos-input
           github-token: ${{ github.token }}
-          run-id: ${{ needs.source.outputs.run || github.run_id }}
+          run-id: ${{ needs.source.outputs.macos_run || github.run_id }}
 
       - name: Create release archives
         shell: bash
