@@ -95,7 +95,9 @@ int main(void)
     read_all(output[0], chunk, 28); /* Adaptive next fragment size may change. */
     /* Failure wakes the event loop; no SIGPIPE abort, unbounded retry or spin. */
     close(output[0]);
-    assert(np_media_send_binary(&media, frame + 12, 4));
+    /* The in-progress bulk write can observe EPIPE before this enqueue. Both
+     * rejecting it immediately and accepting it before failure are correct. */
+    (void)np_media_send_binary(&media, frame + 12, 4);
     while (np_media_connected(&media)) {
         struct pollfd error = { .fd = media.error_fd, .events = POLLIN };
         assert(poll(&error, 1, 2000) > 0);
@@ -103,6 +105,7 @@ int main(void)
         (void)read(media.error_fd, &wake, sizeof(wake));
     }
     assert(!np_media_connected(&media));
+    assert(!np_media_send_binary(&media, frame + 12, 4));
     np_media_finish(&media);
     /* A large application/icon reply must not prevent the next scene from
      * being encoded. Its chunks share bandwidth, not the display work budget. */
