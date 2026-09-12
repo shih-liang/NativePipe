@@ -69,6 +69,38 @@ final class RemotePipelineTests: XCTestCase {
         try await checkPixels(codec: .av1)
     }
 
+    @MainActor func testPixelBudgetRejectsAggregateStreamsAndFollowsConsumersAcrossReset() async throws {
+        let frames = RemoteFrameSource(pixelBudgetBytes: 1_048_576)
+        let packet = try AV1DecoderTests.packets()[0]
+        let first = MediaWire.Header(codec: .av1, surfaceID: 1, resourceID: 1, width: 128, height: 96,
+            ptsNanos: 0, payloadLength: UInt32(packet.count))
+        XCTAssertTrue(frames.ingest(header: first, payload: packet))
+        for _ in 0..<200 {
+            if frames.isResourcePublished(1) { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        var owner: AnyObject? = try XCTUnwrap(frames.resolveFrame(forResource: 1,
+            width: 128, height: 96, bytesPerRow: 512, format: 1).owner)
+        let failed = expectation(description: "aggregate budget")
+        frames.onFailure = { message in
+            XCTAssertTrue(message.contains("pixel budget")); failed.fulfill()
+        }
+        var second = first; second.surfaceID = 2; second.resourceID = 2
+        XCTAssertTrue(frames.ingest(header: second, payload: packet))
+        await fulfillment(of: [failed], timeout: 2)
+        XCTAssertLessThanOrEqual(frames.pixelReservations.total, frames.pixelReservations.limit)
+        frames.removeAll()
+        for _ in 0..<200 {
+            if frames.pixelReservations.decoder == 0 { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(frames.pixelReservations.decoder, 0)
+        XCTAssertGreaterThan(frames.pixelReservations.frame, 0, "The consumer still owns its pixels")
+        withExtendedLifetime(owner) {}
+        owner = nil
+        XCTAssertEqual(frames.pixelReservations.total, 0)
+    }
+
     @MainActor private func checkPixels(codec: MediaWire.Codec) async throws {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue(),
               let gate = device.makeSharedEvent() else { throw XCTSkip("Metal is unavailable") }
@@ -98,13 +130,17 @@ final class RemotePipelineTests: XCTestCase {
             var header = MediaWire.Header(codec: codec, surfaceID: 1, resourceID: resource, width: 128, height: 96,
                 ptsNanos: UInt64(index), payloadLength: UInt32(payload.count))
             XCTAssertTrue(reference.ingest(header: header, payload: payload))
+            let alpha = Data(Array(repeating: [UInt8(129), 64], count: 96).flatMap { $0 })
+            let alphaHeader = MediaWire.Header(codec: .alphaRLE, surfaceID: 1, resourceID: resource,
+                width: 128, height: 96, ptsNanos: UInt64(index), payloadLength: UInt32(alpha.count))
             if index > 0 {
-                let alpha = Data(Array(repeating: [UInt8(129), 64], count: 96).flatMap { $0 })
-                XCTAssertTrue(frames.ingest(header: .init(codec: .alphaRLE, surfaceID: 1, resourceID: resource,
-                    width: 128, height: 96, ptsNanos: UInt64(index), payloadLength: UInt32(alpha.count)), payload: alpha))
                 header.flags = MediaWire.flagHasAlpha
+                if index.isMultiple(of: 2) { XCTAssertTrue(frames.ingest(header: alphaHeader, payload: alpha)) }
             }
             XCTAssertTrue(frames.ingest(header: header, payload: payload))
+            if index > 0, !index.isMultiple(of: 2) {
+                XCTAssertTrue(frames.ingest(header: alphaHeader, payload: alpha))
+            }
             for _ in 0..<400 {
                 if frames.isResourcePublished(resource) && reference.isResourcePublished(resource) { break }
                 try await Task.sleep(for: .milliseconds(5))
@@ -139,6 +175,8 @@ final class RemotePipelineTests: XCTestCase {
                 IOSurfaceUnlock(original, .readOnly, nil)
                 IOSurfaceUnlock(surface, .readOnly, nil)
                 XCTAssertEqual(actual, expected, "Alpha injection must preserve every RGB component")
+                XCTAssertEqual(frames.pixelReservations.alpha, 128 * 96,
+                    "Only lastAlpha survives; video-first delivery must not retain completed sidecars")
             }
         }
         XCTAssertFalse(frames.isResourcePublished(1), "Old cache entry should already be retired")

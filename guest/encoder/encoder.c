@@ -223,7 +223,7 @@ static void *encoder_worker(void *arg) {
 
 struct np_encoder *np_encoder_create(int width, int height, bool allow_h264, np_encoder_output_fn out,
                                     np_encoder_done_fn done, void *user) {
-	if (width < 2 || height < 2 || width > 8192 || height > 8192 || (uint64_t)width * height > 16777216 || !out || !done) return NULL;
+	if (width < 2 || height < 2 || width > NP_ENCODER_MAX_DIMENSION || height > NP_ENCODER_MAX_DIMENSION || (uint64_t)width * height > NP_ENCODER_MAX_PIXELS || !out || !done) return NULL;
 	struct np_encoder *enc = calloc(1, sizeof(*enc));
 	if (!enc) return NULL;
 	enc->width = width & ~1;
@@ -275,7 +275,7 @@ bool np_encoder_push_bgra(struct np_encoder *enc, const uint8_t *bgra, int width
 	                          int stride, uint64_t pts_ns, uint32_t resource_id,
 	                          uint8_t flags) {
 	if (!enc || !bgra || !resource_id || width < 2 || height < 2 ||
-	    width > 8192 || height > 8192 || (uint64_t)width * height > 16777216 || stride < width * 4)
+	    width > NP_ENCODER_MAX_DIMENSION || height > NP_ENCODER_MAX_DIMENSION || (uint64_t)width * height > NP_ENCODER_MAX_PIXELS || stride < width * 4)
 		return false;
 	int even_width = (width + 1) & ~1;
 	int even_height = (height + 1) & ~1;
@@ -301,7 +301,7 @@ bool np_encoder_push_bgra(struct np_encoder *enc, const uint8_t *bgra, int width
 bool np_encoder_take_bgra(struct np_encoder *enc, uint8_t *pixels, int width, int height,
                          int stride, uint64_t pts_ns, uint32_t resource_id, uint8_t flags) {
 	if (!enc || !pixels || !resource_id || width < 2 || height < 2 ||
-	    width > 8192 || height > 8192 || (uint64_t)width * height > 16777216 || (width & 1) || (height & 1) ||
+	    width > NP_ENCODER_MAX_DIMENSION || height > NP_ENCODER_MAX_DIMENSION || (uint64_t)width * height > NP_ENCODER_MAX_PIXELS || (width & 1) || (height & 1) ||
 	    stride < width * 4) return false;
 	pthread_mutex_lock(&enc->lock);
 	if (enc->pending_bgra || enc->encoding || enc->stopping) {

@@ -103,9 +103,9 @@ final class FileDragBridge: NSObject, NSDraggingSource {
             send(.init(.payload, token: token, data: FileTransferURLs.encode(outgoingURLs)))
             return true
         }
-        if !urls.isEmpty { supplyIncomingFiles(); return true }
-        let receipt: IncomingFilePromises
-        do { receipt = try IncomingFilePromises(receivers) }
+        if receivers.isEmpty, !urls.isEmpty { supplyIncomingFiles(); return true }
+        let receipt: IncomingDragFiles
+        do { receipt = try IncomingDragFiles(info.draggingPasteboard) }
         catch {
             send(.init(.payload, token: token))
             bridge?.reportFileTransferError(error)
@@ -115,10 +115,7 @@ final class FileDragBridge: NSObject, NSDraggingSource {
         transfers[token] = Task { [weak self] in
             defer { withExtendedLifetime(receipt) {} }
             do {
-                let selected = try await receipt.files()
-                // Promised directories are temporary: export their contents,
-                // never leave a virtiofs share pointing into deleted staging.
-                let imported = try await access.importFiles(selected, shareDirectories: false)
+                let imported = try await receipt.importFiles(using: access)
                 guard let self, self.generation == connection else { return }
                 self.transfers[token] = nil
                 self.send(.init(.payload, token: token, data: FileTransferURLs.encode(imported)))

@@ -156,4 +156,34 @@ final class NativePipeRemoteTests: XCTestCase {
             XCTAssertEqual(session.exitStatus, 255)
         }
     }
+
+    @MainActor func testCompositorReadyDeadlineDoesNotRequireManualDisconnect() async throws {
+        let session = RemoteSession(testExecutable: "/bin/sleep", arguments: ["10"],
+                                    readyTimeout: .milliseconds(50))
+        for _ in 0..<2 {
+            let start = ContinuousClock.now
+            do { try await session.connect(); XCTFail("Expected automatic timeout") }
+            catch { XCTAssertTrue(error.localizedDescription.contains("did not become ready")) }
+            XCTAssertLessThan(start.duration(to: .now), .seconds(2))
+            XCTAssertFalse(session.isConnected)
+            XCTAssertEqual(session.exitStatus, 1)
+        }
+    }
+
+    @MainActor func testStartupDeadlineBeginsAfterInstallationAndEndsAtReady() async throws {
+        let encoded = try ready().base64EncodedString()
+        let session = RemoteSession(testExecutable: "/bin/sh", arguments: ["-c", """
+            printf 'NATIVEPIPE PHASE INSTALLING\\n' >&2
+            sleep 0.15
+            printf 'NATIVEPIPE PHASE RE' >&2
+            sleep 0.05
+            printf 'ADY\\n' >&2
+            printf '%s' '\(encoded)' | /usr/bin/base64 -D
+            read reply
+            """], readyTimeout: .milliseconds(100), reportsStartup: true)
+        try await session.connect()
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertTrue(session.isConnected)
+        session.disconnect()
+    }
 }

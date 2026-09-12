@@ -13,6 +13,7 @@ struct result {
     pthread_mutex_t lock;
     pthread_cond_t ready;
     bool done;
+    bool tiny;
     unsigned calls;
     uint16_t epoch;
     Dav1dContext *decoder;
@@ -23,7 +24,7 @@ static void output(void *data, const uint8_t *bytes, size_t size, uint64_t pts,
 {
     struct result *r = data; assert(codec == NP_ENCODER_AV1);
     assert(bytes && size && pts == id);
-    assert(width == (id >= 3 ? 322 : 320) && height == 242);
+    assert(width == (r->tiny ? 2 : id >= 3 ? 322 : 320) && height == (r->tiny ? 2 : 242));
     // Decode the real packet using an independent implementation. A nonempty
     // encoder output alone does not prove a usable, correctly labelled frame.
     if (epoch != r->epoch) {
@@ -108,6 +109,24 @@ int main(void)
     np_encoder_destroy(enc);
     dav1d_close(&r.decoder);
     free(pixels);
+    // A 1x1 logical Wayland surface is edge-padded to this real 2x2 video.
+    // Decode it too: accepting the compositor snapshot is only half the path.
+    r.tiny = true; r.done = false; r.epoch = 0; r.calls = 0; r.decoder = NULL;
+    enc = np_encoder_create(2, 2, false, output, done, &r);
+    assert(enc);
+    uint8_t *tiny = malloc(16); assert(tiny);
+    for (unsigned i = 0; i < 4; i++) {
+        tiny[i * 4] = 57; tiny[i * 4 + 1] = 90;
+        tiny[i * 4 + 2] = 40; tiny[i * 4 + 3] = 255;
+    }
+    assert(np_encoder_take_bgra(enc, tiny, 2, 2, 8, 1, 1, NP_ENCODER_FLAG_HAS_ALPHA));
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until); until.tv_sec += 10;
+    pthread_mutex_lock(&r.lock);
+    while (!r.done) assert(pthread_cond_timedwait(&r.ready, &r.lock, &until) == 0);
+    assert(r.calls == 1);
+    pthread_mutex_unlock(&r.lock);
+    np_encoder_destroy(enc); dav1d_close(&r.decoder);
     pthread_cond_destroy(&r.ready); pthread_mutex_destroy(&r.lock);
     puts("AV1 decoded colors/interframes, completion, alpha reuse/change, odd-size padding and resize epoch: PASS");
 }

@@ -40,9 +40,11 @@ public struct SSHCommand: Codable, Sendable, Equatable {
     }
 
     func arguments(uploadCompositor: Bool,
-                   hardwareH264: Bool = H264Decoder.hardwareAvailable) async throws -> [String] {
+                   hardwareH264: Bool = H264Decoder.hardwareAvailable,
+                   reportStartup: Bool = false) async throws -> [String] {
         try validate()
-        var script = makeRemoteScript(uploadCompositor: uploadCompositor, hardwareH264: hardwareH264)
+        var script = makeRemoteScript(uploadCompositor: uploadCompositor,
+                                      hardwareH264: hardwareH264, reportStartup: reportStartup)
         if installCompositor && compositor == "nativepipe-wayland" && !uploadCompositor {
             let release = try await RemoteCompositorRelease.latest()
             script = "release=" + Self.quote(release.absoluteString) + "\n" + script
@@ -57,7 +59,8 @@ public struct SSHCommand: Codable, Sendable, Equatable {
     }
 
     func makeRemoteScript(uploadCompositor: Bool,
-                          hardwareH264: Bool = H264Decoder.hardwareAvailable) -> String {
+                          hardwareH264: Bool = H264Decoder.hardwareAvailable,
+                          reportStartup: Bool = false) -> String {
         let invocation = persistentSession ? "--stdio --session" :
             "--stdio -- " + application.map(Self.quote).joined(separator: " ")
         let prepare = installCompositor ? (uploadCompositor ? RemoteCompositorInstaller.uploadScript : RemoteCompositorInstaller.script) : """
@@ -74,11 +77,13 @@ public struct SSHCommand: Codable, Sendable, Equatable {
         """
         return """
         set -eu
+        \(reportStartup ? "printf 'NATIVEPIPE PHASE INSTALLING\\n' >&2" : "")
         export NATIVEPIPE_HOST_H264_HARDWARE=\(hardwareH264 ? "1" : "0")
         compositor=\(Self.quote(compositor))
         if [ "$compositor" = nativepipe-wayland ]; then
           \(prepare)
         fi
+        \(reportStartup ? "printf 'NATIVEPIPE PHASE READY\\n' >&2" : "")
         exec "$compositor" \(invocation)
         """
     }

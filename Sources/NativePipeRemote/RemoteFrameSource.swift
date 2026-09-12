@@ -12,11 +12,19 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
     // Both decoders finish one access unit on decodeQueue before returning.
     private final class Stream: @unchecked Sendable {
         let decoder = H264Decoder()
-        let av1 = AV1Decoder()
+        let av1: AV1Decoder
         var codec: MediaWire.Codec?
-        func reset() { decoder.reset(); av1.reset() }
+        var decoderReservation: RemotePixelBudget.Lease?
+        var pendingReservations: [UInt32: RemotePixelBudget.Lease] = [:]
+        func reset() {
+            decoder.reset(); av1.reset()
+            decoderReservation = nil
+        }
         let generation: UInt64
-        init(generation: UInt64) { self.generation = generation }
+        init(generation: UInt64, budget: RemotePixelBudget) {
+            self.generation = generation
+            av1 = AV1Decoder(memoryBudget: budget)
+        }
         var epoch: UInt16 = 0
         var resourceIDs: [UInt32] = []
         var publishedThrough: UInt32?
@@ -28,6 +36,7 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
     }
 
     private struct AlphaPlane {
+        let reservation: RemotePixelBudget.Lease
         let width: Int
         let height: Int
         let bytes: Data
@@ -38,8 +47,11 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
         let surfaceID: UInt32
         let pixelBuffer: CVPixelBuffer?
         var texture: MTLTexture?
+        let reservation: RemotePixelBudget.Lease
 
-        init(surface: IOSurfaceRef, surfaceID: UInt32, pixelBuffer: CVPixelBuffer?) {
+        init(surface: IOSurfaceRef, surfaceID: UInt32, pixelBuffer: CVPixelBuffer?,
+             reservation: RemotePixelBudget.Lease) {
+            self.reservation = reservation
             self.surface = surface
             self.surfaceID = surfaceID
             self.pixelBuffer = pixelBuffer
@@ -62,6 +74,9 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
     }
     private let device = MTLCreateSystemDefaultDevice()
     private let maximumFramesPerStream = 12
+    private let maximumStreams: Int
+    private let pixelBudget: RemotePixelBudget
+    var pixelReservations: RemotePixelBudget.Snapshot { pixelBudget.snapshot }
     nonisolated(unsafe) private var generation: UInt64 = 0
     nonisolated(unsafe) private var notificationScheduled = false
     nonisolated(unsafe) private var newestNotification: UInt32?
@@ -93,7 +108,27 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
         }
     }
 
-    public init() {}
+    public convenience init() {
+        self.init(pixelBudgetBytes: Int(min(ProcessInfo.processInfo.physicalMemory / 8, 1 << 30)))
+    }
+
+    init(pixelBudgetBytes: Int, maximumStreams: Int = 256) {
+        pixelBudget = RemotePixelBudget(limit: pixelBudgetBytes)
+        self.maximumStreams = maximumStreams
+    }
+
+    // Called under lock before allocating/decoding. Cache history is expendable;
+    // the latest resource of every source and all consumer-owned pixels remain
+    // valid. Reference bitstreams are never dropped to recover memory.
+    nonisolated private func reservePixels(_ bytes: Int, kind: RemotePixelBudget.Kind) -> RemotePixelBudget.Lease? {
+        if let lease = pixelBudget.reserve(bytes, kind: kind) { return lease }
+        for stream in streams.values where stream.resourceIDs.count > 1 {
+            for id in stream.resourceIDs.dropLast() { frames.removeValue(forKey: id) }
+            stream.resourceIDs = Array(stream.resourceIDs.suffix(1))
+        }
+        return pixelBudget.reserve(bytes, kind: kind)
+    }
+
 
     nonisolated private func fail(_ message: String, generation token: UInt64) {
         lock.lock()
@@ -240,6 +275,8 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
     @discardableResult
     nonisolated public func ingest(header: MediaWire.Header, payload: Data) -> Bool {
         guard header.width > 0, header.height > 0,
+              header.width <= 8192, header.height <= 8192,
+              Int(header.width) * Int(header.height) <= 16_777_216,
               payload.count == Int(header.payloadLength), payload.count <= MediaWire.maximumPayloadSize else { return false }
         lock.lock()
         guard !decodingFailed, payload.count <= 128 * 1024 * 1024 - queuedMediaBytes else {
@@ -263,7 +300,12 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
             if let existing = self.streams[id] {
                 stream = existing
             } else {
-                stream = Stream(generation: token)
+                guard self.streams.count < self.maximumStreams else {
+                    self.lock.unlock()
+                    self.fail("The remote connection exceeded its active image stream limit.", generation: token)
+                    return
+                }
+                stream = Stream(generation: token, budget: self.pixelBudget)
                 self.streams[id] = stream
                 stream.decoder.onFrame = { [weak self, weak stream] resourceID, pixelBuffer in
                     guard let self, let stream else { return }
@@ -290,6 +332,7 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
                 stream.alphaPlanes.removeAll(keepingCapacity: true)
                 stream.lastAlpha = nil
                 stream.pendingVideo.removeAll(keepingCapacity: true)
+                stream.pendingReservations.removeAll(keepingCapacity: true)
                 stream.epoch = header.bitstreamEpoch
                 stream.codec = nil
                 self.lock.unlock()
@@ -309,6 +352,26 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
                     return
                 }
                 stream.codec = header.codec
+                // Cover padded BGRA planes, temporary composition and a worst-
+                // case reference set (16 YUV H.264 or 8 AV1 frames plus workspace).
+                let planeBytes = ((Int(header.width) * 4 + 255) & ~255)
+                    * ((Int(header.height) + 63) & ~63) + 4096
+                if let reservation = stream.decoderReservation {
+                    guard reservation.resize(to: planeBytes * 10) else {
+                        self.lock.unlock()
+                        self.fail("Remote decoder references exceeded the connection pixel budget.", generation: token)
+                        return
+                    }
+                } else {
+                    stream.decoderReservation = self.reservePixels(planeBytes * 10, kind: .decoder)
+                }
+                guard stream.decoderReservation != nil,
+                      let reservation = self.reservePixels(planeBytes * 2, kind: .frame) else {
+                    self.lock.unlock()
+                    self.fail("Remote images exceeded the connection pixel budget. Close large remote windows and reconnect.", generation: token)
+                    return
+                }
+                stream.pendingReservations[header.resourceID] = reservation
                 if header.flags & MediaWire.flagHasAlpha != 0 {
                     if header.flags & MediaWire.flagReuseAlpha != 0 {
                         guard let alpha = stream.lastAlpha, alpha.width == Int(header.width),
@@ -339,6 +402,13 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
             case .alphaRLE:
                 let width = Int(header.width)
                 let height = Int(header.height)
+                self.lock.lock()
+                let reservation = self.reservePixels(width * height, kind: .alpha)
+                self.lock.unlock()
+                guard let reservation else {
+                    self.fail("Remote alpha planes exceeded the connection pixel budget.", generation: token)
+                    return
+                }
                 guard width <= Int.max / height,
                       let alpha = MediaWire.decodeAlphaRLE(
                         payload, pixelCount: width * height) else {
@@ -346,7 +416,7 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
                     return
                 }
                 self.receiveAlpha(
-                    AlphaPlane(width: width, height: height, bytes: alpha),
+                    AlphaPlane(reservation: reservation, width: width, height: height, bytes: alpha),
                     stream: stream, surfaceID: id, resourceID: header.resourceID)
             }
         }
@@ -397,6 +467,13 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
         _ pixelBuffer: CVPixelBuffer, stream: Stream,
         surfaceID: UInt32, resourceID: UInt32, alpha: AlphaPlane? = nil
     ) {
+        lock.lock()
+        let reservation = stream.pendingReservations.removeValue(forKey: resourceID)
+        lock.unlock()
+        guard let reservation else {
+            fail("Remote frame has no pixel reservation.", generation: stream.generation)
+            return
+        }
         let ioSurface: IOSurfaceRef?
         var pixelOwner: CVPixelBuffer?
         if let alpha {
@@ -412,6 +489,10 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
             return
         }
 
+        guard reservation.resize(to: IOSurfaceGetAllocSize(ioSurface)) else {
+            fail("Decoded remote pixels exceeded their reservation.", generation: stream.generation)
+            return
+        }
         lock.lock()
         guard streams[surfaceID] === stream, stream.generation == generation, !decodingFailed else {
             lock.unlock()
@@ -422,7 +503,7 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
         }
         stream.publishedThrough = resourceID
         frames[resourceID] = StoredFrame(
-            surface: ioSurface, surfaceID: surfaceID, pixelBuffer: pixelOwner)
+            surface: ioSurface, surfaceID: surfaceID, pixelBuffer: pixelOwner, reservation: reservation)
         stream.pendingIDs.removeAll { $0 == resourceID }
         stream.resourceIDs.removeAll { $0 == resourceID }
         stream.resourceIDs.append(resourceID)
@@ -475,7 +556,12 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
         stream.lastAlpha = alpha
         trackPending(resourceID, stream: stream)
         let video = stream.pendingVideo.removeValue(forKey: resourceID)
-        if video != nil { stream.expectedAlpha.remove(resourceID) }
+        if video != nil {
+            stream.expectedAlpha.remove(resourceID)
+            // The completed frame and lastAlpha own this sidecar now. Keeping
+            // it in this map leaked one alpha plane for every video-first frame.
+            stream.alphaPlanes.removeValue(forKey: resourceID)
+        }
         lock.unlock()
         if let video {
             publish(
@@ -491,6 +577,7 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
             let expired = stream.pendingIDs.removeFirst()
             stream.alphaPlanes.removeValue(forKey: expired)
             stream.pendingVideo.removeValue(forKey: expired)
+            stream.pendingReservations.removeValue(forKey: expired)
             stream.expectedAlpha.remove(expired)
         }
     }

@@ -41,6 +41,16 @@ int main(void)
     struct np_surface a = { .server = &server, .id = 1 }, b = { .server = &server, .id = 2 }, c = { .server = &server, .id = 3 };
     wl_list_insert(&server.surfaces, &a.link); wl_list_insert(&server.surfaces, &b.link); wl_list_insert(&server.surfaces, &c.link);
     unsigned char pixels[64] = {0};
+    // Logical buffers may be 1px; only the encoded copy requires even sides.
+    for (int width = 1; width <= 3; width++) for (int height = 1; height <= 3; height++) {
+        assert(encode_remote_pixels(&a, pixels, width, height, width * 4, WL_SHM_FORMAT_ARGB8888));
+        assert(a.last_width == width && a.last_height == height);
+        const unsigned char *copy = remote_surface(&a, false)->pixels;
+        size_t size = (size_t)((width + 1) & ~1) * ((height + 1) & ~1) * 4;
+        for (size_t i = 0; i < size; i++) assert(copy[i] == 0);
+    }
+    assert(!encode_remote_pixels(&a, pixels, 0, 1, 4, WL_SHM_FORMAT_ARGB8888));
+    assert(!encode_remote_pixels(&a, pixels, 2, 1, 4, WL_SHM_FORMAT_ARGB8888));
     assert(encode_remote_pixels(&a, pixels, 4, 4, 16, WL_SHM_FORMAT_XRGB8888));
     assert(encode_remote_pixels(&b, pixels, 4, 4, 16, WL_SHM_FORMAT_XRGB8888));
     assert(encode_remote_pixels(&c, pixels, 4, 4, 16, WL_SHM_FORMAT_XRGB8888));

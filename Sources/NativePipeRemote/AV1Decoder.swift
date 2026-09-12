@@ -14,12 +14,17 @@ final class AV1Decoder {
     private var dimensions = (0, 0)
     private var replay: [Data] = []
     private var replayBytes = 0
+    private let memoryBudget: RemotePixelBudget?
+    private var replayReservation: RemotePixelBudget.Lease?
     private let allowHardware: Bool
     private(set) var usingHardware = false
     var onFrame: ((UInt32, CVPixelBuffer) -> Void)?
     var onFailure: ((UInt32) -> Void)?
 
-    init(allowHardware: Bool = true) { self.allowHardware = allowHardware }
+    init(allowHardware: Bool = true, memoryBudget: RemotePixelBudget? = nil) {
+        self.allowHardware = allowHardware
+        self.memoryBudget = memoryBudget
+    }
     deinit { reset() }
 
     func reset() {
@@ -27,7 +32,7 @@ final class AV1Decoder {
         session = nil; format = nil
         np_av1_decoder_destroy(software); software = nil
         epoch = 0; dimensions = (0, 0); usingHardware = false
-        replay.removeAll(); replayBytes = 0
+        replay.removeAll(); replayBytes = 0; replayReservation = nil
     }
 
     /// Also validates OBU framing before passing untrusted bytes to either decoder.
@@ -79,7 +84,7 @@ final class AV1Decoder {
                 }
                 guard valid == 0 else { throw RemoteError.message("Unsupported AV1 sequence.") }
                 // Encoders emit a sequence header at every random-access keyframe.
-                replay.removeAll(keepingCapacity: true); replayBytes = 0
+                replay.removeAll(keepingCapacity: true); replayBytes = 0; replayReservation = nil
                 if software == nil, session == nil {
                     if allowHardware { createHardware(config: Data(config) + sequence, width: width, height: height) }
                     if session == nil { software = np_av1_decoder_create() }
@@ -89,7 +94,8 @@ final class AV1Decoder {
             if session != nil {
                 // Bounded compressed GOP permits software recovery after a driver
                 // failure, without publishing replays or retaining decoded pixels.
-                if replay.count < 120, replayBytes <= 32 * 1024 * 1024 - obu.count {
+                if replay.count < 120, replayBytes <= 32 * 1024 * 1024 - obu.count,
+                   reserveReplay(replayBytes + obu.count) {
                     pixel = decodeHardware(obu)
                 }
                 if let pixel, CVPixelBufferGetWidth(pixel) == width, CVPixelBufferGetHeight(pixel) == height {
@@ -104,12 +110,19 @@ final class AV1Decoder {
                         throw RemoteError.message("Could not recover AV1 reference frames.")
                     }
                 }
-                replay.removeAll(); replayBytes = 0
+                replay.removeAll(); replayBytes = 0; replayReservation = nil
             }
             pixel = decodeSoftware(obu, width: width, height: height)
             guard let pixel else { throw RemoteError.message("Could not decode AV1 frame.") }
             onFrame?(resourceID, pixel)
         } catch { onFailure?(resourceID) }
+    }
+
+    private func reserveReplay(_ bytes: Int) -> Bool {
+        guard let memoryBudget else { return true }
+        if let replayReservation { return replayReservation.resize(to: bytes) }
+        replayReservation = memoryBudget.reserve(bytes, kind: .replay)
+        return replayReservation != nil
     }
 
     private func decodeSoftware(_ packet: Data, width: Int, height: Int) -> CVPixelBuffer? {

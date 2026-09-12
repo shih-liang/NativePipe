@@ -142,7 +142,7 @@ jobs:
                   gdk-pixbuf-dev librsvg-dev dbus dconf
               fi
               python3 scripts/build-codecs.py "$ARCH-$LIBC"
-              make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-remote-transport test-remote-encoder
+              make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-remote-transport test-remote-encoder test-remote-scheduler
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-applications
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-file-drag
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" dist-vmpipe

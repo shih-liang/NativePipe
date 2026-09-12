@@ -109,18 +109,20 @@ static bool encode_remote_pixels(
 	struct np_surface *surface, const unsigned char *source,
 	int32_t width, int32_t height, int32_t stride, uint32_t format)
 {
-	if (!source || width < 2 || height < 2 || width >= UINT16_MAX ||
+	if (!source || width < 1 || height < 1 || width >= UINT16_MAX ||
 	    height >= UINT16_MAX || width > INT32_MAX / 4 || stride < width * 4)
 		return false;
 	if (format != WL_SHM_FORMAT_ARGB8888 && format != WL_SHM_FORMAT_XRGB8888)
 		return false;
+	int even_width = (width + 1) & ~1, even_height = (height + 1) & ~1;
+	if (even_width > NP_ENCODER_MAX_DIMENSION || even_height > NP_ENCODER_MAX_DIMENSION ||
+	    (uint64_t)even_width * even_height > NP_ENCODER_MAX_PIXELS) return false;
 	struct np_remote_surface *state = remote_surface(surface, true);
 	if (!state) return false;
 	uint32_t resource_id = next_media_resource_id(surface->server);
 	uint8_t flags = format == WL_SHM_FORMAT_ARGB8888 &&
 	                source_has_transparency(source, width, height, stride)
 		? NP_MEDIA_FLAG_HAS_ALPHA : 0;
-	int even_width = (width + 1) & ~1, even_height = (height + 1) & ~1;
 	size_t row_size = (size_t)even_width * 4;
 	if ((size_t)even_height > SIZE_MAX / row_size) return false;
 	unsigned char *copy = malloc(row_size * (size_t)even_height);

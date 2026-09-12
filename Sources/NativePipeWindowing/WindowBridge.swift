@@ -479,7 +479,7 @@ public final class WindowBridge: NSObject {
     }
     public var applicationIconProvider: ((String) -> NSImage?)?
 
-    let clipboard = ClipboardBridge()
+    let clipboard: ClipboardBridge
     public var fileAccess: (any UserFileAccess)? {
         didSet { clipboard.fileAccess = fileAccess }
     }
@@ -491,10 +491,12 @@ public final class WindowBridge: NSObject {
     func hideDragIcon() { dragIcon.hide() }
     func reportFileTransferError(_ error: Error) { NSApp.presentError(error) }
 
-    public init(frameSource: FrameSource?) {
+    public init(frameSource: FrameSource?, clipboardFileDirectory: URL? = nil) {
         self.frameSource = frameSource
+        clipboard = ClipboardBridge(fileDirectory: clipboardFileDirectory)
 		super.init()
         clipboard.output = { [weak self] command in self?.send(command) }
+        clipboard.onError = { [weak self] error in self?.reportFileTransferError(error) }
         clipboard.start()
         // Keep AppKit's normal shortcut/menu dispatch. Only rescue releases
         // for presses sent by our own guest views; never monitor other apps.
@@ -979,6 +981,7 @@ public final class WindowBridge: NSObject {
 			lastDisplays.removeAll(keepingCapacity: true)
 			publishDisplayTopology(force: true)
             sendInputPreferences()
+            clipboard.connectionReady()
             break
 
         case .surfaceCreated(let surface):

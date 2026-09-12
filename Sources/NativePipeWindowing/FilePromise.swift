@@ -5,6 +5,36 @@ import UniformTypeIdentifiers
 // Published by the task before signalling, read only after the worker waits.
 private final class PromiseResult: @unchecked Sendable { var error: Error? }
 
+/// AppKit chooses one representation per pasteboard item. Prefer promises over
+/// URLs when an item offers both, while retaining ordinary files in mixed drops.
+/// Start receivers synchronously, then keep their staging alive through import.
+@MainActor
+struct IncomingDragFiles {
+    private let urls: [URL]
+    private let receipt: IncomingFilePromises?
+
+    init(_ pasteboard: NSPasteboard) throws {
+        let items = pasteboard.readObjects(forClasses: [NSFilePromiseReceiver.self, NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]) ?? []
+        urls = items.compactMap { ($0 as? NSURL).map { $0 as URL } }
+        let receivers = items.compactMap { $0 as? NSFilePromiseReceiver }
+        receipt = receivers.isEmpty ? nil : try IncomingFilePromises(receivers)
+    }
+
+    func importFiles(using access: any UserFileAccess) async throws -> [URL] {
+        defer { withExtendedLifetime(receipt) {} }
+        var imported: [URL] = []
+        if !urls.isEmpty { imported = try await access.importFiles(urls) }
+        if let receipt {
+            let files = try await receipt.files()
+            // A temporary promised directory must not become a persistent share.
+            imported += try await access.importFiles(files, shareDirectories: false)
+        }
+        try Task.checkCancellation()
+        return imported
+    }
+}
+
 /// Register every receiver synchronously inside performDragOperation. AppKit
 /// populates fileNames during registration and requires one shared destination.
 @MainActor
@@ -46,7 +76,7 @@ final class IncomingFilePromises {
     deinit { try? FileManager.default.removeItem(at: directory) }
 }
 
-/// Shared by clipboard and drag sources. Finder chooses the destination; no
+/// Drag source adapter. Finder chooses the destination; no
 /// guest path is ever published as a supposedly local file URL.
 @MainActor
 final class LinuxFilePromise: NSObject, NSFilePromiseProviderDelegate {

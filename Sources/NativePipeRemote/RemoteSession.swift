@@ -30,6 +30,11 @@ public final class RemoteSession {
     private var authenticationDirectory: URL?
     private var writer: WindowCommandWriter?
     private var inbound: RemoteInbound?
+    private enum StartupPhase { case authenticating, installing, ready, connected }
+    private var startupPhase = StartupPhase.authenticating
+    private var startupTimeout: Task<Void, Never>?
+    private var readyTimeout: Duration = .seconds(15)
+    private var reportsStartup = true
 
     public init(command: SSHCommand, environment: [String: String]? = nil,
                 localCompositorDirectory: URL? = nil, allowHardwareH264: Bool = true) {
@@ -42,13 +47,16 @@ public final class RemoteSession {
     }
 
     // Uses real pipes and the same lifecycle in transport tests.
-    init(testExecutable: String, arguments: [String], localCompositorDirectory: URL? = nil) {
+    init(testExecutable: String, arguments: [String], localCompositorDirectory: URL? = nil,
+         readyTimeout: Duration = .seconds(15), reportsStartup: Bool = false) {
         command = SSHCommand(destination: "test", application: ["true"], installCompositor: localCompositorDirectory != nil)
         environment = nil
         allowHardwareH264 = false
         self.localCompositorDirectory = localCompositorDirectory
         executable = testExecutable
         argumentsOverride = arguments
+        self.readyTimeout = readyTimeout
+        self.reportsStartup = reportsStartup
     }
 
     public func connect() async throws {
@@ -56,6 +64,7 @@ public final class RemoteSession {
         generation += 1
         let token = generation
         diagnostics = ""
+        startupPhase = .authenticating
         exitStatus = nil
         do { try await establishConnection(token: token) }
         catch {
@@ -73,7 +82,7 @@ public final class RemoteSession {
         let arguments: [String]
         if let argumentsOverride { arguments = argumentsOverride }
         else { arguments = try await command.arguments(uploadCompositor: localCompositor != nil,
-            hardwareH264: allowHardwareH264 && H264Decoder.hardwareAvailable) }
+            hardwareH264: allowHardwareH264 && H264Decoder.hardwareAvailable, reportStartup: true) }
         try Task.checkCancellation()
         guard generation == token else { throw CancellationError() }
         let writer = WindowCommandWriter(remote: true, write: Self.writeAll)
@@ -114,6 +123,7 @@ public final class RemoteSession {
                 continuation = ready
                 do {
                     try child.run()
+                    if !reportsStartup { advanceStartup(to: .ready, token: token) }
                     // Close parent copies of child ends so EOF is observable.
                     try input.fileHandleForReading.close()
                     try output.fileHandleForWriting.close()
@@ -198,6 +208,8 @@ public final class RemoteSession {
     }
 
     public func disconnect() {
+        startupTimeout?.cancel()
+        startupTimeout = nil
         generation += 1
         continuation?.resume(throwing: CancellationError())
         continuation = nil
@@ -222,6 +234,9 @@ public final class RemoteSession {
         switch packet {
         case .event(let event):
             if case .channelReady = event {
+                startupTimeout?.cancel()
+                startupTimeout = nil
+                startupPhase = .connected
                 isReady = true
                 applicationClient.setConnected(true)
                 continuation?.resume()
@@ -239,7 +254,34 @@ public final class RemoteSession {
     private func diagnostic(_ text: String, token: Int) {
         guard token == generation else { return }
         diagnostics = String((diagnostics + text).suffix(65_536))
+        // stderr reads can split a marker. Accumulated diagnostics preserve its
+        // boundary; phase transitions are monotonic, so later logs cannot reset
+        // the deadline. No timer runs while SSH asks the user to authenticate.
+        if reportsStartup {
+            if diagnostics.contains("NATIVEPIPE PHASE READY\n") { advanceStartup(to: .ready, token: token) }
+            else if diagnostics.contains("NATIVEPIPE PHASE INSTALLING\n") {
+                advanceStartup(to: .installing, token: token)
+            }
+        }
         onDiagnostic?(text)
+    }
+
+    private func advanceStartup(to phase: StartupPhase, token: Int) {
+        guard generation == token, !isReady,
+              startupPhase == .authenticating || (startupPhase == .installing && phase == .ready) else { return }
+        startupPhase = phase
+        startupTimeout?.cancel()
+        // Upload and runtime validation have a separate generous deadline.
+        // Once exec is imminent, only the compositor handshake gets 15 seconds.
+        let timeout: Duration = phase == .ready ? readyTimeout : .seconds(600)
+        startupTimeout = Task { [weak self] in
+            do { try await Task.sleep(for: timeout) } catch { return }
+            guard let self, self.generation == token, !self.isReady else { return }
+            let message = phase == .ready
+                ? "The remote compositor did not become ready in time. Check its startup log and reconnect."
+                : "NativePipe installation did not finish in time. Check the remote connection and available disk space."
+            self.fail(RemoteError.message(message + (self.diagnostics.isEmpty ? "" : "\n" + self.diagnostics)), token: token)
+        }
     }
 
     private func ended(_ status: Int32, token: Int) {

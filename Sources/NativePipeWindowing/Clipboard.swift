@@ -5,22 +5,21 @@ import NativePipeProtocol
 ///
 /// The two models agree more than they differ: both are "one owner, advertising
 /// a set of types, handing over bytes on demand". What they disagree about is
-/// naming, and who is allowed to be lazy. NSPasteboard lets an owner promise
-/// data and supply it later, but only through a synchronous callback — and the
-/// data lives on the far side of a vsock round trip, so that callback cannot be
-/// honoured without blocking AppKit. So the guest's side of the bridge is
-/// resolved eagerly at announce time, and only the host's side stays lazy.
+/// naming. Small values and file names are resolved at announce time; file
+/// contents are fetched only by a paste request through ClipboardFileBroker.
 @MainActor
 final class ClipboardBridge {
     /// Sends a host command to the guest.
     var output: ((Windowing.HostCommand) -> Void)?
     var fileAccess: (any UserFileAccess)?
-    private var filePromises: [LinuxFilePromise] = []
+    var onError: ((Error) -> Void)?
+    private let fileBroker: ClipboardFileBroker
     private var selectionGeneration: UInt64 = 0
     private var connectionGeneration: UInt64 = 0
     private var hostTransfers: [UInt32: Task<Void, Never>] = [:]
 
-    private let pasteboard = NSPasteboard.general
+    private let pasteboard: NSPasteboard
+    private var connected = false
     private var nextToken: UInt32 = 0
     /// Pastes from the guest that are waiting on `hostSelectionRequest`.
     private var pendingGuestReads: [UInt32: (Data?) -> Void] = [:]
@@ -52,8 +51,16 @@ final class ClipboardBridge {
         FileHandle.standardError.write(Data("[clip] \(message())\n".utf8))
     }
 
-    init() {
+    init(pasteboard: NSPasteboard = .general, fileDirectory: URL? = nil) {
+        self.pasteboard = pasteboard
+        fileBroker = ClipboardFileBroker(directory: fileDirectory ?? ClipboardFileBroker.defaultDirectory)
         lastSeenChangeCount = pasteboard.changeCount
+    }
+
+    func connectionReady() {
+        disconnect()
+        connected = true
+        pollPasteboard(force: true)
     }
 
     func start() {
@@ -76,8 +83,10 @@ final class ClipboardBridge {
     }
 
     func disconnect() {
+        connected = false
         connectionGeneration &+= 1
         selectionGeneration &+= 1
+        fileBroker.stop()
         for task in hostTransfers.values { task.cancel() }
         hostTransfers.removeAll()
         pendingGuestReads.removeAll()
@@ -89,13 +98,15 @@ final class ClipboardBridge {
         allowsGuestToHost = guestToHost
         if hostToGuest {
             start()
+            if hostChanged { pollPasteboard(force: true) }
         } else {
             poll?.invalidate()
             poll = nil
-            if hostChanged { output?(.hostSelectionOffered(mimeTypes: [])) }
+            if hostChanged, connected { output?(.hostSelectionOffered(mimeTypes: [])) }
             for task in hostTransfers.values { task.cancel() }
         }
         if !guestToHost {
+            fileBroker.stop()
             let pending = Array(pendingGuestReads.values)
             pendingGuestReads.removeAll()
             for completion in pending { completion(nil) }
@@ -108,9 +119,11 @@ final class ClipboardBridge {
     /// it on the Mac's pasteboard.
     func guestOffered(mimeTypes: [String]) {
         selectionGeneration &+= 1
+        pendingGuestReads.removeAll()
+        fileBroker.revoke()
         let generation = selectionGeneration
         let changeCount = pasteboard.changeCount
-        guard allowsGuestToHost else { return }
+        guard connected, allowsGuestToHost else { return }
         guard !mimeTypes.isEmpty else { return }
         let offered = Set(mimeTypes)
         guard let match = Self.guestToNative.first(where: { offered.contains($0.mime) }) else {
@@ -122,9 +135,8 @@ final class ClipboardBridge {
                   let data, !data.isEmpty else { return }
             if match.native == .fileURL {
                 guard let access = self.fileAccess, let urls = try? FileTransferURLs.decode(data) else { return }
-                self.filePromises = urls.map { LinuxFilePromise(remote: $0, access: access) }
-                self.pasteboard.clearContents()
-                self.pasteboard.writeObjects(self.filePromises.map(\.provider))
+                do { try self.fileBroker.publish(urls, using: access, to: self.pasteboard) }
+                catch { self.onError?(error); return }
             } else {
                 // declareTypes, not clearContents: setData refuses to write a
                 // type the pasteboard was never told to expect, and it reports
@@ -158,16 +170,18 @@ final class ClipboardBridge {
 
     // MARK: - Mac owns the selection
 
-    private func pollPasteboard() {
-        guard allowsHostToGuest else { return }
+    func pollPasteboard(force: Bool = false) {
+        guard connected, allowsHostToGuest else { return }
         let current = pasteboard.changeCount
-        guard current != lastSeenChangeCount else { return }
+        guard force || current != lastSeenChangeCount else { return }
         lastSeenChangeCount = current
         selectionGeneration &+= 1
-        filePromises.removeAll()
+        pendingGuestReads.removeAll()
+        fileBroker.revoke()
 
         var mimeTypes: [String] = []
         let available = Set(pasteboard.types ?? [])
+        if ClipboardFileBroker.offer(from: pasteboard) != nil { mimeTypes.append("text/uri-list") }
         for entry in Self.guestToNative where available.contains(entry.native) {
             if !mimeTypes.contains(entry.mime) { mimeTypes.append(entry.mime) }
         }
@@ -176,22 +190,42 @@ final class ClipboardBridge {
 
     /// A guest client is pasting and wants the Mac's clipboard in `mimeType`.
     func guestRequestedHostData(token: UInt32, mimeType: String) {
-        guard allowsHostToGuest else {
+        guard connected, allowsHostToGuest else {
             output?(.hostSelectionData(token: token, mimeType: mimeType, data: nil))
             return
         }
         let native = Self.guestToNative.first { $0.mime == mimeType }?.native
         if native == .fileURL {
-            let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+            let offer = ClipboardFileBroker.offer(from: pasteboard)
+            let urls = pasteboard.readObjects(forClasses: [NSURL.self],
+                options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
             let access = fileAccess
             let connection = connectionGeneration
+            let broker = fileBroker
+            // A request token identifies one live paste, including while its
+            // importer is suspended. Duplicate tokens cannot replace its owner.
+            guard hostTransfers[token] == nil else { return }
+            guard hostTransfers.count < 4 else {
+                output?(.hostSelectionData(token: token, mimeType: mimeType, data: nil))
+                return
+            }
             hostTransfers[token] = Task { @MainActor [weak self] in
                 var bytes: Data?
                 do {
-                    if let access, !urls.isEmpty {
+                    if let access, let offer {
+                        let receipt = try await broker.receive(offer)
+                        defer { withExtendedLifetime(receipt) {} }
+                        bytes = FileTransferURLs.encode(try await access.importFiles(receipt.urls, shareDirectories: false))
+                    } else if let access, !urls.isEmpty {
                         bytes = FileTransferURLs.encode(try await access.importFiles(urls))
                     }
-                } catch { Self.note("file paste: \(error.localizedDescription)") }
+                    try Task.checkCancellation()
+                } catch {
+                    bytes = nil
+                    if !(error is CancellationError), let self, self.connectionGeneration == connection {
+                        self.onError?(error)
+                    }
+                }
                 guard let self, self.connectionGeneration == connection else { return }
                 self.hostTransfers[token] = nil
                 self.output?(.hostSelectionData(token: token, mimeType: mimeType,
