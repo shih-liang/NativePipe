@@ -1,21 +1,76 @@
 name: Build and release NativePipe
 
 on:
+  pull_request:
   push:
     branches: [main]
     tags: ["nativepipe-v*"]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing nativepipe-v* tag to publish (empty means build only)
+        type: string
+        required: false
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
-  group: nativepipe-release-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  group: nativepipe-release-${{ inputs.release_tag || github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && !inputs.release_tag }}
 
 jobs:
+  source:
+    name: Resolve source and reusable artifacts
+    runs-on: ubuntu-24.04
+    outputs:
+      commit: ${{ steps.resolve.outputs.commit }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      run: ${{ steps.resolve.outputs.run }}
+    steps:
+      - name: Check out requested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
+      - name: Resolve exact commit and complete successful build
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || '' }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess
+          tag = os.environ['RELEASE_TAG']
+          if tag and not re.fullmatch(r'nativepipe-v[0-9][A-Za-z0-9._-]*', tag):
+              raise SystemExit('Expected an existing nativepipe-v* version tag')
+          commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          repo = os.environ['GITHUB_REPOSITORY']
+          def api(path):
+              return json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/{path}']))
+          reusable = ''
+          if tag:
+              required = {'nativepipe-macos-cli'} | {
+                  f'nativepipe-linux-{arch}-{libc}'
+                  for arch in ('aarch64', 'x86_64') for libc in ('gnu', 'musl')}
+              runs = api(f'actions/workflows/build-linux.yml/runs?head_sha={commit}&event=push&status=success&per_page=30')
+              for run in runs['workflow_runs']:
+                  if run['head_branch'] != 'main' or run['head_sha'] != commit:
+                      continue
+                  artifacts = api(f"actions/runs/{run['id']}/artifacts?per_page=100")['artifacts']
+                  available = {a['name'] for a in artifacts if not a['expired']}
+                  if required <= available:
+                      reusable = str(run['id'])
+                      break
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'commit={commit}\ntag={tag}\nrun={reusable}\n')
+          print(f'Source: {commit}; release: {tag or "none"}; reusable build: {reusable or "none"}')
+          PY
+
   build:
     name: ${{ matrix.architecture }}-${{ matrix.libc }}
+    needs: source
+    if: needs.source.outputs.run == ''
     strategy:
       fail-fast: false
       matrix:
@@ -45,6 +100,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          ref: ${{ needs.source.outputs.commit }}
 
       - name: Build and test
         shell: bash
@@ -121,46 +178,75 @@ jobs:
 
   macos-cli:
     name: macOS universal nativepipe
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: source
+    if: needs.source.outputs.run == ''
     runs-on: macos-15
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+      - name: Identify Swift toolchain
+        id: toolchain
+        run: echo "id=$({ swift --version; xcodebuild -version; } | shasum -a 256 | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - name: Restore Swift build cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .build
+          key: swift-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('Package.swift', 'Package.resolved') }}-${{ needs.source.outputs.commit }}
+          restore-keys: |
+            swift-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('Package.swift', 'Package.resolved') }}-
       - name: Test Swift package
-        run: make test
+        run: make test SWIFT_FLAGS='--disable-sandbox --build-system native -c release --arch arm64'
       - name: Build and package universal command
         run: |
-          swift build --disable-sandbox -c release --product nativepipe --arch arm64 --arch x86_64
-          binary="$(swift build --disable-sandbox -c release --arch arm64 --arch x86_64 --show-bin-path)/nativepipe"
-          sh scripts/package-macos-cli.sh "$binary" macos-release
+          set -euo pipefail
+          for arch in arm64 x86_64; do
+            swift build --disable-sandbox --build-system native -c release --product nativepipe --arch "$arch"
+          done
+          arm="$(swift build --disable-sandbox --build-system native -c release --arch arm64 --show-bin-path)/nativepipe"
+          intel="$(swift build --disable-sandbox --build-system native -c release --arch x86_64 --show-bin-path)/nativepipe"
+          mkdir -p .build/universal
+          lipo -create "$arm" "$intel" -output .build/universal/nativepipe
+          sh scripts/package-macos-cli.sh .build/universal/nativepipe macos-release
       - name: Upload command archive
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: nativepipe-macos-cli
           path: macos-release
           if-no-files-found: error
+          retention-days: 14
 
   package-release:
     name: Package GitHub release
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-    needs: [build, macos-cli]
+    if: >-
+      always() && needs.source.result == 'success' &&
+      (needs.source.outputs.tag != '' || github.event_name == 'workflow_dispatch') &&
+      (needs.source.outputs.run != '' || (needs.build.result == 'success' && needs.macos-cli.result == 'success'))
+    needs: [source, build, macos-cli]
     runs-on: ubuntu-24.04
 
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          ref: ${{ needs.source.outputs.commit }}
 
       - name: Download Linux binaries
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
           pattern: nativepipe-linux-*
           path: .release-input
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.source.outputs.run || github.run_id }}
 
       - name: Download macOS command
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
           name: nativepipe-macos-cli
           path: .macos-input
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.source.outputs.run || github.run_id }}
 
       - name: Create release archives
         shell: bash
@@ -179,8 +265,8 @@ jobs:
 
   sign-release:
     name: Sign GitHub release digest
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: package-release
+    if: always() && needs.package-release.result == 'success' && needs.source.outputs.tag != ''
+    needs: [source, package-release]
     runs-on: ubuntu-24.04
     environment: lighthouse-runtime-release
     permissions:
@@ -220,8 +306,8 @@ jobs:
 
   publish-release:
     name: Publish GitHub release
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: sign-release
+    if: always() && needs.sign-release.result == 'success' && needs.source.outputs.tag != ''
+    needs: [source, sign-release]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -229,6 +315,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          ref: ${{ needs.source.outputs.commit }}
       - name: Download signed release files
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
@@ -246,7 +334,8 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.source.outputs.tag }}
         run: |
-          gh release create "$GITHUB_REF_NAME" release/* \
+          gh release create "$RELEASE_TAG" release/* \
             --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
-            --title "NativePipe ${GITHUB_REF_NAME#nativepipe-v}"
+            --title "NativePipe ${RELEASE_TAG#nativepipe-v}"

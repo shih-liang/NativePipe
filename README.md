@@ -203,10 +203,17 @@ under the ordinary `guest/**/dist` paths. FluxWindow uses the artifacts from
 the run for the NativePipe checkout commit; it does not build Linux binaries on
 the Mac and it does not use a runtime lock, manifest, or release archive.
 
-Only an explicitly pushed `nativepipe-v*` version tag publishes a GitHub Release.
-Ordinary commits run CI and build artifacts; manual workflow runs build and
-validate the complete product set without publishing. The tag workflow builds
-all three products from the same commit and publishes them together after tests:
+Only an explicitly pushed `nativepipe-v*` version tag, or a manual run with an
+existing `release_tag`, publishes a GitHub Release. Ordinary commits and manual
+runs without a tag only build and validate artifacts. A release reuses a complete
+successful main build for the exact tagged commit when its artifacts are still
+available; otherwise it builds that commit. A manual retry can fix the workflow
+without moving an existing tag. All three products are published together:
+
+The macOS job runs Swift tests in release mode, reuses that Apple Silicon build,
+then compiles Intel with SwiftPM's native backend and merges the two binaries
+with `lipo`. This avoids the Xcode backend implicitly selected by a multi-arch
+SwiftPM invocation. The build cache is isolated by toolchain and package manifest.
 
 | Product | Release archives |
 | --- | --- |

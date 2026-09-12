@@ -14,15 +14,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  swift:
-    name: Swift package
-    runs-on: macos-15
-    steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
-      - name: Build and test
-        run: make test
-
   transport:
     name: Transport and licenses
     runs-on: ubuntu-24.04
