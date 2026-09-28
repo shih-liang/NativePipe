@@ -80,6 +80,8 @@ int np_frontend_run(int argc, char **argv, void *backend_state)
 	/* A peer closing a clipboard pipe must not terminate the compositor. */
 	signal(SIGPIPE, SIG_IGN);
 	np_backend_session_reset_readiness();
+	/* Never publish a session which cannot accept keyboard input. */
+	if (!np_input_create_keymap(&server)) return 1;
 	if (!np_backend_prepare(&server)) return 1;
 
 	server.display = wl_display_create();
@@ -126,9 +128,6 @@ int np_frontend_run(int argc, char **argv, void *backend_state)
 	}
 	if (!np_xwayland_init(&server))
 		fprintf(stderr, "[wayland] Xwayland integration unavailable\n");
-
-	if (!np_input_create_keymap(&server))
-		fprintf(stderr, "[wayland] no keymap; keyboard input will not work\n");
 
     setenv("WAYLAND_DISPLAY", server.session_socket, 1);
     setenv("XDG_SESSION_TYPE", "wayland", 1);

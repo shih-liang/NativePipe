@@ -33,10 +33,19 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-release-check-") as folder:
     archive(macos / "nativepipe-macos-universal.tar.gz", ["bin/nativepipe"])
     subprocess.run(["sh", "scripts/package-release.sh", str(linux), str(macos), str(root / "release")], check=True)
     subprocess.run(["python3", "scripts/verify-release.py", str(root / "release")], check=True)
+    installer = root / "release/install-compositor.sh"
+    original = installer.read_bytes()
+    installer.write_bytes(original + b"\n# changed after packaging\n")
+    rejected = subprocess.run(["python3", "scripts/verify-release.py", str(root / "release")], capture_output=True)
+    assert rejected.returncode != 0, "A changed installer must fail validation"
+    installer.unlink()
+    rejected = subprocess.run(["python3", "scripts/verify-release.py", str(root / "release")], capture_output=True)
+    assert rejected.returncode != 0, "A missing installer must prevent the release"
+    installer.write_bytes(original)
     (root / "release/unnecessary-report.json").write_text("{}")
     rejected = subprocess.run(["python3", "scripts/verify-release.py", str(root / "release")], capture_output=True)
     assert rejected.returncode != 0, "Unexpected release files must fail validation"
     (macos / "nativepipe-macos-universal.tar.gz").unlink()
     rejected = subprocess.run(["sh", "scripts/package-release.sh", str(linux), str(macos), str(root / "incomplete")], capture_output=True)
     assert rejected.returncode != 0, "A missing CLI must prevent the release"
-    print("PASS complete product set, restored executable modes, missing product rejection, unwanted file rejection")
+    print("PASS complete product set, restored executable modes, installer integrity, missing product rejection, unwanted file rejection")

@@ -12,6 +12,8 @@
 #include <string.h>
 #include <unistd.h>
 
+bool np_backend_check_runtime(void) { return true; }
+
 int np_backend_run(int argc, char **argv)
 {
 	struct np_vmpipe_backend backend;

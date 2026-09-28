@@ -19,8 +19,11 @@ tool = Path(sys.argv[0]).name
 if tool in ("curl", "uname", "ldd", "mv", "sha256sum", "head"):
     fixture = Path(os.environ["INSTALLER_FIXTURE"])
     if tool == "uname":
-        print("x86_64")
+        print(os.environ.get("INSTALLER_ARCH", "x86_64"))
     elif tool == "ldd":
+        if os.environ.get("INSTALLER_LIBC") == "musl":
+            print("musl libc")
+            sys.exit(1)  # musl's loader prints its version with a nonzero status.
         print("ldd GNU libc")
     elif tool == "head":
         if sys.platform != 'darwin' or sys.argv[1] != '-c':
@@ -63,19 +66,32 @@ if tool in ("curl", "uname", "ldd", "mv", "sha256sum", "head"):
         if tag == "offline":
             print("curl: HTTP 404", file=sys.stderr)
             sys.exit(22)
-        destination = args[args.index("-o") + 1]
-        shutil.copyfile(fixture / tag / name, destination)
+        source = fixture / tag / name
+        if not source.is_file():
+            print("curl: HTTP 404", file=sys.stderr)
+            sys.exit(22)
+        if "-o" in args:
+            shutil.copyfile(source, args[args.index("-o") + 1])
+        else:
+            sys.stdout.buffer.write(source.read_bytes())
+            if (fixture / tag / "download-failed").exists():
+                print("curl: interrupted download", file=sys.stderr)
+                sys.exit(18)
     sys.exit(0)
 
 script = sys.stdin.read()
+installer = Path(sys.argv[1]).read_bytes()
 upload = "--upload" in sys.argv
-assert ("NATIVEPIPE TARGET" if upload else "Checking NativePipe") in script
+assert ("NATIVEPIPE INSTALLER" if upload else "| sh -s") in script
+assert "tar -xzf" not in script, "Installation policy must stay out of SSH arguments"
 with tempfile.TemporaryDirectory(prefix="nativepipe-installer-") as directory:
     root = Path(directory)
     fixture = root / "github"
     fixture.mkdir()
     test_home = root / "user account"
     test_home.mkdir()
+    scratch = root / "temporary"
+    scratch.mkdir()
     binary = root / "bin"
     binary.mkdir()
     utilities = ["curl", "uname", "ldd", "mv"]
@@ -87,20 +103,22 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-installer-") as directory:
         shutil.copyfile(__file__, binary / name)
         (binary / name).chmod(0o755)
     env = dict(os.environ, HOME=str(test_home), INSTALLER_FIXTURE=str(fixture),
+               INSTALLER_ARCH="x86_64", INSTALLER_LIBC="gnu",
+               TMPDIR=str(scratch),
                PATH=str(binary) + os.pathsep + os.environ["PATH"])
     asset = "nativepipe-compositor-x86_64-gnu.tar.gz"
 
     def release(version, executable=True):
         target = fixture / version
         target.mkdir()
+        (target / "install-compositor.sh").write_bytes(installer)
         with tarfile.open(target / asset, "w:gz") as archive:
             files = {"lib/version": version.encode()}
             if executable:
                 # The upload prelude must leave following stdin bytes intact.
                 status = 71 if version == 'bad-runtime' else 0
                 check = f'if [ "${{1:-}}" = --check-runtime ]; then exit {status}; fi\n'
-                if upload:
-                    check += 'read marker\n[ "$marker" = AFTER_ARCHIVE ] || exit 97\n'
+                check += 'read marker\n[ "$marker" = AFTER_ARCHIVE ] || exit 97\n'
                 files["nativepipe-wayland"] = ("#!/bin/sh\n" + check + "printf '%s\\n' '" + version + "'\n").encode()
             for name, data in files.items():
                 info = tarfile.TarInfo(name)
@@ -120,7 +138,11 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-installer-") as directory:
         if upload:
             process = subprocess.Popen(["/bin/sh", "-c", script], env=env,
                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            assert process.stdout.readline() == b'NATIVEPIPE TARGET x86_64 gnu\n'
+            assert process.stdout.readline() == b'NATIVEPIPE INSTALLER\n'
+            process.stdin.write(f'{len(installer)}\n'.encode() + installer)
+            process.stdin.flush()
+            target = f'NATIVEPIPE TARGET {env["INSTALLER_ARCH"]} {env["INSTALLER_LIBC"]}\n'.encode()
+            assert process.stdout.readline() == target
             directory = fixture / (fixture / 'latest').read_text()
             data = (directory / asset).read_bytes()
             digest = (directory / 'SHA256SUMS').read_text().split()[0]
@@ -135,7 +157,7 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-installer-") as directory:
             result = subprocess.CompletedProcess(process.args, process.returncode, out.decode(), err.decode())
         else:
             result = subprocess.run(["/bin/sh", "-c", resolved_script()], env=env,
-                                    capture_output=True, text=True, timeout=20)
+                                    input="AFTER_ARCHIVE\n", capture_output=True, text=True, timeout=20)
         assert (result.returncode == 0) == success, result.stderr
         if success:
             assert result.stdout == (fixture / "latest").read_text() + "\n", result
@@ -178,7 +200,29 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-installer-") as directory:
     if upload:
         release('truncated')
         assert 'interrupted' in invoke(success=False, truncate=True).stderr
+        for data in (b'0\n', b'65537\n', b'invalid\n', b'100\nshort script'):
+            result = subprocess.run(["/bin/sh", "-c", script], env=env, input=data,
+                                    capture_output=True, timeout=20)
+            assert result.returncode != 0 and b'NATIVEPIPE TARGET' not in result.stdout, result
+            assert current.resolve().name == second
     else:
+        for version, data in (("empty-installer", b""), ("partial-installer", installer.split(b'\ninstall_compositor "$@"')[0])):
+            release(version)
+            (fixture / version / 'install-compositor.sh').write_bytes(data)
+            invoke(success=False)
+            assert current.resolve().name == second
+        release('interrupted-installer')
+        (fixture / 'interrupted-installer/install-compositor.sh').write_bytes(b'exit 0\n')
+        (fixture / 'interrupted-installer/download-failed').touch()
+        assert 'interrupted download' in invoke(success=False).stderr
+        release('interrupted-with-valid-output')
+        executable = shlex.quote(str(current.resolve() / 'nativepipe-wayland'))
+        (fixture / 'interrupted-with-valid-output/install-compositor.sh').write_text(f"printf '%s\\n' {executable}\n")
+        (fixture / 'interrupted-with-valid-output/download-failed').touch()
+        assert 'download did not complete' in invoke(success=False).stderr
+        release('missing-installer')
+        (fixture / 'missing-installer/install-compositor.sh').unlink()
+        assert 'HTTP 404' in invoke(success=False).stderr
         (fixture / "latest").write_text("offline")
         assert "HTTP 404" in invoke(success=False).stderr
     assert current.resolve().name == second
@@ -189,11 +233,26 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-installer-") as directory:
             list(workers.map(lambda _: invoke(), range(3)))
     else:
         children = [subprocess.Popen(["/bin/sh", "-c", resolved_script()], env=env,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(3)]
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(3)]
         for child in children:
-            out, err = child.communicate(timeout=20)
+            out, err = child.communicate(input=b'AFTER_ARCHIVE\n', timeout=20)
             assert child.returncode == 0 and out == b"v3\n", err.decode()
     assert current.resolve().name == third
     assert (current / "lib/version").read_text() == "v3"
+    for arch, libc in (("aarch64", "gnu"), ("aarch64", "musl"), ("x86_64", "musl")):
+        env.update(INSTALLER_ARCH=arch, INSTALLER_LIBC=libc)
+        asset = f"nativepipe-compositor-{arch}-{libc}.tar.gz"
+        digest = release(f"target-{arch}-{libc}")
+        invoke(cached=False)
+        assert current.resolve().name == digest
+    (binary / "bash").write_text("#!/bin/sh\necho 'bash is unavailable' >&2\nexit 127\n")
+    (binary / "bash").chmod(0o755)
+    release("without-bash")
+    invoke(cached=False)
     assert not list(installation.glob(".install-*")), "Staging directories leaked"
-    print("PASS", "bundled upload" if upload else "GitHub download", "install, cached reconnect, update, immutable running version, corrupt archive, missing executable, invalid manifest, interruption/offline, concurrent publication")
+    leftovers = {path.name for path in scratch.iterdir()}
+    if sys.platform == "darwin":
+        # Apple's python3 launcher creates this toolchain cache in TMPDIR.
+        leftovers.discard("xcrun_db")
+    assert not leftovers, f"Installer bootstrap temporary files leaked: {leftovers}"
+    print("PASS", "bundled upload" if upload else "curl | sh", "install, cached reconnect, update, immutable running version, corrupt archive, missing executable, invalid manifest, installer failure, stdin handoff, interruption/offline, concurrent publication, four architecture/libc targets, no Bash dependency")

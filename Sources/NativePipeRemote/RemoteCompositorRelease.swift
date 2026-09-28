@@ -1,7 +1,7 @@
 import Foundation
 
-/// Release discovery runs asynchronously on the Mac; Linux only needs curl,
-/// sha256sum and tar. VM runtime releases must not hide compositor releases.
+/// Release discovery runs asynchronously on the Mac. Select the installer and
+/// compositor from one tag; VM-only and legacy releases are not installable.
 enum RemoteCompositorRelease {
     struct Release: Decodable {
         struct Asset: Decodable { let name: String; let browser_download_url: URL }
@@ -24,7 +24,7 @@ enum RemoteCompositorRelease {
             if let base = try select(releases) { return base }
             if releases.count < 100 { break }
         }
-        throw RemoteError.message("GitHub has no NativePipe compositor release available. The repository needs a release containing nativepipe-compositor-<architecture>-<libc>.tar.gz and SHA256SUMS. VM runtime packages cannot be used for remote connections.")
+        throw RemoteError.message("GitHub has no installable NativePipe compositor release available. A release must contain install-compositor.sh, nativepipe-compositor-<architecture>-<libc>.tar.gz and SHA256SUMS.")
     }
 
     static func select(_ releases: [Release]) throws -> URL? {
@@ -33,6 +33,7 @@ enum RemoteCompositorRelease {
         }
         for release in releases where !release.draft && !release.prerelease {
             guard release.assets.contains(where: { $0.name == "SHA256SUMS" }),
+                  release.assets.contains(where: { $0.name == "install-compositor.sh" }),
                   let asset = release.assets.first(where: { names.contains($0.name) }) else { continue }
             let url = asset.browser_download_url
             guard url.scheme == "https", url.host == "github.com", url.user == nil, url.password == nil,

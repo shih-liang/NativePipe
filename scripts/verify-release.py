@@ -11,20 +11,24 @@ for arch in ("aarch64", "x86_64"):
     archives.add(f"nativepipe-vm-compositor-{arch}.tar.gz")
     archives.update(f"nativepipe-compositor-{arch}-{libc}.tar.gz" for libc in ("gnu", "musl"))
 files = {p.name for p in root.iterdir()}
-assert archives | {"SHA256SUMS"} <= files, "A product or checksum is missing"
-assert files <= archives | {"SHA256SUMS", "SHA256SUMS.sig", "nativepipe-ed25519-public-key.pem"}, "Unexpected release files"
+payloads = archives | {"install-compositor.sh"}
+assert payloads | {"SHA256SUMS"} <= files, "A product, installer or checksum is missing"
+assert files <= payloads | {"SHA256SUMS", "SHA256SUMS.sig", "nativepipe-ed25519-public-key.pem"}, "Unexpected release files"
 checksums = {}
 for line in (root / "SHA256SUMS").read_text().splitlines():
     digest, name = line.split("  ", 1)
     assert name not in checksums, "Duplicate checksum"
     checksums[name] = digest
-assert set(checksums) == archives, "Checksums must cover exactly the product archives"
-for name in sorted(archives):
+assert set(checksums) == payloads, "Checksums must cover exactly the product archives and installer"
+for name in sorted(payloads):
     with (root / name).open("rb") as handle:
         digest = hashlib.sha256()
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     assert digest.hexdigest() == checksums[name], f"Checksum mismatch: {name}"
+    if name == "install-compositor.sh":
+        assert (root / name).read_bytes() == (Path(__file__).parent / name).read_bytes(), "Installer differs from release source"
+        continue
     with tarfile.open(root / name) as archive:
         members = {m.name.removeprefix("./"): m for m in archive.getmembers()}
         if name.startswith("nativepipe-vm-"):
@@ -39,4 +43,4 @@ for name in sorted(archives):
         for path in required:
             assert path in members and members[path].isfile() and members[path].mode & 0o111, f"Missing executable {path} in {name}"
         assert any(p.startswith("LICENSES/") for p in members), f"Missing notices in {name}"
-print("Release verified: 2 VM bundles, 4 remote bundles, 1 universal macOS CLI, shared checksums")
+print("Release verified: 2 VM bundles, 4 remote bundles, 1 universal macOS CLI, installer, shared checksums")

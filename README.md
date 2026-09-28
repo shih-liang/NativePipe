@@ -134,8 +134,17 @@ sent or a lost TCP packet; bounded adaptive admission reduces that unavoidable
 head-of-line delay, not the physical network RTT.
 
 If the compositor is missing, NativePipe explains how to install it.
-`--install-compositor` checks GitHub on each connection and downloads the
-architecture/libc-specific release only when its published SHA-256 digest changes.
+`--install-compositor` checks GitHub on each connection and selects a release
+containing `install-compositor.sh`, the compositor archives and `SHA256SUMS`.
+The SSH command downloads that pinned release's installer with `curl | sh`;
+installation policy is maintained in `scripts/install-compositor.sh`, outside
+the SSH command string. A completion marker checks curl's success independently
+of the pipeline's last command, and an empty installer result cannot start the
+display session. The installer returns
+the executable path on stdout and diagnostics on stderr; the SSH shell then
+executes the compositor with its original stdin/stdout intact.
+This download path needs POSIX sh, curl, tar and sha256sum. The architecture/libc-specific
+archive is downloaded only when its published SHA-256 digest is not already installed.
 Verified bundles live under `~/.local/share/nativepipe/compositor/releases/<digest>`;
 an atomic `current` link selects the completed installation. Running connections
 keep their own immutable directory, including libraries loaded later. Explicit
@@ -145,7 +154,11 @@ distribution; they are not bundled or replaced. Image libraries and matching
 GdkPixbuf PNG/XPM loaders are bundled without exporting LD_LIBRARY_PATH.
 
 FluxWindow supplies these same remote archives from its application bundle via
-`localCompositorDirectory`. Its connection selects the SSH host's architecture
+`localCompositorDirectory`, together with the same `install-compositor.sh`.
+A short SSH bootstrap receives the bounded script as a temporary file, runs
+its offline upload mode with the system `sh` and removes the file before starting
+the compositor. This offline path does not require curl; neither path needs Bash.
+Its connection selects the SSH host's architecture
 and libc, compares the local archive digest with the installed version, and
 uploads only a missing version. The bounded installation prelude and display
 protocol share one SSH process. Neither the Mac nor Linux needs GitHub access
@@ -243,6 +256,12 @@ helpers need DRM and Vulkan headers. Rootless X11 additionally requires the
 distribution packages `xwayland-satellite` and Xwayland at runtime. Remote
 sessions require `dbus-run-session` to isolate application activation from the
 remote machine's physical desktop session.
+Both compositors require XKB keyboard data (`xkb-data` on Debian/Ubuntu,
+`xkeyboard-config` on Arch/Alpine) at runtime. `--check-runtime` verifies that
+the default keymap compiles and, for remote sessions, that `dbus-run-session`
+is available. Missing prerequisites fail before any session/protocol output;
+the installer keeps the previous working version. Xwayland and hardware
+video encoders remain optional.
 
 ## Builds and releases
 
@@ -280,7 +299,7 @@ SwiftPM invocation. The build cache is isolated by toolchain and package manifes
 | Remote compositor with private image libraries | `nativepipe-compositor-{aarch64,x86_64}-{gnu,musl}.tar.gz` |
 | macOS `nativepipe` CLI | `nativepipe-macos-universal.tar.gz` (Apple Silicon and Intel, macOS 14+) |
 
-There are seven product archives and three shared verification files:
+There are seven product archives, `install-compositor.sh` and three shared verification files:
 `SHA256SUMS`, its Ed25519 signature, and the public key. Reports, provenance,
 test results and intermediate build files stay in CI artifacts. License notices
 remain inside the corresponding archives. VM archives exclude the remote binary.

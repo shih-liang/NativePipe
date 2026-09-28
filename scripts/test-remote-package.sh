@@ -79,6 +79,37 @@ fi
 step='missing-library stdout remains empty'
 test ! -s "$temporary/stdout"
 step='missing-library actionable diagnostic'
-grep -q 'NativePipe cannot load its Linux runtime libraries' "$temporary/stderr"
+grep -q 'NativePipe runtime check failed' "$temporary/stderr"
 grep -q 'AV1 software encoding is bundled' "$temporary/stderr"
-echo 'Remote package: static AV1, optional NVENC/VA-API, runtime diagnostics PASS'
+
+# Exercise the real ELF too, so bypassing the package wrapper cannot announce
+# a ready session with broken input. Each failure must be immediate and silent
+# on the binary protocol stream. timeout turns an accidental session into failure.
+mkdir "$temporary/path" "$temporary/empty-xkb"
+ln -s "$(command -v dirname)" "$temporary/path/dirname"
+for entry in "$binary" "$root/nativepipe-wayland"; do
+    for mode in preflight session; do
+        if [ "$mode" = preflight ]; then set -- --check-runtime; else set -- --stdio --session; fi
+        step="missing D-Bus: $entry $mode"
+        status=0
+        timeout 5 env PATH="$temporary/path" "$entry" "$@" > "$temporary/stdout" 2> "$temporary/stderr" || status=$?
+        test "$status" -ne 0 && test "$status" -ne 124
+        test ! -s "$temporary/stdout"
+        grep -q 'dbus-run-session is required' "$temporary/stderr"
+        step="missing XKB data: $entry $mode"
+        status=0
+        # New xkbcommon versions fall back to system data if ROOT is absent.
+        # An existing empty root models genuinely missing data on both versions.
+        timeout 5 env HOME="$temporary/no-home" XDG_CONFIG_HOME="$temporary/no-config" \
+            XKB_CONFIG_ROOT="$temporary/empty-xkb" \
+            XKB_CONFIG_EXTRA_PATH="$temporary/empty-xkb" \
+            XKB_CONFIG_VERSIONED_EXTENSIONS_PATH="$temporary/empty-xkb" \
+            XKB_CONFIG_UNVERSIONED_EXTENSIONS_PATH="$temporary/empty-xkb" \
+            "$entry" "$@" > "$temporary/stdout" 2> "$temporary/stderr" || status=$?
+        test "$status" -ne 0 && test "$status" -ne 124
+        test ! -s "$temporary/stdout"
+        grep -q 'cannot compile XKB keymap' "$temporary/stderr"
+        grep -q 'xkeyboard-config' "$temporary/stderr"
+    done
+done
+echo 'Remote package: static AV1, optional NVENC/VA-API, loader/D-Bus/XKB diagnostics PASS'

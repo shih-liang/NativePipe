@@ -50,7 +50,7 @@ GENERATED := xdg-shell-server-protocol.h xdg-shell-client-protocol.h xdg-shell-p
 ENTRY_SOURCE := main.c
 
 FRONTEND_SOURCES := compositor.c applications.c applications_worker.c application_icons.c surface.c surface_commit.c presentation.c \
-	subcompositor.c input.c decoration.c scale.c scene.c region.c perf.c \
+	subcompositor.c input.c keymap.c decoration.c scale.c scene.c region.c perf.c \
 	windowwire.c window_events.c \
 	xdg_shell.c text_input.c fifo.c \
 	data_device.c cursor_shape.c xwayland.c \

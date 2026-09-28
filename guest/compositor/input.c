@@ -4,6 +4,7 @@
 
 #include "compositor_internal.h"
 #include "data_device.h"
+#include "keymap.h"
 #include "scale.h"
 #include "scene.h"
 #include "text_input.h"
@@ -54,23 +55,7 @@ static wl_fixed_t input_fixed_from(double value)
 /// characters — so *something* has to define the layout, and xkbcommon is what
 /// every Wayland client already links against to read it.
 bool np_input_create_keymap(struct np_server *server) {
-	struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-	if (!context) return false;
-
-	struct xkb_rule_names names = {
-		.rules = NULL, .model = "pc105", .layout = server->keyboard_layout,
-		.variant = NULL, .options = NULL,
-	};
-	struct xkb_keymap *keymap = xkb_keymap_new_from_names(context, &names,
-	                                                      XKB_KEYMAP_COMPILE_NO_FLAGS);
-	if (!keymap) {
-		xkb_context_unref(context);
-		return false;
-	}
-
-	char *text = xkb_keymap_get_as_string(keymap, XKB_KEYMAP_FORMAT_TEXT_V1);
-	xkb_keymap_unref(keymap);
-	xkb_context_unref(context);
+	char *text = np_keymap_text(server->keyboard_layout);
 	if (!text) return false;
 
 	size_t size = strlen(text) + 1;

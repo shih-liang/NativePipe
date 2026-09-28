@@ -133,13 +133,13 @@ jobs:
                   libwayland-dev wayland-protocols libxkbcommon-dev \
                   libvulkan-dev libdrm-dev libegl1-mesa-dev libgles2-mesa-dev \
                   libgbm-dev libva-dev libdav1d-dev libglib2.0-dev \
-                  libgdk-pixbuf-2.0-dev librsvg2-dev dbus dconf-gsettings-backend
+                  libgdk-pixbuf-2.0-dev librsvg2-dev dbus xkb-data dconf-gsettings-backend
               else
                 apk add --no-cache \
                   build-base pkgconf linux-headers patchelf cmake ninja nasm git python3 perl ca-certificates \
                   wayland-dev wayland-protocols libxkbcommon-dev \
                   vulkan-loader-dev vulkan-headers libdrm-dev mesa-dev libva-dev dav1d-dev glib-dev \
-                  gdk-pixbuf-dev librsvg-dev dbus dconf
+                  gdk-pixbuf-dev librsvg-dev dbus xkeyboard-config dconf
               fi
               python3 scripts/build-codecs.py "$ARCH-$LIBC"
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-remote-transport test-remote-encoder test-remote-scheduler

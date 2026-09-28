@@ -26,4 +26,5 @@ for arch in aarch64 x86_64; do
     COPYFILE_DISABLE=1 tar -C "$root" -czf "$out/nativepipe-vm-compositor-$arch.tar.gz" .
 done
 cp "$macos/nativepipe-macos-universal.tar.gz" "$out/"
-(cd "$out" && sha256sum *.tar.gz > SHA256SUMS)
+install -m0755 scripts/install-compositor.sh "$out/install-compositor.sh"
+(cd "$out" && sha256sum *.tar.gz install-compositor.sh > SHA256SUMS)

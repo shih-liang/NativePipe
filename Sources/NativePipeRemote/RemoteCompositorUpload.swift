@@ -9,6 +9,18 @@ enum RemoteCompositorUpload {
 
     static func prepare(directory: URL, input: FileHandle, output: FileHandle,
                         write: (FileHandle, Data) throws -> Void) throws -> Bool {
+        guard let request = try readLine(output) else { return false }
+        guard request == "NATIVEPIPE INSTALLER" else {
+            throw RemoteError.message("Invalid NativePipe installation response: \(request)")
+        }
+        let installer: FileHandle
+        do { installer = try FileHandle(forReadingFrom: directory.appendingPathComponent("install-compositor.sh")) }
+        catch { throw RemoteError.message("This FluxWindow build is missing its compositor installer.") }
+        defer { try? installer.close() }
+        guard let script = try installer.read(upToCount: 65_537), !script.isEmpty, script.count <= 65_536 else {
+            throw RemoteError.message("The bundled NativePipe installer is empty or exceeds the size limit.")
+        }
+        try write(input, Data("\(script.count)\n".utf8) + script)
         guard let target = try readLine(output) else { return false }
         let fields = target.split(separator: " ")
         guard fields.count == 4, fields[0] == "NATIVEPIPE", fields[1] == "TARGET",

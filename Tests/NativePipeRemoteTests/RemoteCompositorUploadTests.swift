@@ -8,6 +8,9 @@ final class RemoteCompositorUploadTests: XCTestCase {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
+        let installer = try Data(contentsOf: RemoteInstallerTests.installerURL)
+        try installer.write(to: directory.appendingPathComponent("install-compositor.sh"))
+        let installerDigest = SHA256.hash(data: installer).map { String(format: "%02x", $0) }.joined()
         var payload = Data(WindowWire.lifecycleMagic + [1, 1, 0, 0, 42, 0, 0, 0])
         var version = WindowWire.windowProtocolVersion.littleEndian
         withUnsafeBytes(of: &version) { payload.append(contentsOf: $0) }
@@ -21,6 +24,10 @@ final class RemoteCompositorUploadTests: XCTestCase {
                 // cached reply and binary ready record arrive in one write.
                 let peer = """
                 import sys, os, hashlib, base64
+                os.write(1, b'NATIVEPIPE INSTALLER\\n')
+                size = int(sys.stdin.buffer.readline())
+                assert size == \(installer.count)
+                assert hashlib.sha256(sys.stdin.buffer.read(size)).hexdigest() == '\(installerDigest)'
                 os.write(1, b'NATIVEPIPE TARGET \(target)\\n')
                 digest, size = sys.stdin.buffer.readline().split()
                 assert digest.decode() == '\(digest)' and int(size) == \(data.count)
@@ -63,12 +70,39 @@ final class RemoteCompositorUploadTests: XCTestCase {
     }
 
     @MainActor func testUntrustedTargetCannotEscapeTheBundle() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.copyItem(at: RemoteInstallerTests.installerURL,
+                                        to: directory.appendingPathComponent("install-compositor.sh"))
         for response in ["NATIVEPIPE TARGET ../../tmp gnu\n", String(repeating: "X", count: 257)] {
-            let session = RemoteSession(testExecutable: "/bin/sh",
-                arguments: ["-c", "printf '%s' \(SSHCommand.quote(response)); read reply"],
-                localCompositorDirectory: FileManager.default.temporaryDirectory)
+            let peer = """
+            import sys, os, base64
+            os.write(1, b'NATIVEPIPE INSTALLER\\n')
+            size = int(sys.stdin.buffer.readline())
+            sys.stdin.buffer.read(size)
+            os.write(1, base64.b64decode('\(Data(response.utf8).base64EncodedString())'))
+            sys.stdin.buffer.read()
+            """
+            let session = RemoteSession(testExecutable: "/usr/bin/python3", arguments: ["-c", peer],
+                localCompositorDirectory: directory)
             do { try await session.connect(); XCTFail("Expected invalid prelude") }
             catch { XCTAssertTrue(error.localizedDescription.contains("response")) }
+            XCTAssertFalse(session.isConnected)
+        }
+    }
+
+    @MainActor func testMissingEmptyOrOversizedInstallerFailsBeforeUpload() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        for size in [-1, 0, 65_537] {
+            if size >= 0 { try Data(repeating: 65, count: size).write(to: directory.appendingPathComponent("install-compositor.sh")) }
+            let session = RemoteSession(testExecutable: "/bin/sh",
+                arguments: ["-c", "printf 'NATIVEPIPE INSTALLER\\n'; read reply"],
+                localCompositorDirectory: directory)
+            do { try await session.connect(); XCTFail("Expected invalid installer") }
+            catch { XCTAssertTrue(error.localizedDescription.contains("installer")) }
             XCTAssertFalse(session.isConnected)
         }
     }

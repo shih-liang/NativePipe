@@ -3,6 +3,7 @@
 #include "backend_internal.h"
 #include "compositor.h"
 #include "dmabuf.h"
+#include <glib.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
@@ -10,6 +11,18 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+bool np_backend_check_runtime(void)
+{
+    char *command = g_find_program_in_path("dbus-run-session");
+    if (!command) {
+        fprintf(stderr, "[wayland] dbus-run-session is required for a private application session. "
+            "Install dbus-daemon (Debian/Ubuntu) or dbus (Arch/Alpine), and check PATH.\n");
+        return false;
+    }
+    g_free(command);
+    return true;
+}
 
 int np_backend_run(int argc, char **argv)
 {

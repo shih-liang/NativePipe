@@ -23,6 +23,8 @@ enum np_buffer_commit_kind {
 /* The executable entry is deliberately link-selected.  Both concrete
  * backends export this exact symbol; a binary links one and only one of them. */
 int np_backend_run(int argc, char **argv);
+/* Essential userspace prerequisites only; must not open a display or GPU. */
+bool np_backend_check_runtime(void);
 
 /* Process/server ownership. */
 bool np_backend_prepare(struct np_server *server);
