@@ -360,6 +360,7 @@ public enum GuestCapability {
     /// Recovery image has GPT/ext4 tooling, DHCP, read-only install payloads,
     /// and can execute the version-1 rootfs adapter contract.
     public static let guidedRootFSInstall = "init.install.rootfs.v1"
+    public static let nativeRootFSInstall = "init.install.rootfs.c.v1"
     public static let fileWrite = "fs.write"
     public static let consoleResize = "console.resize"
     public static let launch = "process.launch"

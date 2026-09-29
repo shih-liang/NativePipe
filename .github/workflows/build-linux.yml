@@ -148,6 +148,7 @@ jobs:
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" dist-vmpipe
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" dist-remote
               make -C guest/session ARCH="$ARCH" LIBC="$LIBC" dist-target
+              make -C guest/session ARCH="$ARCH" LIBC="$LIBC" test
               sh scripts/package-remote-compositor.sh "$ARCH" "$LIBC" remote-release
               sh scripts/test-remote-package.sh remote-release
               tar -C remote-release -czf "nativepipe-compositor-$ARCH-$LIBC.tar.gz" .

@@ -2,6 +2,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -149,7 +150,8 @@ static void align_blob_loaded(void)
 {
 	if (!trace_enabled()) return;
 	const char msg[] = "[align-blob] loaded\n";
-	(void)write(STDERR_FILENO, msg, sizeof(msg) - 1);
+	ssize_t written = write(STDERR_FILENO, msg, sizeof(msg) - 1);
+	(void)written;
 }
 
 /* musl: ioctl(int, int, ...). glibc: ioctl(int, unsigned long, ...). */
@@ -161,13 +163,16 @@ typedef int np_ioctl_request_t;
 
 static int is_create_blob_ioctl(np_ioctl_request_t request)
 {
-#if defined(__GLIBC__)
-	return request == DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB;
-#else
-	/* musl declares request as int; _IOWR constants are unsigned long. */
-	return (unsigned int)request ==
-	       (unsigned int)DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB;
-#endif
+	/* Linux accepts both the original 48-byte request and newer extensions.
+	 * Only inspect the stable prefix through blob_id. Comparing the complete
+	 * ioctl number silently misses Mesa built with a different header version.
+	 * Cast first because musl declares the request as a signed int. */
+	unsigned int code = (unsigned int)request;
+	return _IOC_TYPE(code) == DRM_IOCTL_BASE &&
+	       _IOC_NR(code) == DRM_COMMAND_BASE + DRM_VIRTGPU_RESOURCE_CREATE_BLOB &&
+	       _IOC_DIR(code) == (_IOC_READ | _IOC_WRITE) &&
+	       _IOC_SIZE(code) >= offsetof(struct drm_virtgpu_resource_create_blob,
+	                                  blob_id) + sizeof(uint64_t);
 }
 
 static void record_mappable_blob_fd(int fd, const void *arg, int result)
@@ -179,6 +184,7 @@ static void record_mappable_blob_fd(int fd, const void *arg, int result)
 	atomic_store_explicit(&mappable_blob_fd, fd, memory_order_release);
 }
 
+__attribute__((visibility("default")))
 int ioctl(int fd, np_ioctl_request_t request, ...)
 {
 	static int (*next_ioctl)(int, np_ioctl_request_t, ...);
@@ -204,18 +210,19 @@ int ioctl(int fd, np_ioctl_request_t request, ...)
 	return result;
 }
 
+__attribute__((visibility("default")))
 int drmIoctl(int fd, unsigned long request, void *arg)
 {
 	static int (*next_drm)(int, unsigned long, void *);
 	if (!next_drm) {
 		next_drm = (int (*)(int, unsigned long, void *))dlsym(RTLD_NEXT, "drmIoctl");
 	}
-	if (request == DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB && arg) {
+	if (is_create_blob_ioctl((np_ioctl_request_t)request) && arg) {
 		if (align_create_blob(arg) < 0) return -1;
 	}
 	if (next_drm) {
 		int result = next_drm(fd, request, arg);
-		if (request == DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB)
+		if (is_create_blob_ioctl((np_ioctl_request_t)request))
 			record_mappable_blob_fd(fd, arg, result);
 		return result;
 	}
@@ -228,7 +235,7 @@ int drmIoctl(int fd, unsigned long request, void *arg)
 		return -1;
 	}
 	int result = next_ioctl(fd, (np_ioctl_request_t)request, arg);
-	if (request == DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB)
+	if (is_create_blob_ioctl((np_ioctl_request_t)request))
 		record_mappable_blob_fd(fd, arg, result);
 	return result;
 }
@@ -242,7 +249,7 @@ static void *map_aligned_blob(void *address, size_t length, int prot, int flags,
 	                         int fd, off_t offset)
 {
 	size_t mapped_length = length;
-	if (fd == atomic_load_explicit(&mappable_blob_fd, memory_order_acquire) &&
+	if (fd >= 0 && fd == atomic_load_explicit(&mappable_blob_fd, memory_order_acquire) &&
 	    (flags & MAP_SHARED)) {
 		mapped_length = align_host_page(length);
 		if (!mapped_length) {
@@ -266,6 +273,7 @@ static void *map_aligned_blob(void *address, size_t length, int prot, int flags,
 	return result;
 }
 
+__attribute__((visibility("default")))
 void *mmap(void *address, size_t length, int prot, int flags, int fd,
 	  off_t offset)
 {
@@ -273,6 +281,7 @@ void *mmap(void *address, size_t length, int prot, int flags, int fd,
 }
 
 #if defined(__GLIBC__)
+__attribute__((visibility("default")))
 void *mmap64(void *address, size_t length, int prot, int flags, int fd,
 	    off64_t offset)
 {
@@ -280,6 +289,7 @@ void *mmap64(void *address, size_t length, int prot, int flags, int fd,
 }
 #endif
 
+__attribute__((visibility("default")))
 int munmap(void *address, size_t length)
 {
 	size_t mapped_length = forget_mapping(address);

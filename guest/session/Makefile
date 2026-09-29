@@ -24,7 +24,7 @@ SESSION := dist/nativepipe-session-$(ARCH)-$(LIBC)
 ALIGN   := dist/nativepipe-align-blob-$(ARCH)-$(LIBC).so
 LAYER   := dist/nativepipe-vulkan-layer-$(ARCH)-$(LIBC).so
 
-.PHONY: all dist-target check-arch check-deps clean
+.PHONY: all dist-target check-arch check-deps test clean
 
 all: dist-target
 dist-target: check-arch check-deps $(SESSION) $(ALIGN) $(LAYER)
@@ -56,6 +56,15 @@ $(LAYER): $(LAYER_SOURCE) | dist
 	$(CC) $(BASE_CFLAGS) $(VULKAN_CFLAGS) -shared -fPIC -fvisibility=hidden \
 		-o $@ $< -pthread
 	$(STRIP) $@
+
+test: $(ALIGN)
+	$(CC) $(BASE_CFLAGS) -shared -fPIC -DTEST_IOCTL_BACKEND \
+		-o dist/test-blob-backend.so test-blob-interposition.c
+	$(CC) $(BASE_CFLAGS) -o dist/test-blob-client test-blob-interposition.c -ldl
+	LD_PRELOAD='$(abspath $(ALIGN)):$(abspath dist/test-blob-backend.so)' dist/test-blob-client
+	$(CC) $(BASE_CFLAGS) $(DRM_CFLAGS) -DNATIVEPIPE_ALIGNMENT_SELF_TEST \
+		-o dist/test-blob-alignment $(ALIGN_SOURCE) -ldl
+	dist/test-blob-alignment
 
 clean:
 	rm -rf dist
