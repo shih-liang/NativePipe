@@ -4,18 +4,21 @@ import Darwin
 /// A duplex, nonblocking byte stream. One serial queue owns its descriptor,
 /// pending operations and deadlines; idle sockets occupy no worker threads.
 public final class SocketConnection: @unchecked Sendable {
+    public enum DescriptorType: Sendable { case socket, file }
     public enum Failure: Error, Equatable { case endOfStream, truncated }
     private let state: State
 
     /// Takes ownership, including on failure. Only this connection may read,
     /// write or close the descriptor after adoption.
-    public init(owning descriptor: Int32, maximumQueuedBytes: Int = 64 * 1024 * 1024) throws {
+    public init(owning descriptor: Int32, maximumQueuedBytes: Int = 64 * 1024 * 1024,
+                descriptorType: DescriptorType = .socket) throws {
         precondition(maximumQueuedBytes > 0)
         guard fcntl(descriptor, F_SETFD, FD_CLOEXEC) == 0,
               fcntl(descriptor, F_SETFL, fcntl(descriptor, F_GETFL) | O_NONBLOCK) == 0 else {
             let code = errno; Darwin.close(descriptor); throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
         }
-        state = State(fd: descriptor, maximumQueuedBytes: maximumQueuedBytes)
+        if descriptorType == .file { _ = fcntl(descriptor, F_SETNOSIGPIPE, 1) }
+        state = State(fd: descriptor, maximumQueuedBytes: maximumQueuedBytes, descriptorType: descriptorType)
     }
 
     deinit { close() }
@@ -135,6 +138,7 @@ public final class SocketConnection: @unchecked Sendable {
         let queue = DispatchQueue(label: "com.nativepipe.socket", qos: .userInitiated)
         let fd: Int32
         let maximumQueuedBytes: Int
+        let descriptorType: DescriptorType
         private var readSource: DispatchSourceRead!
         private var writeSource: DispatchSourceWrite!
         private var timer: DispatchSourceTimer!
@@ -156,8 +160,9 @@ public final class SocketConnection: @unchecked Sendable {
         var descriptorClosed = false
         var closeWaiters: [CheckedContinuation<Void, Never>] = []
 
-        init(fd: Int32, maximumQueuedBytes: Int) {
+        init(fd: Int32, maximumQueuedBytes: Int, descriptorType: DescriptorType) {
             self.fd = fd; self.maximumQueuedBytes = maximumQueuedBytes
+            self.descriptorType = descriptorType
             // Initialization precedes publication; all later state stays on queue.
             readSource = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
             writeSource = DispatchSource.makeWriteSource(fileDescriptor: fd, queue: queue)
@@ -258,8 +263,11 @@ public final class SocketConnection: @unchecked Sendable {
             while !writes.isEmpty && budget > 0 {
                 let operation = writes[0]
                 let count = operation.data.withUnsafeBytes {
-                    Darwin.send(fd, $0.baseAddress!.advanced(by: operation.offset),
-                                min($0.count - operation.offset, budget), MSG_NOSIGNAL)
+                    let address = $0.baseAddress!.advanced(by: operation.offset)
+                    let length = min($0.count - operation.offset, budget)
+                    return descriptorType == .socket
+                        ? Darwin.send(fd, address, length, MSG_NOSIGNAL)
+                        : Darwin.write(fd, address, length)
                 }
                 if count < 0 {
                     if errno == EINTR { continue }
@@ -279,7 +287,8 @@ public final class SocketConnection: @unchecked Sendable {
 
         func finishReading() {
             guard !closed, !inputEnded else { return }
-            inputEnded = true; _ = shutdown(fd, SHUT_RD)
+            inputEnded = true
+            if descriptorType == .socket { _ = shutdown(fd, SHUT_RD) }
             let operation = reading; reading = nil; watchRead(false)
             operation?.continuation.resume(returning: Data())
             scheduleTimer()
@@ -297,7 +306,8 @@ public final class SocketConnection: @unchecked Sendable {
             guard !closed, !outputEnded else { return }
             // Called only after the producer has awaited its final write.
             guard writes.isEmpty else { close(error: POSIXError(.EBUSY)); return }
-            outputEnded = true; _ = shutdown(fd, SHUT_WR)
+            outputEnded = true
+            if descriptorType == .socket { _ = shutdown(fd, SHUT_WR) }
         }
 
         func reserveOutput(_ count: Int) -> POSIXError? {
@@ -358,7 +368,7 @@ public final class SocketConnection: @unchecked Sendable {
             outputLock.lock(); acceptsOutput = false; outputLock.unlock()
             let read = reading, connect = connecting, output = writes
             reading = nil; connecting = nil; writes = []
-            if disconnect {
+            if disconnect && descriptorType == .socket {
                 // Darwin can reject SHUT_RDWR with ENOTCONN after a peer's
                 // write-half closes, leaving our output open on duplicated
                 // descriptors. Finish output independently before input.

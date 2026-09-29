@@ -13,6 +13,15 @@ public enum ShortcutKey: String, Codable, CaseIterable, Sendable {
     case enter, tab, space, backspace, escape, delete, home, end, pageUp, pageDown
     case left, right, up, down
     case f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12
+    case f13, f14, f15, f16, f17, f18, f19, f20
+
+    public var isFunctionKey: Bool {
+        switch self {
+        case .f1, .f2, .f3, .f4, .f5, .f6, .f7, .f8, .f9, .f10,
+             .f11, .f12, .f13, .f14, .f15, .f16, .f17, .f18, .f19, .f20: true
+        default: false
+        }
+    }
 
     public var title: String {
         switch self {

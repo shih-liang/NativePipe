@@ -4,6 +4,38 @@ import XCTest
 @testable import NativePipeProtocol
 
 final class SocketConnectionTests: XCTestCase {
+    func testPipeBackpressurePreservesBytesAndEOF() async throws {
+        var descriptors: [Int32] = [-1, -1]
+        XCTAssertEqual(pipe(&descriptors), 0)
+        let reader = try SocketConnection(owning: descriptors[0], descriptorType: .file)
+        let writer = try SocketConnection(owning: descriptors[1], descriptorType: .file)
+        defer { reader.close(); writer.close() }
+        let expected = Data((0..<524_307).map { UInt8(truncatingIfNeeded: $0) })
+        let deadline = DispatchTime.now() + .seconds(5)
+        let sender = Task {
+            try await writer.write(expected, deadline: deadline)
+            writer.close()
+        }
+        var actual = Data()
+        while true {
+            let data = try await reader.read(upToCount: 7139, deadline: deadline)
+            if data.isEmpty { break }
+            actual.append(data)
+            await Task.yield()
+        }
+        try await sender.value
+        XCTAssertEqual(actual, expected)
+    }
+    func testPipePeerCloseDoesNotRaiseSIGPIPE() async throws {
+        var descriptors: [Int32] = [-1, -1]
+        XCTAssertEqual(pipe(&descriptors), 0)
+        let writer = try SocketConnection(owning: descriptors[1], descriptorType: .file)
+        defer { writer.close() }
+        Darwin.close(descriptors[0])
+        do { try await writer.write(Data([1])); XCTFail("Expected EPIPE") }
+        catch let error as POSIXError { XCTAssertEqual(error.code, .EPIPE) }
+        await writer.waitUntilClosed()
+    }
     func testAdoptedSocketSuppressesSIGPIPEWithoutPeerConfiguration() async throws {
         var descriptors: [Int32] = [-1, -1]
         XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors), 0)

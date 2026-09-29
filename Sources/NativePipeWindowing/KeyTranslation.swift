@@ -61,6 +61,8 @@ enum KeyTranslation {
         // Function keys
         0x7A: 59, 0x78: 60, 0x63: 61, 0x76: 62, 0x60: 63, 0x61: 64,
         0x62: 65, 0x64: 66, 0x65: 67, 0x6D: 68, 0x67: 87, 0x6F: 88,
+        0x69: 183, 0x6B: 184, 0x71: 185, 0x6A: 186,
+        0x40: 187, 0x4F: 188, 0x50: 189, 0x5A: 190,
     ]
 
     static func evdevCode(for macKeyCode: UInt16) -> UInt32? { evdev[macKeyCode] }

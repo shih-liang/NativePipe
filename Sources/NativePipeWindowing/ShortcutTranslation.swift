@@ -2,16 +2,18 @@ import AppKit
 import Carbon
 import NativePipeProtocol
 
-enum ShortcutTranslation {
+public enum ShortcutTranslation {
     private static let namedKeys: [UInt16: ShortcutKey] = [
         0x24: .enter, 0x30: .tab, 0x31: .space, 0x33: .backspace, 0x35: .escape,
         0x75: .delete, 0x73: .home, 0x77: .end, 0x74: .pageUp, 0x79: .pageDown,
         0x7b: .left, 0x7c: .right, 0x7d: .down, 0x7e: .up,
         0x7a: .f1, 0x78: .f2, 0x63: .f3, 0x76: .f4, 0x60: .f5, 0x61: .f6,
         0x62: .f7, 0x64: .f8, 0x65: .f9, 0x6d: .f10, 0x67: .f11, 0x6f: .f12,
+        0x69: .f13, 0x6b: .f14, 0x71: .f15, 0x6a: .f16,
+        0x40: .f17, 0x4f: .f18, 0x50: .f19, 0x5a: .f20,
     ]
 
-    static func chord(for event: NSEvent) -> ShortcutChord? {
+    public static func chord(for event: NSEvent) -> ShortcutChord? {
         let key = namedKeys[event.keyCode]
             ?? event.charactersIgnoringModifiers.flatMap { ShortcutKey(rawValue: $0.lowercased()) }
             ?? layoutKey(for: event.keyCode)
@@ -24,6 +26,10 @@ enum ShortcutTranslation {
         // Modifier-only changes preserve the actual source position, including
         // non-US layouts and Command-specific layouts such as Dvorak-QWERTY.
         if chord(for: event)?.key == key { return event.keyCode }
+        return keyCode(for: key)
+    }
+
+    public static func keyCode(for key: ShortcutKey) -> UInt16? {
         if let named = namedKeys.first(where: { $0.value == key }) { return named.key }
         return (UInt16(0)...UInt16(0x7f)).first {
             KeyTranslation.evdevCode(for: $0) != nil && layoutKey(for: $0) == key
