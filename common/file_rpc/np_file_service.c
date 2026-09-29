@@ -112,14 +112,16 @@ fail:;
 }
 void np_file_service_stop(struct np_file_service *service) {
     if (!service) return;
-    char byte = 1; (void)write(service->wake[1], &byte, 1);
+    /* This pipe has one owner and shutdown is one-shot. Closing its writer
+     * wakes poll with HUP without a fallible/interrupted notification write. */
+    close(service->wake[1]);
     pthread_join(service->thread, NULL);
     pthread_mutex_lock(&service->lock);
     for (unsigned i = 0; i < NP_FILE_CLIENTS; i++)
         if (service->clients[i] >= 0) shutdown(service->clients[i], SHUT_RDWR);
     while (service->active) pthread_cond_wait(&service->drained, &service->lock);
     pthread_mutex_unlock(&service->lock);
-    close(service->listener); close(service->wake[0]); close(service->wake[1]);
+    close(service->listener); close(service->wake[0]);
     pthread_cond_destroy(&service->drained); pthread_mutex_destroy(&service->lock);
     free(service->root); free(service);
 }

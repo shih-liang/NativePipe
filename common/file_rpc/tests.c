@@ -36,6 +36,25 @@ static void finish(int fd, pthread_t thread) {
 int main(void) {
     char dir[] = "/tmp/nativepipe-file-rpc.XXXXXX"; assert(mkdtemp(dir));
     int root = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC); assert(root >= 0);
+#ifdef __linux__
+    /* A one-shot service must wake an idle listener before joining it. Test
+     * this on real Linux VMs; ordinary CI hosts may not expose AF_VSOCK. */
+    struct np_file_service *service = np_file_service_start(UINT32_MAX, dir);
+    if (service) {
+        alarm(10);
+        np_file_service_stop(service);
+        for (unsigned i = 0; i < 32; i++) {
+            service = np_file_service_start(UINT32_MAX, dir);
+            assert(service);
+            np_file_service_stop(service);
+        }
+        alarm(0);
+        puts("file service: idle listener shutdown PASS");
+    } else {
+        assert(errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT || errno == EPERM || errno == ENODEV);
+        puts("file service: AF_VSOCK unavailable on test host (skip)");
+    }
+#endif
     struct server s = {.root = root}; pthread_t thread;
     struct np_file_frame frame;
     /* More than the old 7 MiB control-message limit; no whole-file allocation. */
