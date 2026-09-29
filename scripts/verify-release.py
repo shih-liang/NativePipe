@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Reject incomplete releases and unintended sidecar files before publishing."""
 import hashlib
+import json
 from pathlib import Path
 import sys
 import tarfile
 
 root = Path(sys.argv[1])
+source = Path(__file__).resolve().parents[1]
+license_files = json.loads((source / "LICENSES/source-inventory.json").read_text())["releaseLicenseFiles"]
 archives = {"nativepipe-macos-universal.tar.gz"}
 for arch in ("aarch64", "x86_64"):
     archives.add(f"nativepipe-vm-compositor-{arch}.tar.gz")
@@ -42,5 +45,8 @@ for name in sorted(payloads):
             required = ["bin/nativepipe"]
         for path in required:
             assert path in members and members[path].isfile() and members[path].mode & 0o111, f"Missing executable {path} in {name}"
-        assert any(p.startswith("LICENSES/") for p in members), f"Missing notices in {name}"
+        for path in license_files:
+            assert path in members and members[path].isfile(), f"Missing project license file {path} in {name}"
+            with archive.extractfile(members[path]) as handle:
+                assert handle.read() == (source / path).read_bytes(), f"Project license file {path} differs from release source in {name}"
 print("Release verified: 2 VM bundles, 4 remote bundles, 1 universal macOS CLI, installer, shared checksums")

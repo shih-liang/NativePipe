@@ -30,6 +30,9 @@ PYTHON
 # Notices belong only to objects in this bundle. All links must have been
 # materialized so the archive does not depend on the builder's filesystem.
 step='bundled license inventory'
+cmp LICENSE "$root/LICENSE"
+cmp LICENSES/NOTICE "$root/LICENSES/NOTICE"
+cmp LICENSES/source-inventory.json "$root/LICENSES/source-inventory.json"
 test ! -e "$root/LICENSES/distribution"
 test -z "$(find "$root/LICENSES" -type l -print)"
 while IFS="$(printf '\t')" read -r object package version; do

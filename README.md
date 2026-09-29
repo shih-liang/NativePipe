@@ -1,323 +1,329 @@
 # NativePipe
 
-NativePipe is both the standalone macOS remote-Linux client and the shared
-display, input and transport technology used by FluxWindow. There is one
-Wayland protocol and surface-state implementation in `guest/compositor`; two
-concrete backends select how frames and events cross the machine boundary:
+**Waypipe for macOS.** Run Linux graphical applications over SSH and use their
+windows alongside your Mac apps.
 
-- `nativepipe-wayland` uses SSH stdin/stdout and H.264/AV1/alpha media resources
-  for a remote Linux machine.
-- `vmpipe-wayland` uses the FluxWindow vsock window channel and Venus/
-  virtio-gpu resources inside a VM.
-
-The standalone client and FluxWindow therefore share commit, damage, popup,
-input, clipboard, drag-and-drop, scaling, presentation, frame-callback, and
-Xwayland semantics.
-They do not carry two copied compositor state machines.
-
-Backend selection happens entirely at link time. Both implementations export
-the same `np_backend_run` symbol, while the shared `main.c` only calls that
-symbol. `vmpipe-wayland` links `backends/vmpipe`; `nativepipe-wayland` links
-`backends/remote`. There is no runtime backend factory, command-line selector,
-or `NP_REMOTE` conditional compilation in the compositor frontend. Transport
-state, imported GPU resources, encoded media state and presentation holds are
-opaque to the shared Wayland server.
-
-## Display behavior
-
-The shared compositor implements `xdg_toplevel`, `xdg_popup`, synchronized and
-desynchronized subsurfaces, window geometry, pointer/keyboard/scroll/text
-input, clipboard and Wayland drag-and-drop, decorations, viewport and output
-scale, damage, presentation feedback, frame callbacks, and
-`wp_fifo_manager_v1`.
-
-Rootless X11 uses the guest distribution's `xwayland-satellite` and Xwayland
-packages. NativePipe neither fetches nor builds that Rust project. The
-compositor finds `xwayland-satellite` through the session `PATH`, starts it only
-when an X11 client connects, and leaves X11 disabled when the package is absent.
-
-For NativePipe, a scene and its encoded resources are published as one ordered
-unit: metadata follows the images it references. Pending, unencoded updates
-coalesce to the newest state; encoded video reference frames are never dropped.
-Unchanged alpha planes are reused explicitly within the same encoder epoch.
-The remote virtual output grants Wayland frame/FIFO callbacks at its refresh
-deadline only when transport and display capacity remain. Actual macOS
-presentation separately controls admission; network latency is not imposed as
-one stop-and-wait roundtrip per frame. The VM's display-clock pacing is unchanged.
-
-For FluxWindow, the same scene state names guest-created GPU resources. The VM
-backend receives host events over vsock and presents the compositor's
-window-level resources without importing the remote encoder into the VM path.
-
-## NativePipe client
-
-Requirements are macOS 14 or newer and Xcode/Swift 6:
+NativePipe brings the [waypipe](https://gitlab.freedesktop.org/mstoeckl/waypipe)
+workflow to macOS: the application runs on Linux, its windows appear on your
+Mac, and your keyboard and mouse control it remotely.
 
 ```sh
-make nativepipe
-make test
-```
-
-This produces the standalone `.build/release/nativepipe` command. It is never
-copied into FluxWindow.app or the `nativepipe-runtime` guest archive.
-
-`make test` covers the standalone protocol, windowing, and remote-client stack
-without renderer SDKs. FluxWindow owns its VZ custom virtio-gpu device and the
-virglrenderer, MoltenVK, and ANGLE/libepoxy integration because those components
-are specific to its VM host process.
-
-The command has no third-party Swift dependencies. VideoToolbox or bundled
-dav1d decodes into IOSurface-backed BGRA frames, and the shared Metal scene
-renderer composites the same atomic layer snapshots used by FluxWindow.
-
-The optional `RemoteApplicationTests/testLiveRemoteAV1PixelsAndInput` test uses
-the GTK fixture in `guest/compositor/tests/remote_animation.c`. Set
-`NATIVEPIPE_TEST_AV1_PIPELINE=1`, `NATIVEPIPE_TEST_REMOTE`,
-`NATIVEPIPE_TEST_COMPOSITOR`, and `NATIVEPIPE_TEST_ANIMATION` to an authorized
-test host and its executable paths. `NATIVEPIPE_TEST_SSH_CONFIG` selects a
-dedicated SSH config when needed. It verifies changing pixels, retained-frame
-ownership, click markers and resize epochs with a synthetic consumer clock;
-the separate live animation test measures actual visible presentation.
-`testLiveRemoteH264PixelsAndInput` uses the same host/path variables with
-`NATIVEPIPE_TEST_H264_PIPELINE=1`, and requires actual NVENC encoding and
-VideoToolbox hardware decoding. `make -C guest/compositor test-hardware-encoder`
-produces `guest/compositor/.build/<arch>-<libc>/hardware.npen` on an NVIDIA host;
-set `NATIVEPIPE_TEST_NVENC_FIXTURE` to a local copy when running
-`H264HardwareTests` on a Mac to verify colors, alpha, resize/fallback epochs and
-retained pixel ownership independently of transport.
-To include bundled upload/installation in the live test, also set
-`NATIVEPIPE_TEST_COMPOSITOR_DIRECTORY` to the local archives and
-`NATIVEPIPE_TEST_INSTALL_HOME` to a disposable directory on the SSH host.
-
-Use it over SSH:
-
-```sh
-nativepipe user@linux-host firefox --no-remote
-nativepipe --compositor /home/user/bin/nativepipe-wayland user@linux-host gtk4-demo
-nativepipe -i ~/.ssh/id_ed25519 -p 2222 user@linux-host qterminal
 nativepipe --install-compositor user@linux-host gtk4-demo
 ```
 
-Options before the destination configure SSH/NativePipe. Everything after it
-is the target application's argument vector, not a login shell. The command
-starts a dedicated compositor and exits when that command ends. Each invocation
-has a private temporary Wayland runtime directory.
+## Features
 
-The system `/usr/bin/ssh -T -C` owns authentication, host-key checks, encryption,
-and transport. No libssh, local listener, port forwarding, or lane-pairing nonce
-is used. Short NPIP control records bypass credit-paced bulk records. Images,
-scenes and large replies are wrapped in NPRF fragments (at most 16 KiB), inside
-NPIP; display and background lanes preserve their own order.
-Window lifecycle events stay ordered with scenes, and catalog end markers stay
-behind their batches; only independent transactions may overtake these records.
-NPRA acknowledges
-received bytes, independently of decoding and display. Each sender starts with
-4 KiB of credit and adapts between 1–64 KiB from measured acknowledgement delay.
-It pauses admission when the receiver falls behind, instead of queueing more
-frames in SSH. One latest unencoded scene and a per-window limit of 8 pending
-presentations also bound encode/decode work. NPRP distinguishes actual drawable
-presentation from supersession/cancellation; ordinary frame/FIFO acknowledgements
-are not treated as proof that a scene was displayed. It also carries the window's
-current CADisplayLink interval, so encoding follows the actual display cadence,
-not the screen's advertised maximum rate. A zero Metal presented-time
-is not counted as display. Occluded windows retain their unused display credits
-until visible again, so a hidden animation stops encoding instead of cycling
-through discard acknowledgements. This does not stop input or other windows.
+- Linux application windows integrated with the macOS desktop, including popups,
+  resizing, and HiDPI scaling.
+- Keyboard, mouse, scrolling, clipboard, and drag-and-drop support.
+- SSH authentication and encryption using your existing keys, agent, and SSH
+  configuration. No display port forwarding is needed.
+- Wayland applications, plus X11 applications when the Linux host has
+  `xwayland-satellite` and Xwayland installed.
+- Hardware-accelerated video when supported, with software fallback.
+- Install and update the Linux-side helper from GitHub Releases with one option.
 
-Host commands travel over stdin; diagnostics and child output go to stderr.
-The writer never waits for SSH on the Wayland input event loop. OpenSSH
-compression covers every stream, including metadata, alpha, clipboard and SFTP;
-Encoded video is already compressed and has no additional application-level compressor.
-Display and SFTP disable ControlMaster reuse so a file transfer does not share
-the display's TCP queue. A single TCP stream still cannot bypass bytes already
-sent or a lost TCP packet; bounded adaptive admission reduces that unavoidable
-head-of-line delay, not the physical network RTT.
+## Contents
 
-If the compositor is missing, NativePipe explains how to install it.
-`--install-compositor` checks GitHub on each connection and selects a release
-containing `install-compositor.sh`, the compositor archives and `SHA256SUMS`.
-The SSH command downloads that pinned release's installer with `curl | sh`;
-installation policy is maintained in `scripts/install-compositor.sh`, outside
-the SSH command string. A completion marker checks curl's success independently
-of the pipeline's last command, and an empty installer result cannot start the
-display session. The installer returns
-the executable path on stdout and diagnostics on stderr; the SSH shell then
-executes the compositor with its original stdin/stdout intact.
-This download path needs POSIX sh, curl, tar and sha256sum. The architecture/libc-specific
-archive is downloaded only when its published SHA-256 digest is not already installed.
-Verified bundles live under `~/.local/share/nativepipe/compositor/releases/<digest>`;
-an atomic `current` link selects the completed installation. Running connections
-keep their own immutable directory, including libraries loaded later. Explicit
-`--compositor` paths bypass this installer. No root access is
-used. Optional NVIDIA/VA-API drivers, GLib/GIO, EGL/GL/GBM/DRM and libc come from the Linux
-distribution; they are not bundled or replaced. Image libraries and matching
-GdkPixbuf PNG/XPM loaders are bundled without exporting LD_LIBRARY_PATH.
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Usage](#usage)
+- [Examples](#examples)
+- [Updating](#updating)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
 
-FluxWindow supplies these same remote archives from its application bundle via
-`localCompositorDirectory`, together with the same `install-compositor.sh`.
-A short SSH bootstrap receives the bounded script as a temporary file, runs
-its offline upload mode with the system `sh` and removes the file before starting
-the compositor. This offline path does not require curl; neither path needs Bash.
-Its connection selects the SSH host's architecture
-and libc, compares the local archive digest with the installed version, and
-uploads only a missing version. The bounded installation prelude and display
-protocol share one SSH process. Neither the Mac nor Linux needs GitHub access
-for this bundled path. Both installers check runtime compatibility before
-switching `current`, so an incompatible package cannot replace a working version.
+## Requirements
 
-When the Mac supports hardware H.264 decoding, its SSH launch script advertises
-`NATIVEPIPE_HOST_H264_HARDWARE=1`. The guest then prefers direct NVIDIA NVENC
-H.264 (NPEN codec 1), and the Mac requires and verifies VideoToolbox hardware
-decoding for those frames. NVENC accepts BGRA, performs color conversion, and
-uses P1/ultra-low-latency mode with no B frames or lookahead. Four driver buffers
-satisfy the API requirement, but only one frame is submitted at a time. The
-system `libcuda.so.1` and `libnvidia-encode.so.1` are loaded optionally; neither
-CUDA toolkit nor FFmpeg is linked or bundled. Currently this backend selects
-GPU 0 and accepts even dimensions from 32 through 4096 on either axis.
+### Mac
 
-Without both endpoints' hardware capability, or after an NVENC failure, the
-guest emits AV1 low-overhead OBUs (NPEN codec 3). It tries system VA-API AV1,
-then uses pinned, statically linked libaom realtime encoding with libyuv BGRA
-conversion. A codec change restarts the epoch with a keyframe and fresh alpha;
-failed hardware is not repeatedly probed for the same surface. libva is loaded
-optionally; neither FFmpeg nor system AV1 software libraries are required. The direct
-VA-API backend uses one tile and CQP; surfaces exceeding 4096 pixels on either
-axis or the AV1 single-tile area (including superblock padding) use libaom.
-Hardware suitability depends on GPU and driver capabilities.
+- macOS 14 or later, on Apple Silicon or Intel.
+- A graphical macOS login session and the system OpenSSH client.
 
-Mac receivers use AV1 VideoToolbox hardware decoding when available and bundled
-static dav1d otherwise. A bounded compressed GOP supports software recovery from
-a hardware decode failure. Software output owns a fresh BGRA IOSurface, so
-retired cache entries or decoder reference reuse cannot overwrite GPU readers.
-Legacy H.264 streams retain their hardware-preferred decoding behavior. A stream
-explicitly marked for hardware H.264 fails if the Mac cannot create a hardware
-session, rather than silently claiming software decoding as hardware. Decoders
-deliver synchronously on their serial queue, and rendering retains pixel buffers
-until GPU use finishes. Video encode/decode is accelerated; capture, alpha packing
-and transport still use CPU memory. VM rendering uses its separate virtio-gpu path.
+### Linux host
 
-Run `make codecs` once before direct SwiftPM builds (the normal Make targets do
-this automatically). It builds universal macOS dav1d/libyuv using CMake, Meson,
-Ninja and NASM. Dependency sources are pinned in `scripts/build-codecs.py` and
-cached under `.build/codecs`; licenses, patent grants and exact source revisions
-are included in each product's notices. Runtime package compatibility still
-depends on the distribution's libc, graphics and GLib/GIO interfaces.
-Only the 8-bit codec paths are built; unused static functions are removed when
-linking. A generated build identifier forces host executables to relink when
-the pinned codec versions or build options change.
+- An SSH server and an account you can log in to.
+- Linux 5.3 or later, on `aarch64` or `x86_64`. Release packages are available for
+  both glibc and musl systems.
+- The Linux application you want to run, with its normal runtime dependencies.
+- `dbus-run-session` and XKB keyboard data (`xkb-data` on Debian/Ubuntu,
+  `xkeyboard-config` on Arch/Alpine).
+- Compatible system libraries, including libc, GLib/GIO, EGL/GLES, GBM, and DRM.
+  The installer checks runtime compatibility before activating a new version.
+- For automatic installation: POSIX `sh`, `curl`, `tar`, `sha256sum`, and standard
+  Unix utilities. Both the Mac and Linux host need access to GitHub for this step.
 
-OpenSSH can use its normal keys, config and agent. Passwords and encrypted-key
-passphrases can be remembered in macOS Keychain by the askpass dialog; host-key
-confirmation and one-time codes are never replayed as passwords.
+X11 support additionally requires `xwayland-satellite` and Xwayland on the Linux
+host. Hardware video encoding requires a compatible GPU and its Linux drivers;
+software encoding remains available.
 
-## FluxWindow integration
+## Installation
 
-The manager stores each remote computer alongside virtual machines and starts
-one sandboxed `FluxWindowRemoteHost.app` per connection. The helper runs
-`nativepipe-wayland --stdio --session` through the same SSH implementation,
-holding multiple applications on one display. GIO supplies the installed
-desktop application catalogue and launches desktop entries on that display.
-The manager and FluxWindow Apps both browse that catalogue and raise the same
-windows rather than spawning additional SSH sessions.
+### Download the macOS command
 
-VMHost and RemoteHost share `WindowBridge`, the Dock window switcher, and VMHost's
-appearance/input-source observers and preference resolution, now extracted into
-`HostIntegrationController`. Command coalescing/writing and local helper socket
-ownership are shared too. File drag and file clipboard use one AppKit bridge;
-only the user-vsock versus SFTP transfer adapter differs.
-The remote transport/codec remains separate from VZ and virtio-gpu resources.
-SSH file access uses user-selected security-scoped bookmarks; passwords stay in
-the app group's Keychain, not in the connection plist.
+Download `nativepipe-macos-universal.tar.gz` from
+[Releases](https://github.com/shih-liang/NativePipe/releases). It contains the
+command for both Apple Silicon and Intel, along with its license notices.
 
-The remote compositor requires Linux 5.3 or later. Direct command sessions use
-`pidfd` to observe the exact child process independently of Xwayland's signals.
-
-## Guest builds
-
-Builds are native to their target architecture and libc. The release workflow
-uses aarch64 and x86_64 runners with glibc and musl containers. Static AV1
-dependencies are cached by target and dependency recipe. No FFmpeg build or
-runtime dependency is used.
-
-The important targets are:
+From the directory containing the downloaded archive:
 
 ```sh
-python3 scripts/build-codecs.py x86_64-gnu # select the actual architecture/libc
-make -C guest/compositor remote
-make -C guest/compositor vmpipe
-make -C guest/session dist-target
+mkdir -p "$HOME/.local/share/nativepipe" "$HOME/.local/bin"
+tar -xzf nativepipe-macos-universal.tar.gz -C "$HOME/.local/share/nativepipe"
+ln -sf "$HOME/.local/share/nativepipe/bin/nativepipe" "$HOME/.local/bin/nativepipe"
+export PATH="$HOME/.local/bin:$PATH"
+nativepipe --help
 ```
 
-The compositor needs Wayland, xkbcommon, Vulkan, GIO (including gio-unix),
-GdkPixbuf, and librsvg development packages. Both backends use the same
-[application discovery and launch worker](guest/compositor/APPLICATIONS.md).
-The remote backend also needs EGL/GLES, GBM, DRM, and libva development headers. The session
-helpers need DRM and Vulkan headers. Rootless X11 additionally requires the
-distribution packages `xwayland-satellite` and Xwayland at runtime. Remote
-sessions require `dbus-run-session` to isolate application activation from the
-remote machine's physical desktop session.
-Both compositors require XKB keyboard data (`xkb-data` on Debian/Ubuntu,
-`xkeyboard-config` on Arch/Alpine) at runtime. `--check-runtime` verifies that
-the default keymap compiles and, for remote sessions, that `dbus-run-session`
-is available. Missing prerequisites fail before any session/protocol output;
-the installer keeps the previous working version. Xwayland and hardware
-video encoders remain optional.
+Add the `export PATH` line to your shell's startup file to make the command
+available in future terminals. Release binaries are ad-hoc signed, rather than
+Apple Developer ID notarized.
 
-## Builds and releases
+### Build the command from source
 
-`.github/workflows/build-linux.yml` builds the VM compositor and session helpers
-plus the remote compositor for aarch64/x86_64 and GNU/musl. Every successful run uploads four
-checkout-shaped artifacts:
+Building requires Xcode with Swift 6, Git, Python 3, CMake, Meson, Ninja, and NASM.
+The build downloads and compiles its pinned codec dependencies.
+
+```sh
+git clone https://github.com/shih-liang/NativePipe.git
+cd NativePipe
+make nativepipe
+.build/release/nativepipe --help
+```
+
+Use `.build/release/nativepipe` in place of `nativepipe` in the examples below,
+or install that executable in a directory on your `PATH`.
+
+## Quick start
+
+First, check that ordinary SSH login works:
+
+```sh
+ssh user@linux-host
+```
+
+Exit that SSH session and run this **on your Mac**, choosing an application
+already installed on the Linux host:
+
+```sh
+nativepipe --install-compositor user@linux-host gtk4-demo
+```
+
+The `--install-compositor` option installs or updates `nativepipe-wayland`, the
+Linux-side helper that displays applications through NativePipe. It runs as your
+SSH user and does not require root access. It does not install `gtk4-demo` or
+other applications.
+
+Once the helper is installed, launch applications without the installation flag:
+
+```sh
+nativepipe user@linux-host gtk4-demo
+nativepipe user@linux-host firefox --no-remote
+nativepipe user@linux-host qterminal
+```
+
+Each invocation starts a separate session. Linux application paths and files
+refer to the Linux host. The session ends when the launched command exits.
+Keep that command in the foreground; an application that detaches or hands off
+to an existing process may cause the session to end immediately.
+
+To disconnect explicitly, use **NativePipe → Disconnect from …** in the macOS
+menu bar, or press **⌘Q** while a NativePipe window is active. Closing an
+application window ends the session only if the Linux command also exits.
+
+## Usage
 
 ```text
-nativepipe-linux-aarch64-gnu
-nativepipe-linux-aarch64-musl
-nativepipe-linux-x86_64-gnu
-nativepipe-linux-x86_64-musl
+nativepipe [options] destination application [arguments...]
 ```
 
-Downloading one of these artifacts at the repository root restores its files
-under the ordinary `guest/**/dist` paths. FluxWindow uses the artifacts from
-the run for the NativePipe checkout commit; it does not build Linux binaries on
-the Mac and it does not use a runtime lock, manifest, or release archive.
-
-Only an explicitly pushed `nativepipe-v*` version tag, or a manual run with an
-existing `release_tag`, publishes a GitHub Release. Ordinary commits and manual
-runs without a tag only build and validate artifacts. A release reuses a complete
-successful main build for the exact tagged commit when its artifacts are still
-available; otherwise it builds that commit. A manual retry can fix the workflow
-without moving an existing tag. All three products are published together:
-
-The macOS job runs Swift tests in release mode, reuses that Apple Silicon build,
-then compiles Intel with SwiftPM's native backend and merges the two binaries
-with `lipo`. This avoids the Xcode backend implicitly selected by a multi-arch
-SwiftPM invocation. The build cache is isolated by toolchain and package manifest.
-
-| Product | Release archives |
+| Argument | Description |
 | --- | --- |
-| VM compositor and session helpers | `nativepipe-vm-compositor-{aarch64,x86_64}.tar.gz` (GNU and musl in each) |
-| Remote compositor with private image libraries | `nativepipe-compositor-{aarch64,x86_64}-{gnu,musl}.tar.gz` |
-| macOS `nativepipe` CLI | `nativepipe-macos-universal.tar.gz` (Apple Silicon and Intel, macOS 14+) |
+| `destination` | An SSH destination such as `user@linux-host`, a hostname, or a host alias from your SSH configuration. |
+| `application` | A Linux executable found through the remote session's `PATH`, or an absolute path to an executable on Linux. Required. |
+| `arguments...` | Arguments passed to that Linux application. |
 
-There are seven product archives, `install-compositor.sh` and three shared verification files:
-`SHA256SUMS`, its Ed25519 signature, and the public key. Reports, provenance,
-test results and intermediate build files stay in CI artifacts. License notices
-remain inside the corresponding archives. VM archives exclude the remote binary.
-The CLI is ad-hoc signed; it is not Apple Developer ID notarized.
+### Options
 
-The signer has no repository write permission. A separate publisher verifies
-the complete product set, executable modes, digests and signature before creating
-the release. A missing product prevents publication. Remote clients select a
-stable release containing compositor assets, so older VM-runtime-only releases
-cannot be mistaken for an installable remote bundle.
+All NativePipe and SSH options go **before the destination**. Options and their
+values must be separate arguments, for example `-p 2222`.
 
-## Source and license policy
+| Option | Description |
+| --- | --- |
+| `--install-compositor` | Check GitHub Releases and install or update the Linux helper before launching the application. Reuses an already installed bundle when its checksum matches. |
+| `--compositor PATH` | Use a particular Linux compositor executable. The default is `nativepipe-wayland`. A custom executable name or path bypasses automatic installation, even if `--install-compositor` is also present. |
+| `-i FILE` | Pass a local identity file to SSH. |
+| `-F FILE` | Use a local SSH configuration file. |
+| `-J HOST` | Connect through an SSH jump host, for example `user@bastion`. |
+| `-p PORT` | Set the SSH server port. Otherwise SSH uses its configured port, or 22. |
+| `-o OPTION` | Pass an SSH configuration option, such as `IdentitiesOnly=yes`. May be repeated. |
+| `-h`, `--help` | Print command-line help and exit. |
 
-`LICENSES/source-inventory.json` records checked-in source origins. Wayland XML
-and generated protocol sources retain their embedded MIT notices.
-The guest distribution, rather than NativePipe, distributes and updates
-xwayland-satellite and its license notices.
+The destination ends NativePipe option parsing. Everything after it belongs to
+the Linux command. For example, `--no-remote` below is a **Firefox option**:
 
-Project-original integration files remain
-`LicenseRef-NativePipe-Original`: publishing the repository does not itself
-infer or grant an open-source license for those files.
+```sh
+nativepipe -p 2222 user@linux-host firefox --no-remote
+```
+
+Without `--install-compositor`, NativePipe first looks for `nativepipe-wayland`
+on the remote `PATH`, then in its managed installation under
+`~/.local/share/nativepipe/compositor/current/`. It also recognizes the older
+installation directly under `~/.local/share/nativepipe/compositor/`.
+
+SSH handles host-key verification and authentication. When input is needed,
+NativePipe displays an authentication dialog; passwords and key passphrases can
+be remembered in macOS Keychain.
+
+## Examples
+
+### Choose an SSH key and port
+
+```sh
+nativepipe -i "$HOME/.ssh/id_ed25519" -p 2222 user@linux-host gtk4-demo
+```
+
+The identity file is on your **Mac**. The application is on **Linux**.
+
+### Reuse an SSH host alias
+
+Add a host to `~/.ssh/config` on your Mac:
+
+```sshconfig
+Host linux-dev
+    HostName 192.0.2.10
+    User alice
+    Port 2222
+    IdentityFile ~/.ssh/id_ed25519
+```
+
+Then use the alias as the destination:
+
+```sh
+nativepipe --install-compositor linux-dev gtk4-demo
+nativepipe linux-dev firefox --no-remote
+```
+
+### Connect through a jump host
+
+```sh
+nativepipe -J user@bastion user@linux-host gtk4-demo
+```
+
+### Use a separate SSH configuration
+
+```sh
+nativepipe -F "$HOME/.ssh/work-config" linux-dev gtk4-demo
+nativepipe -o IdentitiesOnly=yes -o PreferredAuthentications=publickey linux-dev gtk4-demo
+```
+
+NativePipe uses a dedicated SSH connection for display traffic and clears SSH
+port forwardings. Authentication and routing settings, such as identity files
+and jump hosts, can be supplied through your SSH configuration.
+
+### Pass paths containing spaces
+
+```sh
+nativepipe user@linux-host firefox --no-remote '/home/user/reports/weekly report.html'
+```
+
+Quote arguments for your local shell as usual. NativePipe preserves each
+argument when starting the Linux process.
+
+### Set an environment variable for the application
+
+Run the Linux `env` command:
+
+```sh
+nativepipe user@linux-host env GDK_BACKEND=wayland gtk4-demo
+```
+
+### Change directory or expand variables on Linux
+
+NativePipe launches an argument vector. Invoke a shell explicitly when you need
+remote variable expansion, redirection, or shell operators:
+
+```sh
+nativepipe user@linux-host sh -c 'cd "$HOME/projects" && exec qterminal'
+```
+
+The outer single quotes keep your Mac's shell from expanding `$HOME`; the Linux
+shell expands it instead. The remote directory must already exist.
+
+### Use an existing compositor installation
+
+```sh
+nativepipe --compositor /home/user/nativepipe/nativepipe-wayland user@linux-host gtk4-demo
+```
+
+The executable and any accompanying bundle files must already be on Linux.
+This option is useful for a manually installed version or a custom build.
+
+## Updating
+
+Update the Linux helper on the next launch:
+
+```sh
+nativepipe --install-compositor user@linux-host gtk4-demo
+```
+
+NativePipe selects a stable GitHub release containing an installer and compositor
+assets. On Linux, the installer downloads the matching architecture/libc package,
+verifies its published SHA-256 checksum, and checks that it can run. A matching
+cached bundle is reused.
+
+Installations live under `~/.local/share/nativepipe/compositor/releases/` on
+Linux. The `current` link changes only after validation succeeds. Previous
+versions are retained so active sessions can continue using their own files.
+
+Launches without `--install-compositor` use the existing installation and do not
+check GitHub for updates. A copy found on the remote `PATH` takes precedence over
+the managed installation on those launches; use `--compositor` to select a
+specific executable when several are installed.
+
+To update the macOS command, download a new CLI release and repeat the
+[installation steps](#download-the-macos-command). The compositor option updates
+only the Linux helper.
+
+## Troubleshooting
+
+| Symptom | What to check |
+| --- | --- |
+| SSH login fails | Try ordinary `ssh` with the same destination, key, port, or configuration file. Check the server's availability and host-key/authentication messages. |
+| “NativePipe compositor is not installed” | Run again with `--install-compositor`, or provide an existing executable with `--compositor`. |
+| GitHub download or installation fails | Check GitHub access from both machines, the Linux installation tools listed above, and free space in the remote home directory. |
+| The helper reports a missing library, keyboard data, or `dbus-run-session` | Install the matching Linux distribution packages. A release archive still relies on compatible system libraries. |
+| The application is not found | Install it on Linux and use the executable name or its absolute Linux path. Your interactive shell's aliases and functions are not application executables. |
+| The session exits without a window | Check whether the application exited, detached, or contacted an existing instance. Use its foreground or separate-instance option when available. |
+| A Wayland application works but an X11 application does not | Install `xwayland-satellite` and Xwayland on Linux and make them available in the remote session's `PATH`. |
+
+Connection diagnostics and Linux application output are written to standard
+error. To capture them:
+
+```sh
+nativepipe user@linux-host gtk4-demo 2>nativepipe.log
+```
+
+To check the managed Linux helper independently:
+
+```sh
+ssh user@linux-host '$HOME/.local/share/nativepipe/compositor/current/nativepipe-wayland --check-runtime'
+```
+
+Include the launch command, macOS and Linux versions, selected release, and
+relevant log output in [bug reports](https://github.com/shih-liang/NativePipe/issues).
+Remove credentials and other private information from logs before sharing them.
+
+## License
+
+NativePipe-original code is licensed under the
+[GNU Affero General Public License v3.0 only](LICENSE) (`AGPL-3.0-only`).
+
+The copyright holders may also offer other terms, including commercial licenses,
+through a separate written agreement. Contact the project maintainer to discuss
+alternative licensing. See the [licensing notice](LICENSES/NOTICE).
+
+Third-party components retain their own licenses. Their notices are included in
+release archives; checked-in source origins are listed in
+[LICENSES/source-inventory.json](LICENSES/source-inventory.json).

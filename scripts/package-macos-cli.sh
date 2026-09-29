@@ -13,6 +13,7 @@ install -m0755 "$binary" "$stage/bin/nativepipe"
 codesign --force --sign - "$stage/bin/nativepipe"
 codesign --verify --strict "$stage/bin/nativepipe"
 "$stage/bin/nativepipe" --help >/dev/null
+cp LICENSE "$stage/LICENSE"
 cp -R LICENSES "$stage/LICENSES"
 cp -R .build/codecs/macos/LICENSES/. "$stage/LICENSES/"
 if otool -L "$binary" | grep -E '(libdav1d|libyuv|libaom)'; then

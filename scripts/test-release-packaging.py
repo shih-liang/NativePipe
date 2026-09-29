@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Exercise release assembly with disposable build artifacts, including failure."""
 import io
+import hashlib
+import json
 from pathlib import Path
 import subprocess
 import tarfile
 import tempfile
+
+source = Path(__file__).resolve().parents[1]
+license_files = json.loads((source / "LICENSES/source-inventory.json").read_text())["releaseLicenseFiles"]
 
 with tempfile.TemporaryDirectory(prefix="nativepipe-release-check-") as folder:
     root = Path(folder)
@@ -13,10 +18,10 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-release-check-") as folder:
 
     def archive(path, executables):
         with tarfile.open(path, "w:gz") as output:
-            for name in executables + ["LICENSES/NOTICE"]:
-                data = b"build fixture\n"
+            for name in executables + license_files:
+                data = (source / name).read_bytes() if name in license_files else b"build fixture\n"
                 item = tarfile.TarInfo(name)
-                item.mode, item.size = 0o755, len(data)
+                item.mode, item.size = (0o755 if name in executables else 0o644), len(data)
                 output.addfile(item, io.BytesIO(data))
 
     for arch in ("aarch64", "x86_64"):
@@ -33,6 +38,46 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-release-check-") as folder:
     archive(macos / "nativepipe-macos-universal.tar.gz", ["bin/nativepipe"])
     subprocess.run(["sh", "scripts/package-release.sh", str(linux), str(macos), str(root / "release")], check=True)
     subprocess.run(["python3", "scripts/verify-release.py", str(root / "release")], check=True)
+
+    # Recompute checksums after changing notices, so these failures exercise
+    # license validation rather than archive digest validation.
+    sums = root / "release/SHA256SUMS"
+    original_sums = sums.read_bytes()
+    for name in ("nativepipe-vm-compositor-aarch64.tar.gz",
+                 "nativepipe-compositor-aarch64-gnu.tar.gz",
+                 "nativepipe-macos-universal.tar.gz"):
+        bundle = root / "release" / name
+        original_bundle = bundle.read_bytes()
+        with tarfile.open(bundle) as content:
+            entries = [(member, content.extractfile(member).read() if member.isfile() else b"")
+                       for member in content.getmembers()]
+        for missing in license_files:
+            with tarfile.open(bundle, "w:gz") as output:
+                for member, data in entries:
+                    if member.name.removeprefix("./") != missing:
+                        output.addfile(member, io.BytesIO(data) if member.isfile() else None)
+            digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
+            sums.write_text("".join(
+                f"{digest}  {name}\n" if line.split("  ", 1)[1] == name else line + "\n"
+                for line in original_sums.decode().splitlines()))
+            rejected = subprocess.run(["python3", "scripts/verify-release.py", str(root / "release")], capture_output=True)
+            assert rejected.returncode != 0 and f"Missing project license file {missing}".encode() in rejected.stderr, (name, missing, rejected.stderr)
+
+        with tarfile.open(bundle, "w:gz") as output:
+            for member, data in entries:
+                if member.name.removeprefix("./") == "LICENSE":
+                    data = b"Truncated license text\n"
+                    member.size = len(data)
+                output.addfile(member, io.BytesIO(data) if member.isfile() else None)
+        digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
+        sums.write_text("".join(
+            f"{digest}  {name}\n" if line.split("  ", 1)[1] == name else line + "\n"
+            for line in original_sums.decode().splitlines()))
+        rejected = subprocess.run(["python3", "scripts/verify-release.py", str(root / "release")], capture_output=True)
+        assert rejected.returncode != 0 and b"Project license file LICENSE differs" in rejected.stderr, (name, rejected.stderr)
+        bundle.write_bytes(original_bundle)
+        sums.write_bytes(original_sums)
+
     installer = root / "release/install-compositor.sh"
     original = installer.read_bytes()
     installer.write_bytes(original + b"\n# changed after packaging\n")
@@ -48,4 +93,4 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-release-check-") as folder:
     (macos / "nativepipe-macos-universal.tar.gz").unlink()
     rejected = subprocess.run(["sh", "scripts/package-release.sh", str(linux), str(macos), str(root / "incomplete")], capture_output=True)
     assert rejected.returncode != 0, "A missing CLI must prevent the release"
-    print("PASS complete product set, restored executable modes, installer integrity, missing product rejection, unwanted file rejection")
+    print("PASS complete product set, restored executable modes, complete licenses for all products, missing/changed license rejection, installer integrity, missing product rejection, unwanted file rejection")

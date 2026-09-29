@@ -12,6 +12,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 INVENTORY_PATH = ROOT / "LICENSES/source-inventory.json"
+# Unmodified text from https://raw.githubusercontent.com/spdx/license-list-data/main/text/AGPL-3.0-only.txt
+AGPL3_SHA256 = "d8a6cc31abc16b6748c7a21f21611f5a1ec33f67d22ca23d7da1c19b95496bee"
 
 
 def fail(message: str) -> None:
@@ -63,10 +65,12 @@ def main() -> None:
         fail(f"expected exactly {sorted(required)}, found {sorted(str(key) for key in by_id)}")
 
     original = by_id["nativepipe-original"]
-    if original.get("licenseExpression") != "LicenseRef-NativePipe-Original":
-        fail("original sources must not be assigned an inferred third-party license")
-    if "does not infer" not in str(original.get("licenseNotice", "")):
-        fail("original-source rights notice is missing")
+    if original.get("licenseExpression") != "AGPL-3.0-only":
+        fail("original sources must use the project's AGPL-3.0-only license")
+    if original.get("licenseLocation") != "LICENSE":
+        fail("original-source license must point to LICENSE")
+    if "LICENSES/NOTICE" not in str(original.get("licenseNotice", "")):
+        fail("original-source licensing notice is missing")
 
     nvenc = by_id["nvidia-nvenc-header"]
     header = ROOT / "guest/encoder/vendor/nvEncodeAPI.h"
@@ -87,6 +91,12 @@ def main() -> None:
     for relative in license_files:
         if not isinstance(relative, str) or not (ROOT / relative).is_file():
             fail(f"missing release license file: {relative!r}")
+        if not (ROOT / relative).stat().st_size:
+            fail(f"empty release license file: {relative}")
+    if not {"LICENSE", "LICENSES/NOTICE", "LICENSES/source-inventory.json"} <= set(license_files):
+        fail("release license files must include the license, licensing notice and source inventory")
+    if hashlib.sha256((ROOT / "LICENSE").read_bytes()).hexdigest() != AGPL3_SHA256:
+        fail("LICENSE must contain the complete, unmodified AGPLv3 text")
     uncovered: list[str] = []
     ambiguous: list[str] = []
     for path in source_files():

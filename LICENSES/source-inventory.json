@@ -4,8 +4,9 @@
     {
       "id": "nativepipe-original",
       "origin": "NativePipe project authors",
-      "licenseExpression": "LicenseRef-NativePipe-Original",
-      "licenseNotice": "Copyright remains with the project authors. This inventory does not infer or grant an open-source license for original files.",
+      "licenseExpression": "AGPL-3.0-only",
+      "licenseLocation": "LICENSE",
+      "licenseNotice": "NativePipe-original code is licensed under AGPL-3.0-only. The copyright holders may offer other terms through a separate written agreement. See LICENSES/NOTICE. Third-party components retain their own licenses.",
       "coveredPaths": [
         "Package.swift",
         "README.md",
@@ -51,6 +52,8 @@
     }
   ],
   "releaseLicenseFiles": [
+    "LICENSE",
+    "LICENSES/NOTICE",
     "LICENSES/source-inventory.json"
   ]
 }

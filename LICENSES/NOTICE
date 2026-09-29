@@ -1,0 +1,27 @@
+NativePipe licensing
+
+Project-original code
+---------------------
+NativePipe-original code is licensed under the GNU Affero General Public
+License, version 3 only (SPDX: AGPL-3.0-only). The complete, unmodified license
+text is provided in LICENSE at the root of the source tree and release bundles.
+
+NativePipe is distributed without any warranty, including the implied warranties
+of merchantability or fitness for a particular purpose. See LICENSE for details.
+
+Alternative licensing
+---------------------
+The copyright holders reserve the right to offer NativePipe-original code under
+other terms, including commercial licenses, through a separate written agreement.
+Contact the project maintainer to discuss alternative licensing.
+
+An alternative license must be granted by the relevant copyright holders or their
+authorized representatives. This notice does not itself grant such a license or
+limit rights already granted under AGPL-3.0-only.
+
+Third-party components
+----------------------
+Third-party code retains its existing licenses and copyright notices. Alternative
+licensing of NativePipe-original code does not relicense third-party components.
+See LICENSES/source-inventory.json for checked-in source origins and the other
+notices under LICENSES/ in release bundles for bundled dependencies.

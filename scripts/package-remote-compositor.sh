@@ -113,6 +113,7 @@ for loader in "$loaders/libpixbufloader-png.so" "$loaders/libpixbufloader-xpm.so
     patchelf --set-rpath '$ORIGIN/..' "$out/lib/pixbuf/$(basename "$loader")"
 done
 install -m0755 guest/compositor/remote-launcher.sh "$out/nativepipe-wayland"
+cp LICENSE "$out/LICENSE"
 cp LICENSES/* "$out/LICENSES/"
 
 # AV1 encoder and pixel conversion are statically linked from pinned sources.
