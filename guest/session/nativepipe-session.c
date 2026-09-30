@@ -178,17 +178,19 @@ static int wait_path(const char *path, int seconds) {
 static int setup_runtime(const struct passwd *pw, char *runtime, size_t cap) {
     snprintf(runtime, cap, "/run/user/%d", (int)pw->pw_uid);
 
-    /* A linger-enabled systemd user manager recreates /run/user/$UID during
-     * boot.  Starting the compositor before user-runtime-dir@UID finishes
-     * leaves it listening on an unlinked Wayland socket.  A display manager
-     * would normally get this ordering from pam_systemd; this deliberately
-     * small session launcher waits for the equivalent user-manager marker. */
-    char manager[192];
-    snprintf(manager, sizeof(manager), "%s/systemd", runtime);
-    if (np_path_exists("/run/systemd/system") &&
-        access("/usr/bin/loginctl", X_OK) == 0) {
-        for (int i = 0; i < 500 && !np_path_exists(manager); i++)
-            usleep(20000);
+    /* This autologin session needs its runtime directory for its whole
+     * lifetime. Prepare the linger-enabled user manager before publishing
+     * Wayland sockets; a timed wait followed by mkdir races a slow manager
+     * which can later mount over those sockets. OpenRC uses mkdir below. */
+    if (np_path_exists("/run/systemd/system")) {
+        char unit[96];
+        char *linger[] = {"/usr/bin/loginctl", "--no-ask-password", "enable-linger", pw->pw_name, NULL};
+        snprintf(unit, sizeof(unit), "user@%u.service", (unsigned)pw->pw_uid);
+        char *arguments[] = {"/usr/bin/systemctl", "--system", "--no-ask-password", "start", unit, NULL};
+        if (np_run(linger) != 0 || np_run(arguments) != 0) {
+            errno = EIO;
+            return -1;
+        }
     }
 
     if (np_mkdir_p(runtime) < 0 && !np_path_exists(runtime))

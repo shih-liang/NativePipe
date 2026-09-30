@@ -753,6 +753,35 @@ final class NativeWindow: NSObject {
 
     // MARK: - Geometry
 
+    /// Explicit automation uses the same constraints and final configure/commit
+    /// handshake as a native resize. Client pixels never become geometry owners.
+    func setFrameFromControl(_ frame: CGRect) -> Bool {
+        guard !isPopup, let window, !window.isMiniaturized,
+              !window.styleMask.contains(.fullScreen), !window.inLiveResize,
+              frame.origin.x.isFinite, frame.origin.y.isFinite,
+              abs(frame.origin.x) <= 1_000_000, abs(frame.origin.y) <= 1_000_000,
+              frame.width.isFinite, frame.height.isFinite,
+              frame.width > 0, frame.height > 0,
+              frame.width <= 32_768, frame.height <= 32_768 else { return false }
+        var size = serverDecorated ? window.contentRect(forFrameRect: frame).size : frame.size
+        size.width = min(max(size.width, max(1, window.contentMinSize.width)), window.contentMaxSize.width)
+        size.height = min(max(size.height, max(1, window.contentMinSize.height)), window.contentMaxSize.height)
+        if serverDecorated { size = window.frameRect(forContentRect: CGRect(origin: .zero, size: size)).size }
+        guard size.width > 0, size.height > 0, size.width <= 32_768, size.height <= 32_768 else { return false }
+        let resized = window.frame.size != size
+        window.setFrame(CGRect(origin: frame.origin, size: size), display: true)
+        if resized { finishResize(at: .topLeft) }
+        return true
+    }
+
+    private func finishResize(at anchor: WindowFrameAnchor) {
+        pendingResizeCompletionAnchor = anchor
+        // A fresh final serial excludes older scenes even when no display tick
+        // occurs before the next client commit (for example while occluded).
+        _ = sendConfigure(states: activeStates().filter { $0 != .resizing }, force: true)
+        flushConfigure()
+    }
+
     /// AppKit points and Wayland surface coordinates are both logical units.
     /// Buffer scale controls attached pixel density and must never change an
     /// xdg_toplevel.configure size.
@@ -1032,17 +1061,13 @@ extension NativeWindow: NSWindowDelegate {
 		guard let window else { return }
 		let start = liveResizeStartFrame ?? window.frame
 		liveResizeStartFrame = nil
-		pendingResizeCompletionAnchor = WindowFrameAnchor.inferred(
-			from: start, to: window.frame)
 		// AppKit normally clears inLiveResize before this delegate callback, but
 		// remove the state explicitly so the protocol boundary never depends on
 		// callback timing. This final tuple replaces any unsent resizing tuple and
 		// must receive a fresh serial even when its dimensions are unchanged.
-		let finalStates = activeStates().filter { $0 != .resizing }
-		_ = sendConfigure(states: finalStates, force: true)
         // The final non-resizing state and exact size should not wait for the
         // next turn after AppKit leaves its tracking loop.
-        flushConfigure()
+        finishResize(at: WindowFrameAnchor.inferred(from: start, to: window.frame))
     }
 
     /// Dragging a window to another display changes its backing scale, which in
@@ -1869,6 +1894,8 @@ extension NativeWindow {
     func setTextCursorRect(_ rect: CGRect) {
         contentView.textCursorRect = rect
     }
+
+    var acceptsCommittedText: Bool { contentView.textInputEnabled }
 
     func commitText(_ text: String) {
         bridge?.send(.textCommit(window: windowID, text: text))

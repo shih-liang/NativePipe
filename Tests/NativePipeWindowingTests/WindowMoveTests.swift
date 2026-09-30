@@ -5,6 +5,37 @@ import XCTest
 
 @MainActor
 final class WindowMoveTests: XCTestCase {
+    func testControlledFrameUsesConstraintsAndSendsFinalConfigureWithoutDisplayTick() throws {
+        _ = NSApplication.shared
+        let bridge = WindowBridge(frameSource: nil)
+        defer { bridge.closeAll() }
+        bridge.apply(.surfaceCreated(surface: 8))
+        bridge.apply(.toplevelCreated(window: 3, surface: 8))
+        let native = try XCTUnwrap(bridge.window(3))
+        native.revealToplevel()
+        let window = try XCTUnwrap(native.window)
+        native.setConstraints(minimum: .init(width: 300, height: 200), maximum: .init(width: 700, height: 500))
+        var configurations: [(Windowing.Size, [Windowing.ToplevelState], UInt32)] = []
+        bridge.output = {
+            if case .configure(window: 3, let size, let states, let serial) = $0 {
+                configurations.append((size, states, serial))
+            }
+        }
+        XCTAssertTrue(bridge.setDockWindowFrame(3, frame: CGRect(x: 80, y: 100, width: 1000, height: 1000)))
+        let configuration = try XCTUnwrap(configurations.last)
+        XCTAssertEqual(configuration.0, .init(width: 700, height: 500))
+        XCTAssertFalse(configuration.1.contains(.resizing))
+        XCTAssertEqual(bridge.dockWindows.first?.frame, window.frame)
+        let configured = configurations.count
+        let moved = CGRect(origin: CGPoint(x: 150, y: 180), size: window.frame.size)
+        XCTAssertTrue(bridge.setDockWindowFrame(3, frame: moved))
+        XCTAssertEqual(window.frame.origin, moved.origin)
+        XCTAssertEqual(configurations.count, configured, "Moving alone must not generate a resize")
+        XCTAssertFalse(bridge.setDockWindowFrame(3, frame: CGRect(x: 0, y: 0, width: CGFloat.infinity, height: 10)))
+        XCTAssertFalse(bridge.setDockWindowFrame(99, frame: moved))
+        XCTAssertEqual(window.frame, moved, "Rejected requests must preserve the current rectangle")
+    }
+
     func testMoveUsesOriginalDownAndReleasesGuestGrabWithoutMouseUp() throws {
         _ = NSApplication.shared
         let bridge = WindowBridge(frameSource: nil)

@@ -72,13 +72,15 @@ public struct DockWindow: Sendable, Identifiable, Equatable {
     public let isVisible: Bool
     public let isKey: Bool
     public let canForceQuit: Bool
+    /// Outer window rectangle in AppKit's global, bottom-left screen points.
+    public let frame: CGRect?
 
     public init(
         id: UInt32, title: String, applicationID: String?,
         isMiniaturized: Bool = false, isZoomed: Bool = false,
         isFullscreen: Bool = false, width: Double = 0, height: Double = 0,
         isVisible: Bool = false, isKey: Bool = false,
-        canForceQuit: Bool = false
+        canForceQuit: Bool = false, frame: CGRect? = nil
     ) {
         self.id = id
         self.title = title
@@ -91,6 +93,7 @@ public struct DockWindow: Sendable, Identifiable, Equatable {
         self.isVisible = isVisible
         self.isKey = isKey
         self.canForceQuit = canForceQuit
+        self.frame = frame
     }
 }
 
@@ -612,6 +615,8 @@ public final class WindowBridge: NSObject {
 
     /// Authoritative mapped xdg_toplevels for the VM host's window switcher.
     /// Popups, cursor surfaces and drag icons never become application windows.
+    public private(set) var computerSessionID = UUID()
+
     public var dockWindows: [DockWindow] {
         windows.values.compactMap { native -> DockWindow? in
             guard !native.isPopup, native.window != nil else { return nil }
@@ -626,7 +631,8 @@ public final class WindowBridge: NSObject {
                 height: Double(native.window?.contentView?.bounds.height ?? 0),
                 isVisible: native.window?.isVisible == true,
                 isKey: native.window?.isKeyWindow == true,
-                canForceQuit: forceQuitCapabilities[native.windowID] == true)
+                canForceQuit: forceQuitCapabilities[native.windowID] == true,
+                frame: native.window?.frame)
         }.sorted {
             $0.title.localizedStandardCompare($1.title) == .orderedAscending
         }
@@ -773,8 +779,9 @@ public final class WindowBridge: NSObject {
         window id: UInt32, macKeyCode: UInt16, pressed: Bool,
         modifierFlags: UInt64
     ) -> Bool {
-        guard !presentationSuspended, let native = dockWindow(id) else { return false }
+        guard !presentationSuspended, KeyTranslation.evdevCode(for: macKeyCode) != nil, let native = dockWindow(id) else { return false }
         native.activateFromDock()
+        guard native.window?.isKeyWindow == true, NSApp.isActive else { return false }
         native.key(
             macKeyCode, pressed: pressed,
             flags: NSEvent.ModifierFlags(rawValue: UInt(modifierFlags)))
@@ -786,8 +793,15 @@ public final class WindowBridge: NSObject {
         guard !presentationSuspended, !text.isEmpty, text.utf8.count <= 65_535,
               !text.contains("\0"), let native = dockWindow(id) else { return false }
         native.activateFromDock()
+        guard native.window?.isKeyWindow == true, NSApp.isActive, native.acceptsCommittedText else { return false }
         native.commitText(text)
         return true
+    }
+
+    @discardableResult
+    public func setDockWindowFrame(_ id: UInt32, frame: CGRect) -> Bool {
+        guard !presentationSuspended, let native = dockWindow(id) else { return false }
+        return native.setFrameFromControl(frame)
     }
 
     @discardableResult
@@ -1762,6 +1776,7 @@ public final class WindowBridge: NSObject {
     }
 
     public func closeAll() {
+        computerSessionID = UUID()
         connectionGeneration &+= 1
         fileDrag.disconnect()
         clipboard.disconnect()

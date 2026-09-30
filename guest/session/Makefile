@@ -24,7 +24,7 @@ SESSION := dist/nativepipe-session-$(ARCH)-$(LIBC)
 ALIGN   := dist/nativepipe-align-blob-$(ARCH)-$(LIBC).so
 LAYER   := dist/nativepipe-vulkan-layer-$(ARCH)-$(LIBC).so
 
-.PHONY: all dist-target check-arch check-deps test clean
+.PHONY: all dist-target check-arch check-deps test test-runtime clean
 
 all: dist-target
 dist-target: check-arch check-deps $(SESSION) $(ALIGN) $(LAYER)
@@ -57,7 +57,13 @@ $(LAYER): $(LAYER_SOURCE) | dist
 		-o $@ $< -pthread
 	$(STRIP) $@
 
-test: $(ALIGN)
+test-runtime: dist/test-runtime
+	dist/test-runtime
+
+dist/test-runtime: test-runtime.c nativepipe-session.c ../common/np.h $(COMMON_SOURCE) | dist
+	$(CC) $(BASE_CFLAGS) -I../common -o $@ test-runtime.c $(COMMON_SOURCE)
+
+test: $(ALIGN) test-runtime
 	$(CC) $(BASE_CFLAGS) -shared -fPIC -DTEST_IOCTL_BACKEND \
 		-o dist/test-blob-backend.so test-blob-interposition.c
 	$(CC) $(BASE_CFLAGS) -o dist/test-blob-client test-blob-interposition.c -ldl

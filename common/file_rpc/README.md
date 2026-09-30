@@ -5,6 +5,13 @@ user file worker. It never changes UID/GID and never accepts a UID on the wire.
 The caller chooses its existing process credentials and an open root directory.
 Linux uses `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)` so recovery resolves
 absolute symlinks against the mounted target system, not the initramfs.
+When Rosetta returns `ENOSYS`, only a root descriptor identifying the process's
+actual `/` may fall back to component-by-component `openat` resolution. Each
+component is pinned with `O_PATH | O_NOFOLLOW`; ordinary symlinks are bounded
+to 40 resolutions, and procfs symlinks are rejected conservatively, including
+magic links. Virtual recovery roots fail closed without `openat2`. No fallback
+occurs for permission errors. `make test-linux` also injects `ENOSYS` to check
+this path on native Linux; its `build/file-open-test` runs under Rosetta too.
 
 ## Transport
 

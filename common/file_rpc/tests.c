@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#undef NDEBUG
 #include "np_file_rpc.h"
 #include <assert.h>
 #include <errno.h>
@@ -27,7 +28,12 @@ static void request(int fd, int type, const char *path, int replace) {
 static int start(struct server *s, pthread_t *thread) {
     int sockets[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
     s->socket = sockets[0];
-    assert(pthread_create(thread, NULL, serve, s) == 0);
+    pthread_attr_t attributes;
+    assert(pthread_attr_init(&attributes) == 0);
+    /* Exercise musl's small default even on hosts with larger defaults. */
+    assert(pthread_attr_setstacksize(&attributes, 128 * 1024) == 0);
+    assert(pthread_create(thread, &attributes, serve, s) == 0);
+    assert(pthread_attr_destroy(&attributes) == 0);
     return sockets[1];
 }
 static void finish(int fd, pthread_t thread) {

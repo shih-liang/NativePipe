@@ -145,6 +145,7 @@ jobs:
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-remote-transport test-remote-encoder test-remote-scheduler
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-applications
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-file-drag
+              make -C common/file_rpc test-linux
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" dist-vmpipe
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" dist-remote
               make -C guest/session ARCH="$ARCH" LIBC="$LIBC" dist-target

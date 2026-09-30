@@ -77,7 +77,7 @@ public struct SSHCredentialStore {
         return value.hasSuffix("password:") || value.hasPrefix("enter passphrase for key ")
     }
 
-    static func makeAttemptDirectory(environment: [String: String]) throws -> URL {
+    public static func makeAttemptDirectory(environment: [String: String]) throws -> URL {
         let files = FileManager.default
         let root: URL
         if let group = environment["NATIVEPIPE_KEYCHAIN_GROUP"] {
