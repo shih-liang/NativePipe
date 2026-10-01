@@ -7,18 +7,27 @@ struct RemotePipeCLI {
     static let usage = """
     Usage: nativepipe [options] user@host application [arguments...]
 
-    Launch a Linux application directly; its windows appear on this Mac.
+    Waypipe for macOS: run Linux apps over SSH in native Mac windows.
     SSH handles authentication and communication without port forwarding.
 
+      nativepipe --install-compositor user@host gtk4-demo
       nativepipe user@host firefox --no-remote
-      nativepipe -p 2222 --install-compositor user@host gtk4-demo
+      nativepipe -p 2222 -i ~/.ssh/id_ed25519 user@host qterminal
 
     Options (before user@host):
-      --compositor PATH      Remote compositor executable
+      --compositor PATH      Remote executable (default: nativepipe-wayland)
+                             A custom path bypasses automatic installation
       --install-compositor   Install/update compositor from GitHub Release
       -i FILE, -F FILE, -J HOST, -p PORT, -o OPTION
                              Pass an authentication/connection option to SSH
       -h, --help             Show help
+
+    The Linux application must already be installed. --install-compositor installs
+    only the display helper, as your SSH user. It does not require root access.
+    After the destination, all arguments (including --help) belong to the Linux app.
+    Keep the app in the foreground: its exit ends the session.
+
+    Guide: https://github.com/shih-liang/NativePipe#usage
     """
 
     static func parse(_ arguments: [String]) throws -> Self {

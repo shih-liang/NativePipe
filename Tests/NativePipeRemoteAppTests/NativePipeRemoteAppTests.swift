@@ -14,4 +14,10 @@ final class NativePipeRemoteAppTests: XCTestCase {
         XCTAssertThrowsError(try RemotePipeCLI.parse(["-L", "1025:localhost:1025", "me@host", "true"]))
         XCTAssertThrowsError(try RemotePipeCLI.parse(["--host", "localhost"]))
     }
+    func testHelpBeforeDestinationIsLocalAndAfterDestinationIsPassedThrough() throws {
+        XCTAssertTrue(try RemotePipeCLI.parse(["--help"]).wantHelp)
+        let command = try RemotePipeCLI.parse(["me@host", "firefox", "--help"])
+        XCTAssertFalse(command.wantHelp)
+        XCTAssertEqual(command.command?.application, ["firefox", "--help"])
+    }
 }
