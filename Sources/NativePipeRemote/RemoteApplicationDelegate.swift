@@ -11,7 +11,14 @@ public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
     public var onFailure: ((Error) -> Void)?
     public var onTerminate: (() -> Void)?
     public var exitOnDisconnect = true
-    private let name: String
+    public var displayName: String {
+        didSet {
+            guard displayName != oldValue else { return }
+            switcher.title = displayName
+            disconnectItem?.title = "Disconnect from \(displayName)"
+        }
+    }
+    private weak var disconnectItem: NSMenuItem?
     private let showErrors: Bool
     private let loadsApplicationIcons: Bool
     private var stopping = false
@@ -30,11 +37,11 @@ public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
         return integration
     }()
     private lazy var switcher = DockWindowSwitcherController(
-        title: name, bridge: { [weak self] in self?.display.bridge })
+        title: displayName, bridge: { [weak self] in self?.display.bridge })
 
     public init(command: SSHCommand, environment: [String: String]? = nil,
                 showErrors: Bool = false, localCompositorDirectory: URL? = nil, clipboardFileDirectory: URL? = nil) {
-        name = command.destination
+        displayName = command.destination
         self.showErrors = showErrors
         loadsApplicationIcons = !command.persistentSession
         display = RemoteDisplayController(command: command, environment: environment,
@@ -103,7 +110,7 @@ public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
         onFailure?(error)
         fputs("nativepipe: \(error.localizedDescription)\n", stderr)
         if showErrors {
-            let alert = Self.failureAlert(name: name, log: error.localizedDescription)
+            let alert = Self.failureAlert(name: displayName, log: error.localizedDescription)
             NSApp.activate()
             alert.runModal()
         }
@@ -135,7 +142,7 @@ public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         let app = NSMenuItem()
         let actions = NSMenu(title: "NativePipe")
-        actions.addItem(withTitle: "Disconnect from \(name)",
+        disconnectItem = actions.addItem(withTitle: "Disconnect from \(displayName)",
                         action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         app.submenu = actions
         menu.addItem(app)

@@ -32,7 +32,9 @@ public final class DockWindowSwitcherController: NSObject, NSPopoverDelegate {
         }
     }
 
-    private let title: String
+    public var title: String {
+        didSet { if title != oldValue, popover.isShown { host.rootView = makeView() } }
+    }
     private let bridgeProvider: () -> WindowBridge?
     private let utilitiesProvider: () -> [Utility]
     private let anchorView = NSView(frame: NSRect(x: 0, y: 0, width: 2, height: 2))
@@ -252,6 +254,7 @@ private struct VMWindowSwitcherView: View {
                 Text(machineName)
                     .font(.headline)
                     .lineLimit(1)
+                    .help(machineName)
                 Spacer()
             }
             .padding(.horizontal, 12)
