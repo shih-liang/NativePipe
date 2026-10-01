@@ -316,6 +316,7 @@ int np_agent_recv_hdr(int fd, np_agent_hdr *hdr) {
         return -1;
     }
     hdr->status = rhdr[5];
+    if (hdr->status > NP_STATUS_NOTFOUND) { errno = EPROTO; return -1; }
     uint16_t ver_len = (uint16_t)rhdr[6] | ((uint16_t)rhdr[7] << 8);
     if (ver_len >= NP_MAX_VERSION) {
         errno = EMSGSIZE;
@@ -325,7 +326,7 @@ int np_agent_recv_hdr(int fd, np_agent_hdr *hdr) {
         return -1;
     hdr->version[ver_len] = '\0';
     hdr->payload_len = 0;
-    if (hdr->status == NP_STATUS_FILE || hdr->status == NP_STATUS_FORCE) {
+    if (hdr->status == NP_STATUS_FILE) {
         uint8_t lenbuf[8];
         if (np_read_full(fd, lenbuf, 8) < 0)
             return -1;
@@ -465,7 +466,7 @@ int np_agent_pull_file_mode_n(const char *name, const char *ver,
         rc = 1;
     } else if (hdr.status == NP_STATUS_NOTFOUND) {
         rc = 2;
-    } else if (hdr.status == NP_STATUS_FILE || hdr.status == NP_STATUS_FORCE) {
+    } else if (hdr.status == NP_STATUS_FILE) {
         if (np_agent_recv_payload_file(fd, hdr.payload_len, dest_path, mode) < 0)
             rc = -1;
         else
@@ -501,7 +502,7 @@ int np_agent_pull_mem_n(const char *name, const char *ver, uint8_t **mem, size_t
         rc = 1;
     } else if (hdr.status == NP_STATUS_NOTFOUND) {
         rc = 2;
-    } else if (hdr.status == NP_STATUS_FILE || hdr.status == NP_STATUS_FORCE) {
+    } else if (hdr.status == NP_STATUS_FILE) {
         if (np_agent_recv_payload_mem(fd, hdr.payload_len, mem, len) < 0)
             rc = -1;
         else

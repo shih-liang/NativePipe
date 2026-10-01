@@ -23,7 +23,6 @@
 #define NP_STATUS_FILE 0
 #define NP_STATUS_UPTODATE 1
 #define NP_STATUS_NOTFOUND 2
-#define NP_STATUS_FORCE 3
 
 #define NP_GUESTD_NAME "nativepipe-guestd"
 #define NP_INSTALLED_BIN "/usr/libexec/nativepipe/nativepipe-guestd"
@@ -82,7 +81,7 @@ int np_agent_discard_payload(int fd, uint64_t len);
 /*
  * One-shot pull: connect, request, receive, disconnect.
  * dest_path: write payload here (0755). NULL = memory in *mem.
- * Returns 0 (file/force written), 1 (uptodate), 2 (notfound), -1 error.
+ * Returns 0 (file written), 1 (uptodate), 2 (notfound), -1 error.
  */
 int np_agent_pull_file(const char *name, const char *ver, const char *dest_path,
                        char *host_ver, size_t host_ver_cap);

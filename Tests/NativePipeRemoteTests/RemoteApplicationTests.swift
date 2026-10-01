@@ -270,11 +270,6 @@ final class RemoteApplicationTests: XCTestCase {
                     moveSent = nil
                 }
                 print("NATIVE_MOVE_REQUEST current_event=\(NSApp.currentEvent?.type.rawValue ?? 0)")
-                if env["NATIVEPIPE_TEST_LEGACY_MOVE"] == "1" {
-                    // Controlled A/B: reproduce the previous handoff only.
-                    if let current = NSApp.currentEvent { moveNative?.performDrag(with: current) }
-                    return
-                }
             }
             if env["NATIVEPIPE_TEST_MOVE"] == "1", case .interactiveMoveRequested = event {
                 if let sent = moveSent {

@@ -37,8 +37,6 @@ int np_file_receive(int socket, struct np_file_frame *frame);
 /* SOCK_STREAM supplies backpressure without a roundtrip for every chunk.
  * shutdown + close cancels even a writer stalled by backpressure. */
 int np_file_send_stream(int socket, int source, uint64_t maximum);
-/* Exact-length NPAG payloads let an installed bootstrap fetch its update. */
-int np_file_send_bytes(int socket, int source, uint64_t length);
 int np_file_receive_stream(int socket, int destination, uint64_t maximum,
                            uint64_t *received);
 int np_file_peer_is_host(int socket);

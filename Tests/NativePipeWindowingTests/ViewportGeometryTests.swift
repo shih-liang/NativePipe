@@ -696,7 +696,7 @@ final class ViewportGeometryTests: XCTestCase {
                 opaque: true)])
     }
 
-    func testGPUSubsurfaceCommitIsDeferredInsteadOfDropped() {
+    func testUnboundGPUSurfaceCommitIsDeferredInsteadOfDropped() {
         let bridge = WindowBridge(frameSource: nil)
         var presented: [(UInt32, UInt32)] = []
         bridge.output = { command in
@@ -707,7 +707,6 @@ final class ViewportGeometryTests: XCTestCase {
         bridge.apply(.surfaceCreated(surface: 1))
         bridge.apply(.surfaceCreated(surface: 2))
         bridge.apply(.toplevelCreated(window: 3, surface: 1))
-        bridge.apply(.subsurfaceCreated(surface: 2, parent: 1, x: 10, y: 20))
         bridge.apply(.committed(
             surface: 2,
             frame: Windowing.Frame(

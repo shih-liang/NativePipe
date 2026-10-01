@@ -3,26 +3,21 @@ import Foundation
 /// Named file transfer over vsock (bootstrap, provision extras, self-update).
 ///
 /// Guest → host request:
-///   `"NPAG"` | wire(u8=1) | flags(u8; bit 0 requests NPFR)
+///   `"NPAG"` | wire(u8=1) | flags(u8=1; NPFR required)
 ///          | name_len(u16 LE) | name bytes
 ///          | ver_len(u16 LE) | ver bytes
 ///
 /// Host → guest response:
-///   `"NPAG"` | wire(u8=1) | status(u8: 0=file, 1=uptodate, 2=notfound, 3=force)
+///   `"NPAG"` | wire(u8=1) | status(u8: 0=file, 1=uptodate, 2=notfound)
 ///          | ver_len(u16 LE) | ver bytes
-///          | if status==0 or 3: payload_len(u64 LE) + negotiated payload stream
+///          | if status==0: payload_len(u64 LE) + NPFR payload stream
 ///
-/// `force` is retained only for migrating guests predating `NPSY`. Current
-/// guests receive desired-state notifications on control and use NPAG solely
-/// for bounded, guest-initiated artifact pulls.
 public enum AgentWire {
     public static let magic = Data("NPAG".utf8)
     public static let version: UInt8 = 1
     public static let statusFile: UInt8 = 0
     public static let statusUptodate: UInt8 = 1
     public static let statusNotFound: UInt8 = 2
-    /// Host command: install this payload now, ignore version.
-    public static let statusForce: UInt8 = 3
     public static let maxNameLength = 256
     public static let maxVersionLength = 256
     public static let maxPayloadLength: UInt64 = 512 * 1024 * 1024
@@ -31,39 +26,18 @@ public enum AgentWire {
     public struct Request: Equatable {
         public var name: String
         public var guestVersion: String
-        public var framedPayload: Bool
 
-        public init(name: String, guestVersion: String = "", framedPayload: Bool = true) {
+        public init(name: String, guestVersion: String = "") {
             self.name = name
             self.guestVersion = guestVersion
-            self.framedPayload = framedPayload
         }
     }
 
+    /// Response metadata; file contents follow as an NPFR stream.
     public enum Response: Equatable {
-        case file(hostVersion: String, payload: Data)
-        case uptodate(hostVersion: String)
-        case notFound(hostVersion: String)
-        case force(hostVersion: String, payload: Data)
-
-        var payload: Data? {
-            switch self {
-            case .file(_, let data), .force(_, let data):
-                return data
-            case .uptodate, .notFound:
-                return nil
-            }
-        }
-    }
-
-    /// Header-only representation for hosts that stream a file directly from
-    /// disk instead of materializing `Response.payload` and a second framed
-    /// `Data` value in memory.
-    public enum StreamResponse: Equatable {
         case file(hostVersion: String, payloadLength: UInt64)
         case uptodate(hostVersion: String)
         case notFound(hostVersion: String)
-        case force(hostVersion: String, payloadLength: UInt64)
     }
 
     public enum Failure: LocalizedError {
@@ -94,7 +68,7 @@ public enum AgentWire {
         var out = Data()
         out.append(magic)
         out.append(version)
-        out.append(request.framedPayload ? 1 : 0)
+        out.append(1)
         out.append(contentsOf: u16le(UInt16(name.count)))
         out.append(name)
         out.append(contentsOf: u16le(UInt16(ver.count)))
@@ -105,7 +79,7 @@ public enum AgentWire {
     public static func decodeRequest(from data: Data) throws -> Request {
         guard data.count >= 8 else { throw Failure.truncated }
         guard data.prefix(4) == magic else { throw Failure.badMagic }
-        guard data[4] == version, data[5] & ~1 == 0 else { throw Failure.unsupportedWire }
+        guard data[4] == version, data[5] == 1 else { throw Failure.unsupportedWire }
         let nameLen = Int(u16le(data, at: 6))
         guard nameLen <= maxNameLength else { throw Failure.nameTooLong }
         guard data.count >= 8 + nameLen + 2 else { throw Failure.truncated }
@@ -117,28 +91,11 @@ public enum AgentWire {
         let ver = String(
             data: data.subdata(in: (verOff + 2)..<(verOff + 2 + verLen)),
             encoding: .utf8) ?? ""
-        return Request(name: name, guestVersion: ver, framedPayload: data[5] & 1 != 0)
-    }
-
-    public static func encodeResponseHeader(_ response: Response) throws -> Data {
-        switch response {
-        case .uptodate(let version):
-            return try encodeResponseHeader(
-                StreamResponse.uptodate(hostVersion: version))
-        case .notFound(let version):
-            return try encodeResponseHeader(
-                StreamResponse.notFound(hostVersion: version))
-        case .file(let version, let payload):
-            return try encodeResponseHeader(StreamResponse.file(
-                hostVersion: version, payloadLength: UInt64(payload.count)))
-        case .force(let version, let payload):
-            return try encodeResponseHeader(StreamResponse.force(
-                hostVersion: version, payloadLength: UInt64(payload.count)))
-        }
+        return Request(name: name, guestVersion: ver)
     }
 
     public static func encodeResponseHeader(
-        _ response: StreamResponse
+        _ response: Response
     ) throws -> Data {
         let hostVersion: String
         let status: UInt8
@@ -156,10 +113,6 @@ public enum AgentWire {
             hostVersion = version
             status = statusFile
             payloadLength = length
-        case .force(let version, let length):
-            hostVersion = version
-            status = statusForce
-            payloadLength = length
         }
         let ver = Data(hostVersion.utf8)
         guard ver.count <= maxVersionLength else { throw Failure.versionTooLong }
@@ -175,7 +128,6 @@ public enum AgentWire {
         }
         return out
     }
-
 
     /// Compare dotted numeric versions; non-numeric tails compare lexicographically.
     public static func isNewer(host: String, than guest: String) -> Bool {

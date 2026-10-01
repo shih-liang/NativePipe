@@ -120,7 +120,7 @@ final class ScrollTests: XCTestCase {
         XCTAssertEqual(h.scrolls, [.init(x: 0, y: 8), .stop])
     }
 
-    func testLegacyWheelKeepsItsDisplacementAndSource() throws {
+    func testDiscreteWheelKeepsItsDisplacementAndSource() throws {
         let h = try Harness()
         defer { h.bridge.closeAll() }
         h.send(dx: 2, dy: -3, precise: false)

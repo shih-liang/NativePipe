@@ -209,8 +209,9 @@ static int drop_and_exec(const struct passwd *pw, const char *runtime) {
         return -1;
     if (setuid(pw->pw_uid) < 0)
         return -1;
-    if (pw->pw_dir && pw->pw_dir[0])
-        chdir(pw->pw_dir);
+    const char *home = pw->pw_dir && pw->pw_dir[0] ? pw->pw_dir : "/";
+    if (chdir(home) < 0)
+        return -1;
 
     char userenv[96], lognameenv[96], homeenv[320], shellenv[192];
     char pathenv[] = "PATH=/usr/local/bin:/usr/bin:/bin";
@@ -222,8 +223,7 @@ static int drop_and_exec(const struct passwd *pw, const char *runtime) {
     char alignmentenv[] = "NATIVEPIPE_BLOB_ALIGNMENT=16384";
     snprintf(userenv, sizeof(userenv), "USER=%s", pw->pw_name);
     snprintf(lognameenv, sizeof(lognameenv), "LOGNAME=%s", pw->pw_name);
-    snprintf(homeenv, sizeof(homeenv), "HOME=%s",
-             pw->pw_dir && pw->pw_dir[0] ? pw->pw_dir : "/");
+    snprintf(homeenv, sizeof(homeenv), "HOME=%s", home);
     snprintf(shellenv, sizeof(shellenv), "SHELL=%s",
              pw->pw_shell && pw->pw_shell[0] ? pw->pw_shell : "/bin/sh");
     snprintf(runtimeenv, sizeof(runtimeenv), "XDG_RUNTIME_DIR=%s", runtime);

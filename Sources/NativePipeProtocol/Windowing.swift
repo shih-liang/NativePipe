@@ -84,12 +84,6 @@ extension Windowing {
             window: UInt32, x: Int, y: Int, width: Int, height: Int)
         case popupDestroyed(window: UInt32)
 
-        /// Legacy compatibility events. Current guests composite subsurfaces
-        /// before publishing a frame, so the host ignores these cases.
-        case subsurfaceCreated(surface: UInt32, parent: UInt32, x: Int, y: Int)
-        case subsurfaceMoved(surface: UInt32, x: Int, y: Int)
-        case subsurfaceDestroyed(surface: UInt32)
-
         /// The surface supplied to wl_data_device.start_drag. It is a transient,
         /// pointer-following image rather than a window or subsurface. Nil ends
         /// the overlay when the drag completes or is cancelled.
@@ -349,7 +343,7 @@ extension Windowing {
         /// Nonzero identity used to release presentation source references only
         /// after the host has consumed them.
         public var presentationID: UInt32
-        /// Legacy per-surface viewporter metadata. Current window frames have
+        /// Per-surface viewporter metadata. Window frames have
         /// already consumed this in the guest compositor; cursor/drag surfaces
         /// can still carry it because they are not part of a window scene.
         public var viewportSource: FloatRect?
@@ -380,47 +374,6 @@ extension Windowing {
             self.viewportDestination = viewportDestination
         }
 
-        enum CodingKeys: String, CodingKey {
-            case resourceID, width, height, bytesPerRow, format, scale
-            case windowGeometry, damage, source, codec, bitstreamEpoch
-            case presentationID, viewportSource, viewportDestination
-        }
-
-        public init(from decoder: Decoder) throws {
-            let c = try decoder.container(keyedBy: CodingKeys.self)
-            resourceID = try c.decode(UInt32.self, forKey: .resourceID)
-            width = try c.decode(Int.self, forKey: .width)
-            height = try c.decode(Int.self, forKey: .height)
-            bytesPerRow = try c.decode(Int.self, forKey: .bytesPerRow)
-            format = try c.decode(PixelFormat.self, forKey: .format)
-            scale = try c.decodeIfPresent(Int.self, forKey: .scale) ?? 1
-            windowGeometry = try c.decodeIfPresent(Rect.self, forKey: .windowGeometry)
-            damage = try c.decodeIfPresent([Rect].self, forKey: .damage) ?? []
-            source = try c.decodeIfPresent(FrameSourceKind.self, forKey: .source) ?? .cpu
-            codec = try c.decodeIfPresent(String.self, forKey: .codec)
-            bitstreamEpoch = try c.decodeIfPresent(UInt16.self, forKey: .bitstreamEpoch) ?? 0
-            presentationID = try c.decodeIfPresent(UInt32.self, forKey: .presentationID) ?? 0
-            viewportSource = try c.decodeIfPresent(FloatRect.self, forKey: .viewportSource)
-            viewportDestination = try c.decodeIfPresent(Size.self, forKey: .viewportDestination)
-        }
-
-        public func encode(to encoder: Encoder) throws {
-            var c = encoder.container(keyedBy: CodingKeys.self)
-            try c.encode(resourceID, forKey: .resourceID)
-            try c.encode(width, forKey: .width)
-            try c.encode(height, forKey: .height)
-            try c.encode(bytesPerRow, forKey: .bytesPerRow)
-            try c.encode(format, forKey: .format)
-            try c.encode(scale, forKey: .scale)
-            try c.encodeIfPresent(windowGeometry, forKey: .windowGeometry)
-            try c.encode(damage, forKey: .damage)
-            if source != .cpu { try c.encode(source, forKey: .source) }
-            try c.encodeIfPresent(codec, forKey: .codec)
-            if bitstreamEpoch != 0 { try c.encode(bitstreamEpoch, forKey: .bitstreamEpoch) }
-            if presentationID != 0 { try c.encode(presentationID, forKey: .presentationID) }
-            try c.encodeIfPresent(viewportSource, forKey: .viewportSource)
-            try c.encodeIfPresent(viewportDestination, forKey: .viewportDestination)
-        }
     }
 
     /// Guest compositor's classification of a committed buffer.

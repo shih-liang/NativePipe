@@ -1099,11 +1099,6 @@ public final class WindowBridge: NSObject {
                 native.close()
             }
 
-        case .subsurfaceCreated, .subsurfaceMoved, .subsurfaceDestroyed:
-            // Compatibility with an older guest. Current compositors consume
-            // the surface tree and never publish per-child host state.
-            break
-
         case .dragIconChanged(let surface):
             dragIconSurface = surface
             guard let surface else {

@@ -126,11 +126,12 @@ final class FileRPCTests: XCTestCase {
         XCTAssertTrue(FileRPC.Failure.remote(104).localizedDescription.contains("reset"))
     }
 
-    func testBootstrapNegotiatesFramedPayloadWithoutStrandingInstalledBootstrap() throws {
-        let new = AgentWire.Request(name: "nativepipe-guestd")
-        XCTAssertTrue(try AgentWire.decodeRequest(from: AgentWire.encodeRequest(new)).framedPayload)
-        let installed = AgentWire.Request(name: "nativepipe-guestd", framedPayload: false)
-        XCTAssertFalse(try AgentWire.decodeRequest(from: AgentWire.encodeRequest(installed)).framedPayload)
+    func testBootstrapRequiresFramedPayload() throws {
+        let request = AgentWire.Request(name: "nativepipe-guestd")
+        var encoded = try AgentWire.encodeRequest(request)
+        XCTAssertEqual(try AgentWire.decodeRequest(from: encoded), request)
+        encoded[5] = 0
+        XCTAssertThrowsError(try AgentWire.decodeRequest(from: encoded))
     }
 
     func testUploadStopsWhenReceiverFailsBeforeEOF() async throws {

@@ -143,8 +143,6 @@ static void subsurface_resource_destroy(struct wl_resource *resource) {
 	 * remains SUBSURFACE, so the client may create a new role object later. */
 	if (root && root != surface)
 		np_presentation_queue_scene(root, np_presentation_next_id(surface->server));
-	uint32_t fields[] = {surface->id};
-	np_window_event_send(surface->server, NP_GUEST_SUBSURFACE_DESTROYED, fields, 1);
 }
 
 static void subcompositor_destroy_handler(struct wl_client *client, struct wl_resource *resource) {
@@ -189,8 +187,6 @@ static void subcompositor_get_subsurface(struct wl_client *client, struct wl_res
 	if (np_trace_enabled())
 		fprintf(stderr, "[wayland] subsurface created surface=%u parent=%u\n",
 		        surface->id, parent->id);
-	uint32_t fields[] = {surface->id, parent->id, 0, 0};
-	np_window_event_send(surface->server, NP_GUEST_SUBSURFACE_CREATED, fields, 4);
 }
 
 static const struct wl_subcompositor_interface subcompositor_implementation = {

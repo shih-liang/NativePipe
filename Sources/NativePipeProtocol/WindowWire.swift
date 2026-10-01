@@ -5,7 +5,7 @@ import Foundation
 /// NPIP supplies only bounded length framing. Integer fields are explicitly
 /// little endian; this is a wire format, never a Swift struct memory dump.
 public enum WindowWire {
-    public static let windowProtocolVersion: UInt32 = 9
+    public static let windowProtocolVersion: UInt32 = 10
     public static let motionMagic: [UInt8] = Array("NPMO".utf8)
     public static let motionPayloadSize = 16
     public static let scrollMagic: [UInt8] = Array("NPSC".utf8)
@@ -209,22 +209,6 @@ public enum WindowWire {
                 window: window, x: x, y: y, width: width, height: height))
         case 9:
             return try finished(.popupDestroyed(window: reader.integer()))
-        case 10:
-            let surface: UInt32 = try reader.integer()
-            let parent: UInt32 = try reader.integer()
-            let x = Int(try reader.integer() as Int32)
-            let y = Int(try reader.integer() as Int32)
-            guard surface != 0, parent != 0 else { throw DecodeError.malformed }
-            return try finished(.subsurfaceCreated(
-                surface: surface, parent: parent, x: x, y: y))
-        case 11:
-            let surface: UInt32 = try reader.integer()
-            let x = Int(try reader.integer() as Int32)
-            let y = Int(try reader.integer() as Int32)
-            guard surface != 0 else { throw DecodeError.malformed }
-            return try finished(.subsurfaceMoved(surface: surface, x: x, y: y))
-        case 12:
-            return try finished(.subsurfaceDestroyed(surface: reader.integer()))
         case 13:
             let surface: UInt32 = try reader.integer()
             return try finished(.dragIconChanged(surface: surface == 0 ? nil : surface))

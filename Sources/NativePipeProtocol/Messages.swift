@@ -51,7 +51,6 @@ public struct Request: Sendable {
 
         /// Pull and apply the host-published, signed environment catalog.
         /// The catalog selects only guestd adapters; it carries no commands.
-        case refreshEnvironment
 
         /// Reconcile all host-published guest resources to one desired state.
         /// Current guests use this instead of separate guestd/environment
@@ -101,7 +100,6 @@ public struct InitPlan: Sendable, Codable {
     public var diskIdentifier: String
     public var root: String
     public var payloadTag: String
-    public var adapterPath: String
     public var sourcePath: String
 
     public init(
@@ -110,7 +108,6 @@ public struct InitPlan: Sendable, Codable {
         diskIdentifier: String = "",
         root: String = "",
         payloadTag: String = "nativepipe-install",
-        adapterPath: String = "/run/nativepipe/payload/adapter.sh",
         sourcePath: String = "/run/nativepipe/payload/source"
     ) {
         self.action = action
@@ -118,7 +115,6 @@ public struct InitPlan: Sendable, Codable {
         self.diskIdentifier = diskIdentifier
         self.root = root
         self.payloadTag = payloadTag
-        self.adapterPath = adapterPath
         self.sourcePath = sourcePath
     }
 }
@@ -301,7 +297,7 @@ public struct GuestInfo: Sendable {
     public var distroVersion: String
     public var initSystem: String
     public var capabilities: [String]
-    /// Optional 0.2.9 tail; nil when talking to an older guestd.
+    /// Selected policy; recovery reports an empty profile and revision zero.
     public var environmentProfile: String?
     public var environmentRevision: UInt64?
     /// Optional runtime facts used by the host-side profile matcher. Install
@@ -359,8 +355,7 @@ public enum GuestCapability {
     public static let initControl = "init.control"
     /// Recovery image has GPT/ext4 tooling, DHCP, read-only install payloads,
     /// and can execute the version-1 rootfs adapter contract.
-    public static let guidedRootFSInstall = "init.install.rootfs.v1"
-    public static let nativeRootFSInstall = "init.install.rootfs.c.v1"
+    public static let nativeRootFSInstall = "init.install.rootfs.c.v2"
     public static let fileWrite = "fs.write"
     public static let consoleResize = "console.resize"
     public static let launch = "process.launch"

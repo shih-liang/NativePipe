@@ -1501,7 +1501,7 @@ private final class SurfaceView: NSView {
     /// NSTextInputClient callback consumes it. If it survives, nothing did, and
     /// the key goes to the guest as an ordinary key press.
     private var unconsumedKeyEvent: NSEvent?
-    /// The legacy CPU/remote surface currently on screen, held for exactly as
+    /// The CPU/remote surface currently on screen, held for exactly as
     /// long as it is installed in the layer. GPU windows use `metalLayer`.
     private var displayed: IOSurfaceRef?
     private var displayedOwner: AnyObject?

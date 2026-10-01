@@ -192,7 +192,7 @@ public enum LocalSocket {
         return address
     }
 
-    /// Compatibility for synchronous CLI callers. GUI callers use SocketConnection.
+    /// Blocking entrypoint for synchronous CLI callers. GUI callers use SocketConnection.
     public static func connect(_ url: URL) throws -> FileHandle {
         var address = try address(url)
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)

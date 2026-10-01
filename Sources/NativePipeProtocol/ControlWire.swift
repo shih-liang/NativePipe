@@ -10,7 +10,6 @@ import Foundation
 ///     NPHI  hello         id(u64) ver_len(u16) ver
 ///     NPPG  ping          id(u64)
 ///     NPVQ  getVersion    id(u64)
-///     NPEU  refresh env   id(u64)
 ///     NPSY  sync resources id(u64) guestd_ver(str) env_revision(u64) profile(str)
 ///     NPDP  desktop prefs id(u64) color_scheme(u8)
 ///     NPSF  shared folders id(u64) mounted(u8: 0 or 1)
@@ -59,7 +58,6 @@ public enum ControlWire {
     public static let helloMagic: [UInt8] = Array("NPHI".utf8)
     public static let pingMagic: [UInt8] = Array("NPPG".utf8)
     public static let getVersionMagic: [UInt8] = Array("NPVQ".utf8)
-    public static let refreshEnvironmentMagic: [UInt8] = Array("NPEU".utf8)
     public static let reconcileResourcesMagic: [UInt8] = Array("NPSY".utf8)
     public static let desktopPreferencesMagic: [UInt8] = Array("NPDP".utf8)
     public static let sharedFoldersMagic: [UInt8] = Array("NPSF".utf8)
@@ -107,7 +105,7 @@ public enum ControlWire {
     }
 
     private static let knownMagics: Set<[UInt8]> = [
-        helloMagic, pingMagic, getVersionMagic, refreshEnvironmentMagic, reconcileResourcesMagic,
+        helloMagic, pingMagic, getVersionMagic, reconcileResourcesMagic,
         desktopPreferencesMagic, sharedFoldersMagic,
         resizeMagic, launchMagic, runMagic,
         execMagic, shutdownMagic,
@@ -132,10 +130,6 @@ public enum ControlWire {
             return payload
         case .getVersion:
             var payload = Data(getVersionMagic)
-            append(id, to: &payload)
-            return payload
-        case .refreshEnvironment:
-            var payload = Data(refreshEnvironmentMagic)
             append(id, to: &payload)
             return payload
         case .reconcileResources(let desired):
@@ -200,7 +194,6 @@ public enum ControlWire {
             appendString(plan.diskIdentifier, to: &payload)
             appendString(plan.root, to: &payload)
             appendString(plan.payloadTag, to: &payload)
-            appendString(plan.adapterPath, to: &payload)
             appendString(plan.sourcePath, to: &payload)
             return payload
         case .shutdown:
@@ -334,11 +327,7 @@ public enum ControlWire {
         let stdin = Data((spec.stdin ?? "").utf8)
         append(UInt32(clamping: stdin.count), to: &data)
         data.append(stdin)
-        // Optional tail keeps nil-user calls byte-for-byte compatible with
-        // guestd 0.2.5. Only desktop launches require the 0.2.6 extension.
-        if let username = spec.username {
-            appendString(username, to: &data)
-        }
+        appendString(spec.username ?? "", to: &data)
     }
 
     private static func takeGuestInfo(_ offset: inout Int, from data: Data) -> GuestInfo? {
@@ -354,32 +343,16 @@ public enum ControlWire {
             guard let cap = takeString(&offset, from: data) else { return nil }
             capabilities.append(cap)
         }
-        var environmentProfile: String?
-        var environmentRevision: UInt64?
-        var environmentID: String?
-        var environmentIDLike: [String] = []
-        var architecture: String?
-        if offset < data.count {
-            guard let profile = takeString(&offset, from: data) else { return nil }
-            environmentProfile = profile.isEmpty ? nil : profile
-        }
-        if offset < data.count {
-            guard let revision = takeString(&offset, from: data) else { return nil }
-            environmentRevision = UInt64(revision)
-        }
-        if offset < data.count {
-            guard let id = takeString(&offset, from: data) else { return nil }
-            environmentID = id.isEmpty ? nil : id
-        }
-        if offset < data.count {
-            guard let idLike = takeString(&offset, from: data) else { return nil }
-            environmentIDLike = idLike.split(whereSeparator: { $0 == " " || $0 == "\t" })
-                .map(String.init)
-        }
-        if offset < data.count {
-            guard let arch = takeString(&offset, from: data) else { return nil }
-            architecture = arch.isEmpty ? nil : arch
-        }
+        guard let profile = takeString(&offset, from: data),
+              let revision = takeString(&offset, from: data),
+              let environmentRevision = UInt64(revision),
+              let id = takeString(&offset, from: data),
+              let idLike = takeString(&offset, from: data),
+              let arch = takeString(&offset, from: data), offset == data.count else { return nil }
+        let environmentProfile = profile.isEmpty ? nil : profile
+        let environmentID = id.isEmpty ? nil : id
+        let environmentIDLike = idLike.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+        let architecture = arch.isEmpty ? nil : arch
         return GuestInfo(
             agentVersion: agentVersion,
             kernelRelease: kernelRelease,

@@ -68,7 +68,7 @@ int np_file_receive(int socket, struct np_file_frame *frame) {
     }
     return read_all(socket, frame->data, frame->length);
 }
-static int send_stream(int socket, int source, uint64_t maximum, int framed) {
+int np_file_send_stream(int socket, int source, uint64_t maximum) {
     unsigned char bytes[NP_FILE_CHUNK];
     uint64_t total = 0;
     for (;;) {
@@ -76,27 +76,15 @@ static int send_stream(int socket, int source, uint64_t maximum, int framed) {
         ssize_t n;
         do { n = size ? read(source, bytes, size) : 0; } while (n < 0 && errno == EINTR);
         if (n <= 0) {
-            if (!framed) {
-                if (n < 0) return -1;
-                if (total != maximum) { errno = EIO; return -1; }
-                return 0;
-            }
             unsigned char end[8]; np_file_put64(end, total);
             int error = n < 0 ? errno : 0;
             int result = np_file_send(socket, NP_FILE_END, 0, (uint32_t)error, end, sizeof(end));
             if (error) { errno = error; return -1; }
             return result;
         }
-        if ((framed ? np_file_send(socket, NP_FILE_DATA, 0, 0, bytes, (size_t)n)
-                    : write_all(socket, bytes, (size_t)n, 1)) < 0) return -1;
+        if (np_file_send(socket, NP_FILE_DATA, 0, 0, bytes, (size_t)n) < 0) return -1;
         total += (uint64_t)n;
     }
-}
-int np_file_send_stream(int socket, int source, uint64_t maximum) {
-    return send_stream(socket, source, maximum, 1);
-}
-int np_file_send_bytes(int socket, int source, uint64_t length) {
-    return send_stream(socket, source, length, 0);
 }
 int np_file_receive_stream(int socket, int destination, uint64_t maximum,
                            uint64_t *received) {

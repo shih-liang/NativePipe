@@ -88,10 +88,8 @@ public struct FileRPC: Sendable {
     }
 
     /// NPAG retains named-artifact negotiation; its payload is this same stream.
-    public static func sendStream(_ source: FileHandle, count: UInt64, to socket: FileHandle, framed: Bool = true) throws {
-        let result = framed
-            ? np_file_send_stream(socket.fileDescriptor, source.fileDescriptor, count)
-            : np_file_send_bytes(socket.fileDescriptor, source.fileDescriptor, count)
+    public static func sendStream(_ source: FileHandle, count: UInt64, to socket: FileHandle) throws {
+        let result = np_file_send_stream(socket.fileDescriptor, source.fileDescriptor, count)
         guard result == 0 else {
             throw Failure.local(errno)
         }
