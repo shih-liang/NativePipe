@@ -76,7 +76,26 @@ public final class DockWindowSwitcherController: NSObject, NSPopoverDelegate {
             name: NSApplication.didResignActiveNotification, object: NSApp)
     }
 
-    public func showSwitcher() {
+    var isShowingSwitcher: Bool { popover.isShown }
+
+    public func showWindows() {
+        let bridge = bridgeProvider()
+        let windows = bridge?.dockWindows ?? []
+        // Only open utility windows (such as a VM's Screen) count here.
+        // Console and unopened Screen actions must not force a chooser.
+        let openUtilities = utilitiesProvider().filter { $0.visible }
+        if windows.count + openUtilities.count == 1 {
+            if let window = windows.first {
+                closeSwitcher(immediately: true)
+                _ = bridge?.activateDockWindow(window.id)
+                return
+            }
+            if let utility = openUtilities.first, utility.enabled {
+                closeSwitcher(immediately: true)
+                utility.action()
+                return
+            }
+        }
         if popover.isShown {
             popover.performClose(nil)
             return
@@ -172,8 +191,11 @@ public final class DockWindowSwitcherController: NSObject, NSPopoverDelegate {
         return edge.popoverEdge
     }
 
-    private func closeSwitcher() {
+    private func closeSwitcher(immediately: Bool = false) {
+        let animates = popover.animates
+        if immediately { popover.animates = false }
         popover.performClose(nil)
+        popover.animates = animates
     }
 
     private func selectWindow(_ id: UInt32) {

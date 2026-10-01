@@ -15,7 +15,7 @@ enum RemoteCompositorUpload {
         }
         let installer: FileHandle
         do { installer = try FileHandle(forReadingFrom: directory.appendingPathComponent("install-compositor.sh")) }
-        catch { throw RemoteError.message("This FluxWindow build is missing its compositor installer.") }
+        catch { throw RemoteError.message("This application build is missing its compositor installer.") }
         defer { try? installer.close() }
         guard let script = try installer.read(upToCount: 65_537), !script.isEmpty, script.count <= 65_536 else {
             throw RemoteError.message("The bundled NativePipe installer is empty or exceeds the size limit.")
@@ -30,7 +30,7 @@ enum RemoteCompositorUpload {
         let name = "nativepipe-compositor-\(fields[2])-\(fields[3]).tar.gz"
         let archive: FileHandle
         do { archive = try FileHandle(forReadingFrom: directory.appendingPathComponent(name)) }
-        catch { throw RemoteError.message("This FluxWindow build is missing its remote compositor package: \(name).") }
+        catch { throw RemoteError.message("This application build is missing its remote compositor package: \(name).") }
         defer { try? archive.close() }
         var hash = SHA256(), size = 0
         while let chunk = try archive.read(upToCount: 1_048_576), !chunk.isEmpty {

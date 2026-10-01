@@ -89,7 +89,7 @@ public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
 
     public func applicationShouldHandleReopen(_ sender: NSApplication,
                                               hasVisibleWindows flag: Bool) -> Bool {
-        switcher.showSwitcher()
+        switcher.showWindows()
         return false
     }
     public func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
