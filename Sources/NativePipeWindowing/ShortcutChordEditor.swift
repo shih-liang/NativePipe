@@ -1,3 +1,4 @@
+import NativePipeStrings
 import AppKit
 import NativePipeProtocol
 import SwiftUI
@@ -27,20 +28,20 @@ public struct ShortcutChordEditor: View {
                         ShortcutRecorder(chord: chord, onChange: change, onError: { error = $0 })
                             .frame(width: 180, height: 26)
                     }
-                    Picker("Key", selection: Binding(get: { chord.key }, set: { key in
+                    Picker(NPText("Key"), selection: Binding(get: { chord.key }, set: { key in
                         var next = chord; next.key = key; _ = change(next)
                     })) {
                         ForEach(ShortcutKey.allCases, id: \.self) { Text($0.title).tag($0) }
                     }.frame(width: 160)
                     HStack(spacing: 10) {
-                        modifier(mac ? "⌘" : "Super", .logo, name: mac ? "Command" : "Super")
-                        modifier(mac ? "⌃" : "Ctrl", .control, name: "Control")
-                        modifier(mac ? "⌥" : "Alt", .alt, name: mac ? "Option" : "Alt")
-                        modifier(mac ? "⇧" : "Shift", .shift, name: "Shift")
+                        modifier(mac ? "⌘" : NPText("Super"), .logo, name: mac ? NPText("Command") : NPText("Super"))
+                        modifier(mac ? "⌃" : NPText("Ctrl"), .control, name: "Control")
+                        modifier(mac ? "⌥" : NPText("Alt"), .alt, name: mac ? NPText("Option") : NPText("Alt"))
+                        modifier(mac ? "⇧" : NPText("Shift"), .shift, name: "Shift")
                     }.fixedSize(horizontal: true, vertical: false)
                 }
             }
-            if let error { Text(error).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true) }
+            if let error { Text(error).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true) }
         }.accessibilityElement(children: .contain)
     }
 
@@ -86,8 +87,8 @@ final class ShortcutRecorderButton: NSButton {
         super.init(frame: .zero)
         bezelStyle = .rounded; title = chord.label(mac: true)
         target = self; action = #selector(toggleRecording)
-        setAccessibilityLabel("Record shortcut")
-        toolTip = "Click, then press your shortcut. Press Escape to cancel."
+        setAccessibilityLabel(NPText("Record shortcut"))
+        toolTip = NPText("Click, then press your shortcut. Press Escape to cancel.")
     }
     @available(*, unavailable) required init?(coder: NSCoder) { fatalError() }
     override var acceptsFirstResponder: Bool { true }
@@ -97,7 +98,7 @@ final class ShortcutRecorderButton: NSButton {
     }
     func beginRecording() {
         guard !isRecording, let window, window.makeFirstResponder(self) else { return }
-        isRecording = true; pending = nil; title = "Press shortcut…"; onError?(nil)
+        isRecording = true; pending = nil; title = NPText("Press shortcut…"); onError?(nil)
         NotificationCenter.default.post(name: ShortcutChordEditor.recordingDidChange, object: self, userInfo: ["recording": true])
         monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
             guard let self, self.isRecording, event.window === self.window else { return event }
@@ -117,14 +118,14 @@ final class ShortcutRecorderButton: NSButton {
             }
             guard pending == nil else { return }
             guard let value = ShortcutTranslation.chord(for: event) else {
-                onError?("This key is unavailable. Choose a key from the list."); return
+                onError?(NPText("This key is unavailable. Choose a key from the list.")); return
             }
             pending = (event.keyCode, value); title = value.label(mac: true)
         } else if event.type == .keyUp, let pending, pending.code == event.keyCode {
             // Wait for release before restoring global shortcuts, otherwise
             // the recording press can immediately activate the new binding.
             if onChange?(pending.chord) == true { finishRecording() }
-            else { self.pending = nil; title = "Press shortcut…" }
+            else { self.pending = nil; title = NPText("Press shortcut…") }
         }
     }
     func finishRecording() {

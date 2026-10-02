@@ -223,6 +223,7 @@ jobs:
           intel="$(swift build --disable-sandbox --build-system native -c release --arch x86_64 --show-bin-path)/nativepipe"
           mkdir -p .build/universal
           lipo -create "$arm" "$intel" -output .build/universal/nativepipe
+          cp -R "$(dirname "$arm")/NativePipe_NativePipeStrings.bundle" .build/universal/
           sh scripts/package-macos-cli.sh .build/universal/nativepipe macos-release
       - name: Upload command archive
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0

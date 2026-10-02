@@ -520,7 +520,7 @@ static int create_format_table(struct np_dmabuf *dmabuf, uint32_t *size_out)
 		entries[index].modifier = formats[index].modifier;
 	}
 	int fd = memfd_create(
-		"remotepipe-dmabuf-feedback", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+		"nativepipe-dmabuf-feedback", MFD_CLOEXEC | MFD_ALLOW_SEALING);
 	if (fd < 0) {
 		free(entries);
 		return -1;

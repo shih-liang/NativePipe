@@ -21,3 +21,27 @@ final class NativePipeRemoteAppTests: XCTestCase {
         XCTAssertEqual(command.command?.application, ["firefox", "--help"])
     }
 }
+
+extension NativePipeRemoteAppTests {
+    func testInvalidOptionsFailBeforeConnectingAndDoNotEchoPrivateInput() {
+        for args in [["-p", "0", "host", "app"], ["-p", "65536", "host", "app"],
+                     ["-p", "SECRET", "host", "app"], ["-i", "--help"],
+                     ["--compositor", "", "host", "app"], ["--SECRET", "host", "app"]] {
+            XCTAssertThrowsError(try RemotePipeCLI.parse(args)) { error in
+                XCTAssertFalse(error.localizedDescription.contains("SECRET"))
+            }
+        }
+    }
+    func testLocalHelpNeverCarriesAnExecutableCommand() throws {
+        for args in [["-h"], ["--help"], ["--install-compositor", "--help"], ["-p", "2222", "-h"]] {
+            let value = try RemotePipeCLI.parse(args)
+            XCTAssertTrue(value.wantHelp); XCTAssertNil(value.command)
+        }
+    }
+    func testQuietProgressAndBatchModeAreOnlyClientOptions() throws {
+        let value = try RemotePipeCLI.parse(["--no-progress", "-o", "BatchMode=yes", "host", "app", "path with spaces", "-h"])
+        XCTAssertFalse(value.progress)
+        XCTAssertEqual(value.command?.sshArguments, ["-o", "BatchMode=yes"])
+        XCTAssertEqual(value.command?.application, ["app", "path with spaces", "-h"])
+    }
+}

@@ -26,6 +26,9 @@ public final class RemoteDisplayController {
             self?.applications.first(where: { $0.matches(applicationID: id) })
                 .flatMap { $0.iconData.flatMap(NSImage.init(data:)) }
         }
+        bridge.applicationNameProvider = { [weak self] id in
+            self?.applications.first(where: { $0.matches(applicationID: id) })?.name
+        }
         bridge.output = { [weak self] command in
             self?.session.send(command)
         }

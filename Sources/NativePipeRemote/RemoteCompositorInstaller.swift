@@ -1,5 +1,5 @@
 /// Small SSH bootstraps. Installation policy lives in install-compositor.sh,
-/// published with the selected release or supplied by FluxWindow offline.
+/// published with the selected release or supplied by LinPortal offline.
 enum RemoteCompositorInstaller {
     static let script = #"""
     download_status=$(mktemp)

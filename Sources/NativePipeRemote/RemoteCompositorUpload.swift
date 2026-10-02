@@ -1,3 +1,4 @@
+import NativePipeStrings
 import CryptoKit
 import Darwin
 import Foundation
@@ -11,34 +12,34 @@ enum RemoteCompositorUpload {
                         write: (FileHandle, Data) throws -> Void) throws -> Bool {
         guard let request = try readLine(output) else { return false }
         guard request == "NATIVEPIPE INSTALLER" else {
-            throw RemoteError.message("Invalid NativePipe installation response: \(request)")
+            throw RemoteError.message(NPText("Invalid NativePipe installation response: %@", String(describing: (request))))
         }
         let installer: FileHandle
         do { installer = try FileHandle(forReadingFrom: directory.appendingPathComponent("install-compositor.sh")) }
-        catch { throw RemoteError.message("This application build is missing its compositor installer.") }
+        catch { throw RemoteError.message(NPText("This application build is missing its compositor installer.")) }
         defer { try? installer.close() }
         guard let script = try installer.read(upToCount: 65_537), !script.isEmpty, script.count <= 65_536 else {
-            throw RemoteError.message("The bundled NativePipe installer is empty or exceeds the size limit.")
+            throw RemoteError.message(NPText("The bundled NativePipe installer is empty or exceeds the size limit."))
         }
         try write(input, Data("\(script.count)\n".utf8) + script)
         guard let target = try readLine(output) else { return false }
         let fields = target.split(separator: " ")
         guard fields.count == 4, fields[0] == "NATIVEPIPE", fields[1] == "TARGET",
               ["aarch64", "x86_64"].contains(fields[2]), ["gnu", "musl"].contains(fields[3]) else {
-            throw RemoteError.message("Invalid NativePipe installation response: \(target)")
+            throw RemoteError.message(NPText("Invalid NativePipe installation response: %@", String(describing: (target))))
         }
         let name = "nativepipe-compositor-\(fields[2])-\(fields[3]).tar.gz"
         let archive: FileHandle
         do { archive = try FileHandle(forReadingFrom: directory.appendingPathComponent(name)) }
-        catch { throw RemoteError.message("This application build is missing its remote compositor package: \(name).") }
+        catch { throw RemoteError.message(NPText("This application build is missing its remote compositor package: %@.", String(describing: (name)))) }
         defer { try? archive.close() }
         var hash = SHA256(), size = 0
         while let chunk = try archive.read(upToCount: 1_048_576), !chunk.isEmpty {
             size += chunk.count
-            guard size <= maximumArchiveSize else { throw RemoteError.message("NativePipe archive exceeds the size limit.") }
+            guard size <= maximumArchiveSize else { throw RemoteError.message(NPText("NativePipe archive exceeds the size limit.")) }
             hash.update(data: chunk)
         }
-        guard size > 0 else { throw RemoteError.message("NativePipe archive is empty: \(name).") }
+        guard size > 0 else { throw RemoteError.message(NPText("NativePipe archive is empty: %@.", String(describing: (name)))) }
         let digest = hash.finalize().map { String(format: "%02x", $0) }.joined()
         try write(input, Data("\(digest) \(size)\n".utf8))
         guard let response = try readLine(output) else { return false }
@@ -50,16 +51,16 @@ enum RemoteCompositorUpload {
             var remaining = size
             while remaining > 0 {
                 guard ProcessInfo.processInfo.systemUptime < deadline else {
-                    throw RemoteError.message("NativePipe upload timed out.")
+                    throw RemoteError.message(NPText("NativePipe upload timed out."))
                 }
                 guard let chunk = try archive.read(upToCount: min(65_536, remaining)), !chunk.isEmpty else {
-                    throw RemoteError.message("NativePipe archive changed during upload.")
+                    throw RemoteError.message(NPText("NativePipe archive changed during upload."))
                 }
                 try write(input, chunk)
                 remaining -= chunk.count
             }
             return true
-        default: throw RemoteError.message("Invalid NativePipe upload response: \(response)")
+        default: throw RemoteError.message(NPText("Invalid NativePipe upload response: %@", String(describing: (response))))
         }
     }
 
@@ -69,7 +70,7 @@ enum RemoteCompositorUpload {
         // Read exactly through newline: the next byte may already be NPIP.
         while bytes.count < 256 {
             guard ProcessInfo.processInfo.systemUptime < deadline else {
-                throw RemoteError.message("NativePipe installation handshake timed out.")
+                throw RemoteError.message(NPText("NativePipe installation handshake timed out."))
             }
             var fd = pollfd(fd: handle.fileDescriptor, events: Int16(POLLIN), revents: 0)
             let available = Darwin.poll(&fd, 1, 1000)
@@ -83,6 +84,6 @@ enum RemoteCompositorUpload {
             if byte == 10 { return String(decoding: bytes, as: UTF8.self) }
             bytes.append(byte)
         }
-        throw RemoteError.message("NativePipe installation response exceeds the size limit.")
+        throw RemoteError.message(NPText("NativePipe installation response exceeds the size limit."))
     }
 }

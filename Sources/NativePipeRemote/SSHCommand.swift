@@ -1,3 +1,4 @@
+import NativePipeStrings
 import Foundation
 
 public struct SSHCommand: Codable, Sendable, Equatable {
@@ -23,7 +24,7 @@ public struct SSHCommand: Codable, Sendable, Equatable {
               persistentSession || (!application.isEmpty && !application[0].isEmpty),
               !compositor.isEmpty,
               (application + sshArguments + [compositor]).allSatisfy({ !$0.contains("\0") })
-        else { throw RemoteError.message("Enter an SSH destination and an application to run.") }
+        else { throw RemoteError.message(NPText("Enter an SSH destination and an application to run.")) }
     }
     public var credentialID: String {
         let index = sshArguments.firstIndex(of: "-p")

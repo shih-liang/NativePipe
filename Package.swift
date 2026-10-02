@@ -11,6 +11,8 @@ let products: [Product] = [
     .executable(name: "nativepipe", targets: ["NativePipeRemoteApp"]),
 ]
 let targets: [Target] = [
+        .testTarget(name: "NativePipeStringsTests", dependencies: ["NativePipeStrings"], swiftSettings: [.swiftLanguageMode(.v5)]),
+        .target(name: "NativePipeStrings", resources: [.process("Resources")], swiftSettings: [.swiftLanguageMode(.v5)]),
         .target(name: "CNativePipeAV1", path: "common/av1_decoder", publicHeadersPath: ".",
             cSettings: [.unsafeFlags(["-I" + codecPrefix + "/include"])],
             linkerSettings: [.unsafeFlags(["-L" + codecPrefix + "/lib"]),
@@ -25,19 +27,19 @@ let targets: [Target] = [
         ),
         .target(
             name: "NativePipeProtocol",
-            dependencies: ["CNativePipeFileRPC"],
+            dependencies: ["NativePipeStrings", "CNativePipeFileRPC"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         // Wayland guest events ↔ NSWindow / clipboard / key codes.
         .target(
             name: "NativePipeWindowing",
-            dependencies: ["NativePipeProtocol"],
+            dependencies: ["NativePipeStrings", "NativePipeProtocol"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         // Remote Linux: SSH stdio NPIP + NPEN, VideoToolbox decode, WindowBridge.
         .target(
             name: "NativePipeRemote",
-            dependencies: ["NativePipeProtocol", "NativePipeWindowing", "CNativePipeAV1"],
+            dependencies: ["NativePipeStrings", "NativePipeProtocol", "NativePipeWindowing", "CNativePipeAV1"],
             swiftSettings: [.swiftLanguageMode(.v5)],
             linkerSettings: [
                 .linkedFramework("VideoToolbox"),
@@ -49,7 +51,7 @@ let targets: [Target] = [
         ),
         .executableTarget(
             name: "NativePipeRemoteApp",
-            dependencies: [
+            dependencies: ["NativePipeStrings",
                 "NativePipeRemote",
                 "NativePipeProtocol",
             ],
@@ -78,9 +80,10 @@ let targets: [Target] = [
         ),
 ]
 
-/// NativePipe — shared display, input and transport technology for FluxWindow.
+/// NativePipe — shared display, input and transport technology for LinPortal.
 let package = Package(
     name: "NativePipe",
+    defaultLocalization: "en",
     platforms: [.macOS(.v14)],
     products: products,
     dependencies: [],

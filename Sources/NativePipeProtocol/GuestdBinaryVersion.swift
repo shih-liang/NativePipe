@@ -1,3 +1,4 @@
+import NativePipeStrings
 import Foundation
 
 /// Version stamped into the static `nativepipe-guestd` ELF at build time.
@@ -17,11 +18,11 @@ public enum GuestdBinaryVersion {
         public var errorDescription: String? {
             switch self {
             case .missingTag:
-                return "guestd binary has no \(tagPrefix) version stamp (rebuild with make -C guest/guestd)"
+                return NPText("guestd binary has no %@ version stamp (rebuild with make -C guest/guestd)", String(describing: (tagPrefix)))
             case .emptyVersion:
-                return "guestd binary version stamp is empty"
+                return NPText("guestd binary version stamp is empty")
             case .versionMismatch(let file, let elf):
-                return "VERSION file (\(file)) does not match ELF \(tagPrefix)\(elf)"
+                return NPText("VERSION file (%@) does not match ELF %@%@", String(describing: (file)), String(describing: (tagPrefix)), String(describing: (elf)))
             }
         }
     }

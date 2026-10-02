@@ -73,7 +73,7 @@ cache; there is no second thumbnail byte cache in the compositor.
 
 VMHost's macOS appearance observation, keyboard-source observation and preference
 resolution live in `NativePipeWindowing.HostIntegrationController`. VMHost,
-RemoteHost and the standalone CLI use that implementation. Both FluxWindow
+RemoteHost and the standalone CLI use that implementation. Both LinPortal
 hosts also use one settings-to-window-preferences mapping. Backend code only
 delivers resolved values through VM control or the SSH application worker.
 

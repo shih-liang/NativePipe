@@ -1,5 +1,5 @@
 #!/bin/sh
-# Published with each release and bundled by FluxWindow. stdout returns the
+# Published with each release and bundled by LinPortal. stdout returns the
 # installed executable; the offline upload handshake uses inherited fd 3.
 set -eu
 

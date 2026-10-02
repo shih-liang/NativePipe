@@ -1,3 +1,4 @@
+import NativePipeStrings
 import Foundation
 import Darwin
 
@@ -9,11 +10,13 @@ public final class SFTPTransfer {
         public var id: String { rawValue }
     }
     private var process: Process?
+    private var authenticationDirectory: URL?
     private var cancelled = false
     public init() {}
 
     public func cancel() {
         cancelled = true
+        if let authenticationDirectory { try? FileManager.default.removeItem(at: authenticationDirectory) }
         if let process, process.isRunning { process.terminate() }
     }
 
@@ -21,7 +24,7 @@ public final class SFTPTransfer {
                              recursive: Bool = false, createParent: Bool = false) throws -> String {
         func quote(_ path: String) throws -> String {
             guard !path.isEmpty, !path.contains(where: { $0 == "\0" || $0 == "\n" || $0 == "\r" }) else {
-                throw RemoteError.message("Enter a file path without line breaks.")
+                throw RemoteError.message(NPText("Enter a file path without line breaks."))
             }
             // SFTP protects glob characters inside quotes itself.
             var result = "\""
@@ -44,7 +47,7 @@ public final class SFTPTransfer {
 
     public func run(command: SSHCommand, direction: Direction, local: URL, remote: String,
                     environment: [String: String], recursive: Bool = false, createParent: Bool = false) async throws {
-        guard process == nil else { throw RemoteError.message("A file transfer is already running.") }
+        guard process == nil else { throw RemoteError.message(NPText("A file transfer is already running.")) }
         try command.validate()
         let batch = try Self.batch(direction: direction, local: local.path, remote: remote,
                                   recursive: recursive, createParent: createParent)
@@ -62,7 +65,8 @@ public final class SFTPTransfer {
                            "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30",
                            "-o", "ServerAliveCountMax=3"] + arguments + ["--", destination]
         let auth = try SSHCredentialStore.makeAttemptDirectory(environment: environment)
-        defer { try? FileManager.default.removeItem(at: auth) }
+        authenticationDirectory = auth
+        defer { try? FileManager.default.removeItem(at: auth); authenticationDirectory = nil }
         var environment = environment
         environment["NATIVEPIPE_SSH_CONNECTION"] = command.credentialID
         environment["NATIVEPIPE_SSH_AUTH_SESSION"] = auth.path
@@ -99,9 +103,9 @@ public final class SFTPTransfer {
                 return (child.terminationStatus, String(decoding: diagnostic, as: UTF8.self))
             }.value
             _ = try? await sending.value
-            if cancelled || Task.isCancelled { throw CancellationError() }
+            if cancelled || Task.isCancelled || result.1.contains(SSHAuthentication.cancelledDiagnostic) { throw CancellationError() }
             guard result.0 == 0 else {
-                throw RemoteError.message(result.1.isEmpty ? "The file transfer failed." : result.1)
+                throw RemoteError.message(result.1.isEmpty ? NPText("The file transfer failed.") : result.1)
             }
         } onCancel: {
             Task { @MainActor [weak self] in self?.cancel() }

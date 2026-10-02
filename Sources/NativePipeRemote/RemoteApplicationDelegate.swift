@@ -1,7 +1,8 @@
+import NativePipeStrings
 import AppKit
 import NativePipeWindowing
 
-/// Shared app lifecycle for the standalone CLI and FluxWindow RemoteHost.
+/// Shared app lifecycle for the standalone CLI and LinPortal RemoteHost.
 /// VMHost uses the same bridge, switcher and input command writer.
 @MainActor
 public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
@@ -10,12 +11,14 @@ public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
     public var onDisconnected: (() -> Void)?
     public var onFailure: ((Error) -> Void)?
     public var onTerminate: (() -> Void)?
+    public var onDiagnostic: ((String) -> Void)?
     public var exitOnDisconnect = true
     public var displayName: String {
         didSet {
             guard displayName != oldValue else { return }
             switcher.title = displayName
-            disconnectItem?.title = "Disconnect from \(displayName)"
+            display.bridge.machineName = displayName
+            disconnectItem?.title = NPText("Disconnect from %@", String(describing: (displayName)))
         }
     }
     private weak var disconnectItem: NSMenuItem?
@@ -48,6 +51,7 @@ public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
                                           localCompositorDirectory: localCompositorDirectory,
                                           clipboardFileDirectory: clipboardFileDirectory)
         super.init()
+        display.bridge.machineName = displayName
     }
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
@@ -57,7 +61,10 @@ public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
         guard !started else { return }
         started = true
         NSApp.mainMenu = makeMenu()
-        display.session.onDiagnostic = { text in fputs(text, stderr) }
+        display.session.onDiagnostic = { [weak self] text in
+            fputs(text, stderr)
+            self?.onDiagnostic?(text)
+        }
         display.session.onError = { [weak self] error in self?.failed(error) }
         display.onStateChange = { [weak self] state in
             guard let self else { return }
@@ -82,7 +89,14 @@ public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
                 if let onConnected { onConnected() }
                 else { hostIntegration.sync() }
                 if loadsApplicationIcons { _ = try? await display.refreshApplications() }
-            } catch is CancellationError { }
+            } catch is CancellationError {
+                // A user dismissing askpass cancels the attempt as well. A
+                // superseded Task must not stop the replacement connection.
+                guard !Task.isCancelled else { return }
+                stopping = true
+                onDisconnected?()
+                if exitOnDisconnect { NSApp.terminate(nil) }
+            }
             catch { if !Task.isCancelled { failed(error) } }
         }
     }
@@ -119,9 +133,9 @@ public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
 
     static func failureAlert(name: String, log: String) -> NSAlert {
         let alert = NSAlert()
-        alert.messageText = "Couldn’t Connect to \(name)"
-        alert.informativeText = "The connection has closed. You can try connecting again."
-        alert.addButton(withTitle: "Close")
+        alert.messageText = NPText("Couldn’t Connect to %@", String(describing: (name)))
+        alert.informativeText = NPText("The connection has closed. You can try connecting again.")
+        alert.addButton(withTitle: NPText("Close"))
         let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 520, height: 240))
         scroll.hasVerticalScroller = true
         scroll.borderType = .bezelBorder
@@ -133,7 +147,7 @@ public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
         text.textContainer?.widthTracksTextView = true
         text.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         text.string = log
-        text.setAccessibilityLabel("Connection log")
+        text.setAccessibilityLabel(NPText("Connection Log"))
         scroll.documentView = text
         alert.accessoryView = scroll
         return alert
@@ -142,15 +156,15 @@ public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         let app = NSMenuItem()
         let actions = NSMenu(title: "NativePipe")
-        disconnectItem = actions.addItem(withTitle: "Disconnect from \(displayName)",
+        disconnectItem = actions.addItem(withTitle: NPText("Disconnect from %@", String(describing: (displayName))),
                         action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         app.submenu = actions
         menu.addItem(app)
         let item = NSMenuItem()
-        let windows = NSMenu(title: "Window")
-        windows.addItem(withTitle: "Minimize",
+        let windows = NSMenu(title: NPText("Window"))
+        windows.addItem(withTitle: NPText("Minimize"),
                         action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
-        windows.addItem(withTitle: "Bring All to Front",
+        windows.addItem(withTitle: NPText("Bring All to Front"),
                         action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: "")
         item.submenu = windows
         menu.addItem(item)
@@ -164,6 +178,7 @@ public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
 /// preference file, or log. Host-key decisions remain OpenSSH's responsibility.
 @MainActor
 public enum SSHAuthentication {
+    static let cancelledDiagnostic = "NATIVEPIPE AUTH CANCELLED\n"
     public static func answerPromptIfRequested() -> Bool {
         guard ProcessInfo.processInfo.environment["NATIVEPIPE_SSH_ASKPASS"] == "1" else {
             return false
@@ -171,11 +186,20 @@ public enum SSHAuthentication {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
         let environment = ProcessInfo.processInfo.environment
+        if let path = environment["NATIVEPIPE_SSH_AUTH_SESSION"],
+           !FileManager.default.fileExists(atPath: path) {
+            fputs(cancelledDiagnostic, stderr)
+            exit(EXIT_FAILURE)
+        }
+        // stderr belongs to the SSH diagnostic pipe, never the credential reply.
+        fputs("NATIVEPIPE PHASE AUTHENTICATING\n", stderr)
         let prompt = CommandLine.arguments.dropFirst().joined(separator: " ")
         let rememberable = SSHCredentialStore.mayRemember(prompt)
         let store = SSHCredentialStore(
             connection: environment["NATIVEPIPE_SSH_CONNECTION"] ?? "",
-            accessGroup: environment["NATIVEPIPE_KEYCHAIN_GROUP"])
+            accessGroup: environment["NATIVEPIPE_KEYCHAIN_GROUP"],
+            trustedApplications: environment["NATIVEPIPE_KEYCHAIN_APPLICATIONS"]?
+                .split(separator: "\n").map { URL(fileURLWithPath: String($0)) } ?? [])
         if rememberable,
            SSHCredentialStore.claimCachedAttempt(
                prompt: prompt, directory: environment["NATIVEPIPE_SSH_AUTH_SESSION"]),
@@ -183,12 +207,18 @@ public enum SSHAuthentication {
             print(saved)
             return true
         }
+        // Askpass enters a modal loop without NSApplication.run(). Complete
+        // AppKit startup so the prompt is registered and keyboard-accessible.
+        app.finishLaunching()
         let alert = NSAlert()
-        alert.messageText = "SSH Authentication"
+        alert.messageText = NPText("Sign In to %@", String(describing: (environment["NATIVEPIPE_SSH_CONNECTION"] ?? "Remote Computer")))
         alert.informativeText = prompt
         let confirming = ProcessInfo.processInfo.environment["SSH_ASKPASS_PROMPT"] == "confirm"
+        if confirming { alert.messageText = NPText("Trust This Remote Computer?") }
         let input = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
-        let remember = NSButton(checkboxWithTitle: "Remember in Keychain", target: nil, action: nil)
+        input.placeholderString = rememberable ? NPText("Password or passphrase") : NPText("Authentication response")
+        input.setAccessibilityLabel(input.placeholderString)
+        let remember = NSButton(checkboxWithTitle: NPText("Remember in Keychain"), target: nil, action: nil)
         remember.state = .on
         if !confirming {
             let content = NSStackView(views: rememberable ? [input, remember] : [input])
@@ -199,9 +229,23 @@ public enum SSHAuthentication {
             input.widthAnchor.constraint(equalToConstant: 360).isActive = true
             alert.accessoryView = content
         }
-        alert.addButton(withTitle: confirming ? "Connect" : "Continue")
-        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: confirming ? NPText("Connect") : NPText("Continue"))
+        alert.addButton(withTitle: NPText("Cancel"))
         if !confirming { alert.window.initialFirstResponder = input }
+        // Disconnect removes the attempt directory. Close a pending native
+        // prompt as well, even if OpenSSH's askpass child outlives SSH itself.
+        let watch: DispatchSourceFileSystemObject?
+        if let path = environment["NATIVEPIPE_SSH_AUTH_SESSION"] {
+            let fd = open(path, O_EVTONLY | O_CLOEXEC)
+            if fd >= 0 {
+                let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: .delete, queue: .main)
+                source.setEventHandler { app.abortModal(); alert.window.orderOut(nil) }
+                source.setCancelHandler { close(fd) }
+                source.resume()
+                watch = source
+            } else { fputs(cancelledDiagnostic, stderr); exit(EXIT_FAILURE) }
+        } else { watch = nil }
+        defer { watch?.cancel() }
         app.activate()
         if alert.runModal() == .alertFirstButtonReturn {
             if rememberable {
@@ -210,13 +254,21 @@ public enum SSHAuthentication {
                     else { try store.remove(prompt) }
                 } catch {
                     let warning = NSAlert()
-                    warning.messageText = "Password Wasn’t Saved"
+                    warning.messageText = NPText("Password Wasn’t Saved")
                     warning.informativeText = error.localizedDescription
                     warning.runModal()
                 }
             }
             print(confirming ? "yes" : input.stringValue)
-        } else { exit(EXIT_FAILURE) }
+        } else {
+            // End this attempt for every SSH consumer, including SFTP. Later
+            // authentication methods must not reopen a cancelled prompt.
+            if let path = environment["NATIVEPIPE_SSH_AUTH_SESSION"] {
+                try? FileManager.default.removeItem(atPath: path)
+            }
+            fputs(cancelledDiagnostic, stderr)
+            exit(EXIT_FAILURE)
+        }
         return true
     }
 

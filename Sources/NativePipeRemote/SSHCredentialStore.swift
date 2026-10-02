@@ -1,3 +1,4 @@
+import NativePipeStrings
 import Foundation
 import Security
 import CryptoKit
@@ -10,10 +11,12 @@ public struct SSHCredentialStore {
     }
     private let service: String
     private let group: String?
-    public init(connection: String, accessGroup: String? = nil) {
+    private let trustedApplications: [URL]
+    public init(connection: String, accessGroup: String? = nil, trustedApplications: [URL] = []) {
         service = "com.nativepipe.ssh." + SHA256.hash(data: Data(connection.utf8))
             .map { String(format: "%02x", $0) }.joined()
         group = accessGroup
+        self.trustedApplications = trustedApplications
     }
     private var base: [String: Any] {
         var value: [String: Any] = [
@@ -27,11 +30,13 @@ public struct SSHCredentialStore {
         return value
     }
     public func entries() throws -> [Entry] {
-        var query = base
-        query[kSecReturnAttributes as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitAll
         var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        let status = try perform { query, _ in
+            var query = query
+            query[kSecReturnAttributes as String] = true
+            query[kSecMatchLimit as String] = kSecMatchLimitAll
+            return SecItemCopyMatching(query as CFDictionary, &result)
+        }
         if status == errSecItemNotFound { return [] }
         try check(status)
         return (result as? [[String: Any]] ?? []).compactMap {
@@ -39,36 +44,68 @@ public struct SSHCredentialStore {
         }
     }
     public func read(_ prompt: String) throws -> String? {
-        var query = base
-        query[kSecAttrAccount as String] = prompt
-        query[kSecReturnData as String] = true
         var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        let status = try perform { query, _ in
+            var query = query
+            query[kSecAttrAccount as String] = prompt
+            query[kSecReturnData as String] = true
+            return SecItemCopyMatching(query as CFDictionary, &result)
+        }
         if status == errSecItemNotFound { return nil }
         try check(status)
         return (result as? Data).flatMap { String(data: $0, encoding: .utf8) }
     }
     public func save(_ secret: String, prompt: String) throws {
-        var query = base
-        query[kSecAttrAccount as String] = prompt
-        let values = [kSecValueData as String: Data(secret.utf8)] as [String: Any]
-        let status = SecItemUpdate(query as CFDictionary, values as CFDictionary)
-        if status == errSecItemNotFound {
+        try check(try perform { query, fallback in
+            var query = query
+            query[kSecAttrAccount as String] = prompt
+            let values = [kSecValueData as String: Data(secret.utf8)] as [String: Any]
+            // Updating a secret must preserve the original access policy.
+            // A nested helper may not inspect another owner's bundle on disk.
+            let status = SecItemUpdate(query as CFDictionary, values as CFDictionary)
+            guard status == errSecItemNotFound else { return status }
             query.merge(values) { _, new in new }
-            query[kSecAttrLabel as String] = "NativePipe SSH — " + prompt
-            query[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-            try check(SecItemAdd(query as CFDictionary, nil))
-        } else { try check(status) }
+            if fallback { query[kSecAttrAccess as String] = try applicationAccess() }
+            query[kSecAttrLabel as String] = NPText("NativePipe SSH — %@", prompt)
+            if !fallback { query[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly }
+            return SecItemAdd(query as CFDictionary, nil)
+        })
     }
     public func remove(_ prompt: String? = nil) throws {
-        var query = base
-        if let prompt { query[kSecAttrAccount as String] = prompt }
-        let status = SecItemDelete(query as CFDictionary)
+        let status = try perform { query, _ in
+            var query = query
+            if let prompt { query[kSecAttrAccount as String] = prompt }
+            return SecItemDelete(query as CFDictionary)
+        }
         if status != errSecItemNotFound { try check(status) }
+    }
+    /// Keep existing Data Protection items when that entitlement is available.
+    /// Development signing may only grant the file container, not Keychain.
+    /// In that case the login Keychain trusts explicit signed owners, never all apps.
+    private func perform(_ action: ([String: Any], Bool) throws -> OSStatus) throws -> OSStatus {
+        let status = try action(base, false)
+        guard status == errSecMissingEntitlement, group != nil, !trustedApplications.isEmpty else { return status }
+        var query = base
+        query.removeValue(forKey: kSecAttrAccessGroup as String)
+        query.removeValue(forKey: kSecUseDataProtectionKeychain as String)
+        return try action(query, true)
+    }
+    private func applicationAccess() throws -> SecAccess {
+        var trusted: [SecTrustedApplication] = []
+        for url in trustedApplications {
+            var application: SecTrustedApplication?
+            try check(SecTrustedApplicationCreateFromPath(url.path, &application))
+            guard let application else { throw RemoteError.message(NPText("The SSH password owner could not be authorized.")) }
+            trusted.append(application)
+        }
+        var access: SecAccess?
+        try check(SecAccessCreate(NPText("NativePipe SSH") as CFString, trusted as CFArray, &access))
+        guard let access else { throw RemoteError.message(NPText("The SSH password access policy could not be created.")) }
+        return access
     }
     private func check(_ status: OSStatus) throws {
         guard status == errSecSuccess else {
-            throw RemoteError.message("Keychain: " + (SecCopyErrorMessageString(status, nil) as String? ?? String(status)))
+            throw RemoteError.message(NPText("Keychain: %@", SecCopyErrorMessageString(status, nil) as String? ?? String(status)))
         }
     }
 
@@ -84,7 +121,7 @@ public struct SSHCredentialStore {
             // The manager's SFTP and RemoteHost askpass have different sandboxes.
             // Their retry markers must be shared, just like their Keychain items.
             guard let shared = files.containerURL(forSecurityApplicationGroupIdentifier: group) else {
-                throw RemoteError.message("The SSH credential group is unavailable.")
+                throw RemoteError.message(NPText("The SSH credential group is unavailable."))
             }
             root = shared
         } else { root = files.temporaryDirectory }

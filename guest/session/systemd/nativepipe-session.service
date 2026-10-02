@@ -1,6 +1,6 @@
 [Unit]
 Description=NativePipe empty session (autologin compositor)
-Documentation=https://github.com/shih-liang/LightHouse
+Documentation=https://github.com/shih-liang/NativePipe
 # Display manager analogue: before getty, after the agent that writes the user.
 DefaultDependencies=no
 After=local-fs.target nativepipe-guestd.service

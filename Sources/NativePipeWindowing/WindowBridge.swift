@@ -1,3 +1,4 @@
+import NativePipeStrings
 import AppKit
 import CoreGraphics
 import CoreImage
@@ -64,6 +65,7 @@ public struct DockWindow: Sendable, Identifiable, Equatable {
     public let id: UInt32
     public let title: String
     public let applicationID: String?
+    public let applicationName: String?
     public let isMiniaturized: Bool
     public let isZoomed: Bool
     public let isFullscreen: Bool
@@ -80,11 +82,12 @@ public struct DockWindow: Sendable, Identifiable, Equatable {
         isMiniaturized: Bool = false, isZoomed: Bool = false,
         isFullscreen: Bool = false, width: Double = 0, height: Double = 0,
         isVisible: Bool = false, isKey: Bool = false,
-        canForceQuit: Bool = false, frame: CGRect? = nil
+        canForceQuit: Bool = false, frame: CGRect? = nil, applicationName: String? = nil
     ) {
         self.id = id
         self.title = title
         self.applicationID = applicationID
+        self.applicationName = applicationName
         self.isMiniaturized = isMiniaturized
         self.isZoomed = isZoomed
         self.isFullscreen = isFullscreen
@@ -117,10 +120,10 @@ public enum ComputerUseWindowError: LocalizedError {
 
     public var errorDescription: String? {
         switch self {
-        case .unavailable: "the guest window no longer exists"
-        case .hidden: "the guest window is not visible"
-        case .invalidCoordinates: "input coordinates are outside the guest content"
-        case .captureFailed: "WindowServer could not capture the guest window"
+        case .unavailable: NPText("the guest window no longer exists")
+        case .hidden: NPText("the guest window is not visible")
+        case .invalidCoordinates: NPText("input coordinates are outside the guest content")
+        case .captureFailed: NPText("WindowServer could not capture the guest window")
         }
     }
 }
@@ -475,12 +478,25 @@ public final class WindowBridge: NSObject {
     }
 
     func updateWindowPresence() {
+        notifyDockWindowsChanged()
         let present = hasApplicationWindows
         guard present != reportedWindowPresence else { return }
         reportedWindowPresence = present
         onWindowPresenceChanged?(present)
     }
     public var applicationIconProvider: ((String) -> NSImage?)?
+    public var applicationNameProvider: ((String) -> String?)?
+    public var machineName: String = "" {
+        didSet {
+            guard machineName != oldValue else { return }
+            for window in windows.values { window.refreshHostChrome() }
+            notifyDockWindowsChanged()
+        }
+    }
+    static let dockWindowsDidChange = Notification.Name("NativePipeDockWindowsDidChange")
+    func notifyDockWindowsChanged() {
+        NotificationCenter.default.post(name: Self.dockWindowsDidChange, object: self)
+    }
 
     let clipboard: ClipboardBridge
     public var fileAccess: (any UserFileAccess)? {
@@ -622,7 +638,7 @@ public final class WindowBridge: NSObject {
             guard !native.isPopup, native.window != nil else { return nil }
             return DockWindow(
                 id: native.windowID,
-                title: native.title.isEmpty ? "Untitled Window" : native.title,
+                title: native.title.isEmpty ? NPText("Untitled Window") : native.title,
                 applicationID: native.applicationID,
                 isMiniaturized: native.isMiniaturized,
                 isZoomed: native.isZoomed,
@@ -632,9 +648,11 @@ public final class WindowBridge: NSObject {
                 isVisible: native.window?.isVisible == true,
                 isKey: native.window?.isKeyWindow == true,
                 canForceQuit: forceQuitCapabilities[native.windowID] == true,
-                frame: native.window?.frame)
+                frame: native.window?.frame,
+                applicationName: native.applicationID.flatMap { applicationNameProvider?($0) })
         }.sorted {
-            $0.title.localizedStandardCompare($1.title) == .orderedAscending
+            if $0.title == $1.title { return $0.id < $1.id }
+            return $0.title.localizedStandardCompare($1.title) == .orderedAscending
         }
     }
 
@@ -850,6 +868,7 @@ public final class WindowBridge: NSObject {
 
     public func refreshApplicationIcons() {
         for window in windows.values { window.refreshApplicationIcon() }
+        notifyDockWindowsChanged()
     }
 
     func window(_ id: UInt32) -> NativeWindow? { windows[id] }
@@ -1060,6 +1079,7 @@ public final class WindowBridge: NSObject {
         case .forceQuitCapabilityChanged(let window, let supported):
             guard windows[window] != nil else { break }
             forceQuitCapabilities[window] = supported
+            notifyDockWindowsChanged()
 
         case .popupCreated(let window, let surface, let parent, let x, let y, _, _):
             // Like a toplevel, the NSWindow waits for the first frame; a menu
@@ -1132,10 +1152,12 @@ public final class WindowBridge: NSObject {
 
         case .titleChanged(let window, let title):
             windows[window]?.title = title
+            notifyDockWindowsChanged()
 
         case .appIDChanged(let window, let appID):
             windows[window]?.setAppID(appID)
             notifyApplicationWindowMapped(window)
+            notifyDockWindowsChanged()
 
         case .decorationModeChanged(let window, let serverSide):
             windows[window]?.setServerDecorated(serverSide)
@@ -1324,7 +1346,7 @@ public final class WindowBridge: NSObject {
         if !unavailable.isEmpty {
             discardScene(
                 work,
-                reason: "resources \(unavailable) cannot export their committed Metal textures")
+                reason: NPText("resources %@ cannot export their committed Metal textures", String(describing: (unavailable))))
             return
         }
         guard unpublished.isEmpty else {
@@ -1343,7 +1365,7 @@ public final class WindowBridge: NSObject {
                     self?.releaseScene(work.scene)
                 })
         else {
-            discardScene(work, reason: "window presenter rejected the scene")
+            discardScene(work, reason: NPText("window presenter rejected the scene"))
             return
         }
 

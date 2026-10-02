@@ -1,3 +1,4 @@
+import NativePipeStrings
 import Foundation
 
 /// One catalog/cache and request implementation shared by VMHost and Remote.
@@ -53,13 +54,13 @@ public final class ApplicationClient {
             guard var request = pending[token], request.action == .list else { return }
             for app in apps {
                 guard request.ids.insert(app.id).inserted else {
-                    finish(token, .failure(Failure("Duplicate application ID in catalog."))); return
+                    finish(token, .failure(Failure(NPText("Duplicate application ID in catalog.")))); return
                 }
                 request.bytes += app.metadataByteCount
             }
             // A malicious peer must fail explicitly rather than exhaust host memory.
             guard request.bytes <= Self.maximumMetadataBytes, request.ids.count <= 65_536 else {
-                finish(token, .failure(Failure("Application catalog exceeds the safety limit."))); return
+                finish(token, .failure(Failure(NPText("Application catalog exceeds the safety limit.")))); return
             }
             request.apps += apps; pending[token] = request
         case .end(let token, let message):
@@ -77,12 +78,12 @@ public final class ApplicationClient {
         pending.removeValue(forKey: token)?.continuation.resume(with: result)
     }
     private func request(_ action: ApplicationAction, _ id: String = "") async throws -> ApplicationReply {
-        guard connected else { throw Failure("The Linux window service is disconnected.") }
+        guard connected else { throw Failure(NPText("The Linux window service is disconnected.")) }
         repeat { nextToken &+= 1 } while nextToken == 0 || pending[nextToken] != nil
         let token = nextToken
         let timeout = Task { [weak self] in
             do { try await Task.sleep(for: .seconds(25)) } catch { return }
-            self?.finish(token, .failure(Failure("The Linux application request timed out.")))
+            self?.finish(token, .failure(Failure(NPText("The Linux application request timed out."))))
         }
         defer { timeout.cancel() }
         return try await withTaskCancellationHandler {
@@ -102,7 +103,7 @@ public final class ApplicationClient {
         let task = Task { [self] in
             while true {
                 let version = revision
-                guard case .batch(_, var apps) = try await request(.list) else { throw Failure("Invalid catalog reply.") }
+                guard case .batch(_, var apps) = try await request(.list) else { throw Failure(NPText("Invalid catalog reply.")) }
                 try Task.checkCancellation()
                 if version != revision { continue }
                 apps.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
@@ -129,7 +130,7 @@ public final class ApplicationClient {
                         let id = apps[i].id
                         group.addTask { [self] in
                             guard case .icon(_, let data) = try await request(.icon, id) else {
-                                throw Failure("Invalid icon reply.")
+                                throw Failure(NPText("Invalid icon reply."))
                             }
                             return (i, data)
                         }
@@ -138,7 +139,7 @@ public final class ApplicationClient {
                     while let (i, data) = try await group.next() {
                         iconBytes += data.count
                         guard iconBytes <= Self.maximumIconBytes else {
-                            throw Failure("Application icons exceed the catalog safety limit.")
+                            throw Failure(NPText("Application icons exceed the catalog safety limit."))
                         }
                         try Task.checkCancellation()
                         guard generation == taskGeneration, cached != nil else { throw CancellationError() }
@@ -159,7 +160,7 @@ public final class ApplicationClient {
     public func launch(_ id: String) async throws -> Int32 {
         guard !id.isEmpty, !id.contains("/"), id.utf8.count <= 4096,
               case .launched(_, let pid, _) = try await request(.launch, id) else {
-            throw Failure("Invalid application ID.")
+            throw Failure(NPText("Invalid application ID."))
         }
         return pid
     }

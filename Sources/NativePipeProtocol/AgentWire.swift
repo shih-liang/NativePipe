@@ -1,3 +1,4 @@
+import NativePipeStrings
 import Foundation
 
 /// Named file transfer over vsock (bootstrap, provision extras, self-update).
@@ -50,12 +51,12 @@ public enum AgentWire {
 
         public var errorDescription: String? {
             switch self {
-            case .badMagic: return "agent wire: bad magic"
-            case .unsupportedWire: return "agent wire: unsupported version"
-            case .nameTooLong: return "agent wire: name too long"
-            case .versionTooLong: return "agent wire: version too long"
-            case .truncated: return "agent wire: truncated frame"
-            case .payloadTooLarge: return "agent wire: payload too large"
+            case .badMagic: return NPText("agent wire: bad magic")
+            case .unsupportedWire: return NPText("agent wire: unsupported version")
+            case .nameTooLong: return NPText("agent wire: name too long")
+            case .versionTooLong: return NPText("agent wire: version too long")
+            case .truncated: return NPText("agent wire: truncated frame")
+            case .payloadTooLarge: return NPText("agent wire: payload too large")
             }
         }
     }

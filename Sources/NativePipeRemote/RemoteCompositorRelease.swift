@@ -1,3 +1,4 @@
+import NativePipeStrings
 import Foundation
 
 /// Release discovery runs asynchronously on the Mac. Select the installer and
@@ -18,13 +19,13 @@ enum RemoteCompositorRelease {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let response = response as? HTTPURLResponse, response.statusCode == 200 else {
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-                throw RemoteError.message("Could not check NativePipe updates on GitHub (HTTP \(status)).")
+                throw RemoteError.message(NPText("Could not check NativePipe updates on GitHub (HTTP %@).", String(describing: (status))))
             }
             let releases = try JSONDecoder().decode([Release].self, from: data)
             if let base = try select(releases) { return base }
             if releases.count < 100 { break }
         }
-        throw RemoteError.message("GitHub has no installable NativePipe compositor release available. A release must contain install-compositor.sh, nativepipe-compositor-<architecture>-<libc>.tar.gz and SHA256SUMS.")
+        throw RemoteError.message(NPText("GitHub has no installable NativePipe compositor release available. A release must contain install-compositor.sh, nativepipe-compositor-<architecture>-<libc>.tar.gz and SHA256SUMS."))
     }
 
     static func select(_ releases: [Release]) throws -> URL? {
@@ -40,7 +41,7 @@ enum RemoteCompositorRelease {
                   url.query == nil, url.fragment == nil,
                   url.path.lowercased().hasPrefix("/shih-liang/nativepipe/releases/download/"),
                   url.lastPathComponent == asset.name else {
-                throw RemoteError.message("GitHub returned an invalid NativePipe compositor download URL.")
+                throw RemoteError.message(NPText("GitHub returned an invalid NativePipe compositor download URL."))
             }
             return url.deletingLastPathComponent()
         }

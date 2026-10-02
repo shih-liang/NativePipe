@@ -64,7 +64,8 @@ software encoding remains available.
 
 Download `nativepipe-macos-universal.tar.gz` from
 [Releases](https://github.com/shih-liang/NativePipe/releases). It contains the
-command for both Apple Silicon and Intel, along with its license notices.
+command for both Apple Silicon and Intel, its UI translations, and license notices.
+Keep the resource bundle beside the command; the symlink below preserves that layout.
 
 From the directory containing the downloaded archive:
 
@@ -158,7 +159,8 @@ values must be separate arguments, for example `-p 2222`.
 | `-J HOST` | Connect through an SSH jump host, for example `user@bastion`. |
 | `-p PORT` | Set the SSH server port. Otherwise SSH uses its configured port, or 22. |
 | `-o OPTION` | Pass an SSH configuration option, such as `IdentitiesOnly=yes`. May be repeated. |
-| `-h`, `--help` | Print command-line help and exit. |
+| `--no-progress` | Hide terminal connection status; SSH and application diagnostics remain on stderr. |
+| `-h`, `--help` | Print local help and exit without opening a GUI, connecting, installing, or requesting permissions. |
 
 The destination ends NativePipe option parsing. Everything after it belongs to
 the Linux command. For example, `--no-remote` below is a **Firefox option**:
@@ -299,11 +301,26 @@ only the Linux helper.
 | A Wayland application works but an X11 application does not | Install `xwayland-satellite` and Xwayland on Linux and make them available in the remote session's `PATH`. |
 
 Connection diagnostics and Linux application output are written to standard
-error. To capture them:
+error; stdout stays empty. On a terminal, stderr also shows connection stages.
+Redirection removes these extra status lines; it does not hide failure diagnostics.
+There are no decorative panels, colors, or invented percentages. To capture logs:
 
 ```sh
 nativepipe user@linux-host gtk4-demo 2>nativepipe.log
 ```
+
+For unattended connections, let SSH fail instead of asking for authentication:
+
+```sh
+nativepipe -o BatchMode=yes -o ConnectTimeout=5 linux-dev gtk4-demo 2>nativepipe.log
+```
+
+Invalid CLI arguments fail before connecting with exit status 2. After launch,
+NativePipe preserves the SSH/session exit status (SSH commonly uses 255 for a
+connection failure). This client has no JSON result format or durable job IDs;
+logs are text. Ctrl-C, **Disconnect**, or **⌘Q** ends the session. A new invocation
+starts a new Linux command; it does not resume a previous task. To diagnose failure,
+first test ordinary SSH with the same options, then check the helper and Linux app.
 
 To check the managed Linux helper independently:
 

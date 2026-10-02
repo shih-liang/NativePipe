@@ -1,3 +1,4 @@
+import NativePipeStrings
 import Foundation
 
 /// Symbolic keys keep letter shortcuts independent of the Mac's key positions.
@@ -25,8 +26,8 @@ public enum ShortcutKey: String, Codable, CaseIterable, Sendable {
 
     public var title: String {
         switch self {
-        case .pageUp: "Page Up"
-        case .pageDown: "Page Down"
+        case .pageUp: NPText("Page Up")
+        case .pageDown: NPText("Page Down")
         case .left: "←"
         case .right: "→"
         case .up: "↑"
@@ -97,15 +98,15 @@ public struct KeyboardShortcutPreferences: Codable, Sendable, Equatable {
     /// Validate saved rules even while remapping or individual rules are off;
     /// enabling them later must not introduce an ambiguous mapping.
     public var validationError: String? {
-        guard Set(rules.map(\.id)).count == rules.count else { return "Shortcut rule IDs must be unique." }
+        guard Set(rules.map(\.id)).count == rules.count else { return NPText("Shortcut rule IDs must be unique.") }
         for (index, rule) in rules.enumerated() {
             let mask: UInt32 = 0x0f
             if rule.source.modifiers.rawValue & ~mask != 0 ||
                 (rule.target?.modifiers.rawValue ?? 0) & ~mask != 0 {
-                return "Use only Command, Control, Option and Shift in shortcuts."
+                return NPText("Use only Command, Control, Option and Shift in shortcuts.")
             }
             if let ids = rule.applicationIDs, ids.isEmpty || ids.contains(where: { $0.isEmpty }) {
-                return "Enter an application ID or choose all applications."
+                return NPText("Enter an application ID or choose all applications.")
             }
             for previous in rules[..<index] where previous.source == rule.source {
                 let scope: String?
@@ -117,7 +118,7 @@ public struct KeyboardShortcutPreferences: Codable, Sendable, Equatable {
                 default: scope = nil // An application override is intentional.
                 }
                 if let scope {
-                    return "\(rule.source.label(mac: true)) already has a rule for \(scope). Edit that rule or choose another shortcut or application."
+                    return NPText("%@ already has a rule for %@. Edit that rule or choose another shortcut or application.", String(describing: (rule.source.label(mac: true))), String(describing: (scope)))
                 }
             }
         }

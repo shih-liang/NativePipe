@@ -1,3 +1,4 @@
+import NativePipeStrings
 import Foundation
 import NativePipeProtocol
 
@@ -36,7 +37,7 @@ final class RemoteInbound: @unchecked Sendable {
         case .credit(let count): writer.acknowledgeRemoteBytes(count, received: false)
         case .media(let header, let data):
             if media?(header, data) == false {
-                failLocked(RemoteError.message("Remote media was rejected by the decoder."))
+                failLocked(RemoteError.message(NPText("Remote media was rejected by the decoder.")))
             }
         default: appendLocked(.packet(packet), bytes: bytes)
         }
@@ -64,7 +65,7 @@ final class RemoteInbound: @unchecked Sendable {
 
     private func appendLocked(_ event: Event, bytes count: Int) {
         guard pending.count < 4096, count <= 64 * 1024 * 1024 - bytes else {
-            failLocked(RemoteError.message("Remote UI delivery queue exceeded its memory budget."))
+            failLocked(RemoteError.message(NPText("Remote UI delivery queue exceeded its memory budget.")))
             return
         }
         pending.append((event, count)); bytes += count

@@ -1,3 +1,4 @@
+import NativePipeStrings
 import Foundation
 
 /// Length-prefixed framing for the host <-> guestd control channel.
@@ -27,11 +28,11 @@ public enum WireFormat {
         public var description: String {
             switch self {
             case .badMagic(let bytes):
-                return "bad frame magic \(bytes)"
+                return NPText("bad frame magic %@", String(describing: (bytes)))
             case .unsupportedVersion(let v):
-                return "unsupported wire version \(v)"
+                return NPText("unsupported wire version %@", String(describing: (v)))
             case .payloadTooLarge(let n):
-                return "payload of \(n) bytes exceeds \(WireFormat.maxPayloadSize)"
+                return NPText("payload of %@ bytes exceeds %@", String(describing: (n)), String(describing: (WireFormat.maxPayloadSize)))
             }
         }
     }

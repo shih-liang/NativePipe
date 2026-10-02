@@ -1,3 +1,4 @@
+import NativePipeStrings
 import Accelerate
 import CoreVideo
 import Foundation
@@ -302,7 +303,7 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
             } else {
                 guard self.streams.count < self.maximumStreams else {
                     self.lock.unlock()
-                    self.fail("The remote connection exceeded its active image stream limit.", generation: token)
+                    self.fail(NPText("The remote connection exceeded its active image stream limit."), generation: token)
                     return
                 }
                 stream = Stream(generation: token, budget: self.pixelBudget)
@@ -317,7 +318,7 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
                     self.lock.lock()
                     let current = self.streams[id] === stream && stream.pendingIDs.contains(resourceID)
                     self.lock.unlock()
-                    if current { self.fail("Could not decode remote frame \(resourceID).", generation: stream.generation) }
+                    if current { self.fail(NPText("Could not decode remote frame %@.", String(describing: (resourceID))), generation: stream.generation) }
                 }
             }
             stream.av1.onFrame = stream.decoder.onFrame
@@ -348,7 +349,7 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
                 if let codec = stream.codec, codec != header.codec {
                     stream.codec = header.codec
                     self.lock.unlock()
-                    self.fail("Remote codec changed without a new epoch.", generation: token)
+                    self.fail(NPText("Remote codec changed without a new epoch."), generation: token)
                     return
                 }
                 stream.codec = header.codec
@@ -359,7 +360,7 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
                 if let reservation = stream.decoderReservation {
                     guard reservation.resize(to: planeBytes * 10) else {
                         self.lock.unlock()
-                        self.fail("Remote decoder references exceeded the connection pixel budget.", generation: token)
+                        self.fail(NPText("Remote decoder references exceeded the connection pixel budget."), generation: token)
                         return
                     }
                 } else {
@@ -368,7 +369,7 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
                 guard stream.decoderReservation != nil,
                       let reservation = self.reservePixels(planeBytes * 2, kind: .frame) else {
                     self.lock.unlock()
-                    self.fail("Remote images exceeded the connection pixel budget. Close large remote windows and reconnect.", generation: token)
+                    self.fail(NPText("Remote images exceeded the connection pixel budget. Close large remote windows and reconnect."), generation: token)
                     return
                 }
                 stream.pendingReservations[header.resourceID] = reservation
@@ -377,7 +378,7 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
                         guard let alpha = stream.lastAlpha, alpha.width == Int(header.width),
                               alpha.height == Int(header.height) else {
                             self.lock.unlock()
-                            self.fail("Invalid remote alpha reuse reference.", generation: token)
+                            self.fail(NPText("Invalid remote alpha reuse reference."), generation: token)
                             return
                         }
                         stream.alphaPlanes[header.resourceID] = alpha
@@ -406,13 +407,13 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
                 let reservation = self.reservePixels(width * height, kind: .alpha)
                 self.lock.unlock()
                 guard let reservation else {
-                    self.fail("Remote alpha planes exceeded the connection pixel budget.", generation: token)
+                    self.fail(NPText("Remote alpha planes exceeded the connection pixel budget."), generation: token)
                     return
                 }
                 guard width <= Int.max / height,
                       let alpha = MediaWire.decodeAlphaRLE(
                         payload, pixelCount: width * height) else {
-                    self.fail("Malformed remote alpha sidecar.", generation: token)
+                    self.fail(NPText("Malformed remote alpha sidecar."), generation: token)
                     return
                 }
                 self.receiveAlpha(
@@ -471,7 +472,7 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
         let reservation = stream.pendingReservations.removeValue(forKey: resourceID)
         lock.unlock()
         guard let reservation else {
-            fail("Remote frame has no pixel reservation.", generation: stream.generation)
+            fail(NPText("Remote frame has no pixel reservation."), generation: stream.generation)
             return
         }
         let ioSurface: IOSurfaceRef?
@@ -485,12 +486,12 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
             ioSurface = Self.copyToIOSurface(pixelBuffer)
         }
         guard let ioSurface else {
-            fail("Could not construct remote frame pixels.", generation: stream.generation)
+            fail(NPText("Could not construct remote frame pixels."), generation: stream.generation)
             return
         }
 
         guard reservation.resize(to: IOSurfaceGetAllocSize(ioSurface)) else {
-            fail("Decoded remote pixels exceeded their reservation.", generation: stream.generation)
+            fail(NPText("Decoded remote pixels exceeded their reservation."), generation: stream.generation)
             return
         }
         lock.lock()

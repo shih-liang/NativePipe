@@ -1,20 +1,56 @@
+import NativePipeStrings
 import AppKit
-import SwiftUI
 
 @MainActor
-public final class DockWindowSwitcherController: NSObject, NSPopoverDelegate {
-    private enum DockEdge {
-        case bottom, left, right
+private final class SwitcherContentController: NSViewController {
+    var cancel: (() -> Void)?
+    override func cancelOperation(_ sender: Any?) { cancel?() }
+}
 
-        var popoverEdge: NSRectEdge {
-            switch self {
-            case .bottom: .maxY
-            case .left: .maxX
-            case .right: .minX
-            }
+@MainActor
+private final class SwitcherActionButton: NSButton {
+    var perform: (() -> Void)?
+    @objc func invoke() { perform?() }
+}
+
+@MainActor
+private final class SwitcherCell: NSTableCellView {
+    weak var firstActionButton: NSButton?
+}
+
+@MainActor
+private final class SwitcherTableView: NSTableView {
+    var beginSearch: ((NSEvent?) -> Void)?
+    var activateSelection: (() -> Void)?
+    var showActions: (() -> Void)?
+    override func keyDown(with event: NSEvent) {
+        if event.charactersIgnoringModifiers == "\r" || event.charactersIgnoringModifiers == "\u{3}" {
+            if event.modifierFlags.contains(.option) { showActions?() }
+            else { activateSelection?() }
+            return
         }
+        if event.specialKey == nil,
+           event.modifierFlags.intersection([.command, .control]).isEmpty,
+           !(event.charactersIgnoringModifiers ?? "").isEmpty {
+            beginSearch?(event)
+        } else { super.keyDown(with: event) }
     }
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.modifierFlags.intersection([.command, .control, .option]) == .command,
+           event.charactersIgnoringModifiers?.lowercased() == "f" {
+            beginSearch?(nil)
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
 
+/// Reusable UI code, with a separate panel instance for each machine.
+/// Every instance stays bound to one host's bridge;
+/// neither window IDs nor actions are looked up in a process-global registry.
+@MainActor
+public final class DockWindowSwitcherController: NSObject, NSPopoverDelegate,
+    NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
     public struct Utility {
         public let title: String
         public let symbol: String
@@ -24,36 +60,55 @@ public final class DockWindowSwitcherController: NSObject, NSPopoverDelegate {
 
         public init(title: String, symbol: String, visible: Bool, enabled: Bool,
                     action: @escaping () -> Void) {
-            self.title = title
-            self.symbol = symbol
-            self.visible = visible
-            self.enabled = enabled
-            self.action = action
+            self.title = title; self.symbol = symbol
+            self.visible = visible; self.enabled = enabled; self.action = action
         }
     }
 
-    public var title: String {
-        didSet { if title != oldValue, popover.isShown { host.rootView = makeView() } }
+    private struct Entry {
+        let id: String
+        let title: String
+        let subtitle: String
+        let icon: NSImage?
+        let window: DockWindow?
+        let nativeID: ObjectIdentifier?
+        let utility: Utility?
     }
+    private final class MenuAction: NSObject {
+        let perform: () -> Void
+        init(_ perform: @escaping () -> Void) { self.perform = perform }
+    }
+
+    public var title: String { didSet { refresh() } }
     private let bridgeProvider: () -> WindowBridge?
     private let utilitiesProvider: () -> [Utility]
+    private weak var presentedBridge: WindowBridge?
+    private var presentedSession: UUID?
+    private var entries: [Entry] = []
+    private var filtered: [Entry] = []
+    private var observing = false
+    private var refreshPending = false
     private let anchorView = NSView(frame: NSRect(x: 0, y: 0, width: 2, height: 2))
     private let anchorPanel: NSPanel
     private let popover = NSPopover()
-    private lazy var host = NSHostingController(rootView: makeView())
+    private let content = SwitcherContentController()
+    private let heading = NSTextField(wrappingLabelWithString: "")
+    let searchField = NSSearchField()
+    let tableView: NSTableView = SwitcherTableView()
+    private let emptyLabel = NSTextField(wrappingLabelWithString: NPText("No matching windows. Try another title or app name."))
+    private let actionsButton = NSPopUpButton(frame: .zero, pullsDown: true)
+    private let nativeStateNotifications: [Notification.Name] = [
+        NSWindow.didMiniaturizeNotification, NSWindow.didDeminiaturizeNotification,
+        NSWindow.didEnterFullScreenNotification, NSWindow.didExitFullScreenNotification,
+    ]
 
     public init(title: String, bridge: @escaping () -> WindowBridge?,
                 utilities: @escaping () -> [Utility] = { [] }) {
-        self.title = title
-        self.bridgeProvider = bridge
-        self.utilitiesProvider = utilities
-        anchorPanel = NSPanel(
-            contentRect: anchorView.frame,
-            styleMask: [.borderless, .nonactivatingPanel],
-            backing: .buffered,
-            defer: false)
+        self.title = title; bridgeProvider = bridge; utilitiesProvider = utilities
+        anchorPanel = NSPanel(contentRect: anchorView.frame,
+                              styleMask: [.borderless, .nonactivatingPanel],
+                              backing: .buffered, defer: false)
         super.init()
-
         anchorPanel.contentView = anchorView
         anchorPanel.backgroundColor = .clear
         anchorPanel.isOpaque = false
@@ -63,389 +118,415 @@ public final class DockWindowSwitcherController: NSObject, NSPopoverDelegate {
         anchorPanel.isExcludedFromWindowsMenu = true
         anchorPanel.level = .popUpMenu
         anchorPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
-
         popover.behavior = .transient
-        popover.animates = true
         popover.delegate = self
-        popover.contentViewController = host
-
-        // The nonactivating anchor does not reliably dismiss its transient
-        // popover when a different application becomes active.
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(applicationDidResignActive(_:)),
-            name: NSApplication.didResignActiveNotification, object: NSApp)
+        popover.contentViewController = content
+        content.cancel = { [weak self] in self?.cancelOperation(nil) }
+        buildView()
     }
 
     var isShowingSwitcher: Bool { popover.isShown }
+    var displayedWindowIDs: [UInt32] { filtered.compactMap { $0.window?.id } }
+    var selectedWindowID: UInt32? { selectedEntry?.window?.id }
+    private var selectedEntry: Entry? {
+        filtered.indices.contains(tableView.selectedRow) ? filtered[tableView.selectedRow] : nil
+    }
 
     public func showWindows() {
-        let bridge = bridgeProvider()
-        let windows = bridge?.dockWindows ?? []
-        // Only open utility windows (such as a VM's Screen) count here.
-        // Console and unopened Screen actions must not force a chooser.
-        let openUtilities = utilitiesProvider().filter { $0.visible }
-        if windows.count + openUtilities.count == 1 {
-            if let window = windows.first {
-                closeSwitcher(immediately: true)
-                _ = bridge?.activateDockWindow(window.id)
-                return
-            }
-            if let utility = openUtilities.first, utility.enabled {
-                closeSwitcher(immediately: true)
-                utility.action()
-                return
-            }
-        }
-        if popover.isShown {
-            popover.performClose(nil)
+        // Dock clicks must not bury a connection error or a confirmation dialog.
+        if let modal = NSApp.modalWindow {
+            activateHost()
+            modal.makeKeyAndOrderFront(nil)
             return
         }
-        host.rootView = makeView()
+        let bridge = bridgeProvider()
+        let windows = bridge?.dockWindows ?? []
+        let utilities = utilitiesProvider().filter(\.visible)
+        let count = windows.count + utilities.count
+        guard count > 0 else { closeSwitcher(); return }
+        if count == 1 {
+            closeSwitcher()
+            if let window = windows.first { _ = bridge?.activateDockWindow(window.id) }
+            else if let utility = utilities.first, utility.enabled {
+                activateHost()
+                utility.action()
+            }
+            return
+        }
+        if popover.isShown { closeSwitcher(); return }
+        presentedBridge = bridge
+        presentedSession = bridge?.computerSessionID
+        searchField.stringValue = ""
+        reloadEntries()
+        applyFilter(preferredID: entries.first(where: { $0.window?.isKey == true })?.id)
+        startObserving()
         let edge = positionAnchor()
+        popover.animates = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        activateHost()
         anchorPanel.orderFrontRegardless()
         popover.show(relativeTo: anchorView.bounds, of: anchorView, preferredEdge: edge)
     }
 
-    public func popoverDidShow(_ notification: Notification) {
-        guard popover.isShown, NSApp.isActive else { return }
-        // The invisible anchor is deliberately nonactivating. Showing its
-        // popover alone leaves the previous guest window key, so give focus
-        // to the switcher once AppKit has created and shown its window.
-        host.view.window?.makeKey()
+    /// Hosts call this when their open utility windows change. Guest window
+    /// changes arrive through bridge-scoped notifications, never a polling loop.
+    public func refresh() {
+        guard popover.isShown else { return }
+        guard bridgeProvider() === presentedBridge,
+              presentedBridge?.computerSessionID == presentedSession else {
+            closeSwitcher(); return
+        }
+        let selected = selectedEntry?.id
+        reloadEntries()
+        guard !entries.isEmpty else { closeSwitcher(); return }
+        applyFilter(preferredID: selected)
     }
 
+    private func reloadEntries() {
+        heading.stringValue = title
+        heading.toolTip = title
+        heading.setAccessibilityLabel(NPText("Machine: %@", String(describing: (title))))
+        searchField.setAccessibilityLabel(NPText("Search open windows on %@", String(describing: (title))))
+        tableView.setAccessibilityLabel(NPText("Open windows on %@", String(describing: (title))))
+        let bridge = presentedBridge
+        entries = (bridge?.dockWindows ?? []).map { window in
+            let app = window.applicationName ?? window.applicationID ?? NPText("Application")
+            let state = window.isMiniaturized ? NPText("Minimized") : (window.isFullscreen ? NPText("Full Screen") : "")
+            return Entry(id: "window:\(window.id)", title: window.title, subtitle: state.isEmpty ? app : NPText("%@ · %@", app, state),
+                         icon: bridge?.iconForDockWindow(window.id), window: window,
+                         nativeID: bridge?.window(window.id).map(ObjectIdentifier.init), utility: nil)
+        }
+        entries += utilitiesProvider().filter(\.visible).map {
+            Entry(id: "utility:\($0.title)", title: $0.title, subtitle: title,
+                  icon: NSImage(systemSymbolName: $0.symbol, accessibilityDescription: nil),
+                  window: nil, nativeID: nil, utility: $0)
+        }
+    }
+
+    private func applyFilter(preferredID: String?) {
+        let terms = searchField.stringValue.split(whereSeparator: \.isWhitespace).map(String.init)
+        filtered = entries.filter { entry in
+            let text = [title, entry.title, entry.subtitle, entry.window?.applicationID ?? ""].joined(separator: " ")
+            return terms.allSatisfy { text.localizedStandardContains($0) }
+        }
+        tableView.reloadData()
+        let index = filtered.firstIndex { $0.id == preferredID } ?? (filtered.isEmpty ? nil : 0)
+        if let index { tableView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false) }
+        else { tableView.deselectAll(nil) }
+        emptyLabel.isHidden = !filtered.isEmpty
+        updateTools()
+    }
+
+    private func buildView() {
+        let root = NSView()
+        content.view = root
+        heading.font = .systemFont(ofSize: 14, weight: .semibold)
+        heading.maximumNumberOfLines = 2
+        heading.setAccessibilityLabel(NPText("Machine"))
+        searchField.placeholderString = NPText("Type to search open windows")
+        searchField.toolTip = NPText("Type to search, or press ⌘F")
+        searchField.setAccessibilityLabel(NPText("Search open windows on this machine"))
+        searchField.delegate = self
+        searchField.sendsSearchStringImmediately = true
+        searchField.sendsWholeSearchString = false
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("window"))
+        tableView.addTableColumn(column)
+        tableView.headerView = nil
+        tableView.rowHeight = 76
+        tableView.intercellSpacing = NSSize(width: 0, height: 2)
+        tableView.style = .plain
+        tableView.backgroundColor = .clear
+        tableView.allowsEmptySelection = true
+        tableView.dataSource = self; tableView.delegate = self
+        tableView.target = self; tableView.action = #selector(showSelectedWindow)
+        (tableView as? SwitcherTableView)?.activateSelection = { [weak self] in self?.showSelectedWindow() }
+        (tableView as? SwitcherTableView)?.showActions = { [weak self] in self?.focusSelectedActions() }
+        (tableView as? SwitcherTableView)?.beginSearch = { [weak self] event in
+            guard let self else { return }
+            self.searchField.window?.makeFirstResponder(self.searchField)
+            if let event { self.searchField.currentEditor()?.interpretKeyEvents([event]) }
+        }
+        tableView.setAccessibilityLabel(NPText("Open windows on this machine"))
+        let scroll = NSScrollView()
+        scroll.documentView = tableView
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        scroll.borderType = .noBorder
+        emptyLabel.textColor = .secondaryLabelColor
+        emptyLabel.alignment = .center
+        actionsButton.bezelStyle = .rounded
+        actionsButton.setAccessibilityLabel(NPText("Machine tools"))
+        actionsButton.toolTip = NPText("Open a machine tool")
+        let keyboardHint = NSTextField(labelWithString: NPText("↩ Switch    ⌥↩ Window actions"))
+        keyboardHint.font = .systemFont(ofSize: 11)
+        keyboardHint.textColor = .secondaryLabelColor
+        let footer = NSStackView(views: [actionsButton, NSView(), keyboardHint])
+        footer.orientation = .horizontal
+        footer.spacing = 8
+        let separator = NSBox(); separator.boxType = .separator
+        for view in [heading, searchField, scroll, emptyLabel, separator, footer] {
+            view.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(view)
+        }
+        NSLayoutConstraint.activate([
+            heading.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
+            heading.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
+            heading.topAnchor.constraint(equalTo: root.topAnchor, constant: 14),
+            searchField.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 12),
+            searchField.leadingAnchor.constraint(equalTo: heading.leadingAnchor),
+            searchField.trailingAnchor.constraint(equalTo: heading.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 10),
+            scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 8),
+            scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -8),
+            separator.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 8),
+            separator.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            separator.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            footer.topAnchor.constraint(equalTo: separator.bottomAnchor, constant: 10),
+            footer.leadingAnchor.constraint(equalTo: heading.leadingAnchor),
+            footer.trailingAnchor.constraint(equalTo: heading.trailingAnchor),
+            footer.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -12),
+            emptyLabel.centerYAnchor.constraint(equalTo: scroll.centerYAnchor),
+            emptyLabel.leadingAnchor.constraint(equalTo: heading.leadingAnchor),
+            emptyLabel.trailingAnchor.constraint(equalTo: heading.trailingAnchor),
+        ])
+        root.setAccessibilityLabel(NPText("Window switcher"))
+        root.nextKeyView = tableView
+        searchField.nextKeyView = tableView
+        tableView.nextKeyView = actionsButton
+        actionsButton.nextKeyView = searchField
+    }
+
+    public func numberOfRows(in tableView: NSTableView) -> Int { filtered.count }
+    public func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        // AppKit can finish a pending layout after the transient panel closes.
+        guard filtered.indices.contains(row) else { return nil }
+        let item = filtered[row]
+        let cell = SwitcherCell()
+        let icon = NSImageView()
+        icon.image = item.icon ?? NSImage(systemSymbolName: "macwindow", accessibilityDescription: nil)
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        let name = NSTextField(wrappingLabelWithString: item.title)
+        name.font = .systemFont(ofSize: 13, weight: .medium)
+        name.maximumNumberOfLines = 2
+        name.lineBreakMode = .byWordWrapping
+        let app = NSTextField(labelWithString: item.subtitle)
+        app.font = .systemFont(ofSize: 11)
+        app.textColor = .secondaryLabelColor
+        app.lineBreakMode = .byTruncatingMiddle
+        cell.textField = name; cell.imageView = icon
+        let buttons = windowActions(for: item)
+        cell.firstActionButton = buttons.first
+        let metadata = NSStackView(views: [app, NSView()] + buttons)
+        metadata.orientation = .horizontal; metadata.spacing = 4
+        app.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let text = NSStackView(views: [name, metadata]); text.orientation = .vertical
+        text.alignment = .leading; text.spacing = 3
+        for view in [icon, text] { view.translatesAutoresizingMaskIntoConstraints = false; cell.addSubview(view) }
+        NSLayoutConstraint.activate([
+            icon.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
+            icon.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 48), icon.heightAnchor.constraint(equalToConstant: 48),
+            text.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 10),
+            text.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -8),
+            text.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            name.widthAnchor.constraint(equalTo: text.widthAnchor),
+            metadata.widthAnchor.constraint(equalTo: text.widthAnchor),
+        ])
+        cell.toolTip = "\(item.title)\n\(item.subtitle)\n\(title)"
+        cell.setAccessibilityLabel("\(item.title), \(item.subtitle), \(title)")
+        cell.setAccessibilityHelp(NPText("Click to switch to this window. Window controls are available as labeled icon buttons."))
+        return cell
+    }
+    public func controlTextDidChange(_ notification: Notification) { applyFilter(preferredID: selectedEntry?.id) }
+    public func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+        // Let an IME finish composing before Return/arrows become switch commands.
+        guard !textView.hasMarkedText() else { return false }
+        switch selector {
+        case #selector(NSResponder.moveDown(_:)): moveSelection(1)
+        case #selector(NSResponder.moveUp(_:)): moveSelection(-1)
+        case #selector(NSResponder.insertNewline(_:)): showSelectedWindow()
+        case #selector(NSResponder.cancelOperation(_:)): cancelOperation(nil)
+        default: return false
+        }
+        return true
+    }
+    func moveSelection(_ delta: Int) {
+        guard !filtered.isEmpty else { return }
+        let row = min(max(tableView.selectedRow + delta, 0), filtered.count - 1)
+        tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        tableView.scrollRowToVisible(row)
+    }
+    @objc public func cancelOperation(_ sender: Any?) {
+        if !searchField.stringValue.isEmpty {
+            searchField.stringValue = ""; applyFilter(preferredID: selectedEntry?.id)
+            content.view.window?.makeFirstResponder(tableView)
+        } else { closeSwitcher() }
+    }
+
+    private func updateTools() {
+        let menu = NSMenu()
+        menu.addItem(withTitle: "…", action: nil, keyEquivalent: "")
+        let utilities = utilitiesProvider().filter { !$0.visible }
+        if !utilities.isEmpty {
+            if menu.items.count > 1 { menu.addItem(.separator()) }
+            for utility in utilities {
+                addAction(NPText("Open %@", String(describing: (utility.title))), to: menu, enabled: utility.enabled) { [weak self] in
+                    guard let self, self.bridgeProvider() === self.presentedBridge,
+                          self.presentedBridge?.computerSessionID == self.presentedSession,
+                          let current = self.utilitiesProvider().first(where: { $0.title == utility.title }), current.enabled else { return }
+                    self.closeSwitcher(); current.action()
+                }
+            }
+        }
+        actionsButton.menu = menu
+        actionsButton.isEnabled = menu.items.count > 1
+        actionsButton.isHidden = menu.items.count <= 1
+    }
+    private func windowActions(for entry: Entry) -> [NSButton] {
+        guard let window = entry.window else { return [] }
+        func button(_ label: String, _ symbol: String, _ action: @escaping () -> Void) -> NSButton {
+            let button = SwitcherActionButton()
+            button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+            button.imagePosition = .imageOnly
+            button.bezelStyle = .inline
+            button.isBordered = false
+            button.toolTip = label
+            button.setAccessibilityLabel(NPText("%@: %@ on %@", String(describing: (label)), String(describing: (entry.title)), String(describing: (title))))
+            button.perform = action; button.target = button
+            button.action = #selector(SwitcherActionButton.invoke)
+            button.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([button.widthAnchor.constraint(equalToConstant: 24), button.heightAnchor.constraint(equalToConstant: 24)])
+            return button
+        }
+        var buttons = [
+            button(window.isMiniaturized ? NPText("Restore Window") : NPText("Minimize"), window.isMiniaturized ? "arrow.up.forward.app" : "minus") { [weak self] in
+                self?.perform(entry) { window.isMiniaturized ? $0.activateDockWindow($1) : $0.minimizeDockWindow($1) }
+            },
+            button(window.isZoomed ? NPText("Restore Size") : NPText("Zoom"), window.isZoomed ? "minus.magnifyingglass" : "plus") { [weak self] in self?.perform(entry) { $0.toggleZoomDockWindow($1) } },
+            button(window.isFullscreen ? NPText("Exit Full Screen") : NPText("Enter Full Screen"), window.isFullscreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right") { [weak self] in self?.perform(entry) { $0.toggleFullscreenDockWindow($1) } },
+            button(NPText("Close Window"), "xmark") { [weak self] in self?.perform(entry) { $0.requestCloseDockWindow($1) } },
+        ]
+        if window.canForceQuit {
+            buttons.append(button(NPText("Force Quit Application…"), "stop.circle") { [weak self] in self?.forceQuit(entry) })
+        }
+        for (current, next) in zip(buttons, buttons.dropFirst()) { current.nextKeyView = next }
+        buttons.last?.nextKeyView = searchField
+        return buttons
+    }
+    private func focusSelectedActions() {
+        guard selectedEntry?.window != nil,
+              let cell = tableView.view(atColumn: 0, row: tableView.selectedRow, makeIfNecessary: true) as? SwitcherCell,
+              let button = cell.firstActionButton else { return }
+        button.window?.makeFirstResponder(button)
+    }
+    private func addAction(_ title: String, to menu: NSMenu, enabled: Bool = true, action: @escaping () -> Void) {
+        let item = menu.addItem(withTitle: title, action: #selector(menuAction(_:)), keyEquivalent: "")
+        item.target = self; item.isEnabled = enabled; item.representedObject = MenuAction(action)
+        menu.autoenablesItems = false
+    }
+    @objc private func menuAction(_ sender: NSMenuItem) { (sender.representedObject as? MenuAction)?.perform() }
+
+    @objc func showSelectedWindow() {
+        guard let entry = selectedEntry else { return }
+        if entry.window != nil { perform(entry) { $0.activateDockWindow($1) } }
+        else if bridgeProvider() === presentedBridge,
+                presentedBridge?.computerSessionID == presentedSession,
+                let utility = utilitiesProvider().first(where: { "utility:\($0.title)" == entry.id }), utility.visible, utility.enabled {
+            closeSwitcher(); utility.action()
+        } else { refresh() }
+    }
+    private func currentBridge(for entry: Entry) -> WindowBridge? {
+        guard let bridge = presentedBridge, bridgeProvider() === bridge,
+              bridge.computerSessionID == presentedSession,
+              let id = entry.window?.id, let native = bridge.window(id), native.window != nil,
+              ObjectIdentifier(native) == entry.nativeID else { return nil }
+        return bridge
+    }
+    private func perform(_ entry: Entry, action: (WindowBridge, UInt32) -> Bool) {
+        guard let bridge = currentBridge(for: entry), let id = entry.window?.id else { refresh(); return }
+        closeSwitcher()
+        _ = action(bridge, id)
+    }
+    private func forceQuit(_ entry: Entry) {
+        guard let bridge = currentBridge(for: entry), let window = entry.window else { refresh(); return }
+        let session = bridge.computerSessionID
+        closeSwitcher()
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = NPText("Force Quit %@?", String(describing: (window.applicationName ?? window.applicationID ?? window.title)))
+        alert.informativeText = NPText("All windows of this application on %@ will close. Unsaved changes will be lost.", String(describing: (title)))
+        alert.addButton(withTitle: NPText("Cancel"))
+        alert.addButton(withTitle: NPText("Force Quit"))
+        guard alert.runModal() == .alertSecondButtonReturn,
+              bridgeProvider() === bridge, bridge.computerSessionID == session,
+              bridge.window(window.id).map(ObjectIdentifier.init) == entry.nativeID else { return }
+        _ = bridge.forceQuitDockWindow(window.id)
+    }
+
+    private func startObserving() {
+        guard !observing else { return }; observing = true
+        let center = NotificationCenter.default
+        if let presentedBridge {
+            center.addObserver(self, selector: #selector(windowsChanged), name: WindowBridge.dockWindowsDidChange, object: presentedBridge)
+        }
+        for name in nativeStateNotifications {
+            center.addObserver(self, selector: #selector(windowsChanged), name: name, object: nil)
+        }
+        center.addObserver(self, selector: #selector(deactivated), name: NSApplication.didResignActiveNotification, object: NSApp)
+    }
+    @objc private func windowsChanged() {
+        guard !refreshPending else { return }; refreshPending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }; self.refreshPending = false; self.refresh()
+        }
+    }
+    @objc private func deactivated() { closeSwitcher() }
+    public func popoverWillShow(_ notification: Notification) {
+        content.view.window?.initialFirstResponder = tableView
+    }
+    public func popoverDidShow(_ notification: Notification) {
+        guard NSApp.isActive else { closeSwitcher(); return }
+        content.view.window?.initialFirstResponder = tableView
+        content.view.window?.makeKey()
+        // Window selection is the primary task. Start on the list so an idle
+        // chooser does not redraw a blinking text caret; typing begins search.
+        content.view.window?.makeFirstResponder(tableView)
+    }
     public func popoverDidClose(_ notification: Notification) {
         anchorPanel.orderOut(nil)
+        // Remove only the subscriptions owned by this controller.
+        let center = NotificationCenter.default
+        center.removeObserver(self, name: WindowBridge.dockWindowsDidChange, object: presentedBridge)
+        for name in nativeStateNotifications { center.removeObserver(self, name: name, object: nil) }
+        center.removeObserver(self, name: NSApplication.didResignActiveNotification, object: NSApp)
+        observing = false
+        // Release snapshots and menu closures as soon as they are no longer visible.
+        entries.removeAll(); filtered.removeAll(); actionsButton.menu = nil
+        tableView.reloadData()
+        presentedBridge = nil; presentedSession = nil
     }
-
-    @objc private func applicationDidResignActive(_ notification: Notification) {
-        closeSwitcher()
+    private func activateHost() {
+        if NSApp.isHidden { NSApp.unhide(nil) }
+        if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
     }
-
-    private func makeView() -> VMWindowSwitcherView {
-        let bridge = bridgeProvider()
-        let windows = bridge?.dockWindows.map {
-            SwitcherWindow(window: $0, icon: bridge?.iconForDockWindow($0.id))
-        } ?? []
-        return VMWindowSwitcherView(
-            machineName: title,
-            machineIcon: NSApp.applicationIconImage,
-            windows: windows,
-            utilities: utilitiesProvider().map { item in
-                Utility(title: item.title, symbol: item.symbol, visible: item.visible,
-                        enabled: item.enabled) { [weak self] in
-                    self?.closeSwitcher()
-                    item.action()
-                }
-            },
-            onSelectWindow: { [weak self] id in self?.selectWindow(id) },
-            onMinimizeWindow: { [weak self] id in self?.minimizeWindow(id) },
-            onToggleZoomWindow: { [weak self] id in self?.toggleZoomWindow(id) },
-            onToggleFullscreenWindow: { [weak self] id in self?.toggleFullscreenWindow(id) },
-            onCloseWindow: { [weak self] id in self?.closeWindow(id) },
-            onForceQuitWindow: { [weak self] id, title in
-                self?.forceQuitWindow(id, title: title)
-            })
+    private func closeSwitcher() {
+        // Dismiss synchronously before restoring a guest's first responder.
+        popover.animates = false
+        popover.close()
+        anchorPanel.orderOut(nil)
     }
 
     private func positionAnchor() -> NSRectEdge {
         let pointer = NSEvent.mouseLocation
-        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(pointer) })
-                ?? NSScreen.main else {
-            return .maxY
-        }
-        let frame = screen.frame
-        let visible = screen.visibleFrame
-        let edge: DockEdge
-        if pointer.y < visible.minY {
-            edge = .bottom
-        } else if pointer.x < visible.minX {
-            edge = .left
-        } else if pointer.x > visible.maxX {
-            edge = .right
-        } else {
-            let distances: [(DockEdge, CGFloat)] = [
-                (.bottom, abs(pointer.y - frame.minY)),
-                (.left, abs(pointer.x - frame.minX)),
-                (.right, abs(frame.maxX - pointer.x)),
-            ]
-            edge = distances.min { $0.1 < $1.1 }?.0 ?? .bottom
-        }
-
-        let origin: NSPoint
-        switch edge {
-        case .bottom:
-            origin = NSPoint(
-                x: min(max(pointer.x - 1, visible.minX), visible.maxX - 2),
-                y: visible.minY)
-        case .left:
-            origin = NSPoint(
-                x: visible.minX,
-                y: min(max(pointer.y - 1, visible.minY), visible.maxY - 2))
-        case .right:
-            origin = NSPoint(
-                x: visible.maxX - 2,
-                y: min(max(pointer.y - 1, visible.minY), visible.maxY - 2))
-        }
-        anchorPanel.setFrameOrigin(origin)
-        return edge.popoverEdge
-    }
-
-    private func closeSwitcher(immediately: Bool = false) {
-        let animates = popover.animates
-        if immediately { popover.animates = false }
-        popover.performClose(nil)
-        popover.animates = animates
-    }
-
-    private func selectWindow(_ id: UInt32) {
-        closeSwitcher()
-        _ = bridgeProvider()?.activateDockWindow(id)
-    }
-
-    private func minimizeWindow(_ id: UInt32) {
-        closeSwitcher()
-        _ = bridgeProvider()?.minimizeDockWindow(id)
-    }
-
-    private func toggleZoomWindow(_ id: UInt32) {
-        closeSwitcher()
-        _ = bridgeProvider()?.toggleZoomDockWindow(id)
-    }
-
-    private func toggleFullscreenWindow(_ id: UInt32) {
-        closeSwitcher()
-        _ = bridgeProvider()?.toggleFullscreenDockWindow(id)
-    }
-
-    private func closeWindow(_ id: UInt32) {
-        closeSwitcher()
-        _ = bridgeProvider()?.requestCloseDockWindow(id)
-    }
-
-    private func forceQuitWindow(_ id: UInt32, title: String) {
-        closeSwitcher()
-        let alert = NSAlert()
-        alert.alertStyle = .critical
-        alert.messageText = "Force Quit \(title)?"
-        alert.informativeText =
-            "Unsaved changes will be lost. All windows owned by this guest " +
-            "application process will close."
-        alert.addButton(withTitle: "Force Quit")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        _ = bridgeProvider()?.forceQuitDockWindow(id)
-    }
-
-
-}
-
-private struct SwitcherWindow: Identifiable {
-    let window: DockWindow
-    let icon: NSImage?
-
-    var id: UInt32 { window.id }
-}
-
-private struct VMWindowSwitcherView: View {
-    let machineName: String
-    let machineIcon: NSImage?
-    let windows: [SwitcherWindow]
-    let utilities: [DockWindowSwitcherController.Utility]
-    let onSelectWindow: (UInt32) -> Void
-    let onMinimizeWindow: (UInt32) -> Void
-    let onToggleZoomWindow: (UInt32) -> Void
-    let onToggleFullscreenWindow: (UInt32) -> Void
-    let onCloseWindow: (UInt32) -> Void
-    let onForceQuitWindow: (UInt32, String) -> Void
-
-    private var height: CGFloat {
-        let windowRows = max(windows.count, 1)
-        return min(590, 140 + CGFloat((windowRows + utilities.count) * 44))
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                if let machineIcon {
-                    Image(nsImage: machineIcon)
-                        .resizable()
-                        .scaledToFit()
-                        .frame(width: 28, height: 28)
-                }
-                Text(machineName)
-                    .font(.headline)
-                    .lineLimit(1)
-                    .help(machineName)
-                Spacer()
-            }
-            .padding(.horizontal, 12)
-            .frame(height: 50)
-
-            Divider()
-
-            ScrollView {
-                LazyVStack(spacing: 2) {
-                    SectionHeader(title: "Open Windows", systemImage: "macwindow")
-
-                    if windows.isEmpty {
-                        HStack {
-                            Image(systemName: "macwindow")
-                            Text("No application windows")
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                        }
-                        .padding(.horizontal, 10)
-                        .frame(height: 42)
-                    } else {
-                        ForEach(windows) { window in
-                            SwitcherRow(
-                                title: window.window.title,
-                                subtitle: window.window.applicationID,
-                                systemImage: "app.fill",
-                                icon: window.icon,
-                                windowActions: WindowContextActions(
-                                    isMiniaturized: window.window.isMiniaturized,
-                                    isZoomed: window.window.isZoomed,
-                                    isFullscreen: window.window.isFullscreen,
-                                    show: { onSelectWindow(window.id) },
-                                    minimize: { onMinimizeWindow(window.id) },
-                                    toggleZoom: { onToggleZoomWindow(window.id) },
-                                    toggleFullscreen: {
-                                        onToggleFullscreenWindow(window.id)
-                                    },
-                                    close: { onCloseWindow(window.id) },
-                                    forceQuit: window.window.canForceQuit ? {
-                                        onForceQuitWindow(window.id, window.window.title)
-                                    } : nil),
-                                action: { onSelectWindow(window.id) })
-                        }
-                    }
-
-                    if !utilities.isEmpty {
-                        Divider().padding(.vertical, 6)
-                        SectionHeader(title: "System", systemImage: "gearshape")
-                        ForEach(utilities.indices, id: \.self) { index in
-                            let item = utilities[index]
-                            SwitcherRow(title: item.title, systemImage: item.symbol,
-                                        visible: item.visible, enabled: item.enabled,
-                                        action: item.action)
-                        }
-                    }
-                }
-                .padding(8)
-            }
-        }
-        .frame(width: 390, height: height)
-    }
-}
-
-private struct SectionHeader: View {
-    let title: String
-    let systemImage: String
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Label(title, systemImage: systemImage)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-            Spacer()
-        }
-        .padding(.horizontal, 8)
-        .frame(height: 30)
-    }
-}
-
-private struct WindowContextActions {
-    let isMiniaturized: Bool
-    let isZoomed: Bool
-    let isFullscreen: Bool
-    let show: () -> Void
-    let minimize: () -> Void
-    let toggleZoom: () -> Void
-    let toggleFullscreen: () -> Void
-    let close: () -> Void
-    let forceQuit: (() -> Void)?
-}
-
-private struct SwitcherRow: View {
-    let title: String
-    var subtitle: String?
-    let systemImage: String
-    var icon: NSImage? = nil
-    var visible = false
-    var enabled = true
-    var windowActions: WindowContextActions? = nil
-    let action: () -> Void
-
-    @State private var hovering = false
-
-    private var row: some View {
-        Button(action: action) {
-            HStack(spacing: 10) {
-                Group {
-                    if let icon {
-                        Image(nsImage: icon)
-                            .resizable()
-                            .scaledToFit()
-                    } else {
-                        Image(systemName: systemImage)
-                            .font(.system(size: 16))
-                    }
-                }
-                .frame(width: 24, height: 24)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(title).lineLimit(1)
-                    if let subtitle, !subtitle.isEmpty {
-                        Text(subtitle)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                }
-                Spacer()
-                if visible {
-                    Image(systemName: "checkmark")
-                        .foregroundStyle(.secondary)
-                        .accessibilityLabel("Visible")
-                }
-            }
-            .padding(.horizontal, 10)
-            .frame(minHeight: 42)
-            .contentShape(Rectangle())
-            .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(hovering ? Color.primary.opacity(0.08) : .clear))
-        }
-        .buttonStyle(.plain)
-        .disabled(!enabled)
-        .opacity(enabled ? 1 : 0.45)
-        .onHover { hovering = $0 }
-    }
-
-    @ViewBuilder
-    var body: some View {
-        if let windowActions {
-            row.contextMenu {
-                Button("Show", action: windowActions.show)
-                Divider()
-                Button("Minimize", action: windowActions.minimize)
-                    .disabled(windowActions.isMiniaturized)
-                Button(
-                    windowActions.isZoomed ? "Restore" : "Zoom",
-                    action: windowActions.toggleZoom)
-                Button(
-                    windowActions.isFullscreen ? "Exit Full Screen" : "Enter Full Screen",
-                    action: windowActions.toggleFullscreen)
-                Divider()
-                Button("Close", action: windowActions.close)
-                if let forceQuit = windowActions.forceQuit {
-                    Divider()
-                    Button("Force Quit…", role: .destructive, action: forceQuit)
-                }
-            }
-        } else {
-            row
-        }
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(pointer) }) ?? NSScreen.main else { return .maxY }
+        let frame = screen.frame, visible = screen.visibleFrame
+        content.preferredContentSize = NSSize(width: min(480, visible.width - 24),
+                                              height: min(560, 154 + CGFloat(entries.count) * 78, visible.height - 24))
+        let distances: [(NSRectEdge, CGFloat)] = [(.maxY, abs(pointer.y - frame.minY)),
+            (.maxX, abs(pointer.x - frame.minX)), (.minX, abs(frame.maxX - pointer.x))]
+        let edge = distances.min { $0.1 < $1.1 }?.0 ?? .maxY
+        let x = min(max(pointer.x - 1, visible.minX), visible.maxX - 2)
+        let y = min(max(pointer.y - 1, visible.minY), visible.maxY - 2)
+        anchorPanel.setFrameOrigin(NSPoint(x: edge == .maxX ? visible.minX : (edge == .minX ? visible.maxX - 2 : x),
+                                          y: edge == .maxY ? visible.minY : y))
+        return edge
     }
 }

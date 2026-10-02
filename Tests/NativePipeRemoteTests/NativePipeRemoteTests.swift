@@ -186,4 +186,56 @@ final class NativePipeRemoteTests: XCTestCase {
         XCTAssertTrue(session.isConnected)
         session.disconnect()
     }
+
+    @MainActor func testObservedStartupPhasesSurviveSplitMarkersAndReconnect() async throws {
+        let encoded = try ready().base64EncodedString()
+        let session = RemoteSession(testExecutable: "/bin/sh", arguments: ["-c", """
+            printf 'NATIVEPIPE PHASE AUTHENTI' >&2
+            sleep 0.03
+            printf 'CATING\\n' >&2
+            sleep 0.03
+            printf 'NATIVEPIPE PHASE INSTALLING\\n' >&2
+            sleep 0.03
+            printf 'NATIVEPIPE PHASE READY\\n' >&2
+            sleep 0.03
+            printf '%s' '\(encoded)' | /usr/bin/base64 -D
+            read reply
+            """], reportsStartup: true)
+        for _ in 0..<2 {
+            var phases: [RemoteSession.StartupPhase] = []
+            session.onStartupPhaseChange = { phases.append($0) }
+            try await session.connect()
+            XCTAssertEqual(Array(phases.suffix(4)), [.authenticating, .installing, .ready, .connected])
+            XCTAssertEqual(phases.first, .connecting)
+            session.disconnect()
+            XCTAssertFalse(session.isConnected)
+        }
+    }
+
+    @MainActor func testFailureStageIsRealAndRetryDoesNotNeedManualDisconnect() async throws {
+        for (marker, phase, reason) in [
+            ("", RemoteSession.StartupPhase.connecting, "ssh: connect to host fixture.invalid: Connection refused"),
+            ("NATIVEPIPE PHASE AUTHENTICATING\n", .authenticating, "Permission denied (publickey,password)."),
+            ("NATIVEPIPE PHASE INSTALLING\n", .installing, "NativePipe installation failed: No space left on device")
+        ] {
+            let session = RemoteSession(testExecutable: "/bin/sh", arguments: ["-c",
+                "printf '%s' " + SSHCommand.quote(marker + reason) + " >&2; exit 255"], reportsStartup: true)
+            for _ in 0..<2 {
+                do { try await session.connect(); XCTFail("Expected failure") }
+                catch { XCTAssertTrue(error.localizedDescription.contains(reason)) }
+                XCTAssertEqual(session.startupPhase, phase)
+                XCTAssertFalse(session.isConnected)
+            }
+        }
+    }
+
+    @MainActor func testDismissingAuthenticationCancelsRatherThanFailingConnection() async throws {
+        let session = RemoteSession(testExecutable: "/bin/sh", arguments: ["-c",
+            "printf '%s' " + SSHCommand.quote(SSHAuthentication.cancelledDiagnostic) + " >&2; exit 255"], reportsStartup: true)
+        for _ in 0..<2 {
+            do { try await session.connect(); XCTFail("Expected cancellation") }
+            catch is CancellationError { }
+            XCTAssertFalse(session.isConnected)
+        }
+    }
 }

@@ -1,3 +1,4 @@
+import NativePipeStrings
 import AppKit
 import Darwin
 import NativePipeProtocol
@@ -23,7 +24,7 @@ final class ClipboardFileBroker {
         case unavailable, transfer(String)
         var errorDescription: String? {
             switch self {
-            case .unavailable: return "The source file selection is no longer available. Copy the files again."
+            case .unavailable: return NPText("The source file selection is no longer available. Copy the files again.")
             case .transfer(let message): return message
             }
         }

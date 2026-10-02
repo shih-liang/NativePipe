@@ -1,5 +1,5 @@
 #!/bin/sh
-# The CLI is a single universal Mach-O plus its license notices.
+# Package the universal command, its UI translations and license notices.
 set -eu
 binary=${1:?nativepipe binary}
 out=${2:?output directory}
@@ -10,9 +10,29 @@ stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT HUP INT TERM
 mkdir "$stage/bin"
 install -m0755 "$binary" "$stage/bin/nativepipe"
+resources="$(dirname "$binary")/NativePipe_NativePipeStrings.bundle"
+[ -d "$resources" ] || { echo "missing NativePipe localization bundle" >&2; exit 1; }
+cp -R "$resources" "$stage/bin/"
+for directory in Sources/NativePipeStrings/Resources/*.lproj; do
+    language=$(basename "$directory" .lproj)
+    # Native SwiftPM uses lowercase directories, including on case-sensitive disks.
+    lowercase=$(printf '%s' "$language" | tr '[:upper:]' '[:lower:]')
+    if [ ! -s "$stage/bin/NativePipe_NativePipeStrings.bundle/$language.lproj/Localizable.strings" ] &&
+       [ ! -s "$stage/bin/NativePipe_NativePipeStrings.bundle/$lowercase.lproj/Localizable.strings" ] &&
+       [ ! -s "$stage/bin/NativePipe_NativePipeStrings.bundle/Contents/Resources/$language.lproj/Localizable.strings" ] &&
+       [ ! -s "$stage/bin/NativePipe_NativePipeStrings.bundle/Contents/Resources/$lowercase.lproj/Localizable.strings" ]; then
+        echo "missing NativePipe translations: $language" >&2; exit 1
+    fi
+done
 codesign --force --sign - "$stage/bin/nativepipe"
 codesign --verify --strict "$stage/bin/nativepipe"
-"$stage/bin/nativepipe" --help >/dev/null
+# Execute the independently staged command in each supported language. This
+# also checks resource discovery outside the build tree, including SwiftPM's
+# lowercase language directory names.
+for directory in Sources/NativePipeStrings/Resources/*.lproj; do
+    language=$(basename "$directory" .lproj)
+    "$stage/bin/nativepipe" --help -AppleLanguages "($language)" >/dev/null
+done
 cp LICENSE "$stage/LICENSE"
 cp -R LICENSES "$stage/LICENSES"
 cp -R .build/codecs/macos/LICENSES/. "$stage/LICENSES/"

@@ -1,3 +1,4 @@
+import NativePipeStrings
 import Foundation
 import Darwin
 import CNativePipeFileRPC
@@ -116,34 +117,34 @@ public struct FileRPC: Sendable {
         case protocolError, invalidPath, tooLarge, local(Int32), remote(Int32)
         public var errorDescription: String? {
             switch self {
-            case .protocolError: return "The file transfer returned an invalid response."
-            case .invalidPath: return "The file path is invalid."
-            case .tooLarge: return "Use streaming transfer to read this file."
-            case .local(let code): return "File transfer failed: \(String(cString: strerror(code))) (\(code))."
+            case .protocolError: return NPText("The file transfer returned an invalid response.")
+            case .invalidPath: return NPText("The file path is invalid.")
+            case .tooLarge: return NPText("Use streaming transfer to read this file.")
+            case .local(let code): return NPText("File transfer failed: %@ (%@).", String(describing: (String(cString: strerror(code)))), String(describing: (code)))
             case .remote(let code):
                 // NPFR peers are Linux; Darwin's errno numbering is different.
                 let message: String = switch code {
-                case 1, 13: "Permission denied"
-                case 2: "No such file or directory"
-                case 5: "Input/output error"
-                case 17: "File already exists"
-                case 20: "Not a directory"
-                case 21: "Is a directory"
-                case 22: "Invalid argument"
-                case 27: "File too large"
-                case 28: "No space left on device"
-                case 30: "Read-only file system"
-                case 32: "Broken pipe"
-                case 38: "Operation not implemented"
-                case 39: "Directory not empty"
-                case 40: "Too many symbolic links"
-                case 95: "Operation not supported"
-                case 104: "Connection reset"
-                case 110: "Connection timed out"
-                case 125: "Operation cancelled"
-                default: "File service error"
+                case 1, 13: NPText("Permission denied")
+                case 2: NPText("No such file or directory")
+                case 5: NPText("Input/output error")
+                case 17: NPText("File already exists")
+                case 20: NPText("Not a directory")
+                case 21: NPText("Is a directory")
+                case 22: NPText("Invalid argument")
+                case 27: NPText("File too large")
+                case 28: NPText("No space left on device")
+                case 30: NPText("Read-only file system")
+                case 32: NPText("Broken pipe")
+                case 38: NPText("Operation not implemented")
+                case 39: NPText("Directory not empty")
+                case 40: NPText("Too many symbolic links")
+                case 95: NPText("Operation not supported")
+                case 104: NPText("Connection reset")
+                case 110: NPText("Connection timed out")
+                case 125: NPText("Operation cancelled")
+                default: NPText("File service error")
                 }
-                return "Linux file transfer failed: \(message) (\(code))."
+                return NPText("Linux file transfer failed: %@ (%@).", String(describing: (message)), String(describing: (code)))
             }
         }
     }

@@ -1,3 +1,4 @@
+import NativePipeStrings
 import Foundation
 import NativePipeProtocol
 import Darwin
@@ -30,8 +31,11 @@ public final class RemoteSession {
     private var authenticationDirectory: URL?
     private var writer: WindowCommandWriter?
     private var inbound: RemoteInbound?
-    private enum StartupPhase { case authenticating, installing, ready, connected }
-    private var startupPhase = StartupPhase.authenticating
+    public enum StartupPhase: Sendable { case connecting, authenticating, installing, ready, connected }
+    public var onStartupPhaseChange: ((StartupPhase) -> Void)?
+    public private(set) var startupPhase = StartupPhase.connecting {
+        didSet { if oldValue != startupPhase { onStartupPhaseChange?(startupPhase) } }
+    }
     private var startupTimeout: Task<Void, Never>?
     private var readyTimeout: Duration = .seconds(15)
     private var reportsStartup = true
@@ -64,7 +68,8 @@ public final class RemoteSession {
         generation += 1
         let token = generation
         diagnostics = ""
-        startupPhase = .authenticating
+        startupPhase = .connecting
+        onStartupPhaseChange?(.connecting)
         exitStatus = nil
         do { try await establishConnection(token: token) }
         catch {
@@ -254,6 +259,12 @@ public final class RemoteSession {
     private func diagnostic(_ text: String, token: Int) {
         guard token == generation else { return }
         diagnostics = String((diagnostics + text).suffix(65_536))
+        if !isReady, diagnostics.contains(SSHAuthentication.cancelledDiagnostic) {
+            // Stop before OpenSSH can offer another authentication method and
+            // reopen a prompt the user has just cancelled.
+            disconnect()
+            return
+        }
         // stderr reads can split a marker. Accumulated diagnostics preserve its
         // boundary; phase transitions are monotonic, so later logs cannot reset
         // the deadline. No timer runs while SSH asks the user to authenticate.
@@ -261,6 +272,8 @@ public final class RemoteSession {
             if diagnostics.contains("NATIVEPIPE PHASE READY\n") { advanceStartup(to: .ready, token: token) }
             else if diagnostics.contains("NATIVEPIPE PHASE INSTALLING\n") {
                 advanceStartup(to: .installing, token: token)
+            } else if diagnostics.contains("NATIVEPIPE PHASE AUTHENTICATING\n"), startupPhase == .connecting {
+                startupPhase = .authenticating
             }
         }
         onDiagnostic?(text)
@@ -268,7 +281,7 @@ public final class RemoteSession {
 
     private func advanceStartup(to phase: StartupPhase, token: Int) {
         guard generation == token, !isReady,
-              startupPhase == .authenticating || (startupPhase == .installing && phase == .ready) else { return }
+              startupPhase == .connecting || startupPhase == .authenticating || (startupPhase == .installing && phase == .ready) else { return }
         startupPhase = phase
         startupTimeout?.cancel()
         // Upload and runtime validation have a separate generous deadline.
@@ -278,8 +291,8 @@ public final class RemoteSession {
             do { try await Task.sleep(for: timeout) } catch { return }
             guard let self, self.generation == token, !self.isReady else { return }
             let message = phase == .ready
-                ? "The remote compositor did not become ready in time. Check its startup log and reconnect."
-                : "NativePipe installation did not finish in time. Check the remote connection and available disk space."
+                ? NPText("The remote compositor did not become ready in time. Check its startup log and reconnect.")
+                : NPText("NativePipe installation did not finish in time. Check the remote connection and available disk space.")
             self.fail(RemoteError.message(message + (self.diagnostics.isEmpty ? "" : "\n" + self.diagnostics)), token: token)
         }
     }
@@ -289,7 +302,7 @@ public final class RemoteSession {
         exitStatus = status
         if status != 0 || !isReady {
             fail(RemoteError.message(diagnostics.isEmpty
-                ? "Remote command exited with status \(status)." : diagnostics), token: token)
+                ? NPText("Remote command exited with status %@.", String(describing: (status))) : diagnostics), token: token)
         } else { disconnect() }
     }
 

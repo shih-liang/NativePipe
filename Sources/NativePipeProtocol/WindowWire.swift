@@ -1,3 +1,4 @@
+import NativePipeStrings
 import Foundation
 
 /// Binary payloads for every window-channel message.
@@ -35,11 +36,11 @@ public enum WindowWire {
         public var errorDescription: String? {
             switch self {
             case .unsupportedWindowVersion:
-                "The Linux window service is not compatible with this version. Update NativePipe on the Linux computer and reconnect."
+                NPText("The Linux window service is not compatible with this version. Update NativePipe on the Linux computer and reconnect.")
             case .unsupportedVersion:
-                "The Linux window service sent an unsupported scene version."
+                NPText("The Linux window service sent an unsupported scene version.")
             case .notBinaryScene, .truncated, .malformed:
-                "The Linux window service sent an invalid display message."
+                NPText("The Linux window service sent an invalid display message.")
             }
         }
     }

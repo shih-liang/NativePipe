@@ -1,3 +1,4 @@
+import NativePipeStrings
 import CNativePipeAV1
 import CoreMedia
 import CoreVideo
@@ -41,27 +42,27 @@ final class AV1Decoder {
             var position = 0, sequence: Data?, obuCount = 0, frameCount = 0
             while position < bytes.count {
                 obuCount += 1
-                guard obuCount <= 128 else { throw RemoteError.message("Too many AV1 OBUs.") }
+                guard obuCount <= 128 else { throw RemoteError.message(NPText("Too many AV1 OBUs.")) }
                 let start = position, header = bytes[position]
                 position += 1
-                guard header & 0x81 == 0, header & 2 != 0 else { throw RemoteError.message("Invalid AV1 OBU header.") }
+                guard header & 0x81 == 0, header & 2 != 0 else { throw RemoteError.message(NPText("Invalid AV1 OBU header.")) }
                 if header & 4 != 0 {
-                    guard position < bytes.count, bytes[position] == 0 else { throw RemoteError.message("Unsupported AV1 layer.") }
+                    guard position < bytes.count, bytes[position] == 0 else { throw RemoteError.message(NPText("Unsupported AV1 layer.")) }
                     position += 1
                 }
                 var size: UInt64 = 0, finished = false
                 for shift in stride(from: 0, to: 56, by: 7) {
-                    guard position < bytes.count else { throw RemoteError.message("Truncated AV1 OBU size.") }
+                    guard position < bytes.count else { throw RemoteError.message(NPText("Truncated AV1 OBU size.")) }
                     let value = bytes[position]; position += 1
                     size |= UInt64(value & 127) << shift
                     if value & 128 == 0 { finished = true; break }
                 }
-                guard finished, size <= UInt64(bytes.count - position) else { throw RemoteError.message("Invalid AV1 OBU size.") }
+                guard finished, size <= UInt64(bytes.count - position) else { throw RemoteError.message(NPText("Invalid AV1 OBU size.")) }
                 position += Int(size)
                 let type = (header >> 3) & 15
                 if type == 1 { sequence = data.subdata(in: start..<position) }
                 if type == 3 || type == 6 { frameCount += 1 }
-                guard frameCount <= 1 else { throw RemoteError.message("Multiple AV1 frames for one resource.") }
+                guard frameCount <= 1 else { throw RemoteError.message(NPText("Multiple AV1 frames for one resource.")) }
             }
             return sequence
         }
@@ -82,7 +83,7 @@ final class AV1Decoder {
                     np_av1_configuration($0.bindMemory(to: UInt8.self).baseAddress, $0.count,
                         Int32(width), Int32(height), &config)
                 }
-                guard valid == 0 else { throw RemoteError.message("Unsupported AV1 sequence.") }
+                guard valid == 0 else { throw RemoteError.message(NPText("Unsupported AV1 sequence.")) }
                 // Encoders emit a sequence header at every random-access keyframe.
                 replay.removeAll(keepingCapacity: true); replayBytes = 0; replayReservation = nil
                 if software == nil, session == nil {
@@ -107,13 +108,13 @@ final class AV1Decoder {
                 software = np_av1_decoder_create()
                 for previous in replay {
                     guard decodeSoftware(previous, width: width, height: height) != nil else {
-                        throw RemoteError.message("Could not recover AV1 reference frames.")
+                        throw RemoteError.message(NPText("Could not recover AV1 reference frames."))
                     }
                 }
                 replay.removeAll(); replayBytes = 0; replayReservation = nil
             }
             pixel = decodeSoftware(obu, width: width, height: height)
-            guard let pixel else { throw RemoteError.message("Could not decode AV1 frame.") }
+            guard let pixel else { throw RemoteError.message(NPText("Could not decode AV1 frame.")) }
             onFrame?(resourceID, pixel)
         } catch { onFailure?(resourceID) }
     }

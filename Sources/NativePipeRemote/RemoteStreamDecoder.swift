@@ -1,3 +1,4 @@
+import NativePipeStrings
 import Foundation
 import NativePipeProtocol
 
@@ -37,12 +38,12 @@ struct RemoteStreamDecoder {
                 return .acknowledge(payload.count - 16)
             }
             if payload.prefix(4) == RemoteWire.acknowledgementMagic {
-                guard payload.count == 8 else { throw RemoteError.message("Invalid remote transport credit.") }
+                guard payload.count == 8 else { throw RemoteError.message(NPText("Invalid remote transport credit.")) }
                 return .credit(Int(RemoteWire.number(payload, at: 4)))
             }
             return try decodeControl(payload)
         }
-        throw RemoteError.message("Invalid remote stream. Update the remote compositor to match this client.")
+        throw RemoteError.message(NPText("Invalid remote stream. Update the remote compositor to match this client."))
     }
 
     private mutating func decodeControl(_ payload: Data) throws -> Packet {
@@ -52,10 +53,10 @@ struct RemoteStreamDecoder {
         }
         let event = try WindowWire.guestEvent(from: payload)
         if case .channelReady = event {
-            guard !ready else { throw RemoteError.message("Duplicate remote session handshake.") }
+            guard !ready else { throw RemoteError.message(NPText("Duplicate remote session handshake.")) }
             ready = true
         } else if !ready {
-            throw RemoteError.message("Remote compositor did not send its session handshake.")
+            throw RemoteError.message(NPText("Remote compositor did not send its session handshake."))
         }
         return .event(event)
     }
@@ -63,18 +64,18 @@ struct RemoteStreamDecoder {
     private mutating func decodeRecord(_ record: Data) throws -> Packet {
         if record.prefix(4).elementsEqual(WireFormat.magic) {
             let size = try WireFormat.decodeHeader(Data(record.prefix(WireFormat.headerSize)))
-            guard record.count == WireFormat.headerSize + size else { throw RemoteError.message("Invalid remote record size.") }
+            guard record.count == WireFormat.headerSize + size else { throw RemoteError.message(NPText("Invalid remote record size.")) }
             return try decodeControl(Data(record.dropFirst(WireFormat.headerSize)))
         }
         guard ready, let header = MediaWire.Header.parse(from: Data(record.prefix(MediaWire.headerSize))),
               header.payloadLength <= MediaWire.maximumPayloadSize,
               record.count == MediaWire.headerSize + Int(header.payloadLength) else {
-            throw RemoteError.message("Invalid remote media frame.")
+            throw RemoteError.message(NPText("Invalid remote media frame."))
         }
         return .media(header, Data(record.dropFirst(MediaWire.headerSize)))
     }
 
     func finish() throws {
-        guard buffer.isEmpty, fragments.isEmpty, completed == nil else { throw RemoteError.message("Truncated remote display stream.") }
+        guard buffer.isEmpty, fragments.isEmpty, completed == nil else { throw RemoteError.message(NPText("Truncated remote display stream.")) }
     }
 }

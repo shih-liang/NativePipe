@@ -52,7 +52,7 @@
 int np_read_full(int fd, void *buf, size_t n);
 int np_write_full(int fd, const void *buf, size_t n);
 int np_path_exists(const char *path);
-/* True when the distribution installed a Mesa Venus ICD. LightHouse never
+/* True when the distribution installed a Mesa Venus ICD. LinPortal never
  * supplies or selects a second Mesa implementation inside the guest. */
 int np_venus_icd_available(void);
 int np_mkdir_p(const char *path);

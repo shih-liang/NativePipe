@@ -3,6 +3,51 @@ import XCTest
 @testable import NativePipeRemote
 
 final class SFTPTransferTests: XCTestCase {
+    @MainActor func testCancellingTransferOrAuthenticationClosesAttemptAndAllowsRetry() async throws {
+        let files = FileManager.default
+        let directory = files.temporaryDirectory.appendingPathComponent("nativepipe-sftp-cancel-" + UUID().uuidString)
+        try files.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? files.removeItem(at: directory) }
+        let executable = directory.appendingPathComponent("ssh-fixture")
+        // /usr/bin/sftp uses a local SSH fixture. It never contacts a host or
+        // sends a file; an open authentication prompt keeps stderr alive.
+        try Data("""
+        #!/bin/sh
+        printf '%s' "$NATIVEPIPE_SSH_AUTH_SESSION" > "$TEST_AUTH_READY"
+        if [ "$TEST_CANCEL_AUTH" = 1 ]; then
+            rmdir "$NATIVEPIPE_SSH_AUTH_SESSION"
+        else
+            count=0
+            while [ -d "$NATIVEPIPE_SSH_AUTH_SESSION" ] && [ "$count" -lt 60 ]; do
+                /bin/sleep 0.05
+                count=$((count + 1))
+            done
+        fi
+        printf 'NATIVEPIPE AUTH CANCELLED\\n' >&2
+        exit 1
+        """.utf8).write(to: executable)
+        try files.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        let command = SSHCommand(destination: "unused.invalid", application: ["true"], sshArguments: ["-S", executable.path])
+        let transfer = SFTPTransfer()
+        for cancelPrompt in [false, true] {
+            let ready = directory.appendingPathComponent(UUID().uuidString)
+            let task = Task {
+                try await transfer.run(command: command, direction: .upload, local: directory.appendingPathComponent("unused"),
+                    remote: "unused", environment: ["TEST_AUTH_READY": ready.path, "TEST_CANCEL_AUTH": cancelPrompt ? "1" : "0"])
+            }
+            let deadline = ContinuousClock.now + .seconds(2)
+            while !files.fileExists(atPath: ready.path), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+            let path = try String(contentsOf: ready, encoding: .utf8)
+            if !cancelPrompt {
+                transfer.cancel()
+                XCTAssertFalse(files.fileExists(atPath: path), "Cancellation must close the prompt before waiting for SFTP to exit")
+            }
+            do { try await task.value; XCTFail("Cancellation must not be success") }
+            catch is CancellationError { }
+            XCTAssertFalse(files.fileExists(atPath: path))
+        }
+    }
+
     @MainActor func testLiteralPathsCannotInjectCommands() throws {
         let batch = try SFTPTransfer.batch(direction: .upload, local: "/tmp/a b*[1]\".txt", remote: "-target")
         XCTAssertTrue(batch.hasPrefix("put -- \"/tmp/a b*[1]\\\".txt\" \"-target\""))

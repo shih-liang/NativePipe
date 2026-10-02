@@ -1,3 +1,4 @@
+import NativePipeStrings
 import AppKit
 @preconcurrency import IOSurface
 @preconcurrency import Metal
@@ -230,6 +231,8 @@ final class NativeWindow: NSObject {
 
     func activateFromDock() {
         guard let window, !isPopup else { return }
+        if NSApp.isHidden { NSApp.unhide(nil) }
+        if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
         if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(contentView)
@@ -669,6 +672,13 @@ final class NativeWindow: NSObject {
         window.standardWindowButton(.closeButton)?.isHidden = !serverDecorated
         window.standardWindowButton(.miniaturizeButton)?.isHidden = !serverDecorated
         window.standardWindowButton(.zoomButton)?.isHidden = !serverDecorated
+        refreshHostChrome()
+    }
+
+    func refreshHostChrome() {
+        guard !isPopup else { return }
+        // Native titlebar identity only. CSD pixels and their geometry stay intact.
+        window?.subtitle = serverDecorated ? (bridge?.machineName ?? "") : ""
     }
 
     /// Popup coordinates arrive relative to the parent's xdg window geometry,
@@ -1560,7 +1570,7 @@ private final class SurfaceView: NSView {
     }
 
     @available(*, unavailable)
-    required init?(coder: NSCoder) { fatalError("not supported") }
+    required init?(coder: NSCoder) { fatalError(NPText("not supported")) }
 
     override var isFlipped: Bool { true }
 
