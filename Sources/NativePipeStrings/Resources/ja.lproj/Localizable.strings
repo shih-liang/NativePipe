@@ -181,3 +181,5 @@
 "unsupported wire version %@" = "未対応の通信バージョン %@";
 "window presenter rejected the scene" = "ウィンドウ表示側がシーンを拒否しました";
 "↩ Switch    ⌥↩ Window actions" = "↩ 切り替え    ⌥↩ ウィンドウ操作";
+"Login password" = "ログインパスワード";
+"Enter a non-empty password without line breaks or null characters." = "空ではなく、改行や NUL 文字を含まないパスワードを入力してください。";

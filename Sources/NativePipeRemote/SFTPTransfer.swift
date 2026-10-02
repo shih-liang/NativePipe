@@ -53,7 +53,9 @@ public final class SFTPTransfer {
                                   recursive: recursive, createParent: createParent)
         let child = Process(), input = Pipe(), output = Pipe()
         child.executableURL = URL(fileURLWithPath: "/usr/bin/sftp")
-        var arguments = command.sshArguments
+        var arguments = SSHAuthentication.preferredAuthenticationArguments(connection: command.credentialID, environment: environment,
+            sshArguments: command.sshArguments)
+            + command.sshArguments
         // SSH and SFTP use different spellings for their port option.
         if let index = arguments.firstIndex(of: "-p") { arguments[index] = "-P" }
         var destination = command.destination

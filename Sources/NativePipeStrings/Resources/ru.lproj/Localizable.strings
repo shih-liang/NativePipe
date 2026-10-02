@@ -181,3 +181,5 @@
 "unsupported wire version %@" = "неподдерживаемая версия протокола %@";
 "window presenter rejected the scene" = "модуль отображения окна отклонил сцену";
 "↩ Switch    ⌥↩ Window actions" = "↩ Переключить    ⌥↩ Действия с окном";
+"Login password" = "Пароль для входа";
+"Enter a non-empty password without line breaks or null characters." = "Введите непустой пароль без переводов строки и символов NUL.";

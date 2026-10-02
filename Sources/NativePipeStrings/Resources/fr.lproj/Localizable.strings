@@ -181,3 +181,5 @@
 "unsupported wire version %@" = "version de protocole %@ non prise en charge";
 "window presenter rejected the scene" = "le présentateur de fenêtre a rejeté la scène";
 "↩ Switch    ⌥↩ Window actions" = "↩ Basculer    ⌥↩ Actions de fenêtre";
+"Login password" = "Mot de passe de connexion";
+"Enter a non-empty password without line breaks or null characters." = "Saisissez un mot de passe non vide, sans sauts de ligne ni caractères NUL.";

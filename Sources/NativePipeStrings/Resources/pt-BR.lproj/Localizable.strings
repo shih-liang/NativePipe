@@ -181,3 +181,5 @@
 "unsupported wire version %@" = "versão de protocolo %@ não compatível";
 "window presenter rejected the scene" = "o apresentador de janelas rejeitou a cena";
 "↩ Switch    ⌥↩ Window actions" = "↩ Alternar    ⌥↩ Ações de janela";
+"Login password" = "Senha de login";
+"Enter a non-empty password without line breaks or null characters." = "Digite uma senha não vazia, sem quebras de linha nem caracteres NUL.";

@@ -181,3 +181,5 @@
 "unsupported wire version %@" = "不支持协议版本 %@";
 "window presenter rejected the scene" = "窗口显示组件拒绝了此场景";
 "↩ Switch    ⌥↩ Window actions" = "↩ 切换    ⌥↩ 窗口操作";
+"Login password" = "登录密码";
+"Enter a non-empty password without line breaks or null characters." = "请输入非空密码，且不得包含换行或 NUL 字符。";

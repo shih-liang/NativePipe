@@ -104,10 +104,12 @@ public final class RemoteSession {
         self.inbound = inbound
         let child = Process()
         child.executableURL = URL(fileURLWithPath: executable)
-        child.arguments = arguments
         var childEnvironment = environment ?? SSHAuthentication.environment(
             askpassExecutable: URL(fileURLWithPath: CommandLine.arguments[0]))
         childEnvironment["NATIVEPIPE_SSH_CONNECTION"] = command.credentialID
+        child.arguments = (argumentsOverride == nil
+            ? SSHAuthentication.preferredAuthenticationArguments(connection: command.credentialID, environment: childEnvironment,
+                sshArguments: command.sshArguments) : []) + arguments
         let authDirectory = try SSHCredentialStore.makeAttemptDirectory(environment: childEnvironment)
         authenticationDirectory = authDirectory
         childEnvironment["NATIVEPIPE_SSH_AUTH_SESSION"] = authDirectory.path

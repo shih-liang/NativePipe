@@ -2,13 +2,16 @@ import NativePipeStrings
 import Foundation
 import Security
 import CryptoKit
+import LocalAuthentication
 
 /// Secrets stay in Keychain, separate from plist connection records.
 public struct SSHCredentialStore {
     public struct Entry: Identifiable {
         public let id: String
-        public var title: String { id }
+        public var title: String { id == SSHCredentialStore.loginPasswordAccount ? NPText("Login password") : id }
     }
+    // A typed password belongs to the connection, not to guessed OpenSSH text.
+    private static let loginPasswordAccount = "nativepipe:login-password"
     private let service: String
     private let group: String?
     private let trustedApplications: [URL]
@@ -56,6 +59,7 @@ public struct SSHCredentialStore {
         return (result as? Data).flatMap { String(data: $0, encoding: .utf8) }
     }
     public func save(_ secret: String, prompt: String) throws {
+        if prompt == Self.loginPasswordAccount { try Self.validateLoginPassword(secret) }
         try check(try perform { query, fallback in
             var query = query
             query[kSecAttrAccount as String] = prompt
@@ -66,7 +70,7 @@ public struct SSHCredentialStore {
             guard status == errSecItemNotFound else { return status }
             query.merge(values) { _, new in new }
             if fallback { query[kSecAttrAccess as String] = try applicationAccess() }
-            query[kSecAttrLabel as String] = NPText("NativePipe SSH — %@", prompt)
+            query[kSecAttrLabel as String] = NPText("NativePipe SSH — %@", prompt == Self.loginPasswordAccount ? NPText("Login password") : prompt)
             if !fallback { query[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly }
             return SecItemAdd(query as CFDictionary, nil)
         })
@@ -78,6 +82,46 @@ public struct SSHCredentialStore {
             return SecItemDelete(query as CFDictionary)
         }
         if status != errSecItemNotFound { try check(status) }
+    }
+    public func saveLoginPassword(_ secret: String) throws {
+        try save(secret, prompt: Self.loginPasswordAccount)
+    }
+    /// Checks only the typed account's presence; callers never receive its data.
+    public func hasLoginPassword() throws -> Bool {
+        let status = try perform { query, _ in
+            var query = query
+            query[kSecAttrAccount as String] = Self.loginPasswordAccount
+            let context = LAContext()
+            context.interactionNotAllowed = true
+            query[kSecUseAuthenticationContext as String] = context
+            return SecItemCopyMatching(query as CFDictionary, nil)
+        }
+        if status == errSecItemNotFound { return false }
+        try check(status)
+        return true
+    }
+    public func removeLoginPassword() throws {
+        try remove(Self.loginPasswordAccount)
+    }
+    static func validateLoginPassword(_ secret: String) throws {
+        guard !secret.isEmpty, !secret.unicodeScalars.contains(where: { [0, 10, 13].contains($0.value) }) else {
+            throw RemoteError.message(NPText("Enter a non-empty password without line breaks or null characters."))
+        }
+    }
+    func cachedResponse(prompt: String, confirming: Bool, directory: String?) throws -> String? {
+        try Self.cachedResponse(prompt: prompt, confirming: confirming, directory: directory,
+            readLoginPassword: { try read(Self.loginPasswordAccount) }, readPrompt: read)
+    }
+    /// The same gate covers typed and legacy passwords: rejection must lead to
+    /// a prompt, not a second automatic attempt with an older cached value.
+    static func cachedResponse(prompt: String, confirming: Bool, directory: String?,
+                               readLoginPassword: () throws -> String?,
+                               readPrompt: (String) throws -> String?) rethrows -> String? {
+        guard !confirming, mayRemember(prompt) else { return nil }
+        let loginPassword = isLoginPasswordPrompt(prompt)
+        guard claimCachedAttempt(prompt: loginPassword ? loginPasswordAccount : prompt, directory: directory) else { return nil }
+        if loginPassword, let saved = try readLoginPassword() { return saved }
+        return try readPrompt(prompt)
     }
     /// Keep existing Data Protection items when that entitlement is available.
     /// Development signing may only grant the file container, not Keychain.
@@ -111,7 +155,19 @@ public struct SSHCredentialStore {
 
     static func mayRemember(_ prompt: String) -> Bool {
         let value = prompt.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        return value.hasSuffix("password:") || value.hasPrefix("enter passphrase for key ")
+        return isLoginPasswordPrompt(prompt) || (value.hasPrefix("enter passphrase for key ") && value.hasSuffix(":"))
+    }
+    static func isLoginPasswordPrompt(_ prompt: String) -> Bool {
+        let value = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let suffix = "'s password:"
+        guard value.hasSuffix(suffix) else { return false }
+        let account = value.dropLast(suffix.count)
+        let parts = account.split(separator: "@", omittingEmptySubsequences: false)
+        // A bare Password: can be keyboard-interactive/MFA. Only the explicit
+        // client-shaped user@host prompt may consume the connection password.
+        // Askpass text cannot distinguish a server that deliberately imitates it.
+        return parts.count == 2 && parts.allSatisfy { !$0.isEmpty }
+            && !account.unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.union(.controlCharacters).contains($0) })
     }
 
     public static func makeAttemptDirectory(environment: [String: String]) throws -> URL {
