@@ -123,7 +123,7 @@ public enum ComputerUseWindowError: LocalizedError {
         case .unavailable: NPText("the guest window no longer exists")
         case .hidden: NPText("the guest window is not visible")
         case .invalidCoordinates: NPText("input coordinates are outside the guest content")
-        case .captureFailed: NPText("WindowServer could not capture the guest window")
+        case .captureFailed: NPText("Could not capture the guest window")
         }
     }
 }
@@ -403,24 +403,21 @@ public final class WindowBridge: NSObject {
     /// presentation handler; superseded/cancelled scenes report false.
     /// This is separate from Wayland frame/FIFO latch completion.
     public var onScenePresentation: ((UInt32, UInt32, Bool, UInt32) -> Void)?
-    private var deferredSceneFeedback: [UInt32: [UInt32]] = [:]
+    private var deferredSceneFeedback = DeferredSceneFeedback()
 
     func scenePresented(surface: UInt32, presentationID: UInt32, displayed: Bool) {
         guard onScenePresentation != nil else { return }
-        if !displayed, let id = surfaceToWindow[surface],
-           let native = windows[id], native.window != nil, !native.canPresent {
-            // Returning discard credits continuously while occluded would let
-            // the remote encode an invisible animation forever. Retire these
-            // on visibility restoration; the remote's per-window limit bounds
-            // this list and does not block input or other windows.
-            deferredSceneFeedback[surface, default: []].append(presentationID)
-        } else {
+        let native = surfaceToWindow[surface].flatMap { windows[$0] }
+        let occluded = native?.window != nil && native?.canPresent == false
+        if deferredSceneFeedback.shouldSend(
+            surface: surface, presentationID: presentationID,
+            displayed: displayed, occluded: occluded) {
             onScenePresentation?(surface, presentationID, displayed, displayInterval(for: surface))
         }
     }
 
     func flushSceneFeedback(surface: UInt32) {
-        for id in deferredSceneFeedback.removeValue(forKey: surface) ?? [] {
+        for id in deferredSceneFeedback.take(surface: surface) {
             onScenePresentation?(surface, id, false, displayInterval(for: surface))
         }
     }
@@ -1816,7 +1813,7 @@ public final class WindowBridge: NSObject {
         pointerCursor = .arrow
         for (_, window) in windows { window.close() }
         windows.removeAll()
-        deferredSceneFeedback.removeAll()
+        deferredSceneFeedback.reset()
 		forceQuitCapabilities.removeAll(keepingCapacity: true)
 		windowDisplayStates.removeAll(keepingCapacity: true)
         popupPlacements.removeAll()

@@ -160,7 +160,7 @@
 "VERSION file (%@) does not match ELF %@%@" = "Файл VERSION (%@) не соответствует ELF %@%@";
 "Window" = "Окно";
 "Window switcher" = "Переключатель окон";
-"WindowServer could not capture the guest window" = "WindowServer не удалось захватить окно гостевой системы";
+"Could not capture the guest window" = "Не удалось захватить окно гостевой системы";
 "Zoom" = "Масштаб";
 "agent wire: bad magic" = "протокол агента: неверная сигнатура";
 "agent wire: name too long" = "протокол агента: слишком длинное имя";

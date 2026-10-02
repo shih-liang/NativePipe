@@ -160,7 +160,7 @@
 "VERSION file (%@) does not match ELF %@%@" = "VERSION 파일(%@)이 ELF %@%@과(와) 일치하지 않습니다";
 "Window" = "창";
 "Window switcher" = "창 전환기";
-"WindowServer could not capture the guest window" = "WindowServer가 게스트 창을 캡처하지 못했습니다";
+"Could not capture the guest window" = "게스트 창을 캡처하지 못했습니다";
 "Zoom" = "확대/축소";
 "agent wire: bad magic" = "에이전트 통신: 잘못된 매직 값";
 "agent wire: name too long" = "에이전트 통신: 이름이 너무 깁니다";

@@ -160,7 +160,7 @@
 "VERSION file (%@) does not match ELF %@%@" = "Die VERSION-Datei (%@) stimmt nicht mit ELF %@%@ überein";
 "Window" = "Fenster";
 "Window switcher" = "Fensterumschalter";
-"WindowServer could not capture the guest window" = "WindowServer konnte das Gastfenster nicht erfassen";
+"Could not capture the guest window" = "Das Gastfenster konnte nicht erfasst werden";
 "Zoom" = "Zoomen";
 "agent wire: bad magic" = "Agent-Protokoll: ungültige Kennung";
 "agent wire: name too long" = "Agent-Protokoll: Name zu lang";

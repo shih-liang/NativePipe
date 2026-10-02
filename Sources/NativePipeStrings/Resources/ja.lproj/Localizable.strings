@@ -160,7 +160,7 @@
 "VERSION file (%@) does not match ELF %@%@" = "VERSION ファイル（%@）が ELF %@%@ と一致しません";
 "Window" = "ウィンドウ";
 "Window switcher" = "ウィンドウ切り替え";
-"WindowServer could not capture the guest window" = "WindowServer がゲストウィンドウをキャプチャできませんでした";
+"Could not capture the guest window" = "ゲストウィンドウをキャプチャできませんでした";
 "Zoom" = "拡大／縮小";
 "agent wire: bad magic" = "エージェント通信: マジック値が不正です";
 "agent wire: name too long" = "エージェント通信: 名前が長すぎます";

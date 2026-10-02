@@ -160,7 +160,7 @@
 "VERSION file (%@) does not match ELF %@%@" = "VERSION 文件（%@）与 ELF %@%@ 不匹配";
 "Window" = "窗口";
 "Window switcher" = "窗口切换器";
-"WindowServer could not capture the guest window" = "WindowServer 无法截取 Linux 窗口";
+"Could not capture the guest window" = "无法截取 Linux 窗口";
 "Zoom" = "缩放";
 "agent wire: bad magic" = "代理协议：标记错误";
 "agent wire: name too long" = "代理协议：名称过长";

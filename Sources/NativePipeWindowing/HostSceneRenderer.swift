@@ -16,7 +16,7 @@ struct ResolvedSceneLayer {
     }
 }
 
-/// CPU-owned copy of one fully composed drawable. It is produced only for an
+/// CPU-owned copy of one fully composed scene. It is produced only for an
 /// explicit Computer Use request; the ordinary presentation path performs no
 /// readback and keeps no history texture.
 struct RenderedFrameCapture: Sendable {
@@ -337,11 +337,46 @@ final class HostSceneRenderer: @unchecked Sendable {
         capture: Bool = false,
         completion: @escaping @Sendable (MTLCommandBuffer, RenderedFrameCapture?) -> Void
     ) throws {
+        try encode(scene: scene, layers: layers, damage: damage, redrawAll: redrawAll,
+                   target: drawable.texture, drawable: drawable, capture: capture,
+                   completion: completion)
+    }
+
+    /// An explicit capture can read a protected scene while its window is
+    /// occluded and Core Animation cannot supply a drawable. This target exists
+    /// only until that command buffer completes; it is never a frame history.
+    func encodeCapture(
+        scene: Windowing.SceneSnapshot, layers: [ResolvedSceneLayer],
+        completion: @escaping @Sendable (MTLCommandBuffer, RenderedFrameCapture?) -> Void
+    ) throws {
+        let (pixels, pixelOverflow) = scene.width.multipliedReportingOverflow(by: scene.height)
+        let (bytes, byteOverflow) = pixels.multipliedReportingOverflow(by: 4)
+        guard scene.width > 0, scene.height > 0, !pixelOverflow, !byteOverflow,
+              bytes > 0, bytes <= Self.maximumCaptureBytes else {
+            throw RendererError.incompatibleTexture
+        }
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm, width: scene.width, height: scene.height,
+            mipmapped: false)
+        descriptor.storageMode = .private
+        descriptor.usage = [.renderTarget]
+        guard let target = queue.device.makeTexture(descriptor: descriptor) else {
+            throw RendererError.incompatibleTexture
+        }
+        try encode(scene: scene, layers: layers, damage: [], redrawAll: true,
+                   target: target, drawable: nil, capture: true, completion: completion)
+    }
+
+    private func encode(
+        scene: Windowing.SceneSnapshot, layers: [ResolvedSceneLayer],
+        damage: [Windowing.Rect], redrawAll: Bool,
+        target: MTLTexture, drawable: CAMetalDrawable?, capture: Bool,
+        completion: @escaping @Sendable (MTLCommandBuffer, RenderedFrameCapture?) -> Void
+    ) throws {
         guard layers.count == scene.layers.count,
               let command = queue.makeCommandBuffer() else {
             throw RendererError.commandBuffer
         }
-        let target = drawable.texture
         guard target.pixelFormat == .bgra8Unorm,
               target.width > 0, target.height > 0 else {
             throw RendererError.incompatibleTexture
@@ -433,7 +468,7 @@ final class HostSceneRenderer: @unchecked Sendable {
             }
             completion(command, captured)
         }
-        command.present(drawable)
+        if let drawable { command.present(drawable) }
         command.commit()
     }
 
@@ -542,7 +577,7 @@ final class HostSceneRenderer: @unchecked Sendable {
     private func canBlit(
         scene: Windowing.SceneSnapshot, layer: ResolvedSceneLayer?
     ) -> Bool {
-        guard let layer else { return false }
+        guard scene.layers.count == 1, let layer else { return false }
         let state = layer.state
         return state.opaque && state.alpha == 1 && state.transform == .normal &&
             state.format == .bgra8888 && layer.texture.pixelFormat == .bgra8Unorm &&

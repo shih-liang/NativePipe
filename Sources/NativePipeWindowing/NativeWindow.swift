@@ -87,14 +87,15 @@ private final class FrameCaptureWaiter {
     }
 }
 
-@MainActor
-private final class ScenePresentationCompletion {
-    private var callback: ((Bool) -> Void)?
-    init(_ callback: @escaping (Bool) -> Void) { self.callback = callback }
-    func finish(_ displayed: Bool) {
-        let callback = self.callback
-        self.callback = nil
-        callback?(displayed)
+/// Offscreen reads consume scene damage without updating the screen. Request
+/// one fresh protected scene when display becomes possible, including idle apps.
+struct SceneCaptureRecovery {
+    var needsSceneRefreshAfterCapture = false
+
+    mutating func takeRefresh(canPresent: Bool) -> Bool {
+        guard needsSceneRefreshAfterCapture, canPresent else { return false }
+        needsSceneRefreshAfterCapture = false
+        return true
     }
 }
 
@@ -185,6 +186,8 @@ final class NativeWindow: NSObject {
     }
     private var pendingConfigure: PendingConfigure?
 	private var presenterNeedsDisplayRetry = false
+    private var captureRecovery = SceneCaptureRecovery()
+    private let scenePresentationCredits = ScenePresentationCredits()
 	/// Commits accepted since the previous display tick. This is the Wayland
 	/// output-latch clock; Metal source release remains tied to command completion.
     private struct Presentation: Hashable {
@@ -206,6 +209,10 @@ final class NativeWindow: NSObject {
             layer: contentView.metalLayer, device: metalDevice, renderer: renderer,
             requestDisplayRetry: {
                 MainRunLoop.perform { markRetry() }
+            }, offscreenCaptureCompleted: { [weak self] in
+                guard let self, self.window != nil else { return }
+                self.captureRecovery.needsSceneRefreshAfterCapture = true
+                self.refreshSceneAfterCaptureIfVisible()
             })
     }()
 
@@ -393,7 +400,7 @@ final class NativeWindow: NSObject {
         if bridge?.onScenePresentation != nil {
             // A drawable can finish after its NSWindow has been destroyed.
             // Return its remote credit for as long as the session is alive.
-            completion = ScenePresentationCompletion { [weak bridge = bridge] displayed in
+            completion = scenePresentationCredits.register(scene.presentationID) { [weak bridge = bridge] displayed in
                 guard bridge?.connectionGeneration == generation else { return }
                 bridge?.scenePresented(surface: scene.surface,
                     presentationID: scene.presentationID, displayed: displayed)
@@ -404,9 +411,9 @@ final class NativeWindow: NSObject {
         else { onPresented = nil }
         presenter.enqueue(
             scene: scene, layers: layers, drawableSize: drawableSize,
-            readComplete: { success in
+            readComplete: { [weak self] success in
                 readComplete(success)
-                if !success { completion?.finish(false) }
+                if !success || self?.canPresent != true { completion?.finish(false) }
             },
             latched: { [weak self] in
                 guard self?.bridge?.connectionGeneration == generation else { return }
@@ -428,6 +435,13 @@ final class NativeWindow: NSObject {
 		asyncScenePresenter?.invalidateDrawableAges()
 	}
 
+    private func refreshSceneAfterCaptureIfVisible() {
+        guard bridge != nil, captureRecovery.takeRefresh(canPresent: canPresent) else { return }
+        // Republish current state without registering a readback request. An
+        // idle client then gets its consumed offscreen scene onto the display.
+        bridge?.send(.captureFrame(surface: surfaceID))
+    }
+
     /// Capture the next compositor-protected presentation. The guest republishes
     /// current state even when the client is idle, so static windows work without
     /// retaining a CAMetalDrawable or adding a per-frame history copy.
@@ -438,6 +452,10 @@ final class NativeWindow: NSObject {
         return try await withCheckedThrowingContinuation { continuation in
             let waiter = FrameCaptureWaiter(continuation)
             let requestID = presenter.captureNextFrame { result in waiter.finish(result) }
+            // A drawable may finish its GPU reads while occluded without ever
+            // reporting display presentation. Retire older unreported credits
+            // before asking the guest to publish this explicit capture scene.
+            scenePresentationCredits.discardUnpresented()
             // An explicit screenshot may target an occluded window. Allow its
             // capture scene through without continuously enabling rendering.
             bridge?.flushSceneFeedback(surface: surfaceID)
@@ -729,6 +747,7 @@ final class NativeWindow: NSObject {
         endScrollGesture()
         releasePressedKeys()
         pendingConfigure = nil
+        captureRecovery.needsSceneRefreshAfterCapture = false
         contentView.clearDisplayedSurface()
         let pending = pendingPresentations
         pendingPresentations.removeAll()
@@ -739,6 +758,7 @@ final class NativeWindow: NSObject {
 		bridge?.windowClosed(windowID)
 		bridge?.unregisterDisplayClock(self)
         asyncScenePresenter?.cancelPending()
+        scenePresentationCredits.discardUnpresented()
 		bridge?.flushSceneFeedback(surface: surfaceID)
 		asyncScenePresenter?.invalidateDrawableAges()
         // `orderOut` only hides a window; it does not terminate its AppKit
@@ -825,6 +845,7 @@ final class NativeWindow: NSObject {
         // Deliver the newest resize before waking a frame-throttled client, so
         // the draw started by this tick targets the newest logical size.
         flushConfigure()
+        refreshSceneAfterCaptureIfVisible()
 
         // Frame callbacks and FIFO latching are paced by the display clock.
         // Source buffers were already released by their Metal completion.
@@ -1041,7 +1062,11 @@ extension NativeWindow: NSWindowDelegate {
     }
 
     func windowDidChangeOcclusionState(_ notification: Notification) {
-        if canPresent { bridge?.flushSceneFeedback(surface: surfaceID) }
+        scenePresentationCredits.discardUnpresented()
+        if canPresent {
+            bridge?.flushSceneFeedback(surface: surfaceID)
+            refreshSceneAfterCaptureIfVisible()
+        }
     }
 
 	func windowWillStartLiveResize(_ notification: Notification) {
@@ -1159,6 +1184,7 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
 	private let layer: CAMetalLayer
     private let renderer: HostSceneRenderer
     private let requestDisplayRetry: (@Sendable () -> Void)?
+    private let offscreenCaptureCompleted: (@MainActor @Sendable () -> Void)?
     private let queue = DispatchQueue(
         label: "com.nativepipe.metal-present", qos: .userInteractive)
 	private let lock = NSLock()
@@ -1183,11 +1209,13 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
 
     init(
         layer: CAMetalLayer, device: MTLDevice, renderer: HostSceneRenderer,
-		requestDisplayRetry: (@Sendable () -> Void)? = nil
+		requestDisplayRetry: (@Sendable () -> Void)? = nil,
+        offscreenCaptureCompleted: (@MainActor @Sendable () -> Void)? = nil
 	) {
         self.layer = layer
         self.renderer = renderer
 		self.requestDisplayRetry = requestDisplayRetry
+        self.offscreenCaptureCompleted = offscreenCaptureCompleted
 		self.drawableAges = DrawableAgeTracker(capacity: layer.maximumDrawableCount)
         layer.device = device
 		layer.framebufferOnly = false
@@ -1212,7 +1240,12 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         nextCaptureID &+= 1
         let id = nextCaptureID
         captureRequests.append(CaptureRequest(id: id, completion: completion))
+        // A protected scene may already be waiting for a display-link retry.
+        // Explicit capture must wake it even if the occluded app has no tick.
+        let shouldSchedule = pending != nil && !drainScheduled
+        if shouldSchedule { drainScheduled = true }
         lock.unlock()
+        if shouldSchedule { queue.async { self.drain() } }
         return id
     }
 
@@ -1326,7 +1359,8 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
             }
         }
         let drawableStart = ProcessInfo.processInfo.systemUptime
-        guard let drawable = layer.nextDrawable() else {
+        let drawable = layer.nextDrawable()
+        if drawable == nil {
             if Self.frameTrace {
                 let elapsed =
                     (ProcessInfo.processInfo.systemUptime - drawableStart) * 1_000
@@ -1334,7 +1368,6 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
                     format: "[nsw] nextDrawable nil after %.2f ms\n", elapsed)
                 FileHandle.standardError.write(Data(message.utf8))
             }
-            return .retryAfterDisplay
         }
         if Self.frameTrace {
             let elapsed =
@@ -1352,40 +1385,39 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
             latch(work)
             return .handled
         }
+        // Ordinary scenes keep the drawable retry path. Only an explicit
+        // capture may compose this protected scene into a temporary target.
+        guard drawable != nil || !captureRequests.isEmpty else {
+            lock.unlock()
+            return .retryAfterDisplay
+        }
+        var superseded: Work?
         if let newer = pending {
             // Resize needs a drawable from the new pool; the existing retry
             // path transfers damage and latch obligations to the newer work.
-            guard newer.drawableSize == work.drawableSize else {
+            guard drawable == nil || newer.drawableSize == work.drawableSize else {
                 lock.unlock()
                 return .retryAfterDisplay
             }
             pending = nil
-            let previous = work
-            work = newer.superseding(previous)
-            lock.unlock()
-            finish(previous, success: false)
-        } else {
-            lock.unlock()
+            superseded = work
+            work = newer.superseding(work)
         }
+        let captures = captureRequests
+        captureRequests.removeAll(keepingCapacity: true)
+        lock.unlock()
+        if let superseded { finish(superseded, success: false) }
         let selected = work
         let scene = selected.scene
-        if let presented = work.presented {
+        let offscreen = drawable == nil
+        if let drawable, let presented = work.presented {
             drawable.addPresentedHandler { drawable in
                 let displayed = drawable.presentedTime > 0
                 MainRunLoop.perform { presented(displayed) }
             }
         }
-		let captures = takeCaptureRequests()
-		let plan = drawableAges.plan(
-			drawableID: drawable.texture.gpuResourceID._impl,
-			scene: scene, drawableWidth: drawable.texture.width,
-			drawableHeight: drawable.texture.height)
         do {
-            try renderer.encode(
-                scene: scene, layers: work.layers,
-				damage: plan.damage, redrawAll: plan.redrawAll,
-				drawable: drawable, capture: !captures.isEmpty
-            ) { command, captured in
+            let completion: @Sendable (MTLCommandBuffer, RenderedFrameCapture?) -> Void = { command, captured in
                 if command.status != .completed, let error = command.error {
                     FileHandle.standardError.write(
                         Data("[nsw] Metal scene failed: \(error)\n".utf8))
@@ -1399,10 +1431,35 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
                     } ?? .failure(ComputerUseWindowError.captureFailed)
                     self.completeCaptures(captures, result: result)
                 }
+                if offscreen, let presented = selected.presented {
+                    // Offscreen composition is a successful pixel read, not a
+                    // display presentation. Preserve remote discard credits.
+                    MainRunLoop.perform { presented(false) }
+                }
                 self.finish(selected, success: command.status == .completed)
+                if offscreen, command.status == .completed {
+                    MainRunLoop.perform {
+                        guard self.isCurrent(selected) else { return }
+                        self.offscreenCaptureCompleted?()
+                    }
+                }
             }
-			drawableAges.commit(plan)
-            // A drawable has accepted this scene in FIFO order. Queue its
+            if let drawable {
+                let plan = drawableAges.plan(
+                    drawableID: drawable.texture.gpuResourceID._impl,
+                    scene: scene, drawableWidth: drawable.texture.width,
+                    drawableHeight: drawable.texture.height)
+                try renderer.encode(scene: scene, layers: work.layers,
+                    damage: plan.damage, redrawAll: plan.redrawAll,
+                    drawable: drawable, capture: !captures.isEmpty, completion: completion)
+                drawableAges.commit(plan)
+            } else {
+                try renderer.encodeCapture(scene: scene, layers: work.layers, completion: completion)
+                // This scene's damage never reached the screen drawable pool.
+                // On visibility restoration, redraw its current state in full.
+                drawableAges.invalidate()
+            }
+            // The command has accepted this scene in FIFO order. Queue its
             // Wayland callback for the next display-link tick. Source-buffer
             // release remains tied to Metal completion above.
             latch(work)
@@ -1421,14 +1478,6 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return work.epoch == epoch
-    }
-
-    private func takeCaptureRequests() -> [CaptureRequest] {
-        lock.lock()
-        defer { lock.unlock() }
-        let requests = captureRequests
-        captureRequests.removeAll(keepingCapacity: true)
-        return requests
     }
 
     private func completeCaptures(
