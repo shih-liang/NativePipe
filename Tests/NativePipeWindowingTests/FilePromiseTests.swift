@@ -5,6 +5,25 @@ import XCTest
 
 @MainActor
 final class FilePromiseTests: XCTestCase {
+    func testProviderOwnsWriterAfterSourceDisappearsWithoutRetainCycle() throws {
+        _ = NSApplication.shared
+        var access: PromiseFileAccess? = PromiseFileAccess()
+        weak var weakAccess = access
+        var promise: LinuxFilePromise? = LinuxFilePromise(remote: URL(fileURLWithPath: "/guest/folder", isDirectory: true), access: access!)
+        weak var weakPromise = promise
+        var provider: NSFilePromiseProvider? = promise!.provider
+        XCTAssertEqual(provider?.fileType, "public.folder")
+        XCTAssertTrue(provider === promise!.provider)
+        access = nil
+        promise = nil
+        XCTAssertNotNil(weakAccess)
+        XCTAssertNotNil(weakPromise)
+        XCTAssertEqual(provider?.delegate?.filePromiseProvider(provider!, fileNameForType: "public.folder"), "folder")
+        provider = nil
+        XCTAssertNil(weakPromise)
+        XCTAssertNil(weakAccess)
+    }
+
     func testIncomingPromisesRegisterBeforeWaitingAndShareOneDestination() async throws {
         let first = TestPromiseReceiver("first.txt"), second = TestPromiseReceiver("second.txt")
         XCTAssertTrue(first.fileNames.isEmpty)

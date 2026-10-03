@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160" role="img" aria-labelledby="title desc">
+<title id="title">NativePipe repository logo</title>
+<desc id="desc">Illustrative preview using fictional sample data. This is a functional illustration, not a captured application screenshot.</desc>
+<defs><linearGradient id="bg" x2="1" y2="1"><stop stop-color="#EFF7F3"/><stop offset="1" stop-color="#F4ECF0"/></linearGradient><linearGradient id="glass" x2="0" y2="1"><stop stop-color="#FFF"/><stop offset="1" stop-color="#F5F8F7"/></linearGradient></defs>
+<style>text{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;font-variant-ligatures:none} .mono{font-family:Menlo,Consolas,monospace}</style>
+<rect x="0" y="0" width="160" height="160" rx="24" fill="url(#bg)"/>
+<rect x="8" y="8" width="144" height="144" rx="30" fill="white" stroke="#D8E3DF"/>
+<rect x="31" y="34" width="71" height="58" rx="11" fill="#E1F1E9" stroke="#187A70"/>
+<path d="M31 49 L102 49" stroke="#187A70" stroke-width="2" fill="none"/>
+<rect x="59" y="69" width="71" height="58" rx="11" fill="#F5E7EE" stroke="#773D56"/>
+<path d="M59 84 L130 84" stroke="#773D56" stroke-width="2" fill="none"/>
+<path d="M58 105 L37 105 L37 91 M102 57 L123 57 L123 70" fill="none" stroke="#187A70" stroke-width="5" stroke-linejoin="round" stroke-linecap="round"/>
+</svg>

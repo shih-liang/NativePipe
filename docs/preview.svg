@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="720" viewBox="0 0 1160 720" role="img" aria-labelledby="title desc">
+<title id="title">NativePipe command and Linux application windows</title>
+<desc id="desc">Illustrative preview using fictional sample data. This is a functional illustration, not a captured application screenshot.</desc>
+<defs><linearGradient id="bg" x2="1" y2="1"><stop stop-color="#EFF7F3"/><stop offset="1" stop-color="#F4ECF0"/></linearGradient><linearGradient id="glass" x2="0" y2="1"><stop stop-color="#FFF"/><stop offset="1" stop-color="#F5F8F7"/></linearGradient></defs>
+<style>text{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;font-variant-ligatures:none} .mono{font-family:Menlo,Consolas,monospace}</style>
+<rect x="0" y="0" width="1160" height="720" rx="24" fill="url(#bg)"/>
+<text xml:space="preserve" x="50" y="48" font-size="27" fill="#23302F" font-weight="600">Waypipe for macOS</text>
+<rect x="50" y="109" width="614" height="485" rx="16" fill="#D9E3DF"/>
+<rect x="50" y="104" width="614" height="485" rx="16" fill="#191F22" stroke="#C9D6D1"/>
+<rect x="51" y="105" width="612" height="47" rx="15" fill="#252C30"/>
+<rect x="51" y="128" width="612" height="24" rx="0" fill="#252C30"/>
+<path d="M50 152 L664 152" stroke="#3A4246" stroke-width="1" fill="none"/>
+<circle cx="73" cy="128" r="6" fill="#F26865"/>
+<circle cx="95" cy="128" r="6" fill="#EEBA4B"/>
+<circle cx="117" cy="128" r="6" fill="#5CBB7A"/>
+<text xml:space="preserve" x="357.0" y="134" font-size="17" fill="#D8E5E0" font-weight="600" text-anchor="middle">Terminal — nativepipe</text>
+<text xml:space="preserve" x="78" y="186" font-size="18" fill="#D9EEE3" font-weight="400" class="mono">$ nativepipe --install-compositor \</text>
+<text xml:space="preserve" x="98" y="223" font-size="18" fill="#D9EEE3" font-weight="400" class="mono">demo@linux.example.invalid gtk4-demo</text>
+<text xml:space="preserve" x="78" y="290" font-size="19" fill="#94B2A4" font-weight="400">The command keeps running</text>
+<text xml:space="preserve" x="78" y="322" font-size="19" fill="#94B2A4" font-weight="400">while the Linux app is open.</text>
+<text xml:space="preserve" x="78" y="526" font-size="18" fill="#94B2A4" font-weight="400">Linux execution · SSH transport</text>
+<path d="M678 339 L735 339" stroke="#187A70" stroke-width="3" fill="none"/>
+<path d="M726 333 L735 339 L726 345" fill="none" stroke="#187A70" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<rect x="749" y="169" width="361" height="365" rx="16" fill="#D9E3DF"/>
+<rect x="749" y="164" width="361" height="365" rx="16" fill="#FFF" stroke="#C9D6D1"/>
+<rect x="750" y="165" width="359" height="47" rx="15" fill="url(#glass)"/>
+<rect x="750" y="188" width="359" height="24" rx="0" fill="#F6F9F7"/>
+<path d="M749 212 L1110 212" stroke="#D8E3DF" stroke-width="1" fill="none"/>
+<circle cx="772" cy="188" r="6" fill="#F26865"/>
+<circle cx="794" cy="188" r="6" fill="#EEBA4B"/>
+<circle cx="816" cy="188" r="6" fill="#5CBB7A"/>
+<text xml:space="preserve" x="929.5" y="194" font-size="17" fill="#23302F" font-weight="600" text-anchor="middle">GTK Demo</text>
+<text xml:space="preserve" x="777" y="240" font-size="25" fill="#23302F" font-weight="600">Linux application</text>
+<text xml:space="preserve" x="777" y="278" font-size="16" fill="#60716E" font-weight="400">Displayed as a Mac window</text>
+<rect x="777" y="310" width="304" height="41" rx="8" fill="#F2F6F3" stroke="#D8E3DF"/>
+<text xml:space="preserve" x="793" y="337" font-size="17" fill="#60716E" font-weight="400">Type here…</text>
+<rect x="777" y="377" width="132" height="34" rx="8" fill="#E6F2ED"/>
+<text xml:space="preserve" x="843.0" y="400" font-size="16" fill="#187A70" font-weight="600" text-anchor="middle">Button</text>
+<rect x="931" y="377" width="150" height="34" rx="8" fill="#F7F4F6" stroke="#D8E3DF"/>
+<text xml:space="preserve" x="950" y="400" font-size="16" fill="#773D56" font-weight="400">Another button</text>
+<text xml:space="preserve" x="778" y="486" font-size="15" fill="#60716E" font-weight="400">Keyboard · Mouse · Clipboard</text>
+<text xml:space="preserve" x="50" y="644" font-size="21" fill="#23302F" font-weight="400">The program runs on Linux. macOS owns the displayed window and input.</text>
+<text xml:space="preserve" x="580.0" y="696" font-size="15" fill="#60716E" font-weight="400" text-anchor="middle">Illustrative preview · Fictional sample data</text>
+</svg>

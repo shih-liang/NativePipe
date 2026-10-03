@@ -1,5 +1,7 @@
 # NativePipe
 
+<img src="docs/logo.svg" width="160" alt="NativePipe: two connected application windows">
+
 **Waypipe for macOS.** Run Linux graphical applications over SSH and use their
 windows alongside your Mac apps.
 
@@ -10,6 +12,10 @@ Mac, and your keyboard and mouse control it remotely.
 ```sh
 nativepipe --install-compositor user@linux-host gtk4-demo
 ```
+
+<img src="docs/preview.png" width="1000" alt="NativePipe command in a Mac terminal displaying a Linux graphical application beside it">
+
+*Illustrative preview, sample data. A Linux application launched from the macOS command line.*
 
 ## Features
 

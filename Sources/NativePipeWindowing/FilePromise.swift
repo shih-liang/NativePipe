@@ -79,14 +79,21 @@ final class IncomingFilePromises {
 /// Drag source adapter. Finder chooses the destination; no
 /// guest path is ever published as a supposedly local file URL.
 @MainActor
-final class LinuxFilePromise: NSObject, NSFilePromiseProviderDelegate {
+public final class LinuxFilePromise: NSObject, NSFilePromiseProviderDelegate {
     let remote: URL
     let access: any UserFileAccess
-    var completed: ((Error?) -> Void)?
-    lazy var provider: NSFilePromiseProvider = {
+    public var completed: ((Error?) -> Void)?
+    private weak var cachedProvider: NSFilePromiseProvider?
+    public var provider: NSFilePromiseProvider {
+        if let cachedProvider { return cachedProvider }
         let type = remote.hasDirectoryPath ? UTType.folder : (UTType(filenameExtension: remote.pathExtension) ?? .data)
-        return NSFilePromiseProvider(fileType: type.identifier, delegate: self)
-    }()
+        let provider = NSFilePromiseProvider(fileType: type.identifier, delegate: self)
+        // AppKit keeps the provider after the source view disappears. Its
+        // delegate is weak; userInfo owns the writer until the promise ends.
+        provider.userInfo = self
+        cachedProvider = provider
+        return provider
+    }
     nonisolated private static let queue: OperationQueue = {
         let queue = OperationQueue()
         queue.name = "com.nativepipe.file-promises"
@@ -94,14 +101,14 @@ final class LinuxFilePromise: NSObject, NSFilePromiseProviderDelegate {
         return queue
     }()
 
-    init(remote: URL, access: any UserFileAccess) { self.remote = remote; self.access = access }
+    public init(remote: URL, access: any UserFileAccess) { self.remote = remote; self.access = access }
 
-    func filePromiseProvider(_ filePromiseProvider: NSFilePromiseProvider, fileNameForType fileType: String) -> String {
+    public func filePromiseProvider(_ filePromiseProvider: NSFilePromiseProvider, fileNameForType fileType: String) -> String {
         remote.lastPathComponent
     }
-    nonisolated func operationQueue(for filePromiseProvider: NSFilePromiseProvider) -> OperationQueue { Self.queue }
+    nonisolated public func operationQueue(for filePromiseProvider: NSFilePromiseProvider) -> OperationQueue { Self.queue }
 
-    nonisolated func filePromiseProvider(_ filePromiseProvider: NSFilePromiseProvider,
+    nonisolated public func filePromiseProvider(_ filePromiseProvider: NSFilePromiseProvider,
         writePromiseTo url: URL, completionHandler: @escaping @Sendable (Error?) -> Void) {
         let result = PromiseResult()
         let done = DispatchSemaphore(value: 0)
