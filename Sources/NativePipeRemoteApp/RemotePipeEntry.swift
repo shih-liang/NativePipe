@@ -1,16 +1,21 @@
 import AppKit
 import NativePipeRemote
+import NativePipeStrings
 
 @main
 struct RemotePipeMain {
     @MainActor static func main() {
         let arguments = Array(CommandLine.arguments.dropFirst())
         // Even an inherited askpass environment must not make local help open UI.
-        if (try? RemotePipeCLI.parse(arguments).wantHelp) == true { print(RemotePipeCLI.usage); return }
+        if let options = try? RemotePipeCLI.parse(arguments) {
+            if options.wantHelp { print(RemotePipeCLI.usage); return }
+            if options.wantVersion { print("nativepipe \(NativePipeVersion.current)"); return }
+        }
         if SSHAuthentication.answerPromptIfRequested() { return }
         do {
             let options = try RemotePipeCLI.parse(arguments)
             if options.wantHelp { print(RemotePipeCLI.usage); return }
+            if options.wantVersion { print("nativepipe \(NativePipeVersion.current)"); return }
             guard let command = options.command else { return }
             let app = NSApplication.shared
             app.setActivationPolicy(.regular)

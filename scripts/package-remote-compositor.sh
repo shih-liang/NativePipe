@@ -114,6 +114,7 @@ for loader in "$loaders/libpixbufloader-png.so" "$loaders/libpixbufloader-xpm.so
 done
 install -m0755 guest/compositor/remote-launcher.sh "$out/nativepipe-wayland"
 cp LICENSE "$out/LICENSE"
+cp Sources/NativePipeStrings/Resources/VERSION "$out/VERSION"
 cp LICENSES/* "$out/LICENSES/"
 
 # AV1 encoder and pixel conversion are statically linked from pinned sources.

@@ -1,4 +1,5 @@
 import XCTest
+import NativePipeStrings
 @testable import NativePipeRemoteApp
 
 final class NativePipeRemoteAppTests: XCTestCase {
@@ -19,6 +20,15 @@ final class NativePipeRemoteAppTests: XCTestCase {
         let command = try RemotePipeCLI.parse(["me@host", "firefox", "--help"])
         XCTAssertFalse(command.wantHelp)
         XCTAssertEqual(command.command?.application, ["firefox", "--help"])
+    }
+    func testVersionIsLocalBeforeDestinationAndPassedThroughAfterDestination() throws {
+        let local = try RemotePipeCLI.parse(["--version"])
+        XCTAssertTrue(local.wantVersion)
+        XCTAssertNil(local.command)
+        XCTAssertEqual(NativePipeVersion.current, "0.2.0")
+        let remote = try RemotePipeCLI.parse(["me@host", "firefox", "--version"])
+        XCTAssertFalse(remote.wantVersion)
+        XCTAssertEqual(remote.command?.application, ["firefox", "--version"])
     }
 }
 

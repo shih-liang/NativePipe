@@ -34,6 +34,9 @@ for name in sorted(payloads):
         continue
     with tarfile.open(root / name) as archive:
         members = {m.name.removeprefix("./"): m for m in archive.getmembers()}
+        assert "VERSION" in members and members["VERSION"].isfile(), f"Missing release version in {name}"
+        with archive.extractfile(members["VERSION"]) as handle:
+            assert handle.read() == (source / "Sources/NativePipeStrings/Resources/VERSION").read_bytes(), f"Release version differs from source in {name}"
         if name.startswith("nativepipe-vm-"):
             arch = name.removeprefix("nativepipe-vm-compositor-").removesuffix(".tar.gz")
             required = [f"guest/compositor/dist/vmpipe-wayland-{arch}-{libc}" for libc in ("gnu", "musl")]

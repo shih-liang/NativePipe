@@ -5,6 +5,7 @@ import NativePipeRemote
 struct RemotePipeCLI {
     var command: SSHCommand?
     var wantHelp = false
+    var wantVersion = false
     var progress = true
     static let usage = NPText("cli.help.nativepiperemoteapp.cli")
 
@@ -14,6 +15,7 @@ struct RemotePipeCLI {
         while index < arguments.count {
             let value = arguments[index]
             if value == "-h" || value == "--help" { result.wantHelp = true; return result }
+            if value == "--version" { result.wantVersion = true; return result }
             if value == "--no-progress" { result.progress = false; index += 1; continue }
             if value == "--install-compositor" { install = true; index += 1; continue }
             if value == "--compositor" || ["-i", "-F", "-J", "-p", "-o"].contains(value) {

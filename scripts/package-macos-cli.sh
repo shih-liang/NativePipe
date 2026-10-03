@@ -26,6 +26,11 @@ for directory in Sources/NativePipeStrings/Resources/*.lproj; do
 done
 codesign --force --sign - "$stage/bin/nativepipe"
 codesign --verify --strict "$stage/bin/nativepipe"
+version=$(cat Sources/NativePipeStrings/Resources/VERSION)
+[ "$("$stage/bin/nativepipe" --version)" = "nativepipe $version" ] || {
+    echo "Command version differs from release source" >&2; exit 1
+}
+cp Sources/NativePipeStrings/Resources/VERSION "$stage/VERSION"
 # Execute the independently staged command in each supported language. This
 # also checks resource discovery outside the build tree, including SwiftPM's
 # lowercase language directory names.

@@ -23,6 +23,7 @@ for arch in aarch64 x86_64; do
     done
     cp -R guest/session/implicit_layer guest/session/openrc guest/session/profile.d guest/session/systemd "$root/guest/session/"
     cp LICENSE "$root/LICENSE"
+    cp Sources/NativePipeStrings/Resources/VERSION "$root/VERSION"
     cp -R LICENSES "$root/LICENSES"
     COPYFILE_DISABLE=1 tar -C "$root" -czf "$out/nativepipe-vm-compositor-$arch.tar.gz" .
 done

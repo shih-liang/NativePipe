@@ -81,6 +81,7 @@ tar -xzf nativepipe-macos-universal.tar.gz -C "$HOME/.local/share/nativepipe"
 ln -sf "$HOME/.local/share/nativepipe/bin/nativepipe" "$HOME/.local/bin/nativepipe"
 export PATH="$HOME/.local/bin:$PATH"
 nativepipe --help
+nativepipe --version
 ```
 
 Add the `export PATH` line to your shell's startup file to make the command

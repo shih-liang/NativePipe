@@ -18,8 +18,11 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-release-check-") as folder:
 
     def archive(path, executables):
         with tarfile.open(path, "w:gz") as output:
-            for name in executables + license_files:
-                data = (source / name).read_bytes() if name in license_files else b"build fixture\n"
+            for name in executables + license_files + ["VERSION"]:
+                if name == "VERSION":
+                    data = (source / "Sources/NativePipeStrings/Resources/VERSION").read_bytes()
+                else:
+                    data = (source / name).read_bytes() if name in license_files else b"build fixture\n"
                 item = tarfile.TarInfo(name)
                 item.mode, item.size = (0o755 if name in executables else 0o644), len(data)
                 output.addfile(item, io.BytesIO(data))
@@ -51,7 +54,7 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-release-check-") as folder:
         with tarfile.open(bundle) as content:
             entries = [(member, content.extractfile(member).read() if member.isfile() else b"")
                        for member in content.getmembers()]
-        for missing in license_files:
+        for missing in license_files + ["VERSION"]:
             with tarfile.open(bundle, "w:gz") as output:
                 for member, data in entries:
                     if member.name.removeprefix("./") != missing:
@@ -61,7 +64,8 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-release-check-") as folder:
                 f"{digest}  {name}\n" if line.split("  ", 1)[1] == name else line + "\n"
                 for line in original_sums.decode().splitlines()))
             rejected = subprocess.run(["python3", "scripts/verify-release.py", str(root / "release")], capture_output=True)
-            assert rejected.returncode != 0 and f"Missing project license file {missing}".encode() in rejected.stderr, (name, missing, rejected.stderr)
+            expected = "Missing release version" if missing == "VERSION" else f"Missing project license file {missing}"
+            assert rejected.returncode != 0 and expected.encode() in rejected.stderr, (name, missing, rejected.stderr)
 
         with tarfile.open(bundle, "w:gz") as output:
             for member, data in entries:
@@ -93,4 +97,4 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-release-check-") as folder:
     (macos / "nativepipe-macos-universal.tar.gz").unlink()
     rejected = subprocess.run(["sh", "scripts/package-release.sh", str(linux), str(macos), str(root / "incomplete")], capture_output=True)
     assert rejected.returncode != 0, "A missing CLI must prevent the release"
-    print("PASS complete product set, restored executable modes, complete licenses for all products, missing/changed license rejection, installer integrity, missing product rejection, unwanted file rejection")
+    print("PASS complete product set, release versions, restored executable modes, complete licenses for all products, missing/changed license rejection, installer integrity, missing product rejection, unwanted file rejection")
