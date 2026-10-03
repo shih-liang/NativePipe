@@ -9,7 +9,7 @@ public func NPText(_ key: String, _ arguments: String...) -> String {
 public enum NPStrings {
     // Native resource directories are the language inventory; SwiftPM may
     // lowercase them, so normalize the public identifiers for both builders.
-    public static let supportedLanguages = Bundle.module.localizations
+    public static let supportedLanguages = NativePipeResources.bundle.localizations
         .filter { $0 != "Base" }
         .map { Locale.canonicalLanguageIdentifier(from: $0) }
         .sorted()
@@ -41,11 +41,11 @@ public enum NPStrings {
         // SwiftPM's native builder lowercases language directory names;
         // Xcode preserves their canonical spelling. Use the bundle's actual
         // localization name because resource lookup is case-sensitive.
-        let resourceName = Bundle.module.localizations.first {
+        let resourceName = NativePipeResources.bundle.localizations.first {
             $0.caseInsensitiveCompare(selected) == .orderedSame
         } ?? "en"
-        guard let url = Bundle.module.url(forResource: resourceName, withExtension: "lproj"),
-              let bundle = Bundle(url: url) else { return Bundle.module }
+        guard let url = NativePipeResources.bundle.url(forResource: resourceName, withExtension: "lproj"),
+              let bundle = Bundle(url: url) else { return NativePipeResources.bundle }
         return bundle
     }
 

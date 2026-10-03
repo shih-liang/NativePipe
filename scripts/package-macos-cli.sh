@@ -38,6 +38,30 @@ for directory in Sources/NativePipeStrings/Resources/*.lproj; do
     language=$(basename "$directory" .lproj)
     "$stage/bin/nativepipe" --help -AppleLanguages "($language)" >/dev/null
 done
+# The same module is linked into native application helpers. Exercise their
+# Contents/Resources layout with a distinct resource value, so the original
+# CI build directory cannot silently satisfy a broken bundle lookup.
+app="$stage/NativePipeResourceProbe.app"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+cp "$stage/bin/nativepipe" "$app/Contents/MacOS/"
+cp -R "$stage/bin/NativePipe_NativePipeStrings.bundle" "$app/Contents/Resources/"
+cat > "$app/Contents/Info.plist" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>nativepipe</string>
+<key>CFBundleIdentifier</key><string>dev.nativepipe.resource-probe</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+</dict></plist>
+EOF
+app_version=$(find "$app/Contents/Resources/NativePipe_NativePipeStrings.bundle" -type f -name VERSION)
+[ -f "$app_version" ]
+printf '%s.resource-probe\n' "$version" > "$app_version"
+[ "$("$app/Contents/MacOS/nativepipe" --version)" = "nativepipe $version.resource-probe" ] || {
+    echo "Application resources are not resolved from Contents/Resources" >&2; exit 1
+}
+"$app/Contents/MacOS/nativepipe" --help -AppleLanguages '(zh-Hans)' >/dev/null
+rm -rf "$app"
 cp LICENSE "$stage/LICENSE"
 cp -R LICENSES "$stage/LICENSES"
 cp -R .build/codecs/macos/LICENSES/. "$stage/LICENSES/"
