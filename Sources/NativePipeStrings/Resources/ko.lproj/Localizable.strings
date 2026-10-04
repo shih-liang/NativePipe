@@ -205,3 +205,8 @@
 "Replacement stopped. Check %@ and %@ to recover the original." = "교체가 중단되었습니다. 원본을 복구하려면 %@ 및 %@ 경로를 확인하세요.";
 "The remote folder contains names that collide on the local filesystem: %@." = "원격 폴더에 로컬 파일 시스템에서 충돌하는 이름이 있습니다: %@.";
 "The transfer stopped. Its temporary data could not be removed from %@: %@" = "전송이 중지되었습니다. %@에서 임시 데이터를 제거할 수 없습니다: %@";
+"%@, %@, %@" = "%@, %@, %@";
+"Hardware H.264 decoding isn’t available on this Mac." = "이 Mac에서는 H.264 하드웨어 디코딩을 사용할 수 없습니다.";
+"Couldn’t match the Linux applications to the macOS appearance: %@" = "Linux 앱의 모양을 macOS에 맞출 수 없습니다: %@";
+"NativePipe couldn’t accept local connections: %@" = "NativePipe가 로컬 연결을 수락할 수 없습니다: %@";
+"A local NativePipe connection failed: %@" = "로컬 NativePipe 연결에 실패했습니다: %@";

@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+import NativePipeStrings
 import Darwin
 @testable import NativePipeRemote
 
@@ -26,15 +27,125 @@ final class SFTPFileSystemTests: XCTestCase {
         }
         return result
     }
-    @MainActor private func realServer(_ root: URL, transportObserver: (@Sendable (SFTPTransport) -> Void)? = nil) throws -> SFTPFileSystem {
+    @MainActor private func realServer(_ root: URL, reuseConnection: Bool = false,
+                                       transportObserver: (@Sendable (SFTPTransport) -> Void)? = nil) throws -> SFTPFileSystem {
         let executable = URL(fileURLWithPath: "/usr/libexec/sftp-server")
         guard FileManager.default.isExecutableFile(atPath: executable.path) else { throw XCTSkip("The system SFTP server is unavailable.") }
-        return SFTPFileSystem(transportFactory: {
+        return SFTPFileSystem(reuseConnection: reuseConnection, transportFactory: {
             let authentication = try self.temporaryDirectory()
             let transport = SFTPSSHTransport(executable: executable, arguments: ["-d", root.path],
                 environment: ProcessInfo.processInfo.environment, authenticationDirectory: authentication)
             transportObserver?(transport); return transport
         })
+    }
+    /// OpenSSH's server answers OPENDIR on a regular file with "No such file" --
+    /// it maps ENOTDIR that way -- so a browser would claim an existing file is
+    /// missing. Listing skips a separate LSTAT on
+    /// purpose, so the explanation has to come from classifying the refusal.
+    @MainActor func testBrowsingAFileExplainsThatADirectoryIsNeeded() async throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        try Data("contents".utf8).write(to: root.appendingPathComponent("file"))
+        let system = try realServer(root)
+        let home = try await system.list()
+        do {
+            _ = try await system.list(path: home.path + "/file")
+            XCTFail("A regular file cannot be listed")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, NPText("Choose a remote directory to browse."))
+        }
+        // The directory itself still lists normally.
+        let listing = try await system.list(path: home.path)
+        XCTAssertEqual(listing.entries.map(\.name), ["file"])
+    }
+
+    @MainActor func testBrowserReusesOneRealConnectionAndExplicitCloseReleasesIt() async throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("child"), withIntermediateDirectories: false)
+        try Data("contents".utf8).write(to: root.appendingPathComponent("child/file"))
+        let transports = SFTPTransportRecorder()
+        let system = try realServer(root, reuseConnection: true, transportObserver: { transports.append($0) })
+        let home = try await system.list()
+        let child = try await system.list(path: home.path + "/child")
+        XCTAssertEqual(child.home, home.home)
+        XCTAssertEqual(child.entries.first?.size, 8)
+        _ = try await system.list(path: home.path)
+        XCTAssertEqual(transports.count, 1, "Navigation must not launch SSH and authenticate again")
+        system.close()
+        _ = try await system.list()
+        XCTAssertEqual(transports.count, 2)
+        system.close()
+    }
+    @MainActor func testIsolatedOperationsStillUseSeparateRealConnections() async throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        let transports = SFTPTransportRecorder()
+        let system = try realServer(root, transportObserver: { transports.append($0) })
+        _ = try await system.list(); _ = try await system.list()
+        XCTAssertEqual(transports.count, 2)
+    }
+    @MainActor func testReusableSessionCachesHomeAndDiscardsFailedProtocolStream() async throws {
+        let counter = SFTPListingSessionRecorder()
+        let system = SFTPFileSystem(reuseConnection: true, transportFactory: { counter.makeTransport() })
+        _ = try await system.list()
+        _ = try await system.list(path: "/fixture/child")
+        XCTAssertEqual(counter.count, 1)
+        XCTAssertEqual(counter.first.realpathCount, 2, "Home is queried once; navigation only canonicalizes its target")
+        XCTAssertEqual(counter.first.lstatCount, 0, "OPENDIR itself validates the directory")
+        counter.first.failNextRequest()
+        do { _ = try await system.list(path: "/fixture/broken"); XCTFail("A failed response must not be reused") }
+        catch SFTPFailure.protocolError { }
+        XCTAssertTrue(counter.first.closed)
+        _ = try await system.list()
+        XCTAssertEqual(counter.count, 2)
+        system.close()
+        XCTAssertTrue(counter.last.closed)
+    }
+    @MainActor func testDirectoryCloseRefusalOrTimeoutDiscardsReusableStream() async throws {
+        for mode in [SFTPListingFixture.CloseFailure.refused, .timeout] {
+            let counter = SFTPListingSessionRecorder(firstCloseFailure: mode)
+            let system = SFTPFileSystem(reuseConnection: true, transportFactory: { counter.makeTransport() })
+            do {
+                _ = try await system.list()
+                XCTFail("A directory must not succeed when its remote handle did not close.")
+            } catch {
+                switch mode {
+                case .refused:
+                    guard let failure = error as? SFTPFailure, case .status(3, _) = failure else {
+                        return XCTFail("Lost CLOSE refusal: \(error)")
+                    }
+                case .timeout:
+                    XCTAssertEqual(error.localizedDescription, "Injected CLOSE timeout.")
+                }
+            }
+            XCTAssertTrue(counter.first.closed, "Unacknowledged CLOSE must release the failed stream.")
+            XCTAssertEqual(counter.first.closeRequests, 1, "A failed CLOSE must not be retried by cleanup.")
+            let recovered = try await system.list()
+            XCTAssertEqual(recovered.entries.map(\.name), ["entry"])
+            XCTAssertEqual(counter.count, 2, "The next directory request must start a new protocol session.")
+            system.close()
+            XCTAssertTrue(counter.last.closed)
+        }
+    }
+    @MainActor func testDirectoryReadErrorSurvivesBestEffortCloseFailure() async throws {
+        for mode in [SFTPListingFixture.CloseFailure.refused, .timeout] {
+            let transport = SFTPListingFixture(names: ["../escape"], closeFailure: mode)
+            let system = SFTPFileSystem(reuseConnection: true, transportFactory: { transport })
+            do { _ = try await system.list(); XCTFail("The invalid directory reply must fail.") }
+            catch SFTPFailure.protocolError { }
+            XCTAssertEqual(transport.closeRequests, 1)
+            XCTAssertTrue(transport.closed, "Failed listing cleanup must release the retained stream.")
+        }
+    }
+    @MainActor func testFailedDirectoryClassificationPreservesOriginalStatus() async throws {
+        let transport = SFTPListingFixture(names: ["entry"], closeFailure: .refused, failStat: true)
+        let system = SFTPFileSystem(reuseConnection: true, transportFactory: { transport })
+        do { _ = try await system.list(); XCTFail("The failed directory operation must remain a failure.") }
+        catch {
+            guard let failure = error as? SFTPFailure, case .status(3, _) = failure else {
+                return XCTFail("The failed classification replaced the original status: \(error)")
+            }
+        }
+        XCTAssertEqual(transport.lstatCount, 1)
+        XCTAssertTrue(transport.closed)
     }
     @MainActor func testRealServerCanonicalHomeLiteralNamesAndSymlinkMetadata() async throws {
         let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
@@ -302,7 +413,7 @@ final class SFTPFileSystemTests: XCTestCase {
             let directory = try await system.list()
             XCTAssertEqual(directory.entries.first?.kind, .file)
             XCTAssertEqual(directory.entries.first?.size, 5)
-            XCTAssertEqual(transport.lstatCount, missingType ? 2 : 1)
+            XCTAssertEqual(transport.lstatCount, missingType ? 1 : 0)
             XCTAssertTrue(transport.closed)
         }
     }
@@ -311,6 +422,28 @@ final class SFTPFileSystemTests: XCTestCase {
             let transport = SFTPListingFixture(names: names)
             let system = SFTPFileSystem(transportFactory: { transport })
             do { _ = try await system.list(); XCTFail("Unsafe directory entries must fail") }
+            catch SFTPFailure.protocolError { }
+            XCTAssertTrue(transport.closed)
+        }
+    }
+    @MainActor func testDirectoryPipelineDrainsReorderedEOFAndNamesBeforeReuse() async throws {
+        let transport = SFTPListingFixture(names: [], pages: [nil, ["first"], ["second"]], reverseResponses: true)
+        let system = SFTPFileSystem(reuseConnection: true, transportFactory: { transport })
+        let first = try await system.list()
+        XCTAssertEqual(first.entries.map(\.name), ["first", "second"])
+        XCTAssertEqual(transport.maximumPendingDirectoryReads, 8)
+        XCTAssertEqual(transport.pendingReplies, 0, "EOF must not strand names or status replies on a reused stream")
+        let second = try await system.list()
+        XCTAssertEqual(second.entries.map(\.name), ["first", "second"])
+        XCTAssertEqual(transport.pendingReplies, 0)
+        system.close()
+    }
+    @MainActor func testDirectoryPipelineValidatesNamesAlreadySentWhenEOFIsObserved() async throws {
+        let cases: [[[String]?]] = [[nil, ["../escape"]], [nil, ["same"], ["same"]]]
+        for pages in cases {
+            let transport = SFTPListingFixture(names: [], pages: pages)
+            let system = SFTPFileSystem(reuseConnection: true, transportFactory: { transport })
+            do { _ = try await system.list(); XCTFail("Pending replies after EOF must still be validated") }
             catch SFTPFailure.protocolError { }
             XCTAssertTrue(transport.closed)
         }
@@ -583,21 +716,41 @@ private final class SFTPFailedWriteFixture: SFTPTransport, @unchecked Sendable {
 }
 
 private final class SFTPListingFixture: SFTPTransport, @unchecked Sendable {
+    enum CloseFailure { case refused, timeout }
     let names: [String]
     let missingType: Bool
     let directoryPath: String
     let emptyFiles: Bool
     private var response = Data()
+    private var responses: [Data] = []
     private var sentEntries = false
+    private let pages: [[String]?]?
+    private let reverseResponses: Bool
+    private var page = 0
+    private var pendingDirectoryReads = Set<UInt32>()
+    private(set) var maximumPendingDirectoryReads = 0
     private(set) var lstatCount = 0
+    private(set) var realpathCount = 0
     private(set) var closed = false
-    init(names: [String], missingType: Bool = false, directoryPath: String = "/fixture", emptyFiles: Bool = false) {
+    private var failNext = false
+    private let closeFailure: CloseFailure?
+    private let failStat: Bool
+    private var failedCloseID: UInt32?
+    private(set) var closeRequests = 0
+    var pendingReplies: Int { responses.count }
+    init(names: [String], missingType: Bool = false, directoryPath: String = "/fixture", emptyFiles: Bool = false,
+         pages: [[String]?]? = nil, reverseResponses: Bool = false, closeFailure: CloseFailure? = nil,
+         failStat: Bool = false) {
         self.names = names; self.missingType = missingType; self.directoryPath = directoryPath; self.emptyFiles = emptyFiles
+        self.pages = pages; self.reverseResponses = reverseResponses
+        self.closeFailure = closeFailure
+        self.failStat = failStat
     }
     func start() throws { }
     func checkCancellation() throws { }
     func cancel() { }
     func close() { closed = true }
+    func failNextRequest() { failNext = true }
     private func attributes(directory: Bool, missingType: Bool = false) -> Data {
         var value = Data(); value.sftpUInt32(missingType ? 1 : 5); value.sftpUInt64(directory || emptyFiles ? 0 : 5)
         if !missingType { value.sftpUInt32(directory ? 0o040700 : 0o100600) }; return value
@@ -606,23 +759,36 @@ private final class SFTPListingFixture: SFTPTransport, @unchecked Sendable {
         var result = Data([101]); result.sftpUInt32(id); result.sftpUInt32(code); result.sftpString(""); result.sftpString(""); return result
     }
     func write(_ data: Data) throws {
+        if failNext { failNext = false; throw SFTPFailure.protocolError("Injected failed stream.") }
+        defer { responses.append(response) }
         var reader = SFTPReader(data); _ = try reader.uint32(); let type = try reader.byte()
         if type == 1 { response = Data([2]); response.sftpUInt32(3); return }
         let id = try reader.uint32()
         switch type {
         case 16:
+            realpathCount += 1
             response = Data([104]); response.sftpUInt32(id); response.sftpUInt32(1)
             response.sftpString("/fixture"); response.sftpString(""); response.append(attributes(directory: true))
         case 7:
             lstatCount += 1; let path = try reader.string()
+            if failStat { response = status(id, 2); return }
             response = Data([105]); response.sftpUInt32(id); response.append(attributes(directory: path == "/fixture" || path == directoryPath))
         case 11:
+            sentEntries = false; page = 0
             response = Data([102]); response.sftpUInt32(id); response.sftpBytes(Data([0, 255, 1]))
         case 12:
-            if sentEntries { response = status(id, 1); return }
-            sentEntries = true; response = Data([104]); response.sftpUInt32(id); response.sftpUInt32(UInt32(names.count))
-            for name in names { response.sftpString(name); response.sftpString(""); response.append(attributes(directory: false, missingType: missingType)) }
-        case 4: response = status(id, 0)
+            pendingDirectoryReads.insert(id)
+            maximumPendingDirectoryReads = max(maximumPendingDirectoryReads, pendingDirectoryReads.count)
+            let batch: [String]?
+            if let pages { batch = page < pages.count ? pages[page] : nil; page += 1 }
+            else { batch = sentEntries ? nil : names; sentEntries = true }
+            guard let batch else { response = status(id, 1); return }
+            response = Data([104]); response.sftpUInt32(id); response.sftpUInt32(UInt32(batch.count))
+            for name in batch { response.sftpString(name); response.sftpString(""); response.append(attributes(directory: false, missingType: missingType)) }
+        case 4:
+            closeRequests += 1
+            if closeFailure == .timeout { failedCloseID = id }
+            response = status(id, closeFailure == .refused ? 3 : 0)
         case 3:
             response = Data([102]); response.sftpUInt32(id); response.sftpBytes(Data([2]))
         case 8:
@@ -631,7 +797,41 @@ private final class SFTPListingFixture: SFTPTransport, @unchecked Sendable {
         default: throw SFTPFailure.protocolError("Unexpected fixture request.")
         }
     }
-    func readPacket() throws -> Data { response }
+    func readPacket() throws -> Data {
+        guard !responses.isEmpty else { throw SFTPFailure.protocolError("Missing fixture response.") }
+        if let failedCloseID {
+            var reader = SFTPReader(reverseResponses ? responses.last! : responses.first!)
+            if try reader.byte() != 2, try reader.uint32() == failedCloseID {
+                throw SFTPFailure.message("Injected CLOSE timeout.")
+            }
+        }
+        let response = reverseResponses ? responses.removeLast() : responses.removeFirst()
+        var reader = SFTPReader(response)
+        if try reader.byte() != 2 { pendingDirectoryReads.remove(try reader.uint32()) }
+        return response
+    }
+}
+
+private final class SFTPTransportRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var transports: [SFTPTransport] = []
+    func append(_ transport: SFTPTransport) { lock.lock(); defer { lock.unlock() }; transports.append(transport) }
+    var count: Int { lock.lock(); defer { lock.unlock() }; return transports.count }
+}
+
+private final class SFTPListingSessionRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var transports: [SFTPListingFixture] = []
+    private let firstCloseFailure: SFTPListingFixture.CloseFailure?
+    init(firstCloseFailure: SFTPListingFixture.CloseFailure? = nil) { self.firstCloseFailure = firstCloseFailure }
+    func makeTransport() -> SFTPTransport {
+        lock.lock(); defer { lock.unlock() }
+        let transport = SFTPListingFixture(names: ["entry"], closeFailure: transports.isEmpty ? firstCloseFailure : nil)
+        transports.append(transport); return transport
+    }
+    var count: Int { lock.lock(); defer { lock.unlock() }; return transports.count }
+    var first: SFTPListingFixture { lock.lock(); defer { lock.unlock() }; return transports.first! }
+    var last: SFTPListingFixture { lock.lock(); defer { lock.unlock() }; return transports.last! }
 }
 
 private final class SFTPTaskHolder: @unchecked Sendable {

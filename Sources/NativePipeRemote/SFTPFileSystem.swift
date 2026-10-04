@@ -52,38 +52,58 @@ public enum SFTPFileSystemError: LocalizedError {
     }
 }
 
-/// Each operation has one SSH SFTP subsystem connection. Its binary protocol,
-/// filesystem reads and preflight run away from the UI's main actor.
+/// Operations run away from the UI's main actor. Browsers may explicitly keep
+/// one connection between requests; transfers default to an isolated session.
 @MainActor
 public final class SFTPFileSystem {
     private let command: SSHCommand
     private let environment: [String: String]
     private let transportFactory: (@Sendable () throws -> SFTPTransport)?
+    private let reuseConnection: Bool
     private var active: SFTPTransport?
-    public init(command: SSHCommand, environment: [String: String]) {
+    private var retained: SFTPFileSession?
+    public init(command: SSHCommand, environment: [String: String], reuseConnection: Bool = false) {
         self.command = command; self.environment = environment; transportFactory = nil
+        self.reuseConnection = reuseConnection
     }
-    init(transportFactory: @escaping @Sendable () throws -> SFTPTransport) {
+    init(reuseConnection: Bool = false, transportFactory: @escaping @Sendable () throws -> SFTPTransport) {
         command = SSHCommand(destination: "fixture", application: ["true"])
-        environment = [:]; self.transportFactory = transportFactory
+        environment = [:]; self.transportFactory = transportFactory; self.reuseConnection = reuseConnection
     }
     public func cancel() { active?.cancel() }
-    public func close() { cancel() }
+    public func close() {
+        cancel()
+        // The worker retains an active session until it has stopped touching
+        // its descriptors. An idle session can be released immediately.
+        retained = nil
+    }
     private func perform<Value: Sendable>(_ operation: @escaping @Sendable (SFTPConnection) throws -> Value) async throws -> Value {
         guard active == nil else { throw SFTPFailure.message(NPText("A remote file operation is already running.")) }
         try Task.checkCancellation()
-        let transport = try makeTransport()
+        let session = try retained ?? SFTPFileSession(transport: makeTransport())
+        let transport = session.transport
+        if reuseConnection { retained = session }
         active = transport
         defer { active = nil }
-        return try await withTaskCancellationHandler {
-            let worker = Task.detached {
-                defer { transport.close() }
-                let connection = try SFTPConnection(transport: transport)
-                return try operation(connection)
-            }
-            let result = try await worker.value
-            return result
-        } onCancel: { transport.cancel() }
+        do {
+            return try await withTaskCancellationHandler {
+                let worker = Task.detached {
+                    let connection: SFTPConnection
+                    if let existing = session.connection { connection = existing }
+                    else {
+                        connection = try SFTPConnection(transport: transport)
+                        session.connection = connection
+                    }
+                    return try operation(connection)
+                }
+                return try await worker.value
+            } onCancel: { transport.cancel() }
+        } catch {
+            // A failed request may leave replies in flight. Do not reuse its
+            // stream or retry a mutation after an ambiguous result.
+            if retained === session { retained = nil }
+            throw error
+        }
     }
     private func makeTransport(cleanup: Bool = false) throws -> SFTPTransport {
         if let transportFactory { return try transportFactory() }
@@ -136,11 +156,26 @@ public final class SFTPFileSystem {
     }
     public func list(path: String? = nil) async throws -> SFTPDirectory {
         try await perform { connection in
-            let home = try connection.realpath(".")
+            let home = try connection.loginHome()
             if let path { try SFTPPath.validate(path) }
-            let canonical = try connection.realpath(path ?? home)
-            guard try connection.attributes(canonical).kind == .directory else { throw SFTPFailure.message(NPText("Choose a remote directory to browse.")) }
-            let entries = try connection.entries(canonical).map { name, listed -> SFTPFileEntry in
+            let canonical = try path.map { try connection.realpath($0) } ?? home
+            // OPENDIR already rejects non-directories. Its READDIR replies
+            // include metadata, so a separate LSTAT is unnecessary here.
+            let listing: [(String, SFTPAttributes)]
+            do { listing = try connection.entries(canonical) }
+            catch let failure as SFTPFailure {
+                // OpenSSH's server maps OPENDIR's ENOTDIR to "No such file",
+                // which is wrong as well as unhelpful: the path exists. Classify
+                // only once that has happened, so a
+                // successful listing still costs one request; a directory that
+                // fails for another reason (permissions) keeps its own error.
+                if case .status = failure, let kind = try? connection.attributes(canonical).kind,
+                   kind != .directory {
+                    throw SFTPFailure.message(NPText("Choose a remote directory to browse."))
+                }
+                throw failure
+            }
+            let entries = try listing.map { name, listed -> SFTPFileEntry in
                 let child = try SFTPPath.child(canonical, name)
                 let attributes = try listed.hasKind ? listed : connection.attributes(child)
                 return SFTPFileEntry(name: name, path: child, kind: attributes.kind, size: attributes.size, modified: attributes.modified)
@@ -180,6 +215,15 @@ public final class SFTPFileSystem {
             throw pending.original
         }
     }
+}
+
+/// Access is serialized by SFTPFileSystem's main-actor active-operation guard.
+/// The connection is only read or changed by its single detached worker.
+private final class SFTPFileSession: @unchecked Sendable {
+    let transport: SFTPTransport
+    var connection: SFTPConnection?
+    init(transport: SFTPTransport) { self.transport = transport }
+    deinit { transport.close() }
 }
 
 private struct SFTPPendingStagingCleanup: Error {

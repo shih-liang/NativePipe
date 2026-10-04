@@ -267,6 +267,7 @@ final class SFTPConnection {
     private var nextID: UInt32 = 1
     private var outstanding = Set<UInt32>()
     private var buffered: [UInt32: (UInt8, SFTPReader)] = [:]
+    private var home: String?
     private(set) var extensions: [String: String] = [:]
     init(transport: SFTPTransport) throws {
         self.transport = transport
@@ -320,7 +321,10 @@ final class SFTPConnection {
     }
     private func nameRequest(_ type: UInt8, path: String) throws -> [(String, SFTPAttributes)]? {
         var payload = Data(); payload.sftpString(path)
-        let reply = try request(type, payload); var reader = reply.1
+        return try directoryNames(request(type, payload))
+    }
+    private func directoryNames(_ reply: (UInt8, SFTPReader)) throws -> [(String, SFTPAttributes)]? {
+        var reader = reply.1
         if reply.0 == 101 {
             guard try status(&reader) == 1 else { throw SFTPFailure.protocolError("Expected directory names.") }; return nil
         }
@@ -339,6 +343,12 @@ final class SFTPConnection {
         guard let names, names.count == 1, let value = names.first?.0, value.hasPrefix("/"), !value.contains("\0") else {
             throw SFTPFailure.protocolError("Expected one absolute canonical path.")
         }
+        return value
+    }
+    func loginHome() throws -> String {
+        if let home { return home }
+        let value = try realpath(".")
+        home = value
         return value
     }
     func attributes(_ path: String) throws -> SFTPAttributes {
@@ -363,31 +373,42 @@ final class SFTPConnection {
     func entries(_ path: String) throws -> [(String, SFTPAttributes)] {
         var payload = Data(); payload.sftpString(path)
         let directory = try handle(request(11, payload))
-        defer { try? closeHandle(directory) }
+        var closeAttempted = false
+        defer { if !closeAttempted { try? closeHandle(directory) } }
         var result: [(String, SFTPAttributes)] = []; var seen = Set<Data>(); var received = 0
-        while let names = try nameRequest(12, pathBytes: directory) {
-            received += names.count
-            guard !names.isEmpty, received <= 100_000 else { throw SFTPFailure.protocolError("Directory listing exceeded its limit.") }
-            for (name, attributes) in names {
-                if name == "." || name == ".." { continue }
-                try SFTPPath.validateChild(name)
-                guard seen.insert(Data(name.utf8)).inserted else { throw SFTPFailure.protocolError("Duplicate directory entry.") }
-                result.append((name, attributes))
+        var handlePayload = Data(); handlePayload.sftpBytes(directory)
+        // READDIR shares the bounded request/reply machinery used by file I/O.
+        // Keeping a small window avoids one network round trip for each page.
+        var pending = try (0..<8).map { _ in try sendRequest(12, handlePayload) }
+        var reachedEnd = false
+        while !pending.isEmpty {
+            let id = pending.removeFirst()
+            if let names = try directoryNames(receiveReply(id)) {
+                received += names.count
+                guard !names.isEmpty, received <= 100_000 else { throw SFTPFailure.protocolError("Directory listing exceeded its limit.") }
+                for (name, attributes) in names {
+                    if name == "." || name == ".." { continue }
+                    try SFTPPath.validateChild(name)
+                    guard seen.insert(Data(name.utf8)).inserted else { throw SFTPFailure.protocolError("Duplicate directory entry.") }
+                    result.append((name, attributes))
+                }
+            } else {
+                reachedEnd = true
             }
+            // Other requests were already sent before EOF was observed. Drain
+            // and validate them, including any names returned out of order,
+            // before closing the handle or reusing this connection.
+            if !reachedEnd { pending.append(try sendRequest(12, handlePayload)) }
         }
-        return result.sorted { $0.0.localizedStandardCompare($1.0) == .orderedAscending }
-    }
-    private func nameRequest(_ type: UInt8, pathBytes: Data) throws -> [(String, SFTPAttributes)]? {
-        // Handles are opaque binary strings, not filenames.
-        var payload = Data(); payload.sftpBytes(pathBytes)
-        let reply = try request(type, payload); var reader = reply.1
-        if reply.0 == 101 { guard try status(&reader) == 1 else { throw SFTPFailure.protocolError("Expected directory names.") }; return nil }
-        guard reply.0 == 104 else { throw SFTPFailure.protocolError("Expected directory names.") }
-        let count = try reader.uint32()
-        guard count <= 100_000, Int(count) <= reader.remaining / 12 else { throw SFTPFailure.protocolError("Invalid directory entry count.") }
-        var result: [(String, SFTPAttributes)] = []
-        for _ in 0..<count { let name = try reader.string(); _ = try reader.data(); result.append((name, try reader.attributes())) }
-        try reader.finish(); return result
+        try checkCancellation()
+        let sorted = result.sorted { $0.0.localizedStandardCompare($1.0) == .orderedAscending }
+        try checkCancellation()
+        // A retained connection may be reused only after CLOSE is acknowledged.
+        // Preserve the original error on failed listings, but propagate CLOSE
+        // failure on success so the owning session discards this stream.
+        closeAttempted = true
+        try closeHandle(directory)
+        return sorted
     }
     func mkdir(_ path: String) throws {
         var payload = Data(); payload.sftpString(path); payload.sftpUInt32(4); payload.sftpUInt32(0o700)

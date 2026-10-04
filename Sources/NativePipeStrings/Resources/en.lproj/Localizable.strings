@@ -205,3 +205,8 @@
 "Replacement stopped. Check %@ and %@ to recover the original." = "Replacement stopped. Check %@ and %@ to recover the original.";
 "The remote folder contains names that collide on the local filesystem: %@." = "The remote folder contains names that collide on the local filesystem: %@.";
 "The transfer stopped. Its temporary data could not be removed from %@: %@" = "The transfer stopped. Its temporary data could not be removed from %@: %@";
+"%@, %@, %@" = "%@, %@, %@";
+"Hardware H.264 decoding isn’t available on this Mac." = "Hardware H.264 decoding isn’t available on this Mac.";
+"Couldn’t match the Linux applications to the macOS appearance: %@" = "Couldn’t match the Linux applications to the macOS appearance: %@";
+"NativePipe couldn’t accept local connections: %@" = "NativePipe couldn’t accept local connections: %@";
+"A local NativePipe connection failed: %@" = "A local NativePipe connection failed: %@";

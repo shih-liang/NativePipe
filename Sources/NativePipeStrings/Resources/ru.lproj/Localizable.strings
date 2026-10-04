@@ -205,3 +205,8 @@
 "Replacement stopped. Check %@ and %@ to recover the original." = "Замена остановлена. Проверьте %@ и %@, чтобы восстановить оригинал.";
 "The remote folder contains names that collide on the local filesystem: %@." = "Удалённая папка содержит имена, конфликтующие в локальной файловой системе: %@.";
 "The transfer stopped. Its temporary data could not be removed from %@: %@" = "Передача остановлена. Не удалось удалить временные данные из %@: %@";
+"%@, %@, %@" = "%@, %@, %@";
+"Hardware H.264 decoding isn’t available on this Mac." = "Аппаратное декодирование H.264 недоступно на этом Mac.";
+"Couldn’t match the Linux applications to the macOS appearance: %@" = "Не удалось согласовать внешний вид приложений Linux с оформлением macOS: %@";
+"NativePipe couldn’t accept local connections: %@" = "NativePipe не удалось принимать локальные подключения: %@";
+"A local NativePipe connection failed: %@" = "Не удалось установить локальное подключение NativePipe: %@";
