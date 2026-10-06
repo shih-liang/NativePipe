@@ -111,7 +111,8 @@ for entry in "$binary" "$root/nativepipe-wayland"; do
             "$entry" "$@" > "$temporary/stdout" 2> "$temporary/stderr" || status=$?
         test "$status" -ne 0 && test "$status" -ne 124
         test ! -s "$temporary/stdout"
-        grep -q 'cannot compile XKB keymap' "$temporary/stderr"
+        grep -q 'keyboard layout' "$temporary/stderr"
+        grep -q 'XKB_CONFIG_ROOT' "$temporary/stderr"
         grep -q 'xkeyboard-config' "$temporary/stderr"
     done
 done
