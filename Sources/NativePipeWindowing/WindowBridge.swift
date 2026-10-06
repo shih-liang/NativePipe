@@ -457,8 +457,9 @@ public final class WindowBridge: NSObject {
     /// drops every frame the moment the caller stops holding the source itself.
     private let frameSource: FrameSource?
 
-    /// Sends a command down to the guest translator. Wired to the vsock channel
-    /// in the real path; the demo driver substitutes its own sink.
+    /// Sends a command down to the guest translator. Each host wires it to its
+    /// own transport -- vsock for the VM host, SSH stdio for the remote one --
+    /// and the demo driver substitutes its own sink.
     public var output: ((Windowing.HostCommand) -> Void)?
     private(set) var connectionGeneration: UInt64 = 0
     /// Fired once when a toplevel has both an app id and a materialized
@@ -1343,7 +1344,7 @@ public final class WindowBridge: NSObject {
         if !unavailable.isEmpty {
             discardScene(
                 work,
-                reason: NPText("resources %@ cannot export their committed Metal textures", String(describing: (unavailable))))
+                reason: NPText("resources %@ cannot export their committed Metal textures", String(describing: unavailable)))
             return
         }
         guard unpublished.isEmpty else {

@@ -46,6 +46,43 @@ void np_scene_note_damage(struct np_surface *surface,
 	if (full_scene) root->scene_full_damage = true;
 }
 
+bool np_scene_update_changes_structure(
+	const struct np_surface_update *update,
+	uint32_t previous_width, uint32_t previous_height,
+	uint32_t content_width, uint32_t content_height, bool scale_changed)
+{
+	/* Everything that changes what the output shows beyond the pixels inside
+	 * the buffer. Buffer damage cannot describe any of these: it is expressed
+	 * in the new buffer's own coordinates, so it says nothing about the area a
+	 * surface stopped covering or started covering.
+	 *
+	 * Content size belongs here for that reason. First attach counts as well --
+	 * the previous size is zero, and the surface has just begun covering
+	 * something. */
+	if (content_width != previous_width || content_height != previous_height)
+		return true;
+	return update->buffer_commit == NP_BUFFER_DETACH || update->geometry_set ||
+		update->popup_geometry_changed || update->viewport_changed ||
+		update->transform_changed || update->offset_changed || scale_changed ||
+		update->subsurface_state_changed ||
+		!wl_list_empty(&update->subsurface_positions) ||
+		!wl_list_empty(&update->stack_ops);
+}
+
+void np_scene_note_structure_change(struct np_surface *root)
+{
+	/* Takes the root directly, because the callers are surfaces on their way
+	 * out of the tree: once unlinked they can no longer reach it.
+	 *
+	 * The whole scene is marked rather than the vacated rectangle. A detached
+	 * surface's position and size are no longer derivable, and the host's
+	 * drawable pool repairs by damage alone -- an unrecorded region keeps
+	 * whatever that drawable held several frames ago. Detaches are rare enough
+	 * that paying for a full repaint is the right trade against being subtly
+	 * wrong. */
+	if (root) root->scene_full_damage = true;
+}
+
 void np_scene_damage_sent(struct np_surface *root)
 {
 	if (!root) return;

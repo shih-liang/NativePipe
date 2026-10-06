@@ -150,7 +150,7 @@ jobs:
               python3 scripts/build-codecs.py "$ARCH-$LIBC"
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-remote-transport test-remote-encoder test-remote-scheduler
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-applications
-              make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-file-drag
+              make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-file-drag test-scene-damage
               make -C common/file_rpc test-linux
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" dist-vmpipe
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" dist-remote

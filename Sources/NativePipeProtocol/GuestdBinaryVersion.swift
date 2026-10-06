@@ -18,11 +18,11 @@ public enum GuestdBinaryVersion {
         public var errorDescription: String? {
             switch self {
             case .missingTag:
-                return NPText("guestd binary has no %@ version stamp (rebuild with make -C guest/guestd)", String(describing: (tagPrefix)))
+                return NPText("guestd binary has no %@ version stamp (rebuild with make -C guest/guestd)", tagPrefix)
             case .emptyVersion:
                 return NPText("guestd binary version stamp is empty")
             case .versionMismatch(let file, let elf):
-                return NPText("VERSION file (%@) does not match ELF %@%@", String(describing: (file)), String(describing: (tagPrefix)), String(describing: (elf)))
+                return NPText("VERSION file (%@) does not match ELF %@%@", file, tagPrefix, elf)
             }
         }
     }

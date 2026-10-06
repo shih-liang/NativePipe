@@ -43,6 +43,20 @@ enum np_scene_build_result np_scene_hold_current(
 void np_scene_note_damage(struct np_surface *surface,
 	                      const struct np_box *buffer_damage, bool full_scene);
 void np_scene_damage_sent(struct np_surface *root);
+/* Damage contract. The host's drawable pool repairs by damage alone: an
+ * output region nobody reports keeps whatever that drawable held several
+ * frames earlier. So every way the output can change has to land in one of
+ * the three functions below -- buffer damage, a structural update, or a
+ * surface leaving the tree. */
+struct np_surface_update;
+bool np_scene_update_changes_structure(
+	const struct np_surface_update *update,
+	uint32_t previous_width, uint32_t previous_height,
+	uint32_t content_width, uint32_t content_height, bool scale_changed);
+/* Leaving the scene tree changes what the output shows without any commit
+ * reporting damage for it. Call before unlinking, while the root is still
+ * reachable. */
+void np_scene_note_structure_change(struct np_surface *root);
 
 void np_scene_presented(struct np_surface *root, uint32_t presentation_id);
 /* Drop every host-read hold owned by this surface. Used both at surface

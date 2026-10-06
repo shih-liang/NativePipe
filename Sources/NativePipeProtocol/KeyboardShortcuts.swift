@@ -118,7 +118,7 @@ public struct KeyboardShortcutPreferences: Codable, Sendable, Equatable {
                 default: scope = nil // An application override is intentional.
                 }
                 if let scope {
-                    return NPText("%@ already has a rule for %@. Edit that rule or choose another shortcut or application.", String(describing: (rule.source.label(mac: true))), String(describing: (scope)))
+                    return NPText("%@ already has a rule for %@. Edit that rule or choose another shortcut or application.", rule.source.label(mac: true), scope)
                 }
             }
         }

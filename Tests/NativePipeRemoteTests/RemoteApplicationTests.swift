@@ -33,14 +33,40 @@ final class RemoteApplicationTests: XCTestCase {
     @MainActor func testConnectionFailureCardKeepsSelectableLog() throws {
         _ = NSApplication.shared
         let log = "Checking GitHub…\nDownload failed: HTTP 404"
-        let alert = RemoteApplicationDelegate.failureAlert(name: "Linux", log: log)
+        let alert = RemoteApplicationDelegate.failureAlert(
+            name: "Linux", connected: false, summary: "Download failed: HTTP 404", log: log)
         XCTAssertEqual(alert.messageText, "Couldn’t Connect to Linux")
+        XCTAssertEqual(alert.informativeText, "Download failed: HTTP 404")
         let scroll = try XCTUnwrap(alert.accessoryView as? NSScrollView)
         let text = try XCTUnwrap(scroll.documentView as? NSTextView)
         XCTAssertEqual(text.string, log)
         XCTAssertTrue(text.isSelectable)
         XCTAssertFalse(text.isEditable)
         XCTAssertEqual(alert.buttons.first?.title, "Close")
+    }
+
+    /// After a session was up, "Couldn't Connect" sends the user to check SSH
+    /// access that demonstrably worked. And a log that only repeats the summary
+    /// is a large monospaced box holding one sentence.
+    @MainActor func testFailureCardDistinguishesDisconnectAndOmitsRedundantLog() {
+        _ = NSApplication.shared
+        let alert = RemoteApplicationDelegate.failureAlert(
+            name: "Linux", connected: true, summary: "Lost the connection.", log: "Lost the connection.\n")
+        XCTAssertEqual(alert.messageText, "Disconnected from Linux")
+        XCTAssertNil(alert.accessoryView)
+    }
+
+    /// The cause of a remote exit is the last thing written before it, not an
+    /// installer's progress line at the top.
+    func testFailureSummaryPicksTheCauseOutOfRemoteDiagnostics() {
+        let diagnostics = "Checking NativePipe v1.2...\nNativePipe is up to date.\nPermission denied (publickey).\n"
+        XCTAssertEqual(RemoteApplicationDelegate.failureSummary(
+            error: RemoteError.message(diagnostics), remoteExitStatus: 255, diagnostics: diagnostics),
+            "Permission denied (publickey).")
+        // A failure this Mac detected is already a sentence; take its first line.
+        XCTAssertEqual(RemoteApplicationDelegate.failureSummary(
+            error: RemoteError.message("The compositor didn’t start.\nssh: noise"), remoteExitStatus: nil, diagnostics: "x"),
+            "The compositor didn’t start.")
     }
 
     @MainActor func testLiveRemoteAnimationLatency() throws {

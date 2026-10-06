@@ -1,4 +1,5 @@
 #include "keymap.h"
+#include "user_text.h"
 #include <stdio.h>
 #include <xkbcommon/xkbcommon.h>
 
@@ -12,7 +13,6 @@ char *np_keymap_text(const char *layout)
     xkb_keymap_unref(keymap);
     xkb_context_unref(context);
     if (!text)
-        fprintf(stderr, "[wayland] cannot compile XKB keymap '%s'. Install xkb-data "
-            "(Debian/Ubuntu) or xkeyboard-config (Arch/Alpine), and check XKB_CONFIG_ROOT.\n", layout);
+        np_user_text("KEYMAP_MISSING", "Couldn’t load the %s keyboard layout. Install xkb-data (Debian/Ubuntu) or xkeyboard-config (Arch/Alpine), and check XKB_CONFIG_ROOT.", layout, NULL);
     return text;
 }

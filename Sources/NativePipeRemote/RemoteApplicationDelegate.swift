@@ -13,15 +13,32 @@ public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
     public var onTerminate: (() -> Void)?
     public var onDiagnostic: ((String) -> Void)?
     public var exitOnDisconnect = true
+    /// Whether a failure is also written to stderr as one raw line. A host that
+    /// presents failures itself -- the CLI writes a summary keyed to what went
+    /// wrong -- turns this off so the terminal does not get both.
+    public var reportsFailureToStderr = true
+    /// True once this attempt reached the Linux application. Decides whether a
+    /// failure is "couldn't connect" or "disconnected": the user has very
+    /// different things to check in each case.
+    public private(set) var hasConnected = false
+    /// True when this attempt ended because the user dismissed the sign-in
+    /// prompt. Not a failure, and not a success either: the session never ran.
+    public private(set) var signInCancelled = false
     public var displayName: String {
         didSet {
             guard displayName != oldValue else { return }
             switcher.title = displayName
             display.bridge.machineName = displayName
-            disconnectItem?.title = NPText("Disconnect from %@", String(describing: (displayName)))
+            disconnectItem?.title = NPText("Disconnect from %@", displayName)
         }
     }
     private weak var disconnectItem: NSMenuItem?
+    /// Adds an About item to the app menu when set. Off by default: this
+    /// delegate is shared with embedding hosts, which own their own About and
+    /// must not end up showing NativePipe's. A bare executable has no
+    /// Info.plist for the standard panel to read, so the caller supplies the
+    /// name and version explicitly.
+    public var aboutPanelOptions: [NSApplication.AboutPanelOptionKey: Any]?
     private let showErrors: Bool
     private let loadsApplicationIcons: Bool
     private var stopping = false
@@ -34,7 +51,7 @@ public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
             guard let self, self.display.session.isConnected else { return }
             Task { @MainActor [weak self] in
                 do { try await self?.display.session.applicationClient.setAppearance(value.colorScheme) }
-                catch { fputs("[remote] appearance: \(error.localizedDescription)\n", stderr) }
+                catch { fputs("nativepipe: " + NPText("Couldn’t match the Linux applications to the macOS appearance: %@", error.localizedDescription) + "\n", stderr) }
             }
         }
         return integration
@@ -81,11 +98,14 @@ public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
     public func connect() {
         connectionTask?.cancel()
         stopping = false
+        hasConnected = false
+        signInCancelled = false
         connectionTask = Task {
             do {
                 try await display.connect()
                 try Task.checkCancellation()
                 guard display.session.isConnected else { return }
+                hasConnected = true
                 if let onConnected { onConnected() }
                 else { hostIntegration.sync() }
                 if loadsApplicationIcons { _ = try? await display.refreshApplications() }
@@ -94,6 +114,7 @@ public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
                 // superseded Task must not stop the replacement connection.
                 guard !Task.isCancelled else { return }
                 stopping = true
+                signInCancelled = true
                 onDisconnected?()
                 if exitOnDisconnect { NSApp.terminate(nil) }
             }
@@ -122,20 +143,48 @@ public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
         stopping = true
         display.disconnect()
         onFailure?(error)
-        fputs("nativepipe: \(error.localizedDescription)\n", stderr)
+        if reportsFailureToStderr { fputs("nativepipe: \(error.localizedDescription)\n", stderr) }
         if showErrors {
-            let alert = Self.failureAlert(name: displayName, log: error.localizedDescription)
+            let session = display.session
+            let alert = Self.failureAlert(
+                name: displayName, connected: hasConnected,
+                summary: Self.failureSummary(error: error, remoteExitStatus: session.remoteExitStatus,
+                                             diagnostics: session.visibleDiagnostics),
+                log: session.visibleDiagnostics)
             NSApp.activate()
             alert.runModal()
         }
         if exitOnDisconnect { NSApp.terminate(nil) }
     }
 
-    static func failureAlert(name: String, log: String) -> NSAlert {
+    /// One sentence saying what went wrong, for the alert's informative text.
+    ///
+    /// A failure this Mac detected already is that sentence. When the remote
+    /// command exited, its error is SSH's or the compositor's stderr instead,
+    /// and the cause is usually the last thing written before the exit -- an
+    /// installer's progress or a toolkit's warnings come earlier.
+    nonisolated static func failureSummary(error: Error, remoteExitStatus: Int32?, diagnostics: String) -> String {
+        let lines = { (text: String) in
+            text.split(whereSeparator: \.isNewline)
+                .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        }
+        if remoteExitStatus != nil, let last = lines(diagnostics).last { return last }
+        return lines(error.localizedDescription).first ?? error.localizedDescription
+    }
+
+    /// The title says which side of a successful connection the failure is on,
+    /// because the user checks different things in each case: SSH access and
+    /// the compositor before, the application and the network after. The log
+    /// is shown only when it says more than the summary already does.
+    static func failureAlert(name: String, connected: Bool, summary: String, log: String) -> NSAlert {
         let alert = NSAlert()
-        alert.messageText = NPText("Couldn’t Connect to %@", String(describing: (name)))
-        alert.informativeText = NPText("The connection has closed. You can try connecting again.")
+        alert.messageText = connected
+            ? NPText("Disconnected from %@", name)
+            : NPText("Couldn’t Connect to %@", name)
+        alert.informativeText = summary
         alert.addButton(withTitle: NPText("Close"))
+        let trimmedLog = log.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedLog.isEmpty, trimmedLog != summary else { return alert }
         let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 520, height: 240))
         scroll.hasVerticalScroller = true
         scroll.borderType = .bezelBorder
@@ -146,7 +195,7 @@ public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
         text.autoresizingMask = [.width]
         text.textContainer?.widthTracksTextView = true
         text.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        text.string = log
+        text.string = trimmedLog
         text.setAccessibilityLabel(NPText("Connection Log"))
         scroll.documentView = text
         alert.accessoryView = scroll
@@ -156,10 +205,17 @@ public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         let app = NSMenuItem()
         let actions = NSMenu(title: "NativePipe")
-        disconnectItem = actions.addItem(withTitle: NPText("Disconnect from %@", String(describing: (displayName))),
+        if aboutPanelOptions != nil {
+            let about = actions.addItem(withTitle: NPText("About NativePipe"),
+                                        action: #selector(showAboutPanel(_:)), keyEquivalent: "")
+            about.target = self
+            actions.addItem(.separator())
+        }
+        disconnectItem = actions.addItem(withTitle: NPText("Disconnect from %@", displayName),
                         action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         app.submenu = actions
         menu.addItem(app)
+        menu.addItem(StandardEditMenu.item())
         let item = NSMenuItem()
         let windows = NSMenu(title: NPText("Window"))
         windows.addItem(withTitle: NPText("Minimize"),
@@ -170,6 +226,39 @@ public final class RemoteApplicationDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(item)
         NSApp.windowsMenu = windows
         return menu
+    }
+
+    @objc private func showAboutPanel(_ sender: Any?) {
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.orderFrontStandardAboutPanel(options: aboutPanelOptions ?? [:])
+    }
+}
+
+/// Cut, Copy, Paste and Select All reach AppKit text controls only through the
+/// main menu's key equivalents. Without this menu the SSH password prompt, the
+/// window switcher's search field and the connection log all lose them.
+///
+/// Guest windows are unaffected. Their content view implements none of these
+/// actions, so over guest content every item validates as disabled and its
+/// key equivalent falls through to keyDown, where the shortcut translation
+/// handles it exactly as it did before (Cmd-C becomes the Linux app's Ctrl-C).
+/// Translated chords never even get this far: the content view claims them in
+/// performKeyEquivalent, which AppKit consults before the main menu.
+@MainActor
+enum StandardEditMenu {
+    static func item() -> NSMenuItem {
+        let menu = NSMenu(title: NPText("Edit"))
+        menu.addItem(withTitle: NPText("Undo"), action: Selector(("undo:")), keyEquivalent: "z")
+        let redo = menu.addItem(withTitle: NPText("Redo"), action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        menu.addItem(.separator())
+        menu.addItem(withTitle: NPText("Cut"), action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        menu.addItem(withTitle: NPText("Copy"), action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        menu.addItem(withTitle: NPText("Paste"), action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        menu.addItem(withTitle: NPText("Select All"), action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        let item = NSMenuItem()
+        item.submenu = menu
+        return item
     }
 }
 
@@ -206,8 +295,18 @@ public enum SSHAuthentication {
         // Askpass enters a modal loop without NSApplication.run(). Complete
         // AppKit startup so the prompt is registered and keyboard-accessible.
         app.finishLaunching()
+        // Without it, Cmd-V cannot paste a password from a password manager.
+        // The menu bar stays hidden for an accessory process, but AppKit still
+        // matches key equivalents against it -- the first item is the
+        // application menu's slot, so it holds an empty placeholder.
+        let bar = NSMenu()
+        let placeholder = NSMenuItem()
+        placeholder.submenu = NSMenu()
+        bar.addItem(placeholder)
+        bar.addItem(StandardEditMenu.item())
+        app.mainMenu = bar
         let alert = NSAlert()
-        alert.messageText = NPText("Sign In to %@", String(describing: (environment["NATIVEPIPE_SSH_CONNECTION"] ?? "Remote Computer")))
+        alert.messageText = NPText("Sign In to %@", environment["NATIVEPIPE_SSH_CONNECTION"] ?? NPText("Remote Computer"))
         alert.informativeText = prompt
         if confirming { alert.messageText = NPText("Trust This Remote Computer?") }
         let input = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
@@ -254,9 +353,18 @@ public enum SSHAuthentication {
                     } else if remember.state == .on { try store.save(input.stringValue, prompt: prompt) }
                     else { try store.remove(prompt) }
                 } catch {
+                    // Unchecking Remember asks for removal, and that can fail
+                    // too; titling it "Wasn't Saved" would describe the opposite
+                    // of what the user just asked for. Either way the sign-in
+                    // itself continues -- the reply is printed below.
+                    let saving = remember.state == .on
                     let warning = NSAlert()
-                    warning.messageText = NPText("Password Wasn’t Saved")
-                    warning.informativeText = error.localizedDescription
+                    warning.messageText = saving
+                        ? NPText("Password Wasn’t Saved")
+                        : NPText("Saved Password Wasn’t Removed")
+                    warning.informativeText = saving
+                        ? NPText("You’re still signing in, but NativePipe will ask for this password again next time.\n\n%@", error.localizedDescription)
+                        : NPText("You’re still signing in, but the saved password remains in your Keychain.\n\n%@", error.localizedDescription)
                     warning.runModal()
                 }
             }

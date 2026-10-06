@@ -1746,8 +1746,9 @@ private final class SurfaceView: NSView {
             return false
         }
         // Cmd+Q is reserved for this guest even with remapping disabled, while
-        // paused, or when its rule has been deleted. Never fall through to Quit
-        // VMHost. Explicitly choosing Quit from the host menu still works.
+        // paused, or when its rule has been deleted. Never fall through to the
+        // host's own Cmd+Q item (Quit in the VM host, Disconnect in the remote
+        // one). Choosing that item from the menu explicitly still works.
         keyDown(with: event)
         return true
     }

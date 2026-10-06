@@ -1,4 +1,6 @@
+import AppKit
 import XCTest
+import NativePipeStrings
 import NativePipeProtocol
 @testable import NativePipeRemote
 
@@ -85,6 +87,38 @@ final class NativePipeRemoteTests: XCTestCase {
             XCTAssertTrue(error.localizedDescription.contains("Update NativePipe"))
         }
     }
+    /// OpenSSH keeps the first value it sees for a -o option, so the session's
+    /// safety settings hold only while they precede everything the user passed.
+    /// A user's -o RequestTTY=force or -o ControlPath=... must lose to them.
+    func testBuiltInSafetyOptionsPrecedeUserArguments() async throws {
+        let user = ["-A", "-o", "RequestTTY=force", "-o", "ControlPath=/tmp/shared"]
+        let command = SSHCommand(destination: "user@host", application: ["app"], sshArguments: user)
+        let arguments = try await command.arguments()
+        let firstUser = try XCTUnwrap(arguments.firstIndex(of: "-A"))
+        for safety in ["-T", "ControlPath=none", "ClearAllForwardings=yes"] {
+            let index = try XCTUnwrap(arguments.firstIndex(of: safety), safety)
+            XCTAssertLessThan(index, firstUser, safety)
+        }
+        XCTAssertFalse(arguments.contains("-t"))
+    }
+    /// AppKit text controls -- the SSH password prompt above all -- get
+    /// Cut/Copy/Paste/Select All only from these key equivalents.
+    @MainActor
+    func testStandardEditMenuCarriesTheTextKeyEquivalents() throws {
+        let menu = try XCTUnwrap(StandardEditMenu.item().submenu)
+        func item(_ key: String, _ modifiers: NSEvent.ModifierFlags = .command) -> NSMenuItem? {
+            menu.items.first { $0.keyEquivalent == key && $0.keyEquivalentModifierMask == modifiers }
+        }
+        XCTAssertEqual(item("x")?.action, #selector(NSText.cut(_:)))
+        XCTAssertEqual(item("c")?.action, #selector(NSText.copy(_:)))
+        XCTAssertEqual(item("v")?.action, #selector(NSText.paste(_:)))
+        XCTAssertEqual(item("a")?.action, #selector(NSText.selectAll(_:)))
+        XCTAssertEqual(item("z")?.action, Selector(("undo:")))
+        XCTAssertEqual(item("z", [.command, .shift])?.action, Selector(("redo:")))
+        // Nil targets, so AppKit validates them against the responder chain.
+        XCTAssertTrue(menu.items.allSatisfy { $0.target == nil })
+    }
+
     func testShellQuotingAndNoForwarding() async throws {
         let command = SSHCommand(destination: "user@host", application: ["echo", "a'b", "$(touch /tmp/no)"])
         let arguments = try await command.arguments()
@@ -163,7 +197,10 @@ final class NativePipeRemoteTests: XCTestCase {
         for _ in 0..<2 {
             let start = ContinuousClock.now
             do { try await session.connect(); XCTFail("Expected automatic timeout") }
-            catch { XCTAssertTrue(error.localizedDescription.contains("did not become ready")) }
+            catch {
+                XCTAssertTrue(error.localizedDescription.hasPrefix(
+                    NPText("The NativePipe compositor didn’t start in time. The connection messages may show why.")))
+            }
             XCTAssertLessThan(start.duration(to: .now), .seconds(2))
             XCTAssertFalse(session.isConnected)
             XCTAssertEqual(session.exitStatus, 1)
@@ -237,5 +274,47 @@ final class NativePipeRemoteTests: XCTestCase {
             catch is CancellationError { }
             XCTAssertFalse(session.isConnected)
         }
+    }
+
+    // MARK: What reaches the user from stderr
+
+    /// NativePipe's own startup markers drive phase tracking. Printed, they are
+    /// a packet header in the user's terminal or error dialog.
+    func testDiagnosticLinesDropMarkersEvenWhenReadsSplitThem() {
+        var lines = DiagnosticLines()
+        var shown = lines.visible("Checking NativePipe v1…\nNATIVEPIPE PHASE INST")
+        shown += lines.visible("ALLING\nssh: warning\r\nNATIVEPIPE PHASE READY\r\n")
+        shown += lines.visible("NATIVEPIPE AUTH CANCELLED\nPermission denied")   // no final newline
+        shown += lines.finish()
+        XCTAssertEqual(shown, "Checking NativePipe v1…\nssh: warning\r\nPermission denied")
+    }
+
+    func testOnlyUpperCaseNativePipeLinesAreMarkers() {
+        XCTAssertTrue(DiagnosticLines.isMarker("NATIVEPIPE PHASE READY\n"))
+        XCTAssertTrue(DiagnosticLines.isMarker("NATIVEPIPE AUTH CANCELLED"))
+        XCTAssertFalse(DiagnosticLines.isMarker("NativePipe compositor is up to date.\n"))
+        XCTAssertFalse(DiagnosticLines.isMarker("NATIVEPIPE failed: see log\n"))
+        var lines = DiagnosticLines()
+        XCTAssertEqual(lines.visible("NATIVEPIPE PHA"), "")
+        XCTAssertEqual(lines.finish(), "", "a marker cut off by the end of the stream is still a marker")
+    }
+
+    /// End to end through a real process: the reason survives (even without a
+    /// trailing newline), the markers never reach onDiagnostic, the error text
+    /// or visibleDiagnostics, and the remote status is kept apart from a local one.
+    @MainActor func testMarkersNeverReachTheUserButTheReasonDoes() async throws {
+        let session = RemoteSession(testExecutable: "/bin/sh", arguments: ["-c",
+            "printf 'NATIVEPIPE PHASE AUTHENTI' >&2; printf 'CATING\\nPermission denied (publickey).' >&2; exit 255"],
+            reportsStartup: true)
+        var forwarded = ""
+        session.onDiagnostic = { forwarded += $0 }
+        do { try await session.connect(); XCTFail("Expected failure") }
+        catch {
+            XCTAssertEqual(error.localizedDescription, "Permission denied (publickey).")
+        }
+        XCTAssertEqual(session.startupPhase, .authenticating, "phase tracking still sees the marker")
+        XCTAssertEqual(forwarded, "Permission denied (publickey).")
+        XCTAssertEqual(session.visibleDiagnostics, "Permission denied (publickey).")
+        XCTAssertEqual(session.remoteExitStatus, 255)
     }
 }

@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "dmabuf_egl.h"
+#include "user_text.h"
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -87,7 +88,7 @@ static GLuint compile_shader(GLenum type, const char *source)
 	if (compiled == GL_TRUE) return shader;
 	char log[1024] = {0};
 	glGetShaderInfoLog(shader, sizeof(log), NULL, log);
-	fprintf(stderr, "[wayland] dma-buf readback shader failed: %s\n", log);
+	np_debug_log("[wayland] dma-buf readback shader failed: %s\n", log);
 	glDeleteShader(shader);
 	return 0;
 }
@@ -130,7 +131,7 @@ static bool create_program(struct np_egl_importer *importer)
 	if (linked != GL_TRUE) {
 		char log[1024] = {0};
 		glGetProgramInfoLog(importer->program, sizeof(log), NULL, log);
-		fprintf(stderr, "[wayland] dma-buf readback program failed: %s\n", log);
+		np_debug_log("[wayland] dma-buf readback program failed: %s\n", log);
 		return false;
 	}
 	importer->position_location =
@@ -297,7 +298,7 @@ struct np_egl_importer *np_egl_importer_create(int drm_fd)
 	glGenFramebuffers(1, &importer->framebuffer);
 	glGenTextures(1, &importer->output_texture);
 	if (!importer->framebuffer || !importer->output_texture) goto failed;
-	fprintf(stderr,
+	np_debug_log(
 	        "[wayland] EGL dma-buf importer %d.%d vendor=%s pairs=%zu\n",
 	        major, minor, eglQueryString(importer->display, EGL_VENDOR),
 	        importer->format_count);
@@ -378,7 +379,7 @@ struct np_egl_buffer *np_egl_buffer_import(
 		importer->display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT,
 		(EGLClientBuffer)NULL, attributes);
 	if (image == EGL_NO_IMAGE_KHR) {
-		fprintf(stderr,
+		np_debug_log(
 		        "[wayland] EGL dma-buf import failed modifier=0x%016" PRIx64
 		        " error=0x%x\n", modifier, eglGetError());
 		return NULL;
@@ -403,7 +404,7 @@ struct np_egl_buffer *np_egl_buffer_import(
 	GLenum error = glGetError();
 	glBindTexture(GL_TEXTURE_2D, 0);
 	if (!buffer->texture || error != GL_NO_ERROR) {
-		fprintf(stderr, "[wayland] EGL image texture failed error=0x%x\n", error);
+		np_debug_log("[wayland] EGL image texture failed error=0x%x\n", error);
 		np_egl_buffer_destroy(buffer);
 		return NULL;
 	}
@@ -494,7 +495,7 @@ bool np_egl_buffer_read_bgra(
 	glBindTexture(GL_TEXTURE_2D, 0);
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	if (error != GL_NO_ERROR) {
-		fprintf(stderr, "[wayland] dma-buf readback failed error=0x%x\n", error);
+		np_debug_log("[wayland] dma-buf readback failed error=0x%x\n", error);
 		return false;
 	}
 	*pixels = buffer->pixels;

@@ -19,6 +19,7 @@
 #include "fifo-v1-server-protocol.h"
 #include "text-input-v3-server-protocol.h"
 #include "xdg-shell-server-protocol.h"
+#include "user_text.h"
 
 #include <signal.h>
 #include <stdio.h>
@@ -86,11 +87,11 @@ int np_frontend_run(int argc, char **argv, void *backend_state)
 
 	server.display = wl_display_create();
 	if (!server.display) {
-		fprintf(stderr, "[wayland] wl_display_create failed\n");
+		np_user_text("STARTUP_FAILED", "The NativePipe compositor couldn’t start (%s).", "wl_display_create failed", NULL);
 		return 1;
 	}
 	if (wl_display_init_shm(server.display) < 0) {
-		fprintf(stderr, "[wayland] wl_display_init_shm failed\n");
+		np_user_text("STARTUP_FAILED", "The NativePipe compositor couldn’t start (%s).", "wl_display_init_shm failed", NULL);
 		return 1;
 	}
 
@@ -118,16 +119,16 @@ int np_frontend_run(int argc, char **argv, void *backend_state)
 
 	const char *socket = wl_display_add_socket_auto(server.display);
 	if (!socket) {
-		fprintf(stderr, "[wayland] could not create a Wayland socket\n");
+		np_user_text("STARTUP_FAILED", "The NativePipe compositor couldn’t start (%s).", "could not create a Wayland socket", NULL);
 		return 1;
 	}
-	fprintf(stderr, "[wayland] WAYLAND_DISPLAY=%s\n", socket);
+	np_debug_log("[wayland] WAYLAND_DISPLAY=%s\n", socket);
 	if (!np_backend_session_set_socket(&server, socket)) {
-		fprintf(stderr, "[wayland] could not publish display name\n");
+		np_user_text("STARTUP_FAILED", "The NativePipe compositor couldn’t start (%s).", "could not publish the display name", NULL);
 		return 1;
 	}
 	if (!np_xwayland_init(&server))
-		fprintf(stderr, "[wayland] Xwayland integration unavailable\n");
+		np_debug_log("[wayland] Xwayland integration unavailable\n"); /* cause already reported */
 
     setenv("WAYLAND_DISPLAY", server.session_socket, 1);
     setenv("XDG_SESSION_TYPE", "wayland", 1);
@@ -144,7 +145,7 @@ int np_frontend_run(int argc, char **argv, void *backend_state)
     server.application_generation = 1;
     bool applications_started = np_applications_init(&server);
     if (!applications_started) {
-        fprintf(stderr, "[wayland] cannot start ordinary-user application service\n");
+        np_user_text("STARTUP_FAILED", "The NativePipe compositor couldn’t start (%s).", "cannot start the application service", NULL);
         server.terminate = true;
     } else np_backend_session_attach(&server, loop);
 	while (!server.terminate) {

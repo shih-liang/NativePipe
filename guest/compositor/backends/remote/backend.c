@@ -3,6 +3,7 @@
 #include "backend_internal.h"
 #include "compositor.h"
 #include "dmabuf.h"
+#include "user_text.h"
 #include <glib.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -16,8 +17,7 @@ bool np_backend_check_runtime(void)
 {
     char *command = g_find_program_in_path("dbus-run-session");
     if (!command) {
-        fprintf(stderr, "[wayland] dbus-run-session is required for a private application session. "
-            "Install dbus-daemon (Debian/Ubuntu) or dbus (Arch/Alpine), and check PATH.\n");
+        np_user_text("DBUS_REQUIRED", "dbus-run-session is required to run applications in their own session. Install dbus-daemon (Debian/Ubuntu) or dbus (Arch/Alpine), and check PATH.", NULL, NULL);
         return false;
     }
     g_free(command);
@@ -61,7 +61,7 @@ int np_backend_run(int argc, char **argv)
     if (sscanf(streams, "%d:%d%c", &input_fd, &output_fd, &trailing) != 2 ||
         input_fd < 3 || output_fd < 3 || input_fd == output_fd ||
         fcntl(output_fd, F_SETFD, FD_CLOEXEC) < 0 || dup2(input_fd, STDIN_FILENO) < 0) {
-        fprintf(stderr, "[wayland] invalid private session streams\n"); return 1;
+        np_user_text("STARTUP_FAILED", "The NativePipe compositor couldn’t start (%s).", "invalid private session streams", NULL); return 1;
     }
     close(input_fd);
     unsetenv("NP_REMOTE_STREAM_FDS");
@@ -88,7 +88,7 @@ bool np_backend_prepare(struct np_server *server)
 {
     const char *capability = getenv("NATIVEPIPE_HOST_H264_HARDWARE");
     np_remote_backend(server)->host_h264_hardware = capability && !strcmp(capability, "1");
-    fprintf(stderr, "[wayland] remote backend: SSH stdio, %s/alpha resources\n",
+    np_debug_log("[wayland] remote backend: SSH stdio, %s/alpha resources\n",
         np_remote_backend(server)->host_h264_hardware ? "NVENC H.264 preferred, AV1 fallback" : "AV1");
     return true;
 }
@@ -99,11 +99,11 @@ void np_backend_advertise_globals(struct np_server *server)
 void np_backend_finish(struct np_server *server)
 {
     struct np_remote_backend *b = np_remote_backend(server);
-    fprintf(stderr, "[remote] frames captured=%llu coalesced-before-encode=%llu encoded=%llu scenes=%llu displayed=%llu discarded=%llu\n",
+    np_debug_log("[remote] frames captured=%llu coalesced-before-encode=%llu encoded=%llu scenes=%llu displayed=%llu discarded=%llu\n",
         (unsigned long long)b->captured_frames, (unsigned long long)b->coalesced_frames,
         (unsigned long long)b->encoded_frames, (unsigned long long)b->sent_scenes,
         (unsigned long long)b->displayed_scenes, (unsigned long long)b->discarded_scenes);
-    fprintf(stderr, "[remote] transport pending-display=%zu pending-all=%zu flight=%zu budget=%zu\n",
+    np_debug_log("[remote] transport pending-display=%zu pending-all=%zu flight=%zu budget=%zu\n",
         b->media.display_bytes, b->media.queued_bytes, b->media.flow.bytes, b->media.flow.window);
     free(b->input_record);
 }

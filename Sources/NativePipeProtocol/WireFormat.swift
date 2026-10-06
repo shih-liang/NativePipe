@@ -28,11 +28,11 @@ public enum WireFormat {
         public var description: String {
             switch self {
             case .badMagic(let bytes):
-                return NPText("bad frame magic %@", String(describing: (bytes)))
+                return NPText("bad frame magic %@", String(describing: bytes))
             case .unsupportedVersion(let v):
-                return NPText("unsupported wire version %@", String(describing: (v)))
+                return NPText("unsupported wire version %@", String(v))
             case .payloadTooLarge(let n):
-                return NPText("payload of %@ bytes exceeds %@", String(describing: (n)), String(describing: (WireFormat.maxPayloadSize)))
+                return NPText("payload of %@ bytes exceeds %@", String(n), String(WireFormat.maxPayloadSize))
             }
         }
     }

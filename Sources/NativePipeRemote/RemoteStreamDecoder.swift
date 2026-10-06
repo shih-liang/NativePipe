@@ -43,7 +43,8 @@ struct RemoteStreamDecoder {
             }
             return try decodeControl(payload)
         }
-        throw RemoteError.message(NPText("Invalid remote stream. Update the remote compositor to match this client."))
+        // An unknown record type is what a version mismatch looks like here.
+        throw RemoteError.message(NPText("The NativePipe compositor on Linux doesn’t match this version of NativePipe. Update NativePipe on both computers to the same version, then reconnect."))
     }
 
     private mutating func decodeControl(_ payload: Data) throws -> Packet {
@@ -56,7 +57,7 @@ struct RemoteStreamDecoder {
             guard !ready else { throw RemoteError.message(NPText("Duplicate remote session handshake.")) }
             ready = true
         } else if !ready {
-            throw RemoteError.message(NPText("Remote compositor did not send its session handshake."))
+            throw RemoteError.message(NPText("The NativePipe compositor didn’t respond when the session started."))
         }
         return .event(event)
     }

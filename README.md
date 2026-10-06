@@ -27,7 +27,7 @@ nativepipe --install-compositor user@linux-host gtk4-demo
 - Wayland applications, plus X11 applications when the Linux host has
   `xwayland-satellite` and Xwayland installed.
 - Hardware-accelerated video when supported, with software fallback.
-- Install and update the Linux-side helper from GitHub Releases with one option.
+- Install and update the NativePipe compositor on Linux from GitHub Releases with one option.
 
 ## Contents
 
@@ -118,12 +118,13 @@ already installed on the Linux host:
 nativepipe --install-compositor user@linux-host gtk4-demo
 ```
 
-The `--install-compositor` option installs or updates `nativepipe-wayland`, the
-Linux-side helper that displays applications through NativePipe. It runs as your
+The `--install-compositor` option installs or updates the NativePipe compositor
+(`nativepipe-wayland`), the Linux-side part of NativePipe that shows applications
+on your Mac. It runs as your
 SSH user and does not require root access. It does not install `gtk4-demo` or
 other applications.
 
-Once the helper is installed, launch applications without the installation flag:
+Once the compositor is installed, launch applications without the installation flag:
 
 ```sh
 nativepipe user@linux-host gtk4-demo
@@ -159,15 +160,22 @@ values must be separate arguments, for example `-p 2222`.
 
 | Option | Description |
 | --- | --- |
-| `--install-compositor` | Check GitHub Releases and install or update the Linux helper before launching the application. Reuses an already installed bundle when its checksum matches. |
+| `--install-compositor` | Check GitHub Releases and install or update the NativePipe compositor before launching the application. Reuses an already installed bundle when its checksum matches. |
 | `--compositor PATH` | Use a particular Linux compositor executable. The default is `nativepipe-wayland`. A custom executable name or path bypasses automatic installation, even if `--install-compositor` is also present. |
 | `-i FILE` | Pass a local identity file to SSH. |
 | `-F FILE` | Use a local SSH configuration file. |
 | `-J HOST` | Connect through an SSH jump host, for example `user@bastion`. |
 | `-p PORT` | Set the SSH server port. Otherwise SSH uses its configured port, or 22. |
 | `-o OPTION` | Pass an SSH configuration option, such as `IdentitiesOnly=yes`. May be repeated. |
+| `-4`, `-6` | Make SSH use IPv4 or IPv6 addresses only. |
+| `-A`, `-a` | Enable or disable SSH agent forwarding. |
 | `--no-progress` | Hide terminal connection status; SSH and application diagnostics remain on stderr. |
 | `-h`, `--help` | Print local help and exit without opening a GUI, connecting, installing, or requesting permissions. |
+
+Other SSH options are rejected rather than passed through, because SSH's
+standard input and output carry NativePipe's display stream: `-t` would put a
+terminal in that stream, and `-N`, `-f` or `-W` would replace the remote command.
+Use `user@host` rather than `-l`, and `-o` for any SSH setting not listed above.
 
 The destination ends NativePipe option parsing. Everything after it belongs to
 the Linux command. For example, `--no-remote` below is a **Firefox option**:
@@ -271,7 +279,7 @@ This option is useful for a manually installed version or a custom build.
 
 ## Updating
 
-Update the Linux helper on the next launch:
+Update the NativePipe compositor on the next launch:
 
 ```sh
 nativepipe --install-compositor user@linux-host gtk4-demo
@@ -281,6 +289,11 @@ NativePipe selects a stable GitHub release containing an installer and composito
 assets. On Linux, the installer downloads the matching architecture/libc package,
 verifies its published SHA-256 checksum, and checks that it can run. A matching
 cached bundle is reused.
+
+The checksum file comes from the same GitHub release as the package, over
+HTTPS. It detects a corrupted or truncated download; it is not a signature, so
+it cannot detect a release that was itself replaced. If that matters for your
+hosts, install a reviewed build yourself and select it with `--compositor`.
 
 Installations live under `~/.local/share/nativepipe/compositor/releases/` on
 Linux. The `current` link changes only after validation succeeds. Previous
@@ -292,17 +305,18 @@ the managed installation on those launches; use `--compositor` to select a
 specific executable when several are installed.
 
 To update the macOS command, download a new CLI release and repeat the
-[installation steps](#download-the-macos-command). The compositor option updates
-only the Linux helper.
+[installation steps](#download-the-macos-command). The `--install-compositor` option updates
+only the NativePipe compositor.
 
 ## Troubleshooting
 
 | Symptom | What to check |
 | --- | --- |
-| SSH login fails | Try ordinary `ssh` with the same destination, key, port, or configuration file. Check the server's availability and host-key/authentication messages. |
-| “NativePipe compositor is not installed” | Run again with `--install-compositor`, or provide an existing executable with `--compositor`. |
-| GitHub download or installation fails | Check GitHub access from both machines, the Linux installation tools listed above, and free space in the remote home directory. |
-| The helper reports a missing library, keyboard data, or `dbus-run-session` | Install the matching Linux distribution packages. A release archive still relies on compatible system libraries. |
+| “Couldn’t connect to …”, or SSH login fails | Try ordinary `ssh` with the same destination, key, port, or configuration file. Check the server's availability and host-key/authentication messages. |
+| “The NativePipe compositor isn’t installed on …” | Run again with `--install-compositor`, or provide an existing executable with `--compositor`. |
+| “The NativePipe compositor on Linux doesn’t match this version of NativePipe” | Update the macOS command, then run once with `--install-compositor` so both sides match. |
+| GitHub download or installation fails | Check GitHub access from both machines, the Linux installation tools listed above, and free space in the remote home directory. “GitHub is limiting requests from your network” clears by itself after a few minutes. |
+| The compositor reports a missing library, keyboard data, or `dbus-run-session` | Install the matching Linux distribution packages. A release archive still relies on compatible system libraries. |
 | The application is not found | Install it on Linux and use the executable name or its absolute Linux path. Your interactive shell's aliases and functions are not application executables. |
 | The session exits without a window | Check whether the application exited, detached, or contacted an existing instance. Use its foreground or separate-instance option when available. |
 | A Wayland application works but an X11 application does not | Install `xwayland-satellite` and Xwayland on Linux and make them available in the remote session's `PATH`. |
@@ -324,12 +338,13 @@ nativepipe -o BatchMode=yes -o ConnectTimeout=5 linux-dev gtk4-demo 2>nativepipe
 
 Invalid CLI arguments fail before connecting with exit status 2. After launch,
 NativePipe preserves the SSH/session exit status (SSH commonly uses 255 for a
-connection failure). This client has no JSON result format or durable job IDs;
+connection failure). Cancelling the sign-in prompt exits with 130, the same
+status Ctrl-C produces, so scripts never mistake it for success. This client has no JSON result format or durable job IDs;
 logs are text. Ctrl-C, **Disconnect**, or **⌘Q** ends the session. A new invocation
 starts a new Linux command; it does not resume a previous task. To diagnose failure,
-first test ordinary SSH with the same options, then check the helper and Linux app.
+first test ordinary SSH with the same options, then check the compositor and Linux app.
 
-To check the managed Linux helper independently:
+To check the managed NativePipe compositor independently:
 
 ```sh
 ssh user@linux-host '$HOME/.local/share/nativepipe/compositor/current/nativepipe-wayland --check-runtime'

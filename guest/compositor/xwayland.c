@@ -5,6 +5,7 @@
 #include "xwayland.h"
 
 #include "compositor_internal.h"
+#include "user_text.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -242,7 +243,7 @@ static int start_satellite(int fd, uint32_t mask, void *data)
 	struct np_xwayland *xw = data;
 	if (xw->pid > 0) return 0;
 	if (!xw->server->session_socket[0]) {
-		fprintf(stderr, "[xwayland] Wayland socket is not ready\n");
+		np_user_text("X11_FAILED", "X11 applications won’t open: xwayland-satellite couldn’t start (%s).", "the Wayland socket is not ready", NULL);
 		return 0;
 	}
 	remove_listen_sources(xw);
@@ -271,13 +272,12 @@ static int start_satellite(int fd, uint32_t mask, void *data)
 		_exit(errno == ENOENT ? 127 : 126);
 	}
 	if (pid < 0) {
-		fprintf(stderr, "[xwayland] could not start satellite: %s\n",
-		        strerror(errno));
+		np_user_text("X11_FAILED", "X11 applications won’t open: xwayland-satellite couldn’t start (%s).", strerror(errno), NULL);
 		add_listen_sources(xw);
 		return 0;
 	}
 	xw->pid = pid;
-	fprintf(stderr, "[xwayland] satellite pid=%ld starting on %s\n",
+	np_debug_log("[xwayland] satellite pid=%ld starting on %s\n",
 	        (long)pid, xw->server->xwayland_display);
 	return 0;
 }
@@ -291,7 +291,7 @@ static void add_listen_sources(struct np_xwayland *xw)
 			loop, xw->listen_fd[i], WL_EVENT_READABLE,
 			start_satellite, xw);
 		if (!xw->listen_source[i]) {
-			fprintf(stderr, "[xwayland] could not watch display socket\n");
+			np_user_text("X11_FAILED", "X11 applications won’t open: xwayland-satellite couldn’t start (%s).", "cannot watch the display socket", NULL);
 			remove_listen_sources(xw);
 			return;
 		}
@@ -307,7 +307,7 @@ static int sigchld_received(int signal_number, void *data)
 	pid_t result = waitpid(xw->pid, &status, WNOHANG);
 	if (result != xw->pid) return 0;
 
-	fprintf(stderr, "[xwayland] satellite exited status=%d\n", status);
+	np_debug_log("[xwayland] satellite exited status=%d\n", status);
 	xw->pid = -1;
 	add_listen_sources(xw);
 	return 0;
@@ -315,7 +315,13 @@ static int sigchld_received(int signal_number, void *data)
 
 bool np_xwayland_init(struct np_server *server)
 {
-	if (!server || !executable_in_path(XWAYLAND_SATELLITE_NAME)) return false;
+	if (!server) return false;
+	if (!executable_in_path(XWAYLAND_SATELLITE_NAME)) {
+		/* Without it every X11 application fails with an opaque "cannot open
+		 * display", far from here. Say what is missing while it can be fixed. */
+		np_user_text("X11_NOT_INSTALLED", "X11 applications won’t open because xwayland-satellite isn’t installed. Install xwayland-satellite and Xwayland on the Linux computer.", NULL, NULL);
+		return false;
+	}
 	struct np_xwayland *xw = calloc(1, sizeof(*xw));
 	if (!xw) return false;
 	xw->server = server;
@@ -324,6 +330,7 @@ bool np_xwayland_init(struct np_server *server)
 	server->xwayland = xw;
 
 	if (!reserve_display(xw) || !create_auth_file(xw)) {
+		np_user_text("X11_FAILED", "X11 applications won’t open: xwayland-satellite couldn’t start (%s).", "cannot reserve an X11 display", NULL);
 		np_xwayland_finish(server);
 		return false;
 	}
@@ -334,6 +341,7 @@ bool np_xwayland_init(struct np_server *server)
 	xw->sigchld_source = wl_event_loop_add_signal(
 		loop, SIGCHLD, sigchld_received, xw);
 	if (!xw->sigchld_source) {
+		np_user_text("X11_FAILED", "X11 applications won’t open: xwayland-satellite couldn’t start (%s).", "cannot watch the satellite process", NULL);
 		np_xwayland_finish(server);
 		return false;
 	}
@@ -343,7 +351,7 @@ bool np_xwayland_init(struct np_server *server)
 		return false;
 	}
 
-	fprintf(stderr, "[xwayland] satellite display reserved at %s\n",
+	np_debug_log("[xwayland] satellite display reserved at %s\n",
 	        server->xwayland_display);
 	return true;
 }

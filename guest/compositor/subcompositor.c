@@ -28,6 +28,10 @@ void np_subsurface_detach(struct np_surface *surface)
 	np_surface_drop_queued_references(surface->server, surface);
 	drop_stack_ops_referencing(surface->server, surface);
 	if (surface->parent) {
+		/* Before unlinking: afterwards np_scene_root() cannot find the root
+		 * this surface was contributing to, and the area it covered still has
+		 * to be repainted. */
+		np_scene_note_structure_change(np_scene_root(surface));
 		wl_list_remove(&surface->sibling_link);
 		wl_list_init(&surface->sibling_link);
 		surface->parent = NULL;

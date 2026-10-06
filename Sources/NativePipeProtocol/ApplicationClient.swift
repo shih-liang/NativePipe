@@ -78,7 +78,7 @@ public final class ApplicationClient {
         pending.removeValue(forKey: token)?.continuation.resume(with: result)
     }
     private func request(_ action: ApplicationAction, _ id: String = "") async throws -> ApplicationReply {
-        guard connected else { throw Failure(NPText("The Linux window service is disconnected.")) }
+        guard connected else { throw Failure(NPText("NativePipe isn’t connected to the Linux computer.")) }
         repeat { nextToken &+= 1 } while nextToken == 0 || pending[nextToken] != nil
         let token = nextToken
         let timeout = Task { [weak self] in

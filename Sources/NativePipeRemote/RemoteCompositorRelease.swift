@@ -19,13 +19,18 @@ enum RemoteCompositorRelease {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let response = response as? HTTPURLResponse, response.statusCode == 200 else {
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-                throw RemoteError.message(NPText("Could not check NativePipe updates on GitHub (HTTP %@).", String(describing: (status))))
+                // Unauthenticated API calls are limited per network address,
+                // and "HTTP 403" gives no hint that waiting is the whole fix.
+                if status == 403 || status == 429 {
+                    throw RemoteError.message(NPText("GitHub is limiting requests from your network. Try again in a few minutes."))
+                }
+                throw RemoteError.message(NPText("Couldn’t check GitHub for NativePipe compositor updates (HTTP %@). Check your internet connection, then try again.", String(status)))
             }
             let releases = try JSONDecoder().decode([Release].self, from: data)
             if let base = try select(releases) { return base }
             if releases.count < 100 { break }
         }
-        throw RemoteError.message(NPText("GitHub has no installable NativePipe compositor release available. A release must contain install-compositor.sh, nativepipe-compositor-<architecture>-<libc>.tar.gz and SHA256SUMS."))
+        throw RemoteError.message(NPText("GitHub has no NativePipe compositor release that can be installed. Try again later."))
     }
 
     static func select(_ releases: [Release]) throws -> URL? {

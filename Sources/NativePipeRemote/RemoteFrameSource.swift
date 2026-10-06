@@ -318,7 +318,7 @@ public final class RemoteFrameSource: @unchecked Sendable, FrameSource {
                     self.lock.lock()
                     let current = self.streams[id] === stream && stream.pendingIDs.contains(resourceID)
                     self.lock.unlock()
-                    if current { self.fail(NPText("Could not decode remote frame %@.", String(describing: (resourceID))), generation: stream.generation) }
+                    if current { self.fail(NPText("Could not decode remote frame %@.", String(resourceID)), generation: stream.generation) }
                 }
             }
             stream.av1.onFrame = stream.decoder.onFrame

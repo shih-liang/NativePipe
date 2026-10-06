@@ -1,4 +1,5 @@
 import Foundation
+import NativePipeStrings
 import Darwin
 
 /// Shared local IPC listener. Parsing, business requests and long-lived
@@ -111,7 +112,7 @@ public final class LocalSocketServer {
                         return
                     default:
                         let code = errno
-                        fputs("Local IPC listener failed: \(String(cString: strerror(code)))\n", stderr)
+                        fputs(NPText("NativePipe couldn’t accept local connections: %@", String(cString: strerror(code))) + "\n", stderr)
                         stopAcceptingOnQueue()
                         return
                     }
@@ -134,7 +135,7 @@ public final class LocalSocketServer {
                     clients[id] = (connection, task)
                 } catch {
                     // SocketConnection owns the descriptor even when setup fails.
-                    fputs("Local IPC connection failed: \(error.localizedDescription)\n", stderr)
+                    fputs(NPText("A local NativePipe connection failed: %@", error.localizedDescription) + "\n", stderr)
                 }
             }
             if clients.count >= maximumConnections { pause() }

@@ -5,6 +5,7 @@
 #include "compositor_internal.h"
 #include "window_events.h"
 #include "windowwire.h"
+#include "user_text.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -149,7 +150,7 @@ void np_backend_session_attach(struct np_server *server, struct wl_event_loop *l
     posix_spawnattr_destroy(&attr);
     posix_spawn_file_actions_destroy(&actions);
     if (error) {
-        fprintf(stderr, "[wayland] cannot launch %s: %s\n", b->command[0], strerror(error));
+        np_user_text("CANNOT_LAUNCH", "Couldn’t start %s: %s.", b->command[0], strerror(error));
         b->application_pid = 0;
         b->exit_status = error == ENOENT ? 127 : 126;
         server->terminate = true;
@@ -159,7 +160,9 @@ void np_backend_session_attach(struct np_server *server, struct wl_event_loop *l
         b->application_fd = syscall(SYS_pidfd_open, b->application_pid, 0);
         if (b->application_fd < 0 || !wl_event_loop_add_fd(loop, b->application_fd,
                 WL_EVENT_READABLE, application_exited, server)) {
-            fprintf(stderr, "[wayland] cannot watch application exit: %s\n", strerror(errno));
+            char detail[160];
+            snprintf(detail, sizeof(detail), "cannot watch the application: %s", strerror(errno));
+            np_user_text("STARTUP_FAILED", "The NativePipe compositor couldn’t start (%s).", detail, NULL);
             b->exit_status = 1;
             server->terminate = true;
         }

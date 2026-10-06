@@ -608,10 +608,12 @@ static void apply_surface_update_now(struct np_surface_update *update) {
 			surface, update->minimum_width, update->minimum_height,
 			update->maximum_width, update->maximum_height);
 	}
-	uint32_t content_width = surface->last_width > 0
+	uint32_t previous_width = surface->last_width > 0
 		? (uint32_t)surface->last_width : 0;
-	uint32_t content_height = surface->last_height > 0
+	uint32_t previous_height = surface->last_height > 0
 		? (uint32_t)surface->last_height : 0;
+	uint32_t content_width = previous_width;
+	uint32_t content_height = previous_height;
 	if (update->buffer_commit == NP_BUFFER_DETACH) {
 		content_width = content_height = 0;
 	} else if (update->buffer_commit == NP_BUFFER_ATTACH) {
@@ -634,13 +636,9 @@ static void apply_surface_update_now(struct np_surface_update *update) {
 	np_shm_texture_prepare_commit(
 		surface, content_width, content_height,
 		update->viewport_changed || update->transform_changed || scale_changed);
-	bool scene_structure_changed =
-		update->buffer_commit == NP_BUFFER_DETACH || update->geometry_set ||
-		update->popup_geometry_changed || update->viewport_changed ||
-		update->transform_changed || update->offset_changed || scale_changed ||
-		update->subsurface_state_changed ||
-		!wl_list_empty(&update->subsurface_positions) ||
-		!wl_list_empty(&update->stack_ops);
+	bool scene_structure_changed = np_scene_update_changes_structure(
+		update, previous_width, previous_height,
+		content_width, content_height, scale_changed);
 	np_scene_note_damage(surface, &update->damage, scene_structure_changed);
 	struct np_subsurface_position_update *position, *position_tmp;
 	wl_list_for_each_safe(position, position_tmp,

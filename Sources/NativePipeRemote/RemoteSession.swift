@@ -15,6 +15,14 @@ public final class RemoteSession {
     public var onDiagnostic: ((String) -> Void)?
     public var onError: ((Error) -> Void)?
     public private(set) var exitStatus: Int32?
+    /// The remote command's own exit status, set only when it actually exited.
+    /// `exitStatus` is also synthesized for local failures, so it cannot tell a
+    /// command that exited with 1 apart from a stream this Mac rejected.
+    public private(set) var remoteExitStatus: Int32?
+    /// SSH and remote stderr as a person should read it: NativePipe's own
+    /// startup markers removed, capped like the raw buffer.
+    public private(set) var visibleDiagnostics = ""
+    private var diagnosticLines = DiagnosticLines()
     public lazy var applicationClient = ApplicationClient { [weak self] in self?.send($0) }
     private let command: SSHCommand
     private let environment: [String: String]?
@@ -68,6 +76,9 @@ public final class RemoteSession {
         generation += 1
         let token = generation
         diagnostics = ""
+        visibleDiagnostics = ""
+        diagnosticLines = DiagnosticLines()
+        remoteExitStatus = nil
         startupPhase = .connecting
         onStartupPhaseChange?(.connecting)
         exitStatus = nil
@@ -278,7 +289,24 @@ public final class RemoteSession {
                 startupPhase = .authenticating
             }
         }
+        show(diagnosticLines.visible(text))
+    }
+
+    private func show(_ text: String) {
+        guard !text.isEmpty else { return }
+        visibleDiagnostics = String((visibleDiagnostics + text).suffix(65_536))
         onDiagnostic?(text)
+    }
+
+    /// A final line without a newline is held back in case it is the first half
+    /// of a marker; once the stream is over it can only be text.
+    private func flushDiagnostics() {
+        show(diagnosticLines.finish())
+    }
+
+    /// The diagnostics as an error message: no markers, no trailing newline.
+    private var diagnosticMessage: String {
+        visibleDiagnostics.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func advanceStartup(to phase: StartupPhase, token: Int) {
@@ -293,18 +321,22 @@ public final class RemoteSession {
             do { try await Task.sleep(for: timeout) } catch { return }
             guard let self, self.generation == token, !self.isReady else { return }
             let message = phase == .ready
-                ? NPText("The remote compositor did not become ready in time. Check its startup log and reconnect.")
+                ? NPText("The NativePipe compositor didn’t start in time. The connection messages may show why.")
                 : NPText("NativePipe installation did not finish in time. Check the remote connection and available disk space.")
-            self.fail(RemoteError.message(message + (self.diagnostics.isEmpty ? "" : "\n" + self.diagnostics)), token: token)
+            self.flushDiagnostics()
+            let details = self.diagnosticMessage
+            self.fail(RemoteError.message(message + (details.isEmpty ? "" : "\n" + details)), token: token)
         }
     }
 
     private func ended(_ status: Int32, token: Int) {
         guard token == generation else { return }
+        flushDiagnostics()
         exitStatus = status
+        remoteExitStatus = status
         if status != 0 || !isReady {
-            fail(RemoteError.message(diagnostics.isEmpty
-                ? NPText("Remote command exited with status %@.", String(describing: (status))) : diagnostics), token: token)
+            fail(RemoteError.message(diagnosticMessage.isEmpty
+                ? NPText("Remote command exited with status %@.", String(status)) : diagnosticMessage), token: token)
         } else { disconnect() }
     }
 
@@ -353,6 +385,54 @@ public final class RemoteSession {
             let count = Darwin.read(handle.fileDescriptor, &buffer, capacity)
             if count >= 0 { return Data(buffer.prefix(count)) }
             if errno != EINTR { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        }
+    }
+}
+
+/// Splits SSH's stderr into the text a person should read and NativePipe's own
+/// startup markers ("NATIVEPIPE PHASE READY" and the like). The markers drive
+/// startup tracking; they are protocol, and echoing them to a terminal or into
+/// an error dialog shows the user a packet header.
+///
+/// Works a line at a time, because a read can end halfway through a marker.
+/// Scans Unicode scalars rather than Characters: Swift treats "\r\n" as one
+/// Character, so searching Characters for "\n" would miss CRLF line ends.
+struct DiagnosticLines {
+    private var pending = String.UnicodeScalarView()
+
+    /// The complete, non-marker lines in `text`, newlines included. A trailing
+    /// partial line is held until the rest of it arrives.
+    mutating func visible(_ text: String) -> String {
+        pending.append(contentsOf: text.unicodeScalars)
+        guard let lastNewline = pending.lastIndex(of: "\n") else { return "" }
+        let complete = pending[...lastNewline]
+        pending = String.UnicodeScalarView(pending[pending.index(after: lastNewline)...])
+        var result = String.UnicodeScalarView()
+        var start = complete.startIndex
+        for index in complete.indices where complete[index] == "\n" {
+            let line = complete[start...index]
+            if !Self.isMarker(String(String.UnicodeScalarView(line))) {
+                result.append(contentsOf: line)
+            }
+            start = complete.index(after: index)
+        }
+        return String(result)
+    }
+
+    /// The held partial line, once the stream has ended.
+    mutating func finish() -> String {
+        defer { pending = String.UnicodeScalarView() }
+        let rest = String(pending)
+        return Self.isMarker(rest) ? "" : rest
+    }
+
+    /// "NATIVEPIPE" followed only by upper-case words. Ordinary messages that
+    /// mention the product spell it "NativePipe", so they never match.
+    static func isMarker(_ line: String) -> Bool {
+        let body = line.trimmingCharacters(in: .newlines)
+        guard body.hasPrefix("NATIVEPIPE ") else { return false }
+        return body.unicodeScalars.dropFirst(11).allSatisfy {
+            (65...90).contains($0.value) || (48...57).contains($0.value) || $0 == " " || $0 == "_"
         }
     }
 }

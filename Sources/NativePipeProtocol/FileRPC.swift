@@ -120,7 +120,7 @@ public struct FileRPC: Sendable {
             case .protocolError: return NPText("The file transfer returned an invalid response.")
             case .invalidPath: return NPText("The file path is invalid.")
             case .tooLarge: return NPText("Use streaming transfer to read this file.")
-            case .local(let code): return NPText("File transfer failed: %@ (%@).", String(describing: (String(cString: strerror(code)))), String(describing: (code)))
+            case .local(let code): return NPText("File transfer failed: %@ (%@).", String(cString: strerror(code)), String(code))
             case .remote(let code):
                 // NPFR peers are Linux; Darwin's errno numbering is different.
                 let message: String = switch code {
@@ -144,7 +144,7 @@ public struct FileRPC: Sendable {
                 case 125: NPText("Operation cancelled")
                 default: NPText("File service error")
                 }
-                return NPText("Linux file transfer failed: %@ (%@).", String(describing: (message)), String(describing: (code)))
+                return NPText("Linux file transfer failed: %@ (%@).", message, String(code))
             }
         }
     }

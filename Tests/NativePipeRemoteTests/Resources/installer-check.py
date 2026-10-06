@@ -219,7 +219,7 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-installer-") as directory:
         executable = shlex.quote(str(current.resolve() / 'nativepipe-wayland'))
         (fixture / 'interrupted-with-valid-output/install-compositor.sh').write_text(f"printf '%s\\n' {executable}\n")
         (fixture / 'interrupted-with-valid-output/download-failed').touch()
-        assert 'download did not complete' in invoke(success=False).stderr
+        assert 'didn’t download completely' in invoke(success=False).stderr
         release('missing-installer')
         (fixture / 'missing-installer/install-compositor.sh').unlink()
         assert 'HTTP 404' in invoke(success=False).stderr

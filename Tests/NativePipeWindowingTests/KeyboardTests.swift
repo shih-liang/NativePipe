@@ -241,4 +241,20 @@ final class KeyboardTests: XCTestCase {
         view.keyUp(with: event(.keyUp))
         XCTAssertEqual(output.keys.map(\.pressed), [true, false, true, false])
     }
+
+    /// The app's Edit menu is harmless over guest content only because nothing
+    /// on the guest's side of the responder chain answers its actions. Its items
+    /// then validate as disabled, and their key equivalents fall through to
+    /// keyDown and the shortcut translation. If the content view or the window's
+    /// delegate ever implements one, AppKit enables that item and the keystroke
+    /// stops reaching the Linux application.
+    func testGuestContentAnswersNoEditMenuAction() throws {
+        let (_, native, view, _) = try fixture()
+        for action in ["cut:", "copy:", "paste:", "selectAll:", "undo:", "redo:", "delete:"] {
+            XCTAssertFalse(view.responds(to: Selector(action)), "content view answers \(action)")
+        }
+        for action in ["cut:", "copy:", "paste:", "selectAll:", "delete:"] {
+            XCTAssertFalse(native.responds(to: Selector(action)), "window delegate answers \(action)")
+        }
+    }
 }

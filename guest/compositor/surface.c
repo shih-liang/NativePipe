@@ -233,7 +233,16 @@ static void surface_resource_destroy(struct wl_resource *resource) {
 
 	// Children may outlive their parent's resource. Remove both active stacking
 	// links and unapplied restack operations before any pointer can go stale.
+	//
+	// A client may destroy the wl_surface while leaving the wl_subsurface role
+	// object alive, so this -- not only the role object's destructor -- has to
+	// republish the scene it was part of. Without it the host goes on showing
+	// the layer list that still contains this surface.
+	struct np_surface *former_root = np_scene_root(surface);
 	np_subsurface_detach_tree(surface);
+	if (former_root && former_root != surface)
+		np_presentation_queue_scene(
+			former_root, np_presentation_next_id(surface->server));
 	if (np_surface_is_toplevel(surface)) {
 		uint32_t fields[] = {surface->window_id};
 		np_window_event_send(surface->server, NP_GUEST_TOPLEVEL_DESTROYED,

@@ -12,6 +12,7 @@
 #include "xdg_shell.h"
 #include "xwayland.h"
 #include "xdg-shell-server-protocol.h"
+#include "user_text.h"
 
 #include <errno.h>
 #include <ctype.h>
@@ -640,8 +641,7 @@ static void handle_close(struct np_server *server, uint32_t window_id,
 	gid_t gid = 0;
 	wl_client_get_credentials(client, &pid, &uid, &gid);
 	if (pid > 1 && pid != getpid() && kill(pid, SIGKILL) < 0)
-		fprintf(stderr, "[wayland] force quit pid %ld failed: %s\n",
-		        (long)pid, strerror(errno));
+		np_user_text("FORCE_QUIT_FAILED", "Couldn’t force quit the application: %s.", strerror(errno), NULL);
 }
 
 static void handle_keyboard_focus(struct np_server *server, uint32_t window) {

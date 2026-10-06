@@ -7,6 +7,7 @@
 #include "scene.h"
 #include "window_events.h"
 #include "windowwire.h"
+#include "user_text.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -415,8 +416,12 @@ static int clip_read_ready(int fd, uint32_t mask, void *data) {
 		if (read_state->len == read_state->cap) {
 			size_t cap = read_state->cap ? read_state->cap * 2 : 8192;
 			if (cap > (read_state->file_drag ? 1024u * 1024u : NP_CLIP_MAX)) {
-				fprintf(stderr, "[wayland] selection exceeds %u bytes; refusing\n",
-				        NP_CLIP_MAX);
+				{
+					char limit[24];
+					snprintf(limit, sizeof(limit), "%u",
+					         read_state->file_drag ? 1024u * 1024u : NP_CLIP_MAX);
+					np_user_text("TRANSFER_TOO_LARGE", "The copied or dragged content is larger than %s bytes, so it wasn’t transferred.", limit, NULL);
+				}
 				clip_read_finish(read_state, false);
 				return 0;
 			}

@@ -42,8 +42,8 @@ jobs:
         run: make -C guest/compositor test-remote-transport test-remote-encoder test-remote-scheduler
       - name: Test ordinary-user application service
         run: make -C guest/compositor test-applications
-      - name: Test file drag lifecycle
-        run: make -C guest/compositor test-file-drag
+      - name: Test file drag lifecycle and scene damage
+        run: make -C guest/compositor test-file-drag test-scene-damage
       - name: Test bounded file service and syscall fallback
         run: make -C common/file_rpc test-linux
       - name: Test guest GPU compatibility hooks

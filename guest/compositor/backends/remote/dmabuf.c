@@ -8,6 +8,7 @@
 #include "dmabuf_egl.h"
 #include "linux-dmabuf-unstable-v1-server-protocol.h"
 #include "syncobj.h"
+#include "user_text.h"
 
 #include <drm_fourcc.h>
 #include <errno.h>
@@ -200,7 +201,7 @@ void np_gpu_buffer_end_cpu_read(struct np_gpu_buffer *buffer)
 	if (gpu->mapping && gpu->mapping != MAP_FAILED) {
 		struct dma_buf_sync sync = {.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ};
 		if (ioctl(gpu->fd, DMA_BUF_IOCTL_SYNC, &sync) < 0 && errno != ENOTTY)
-			fprintf(stderr, "[wayland] DMA_BUF_SYNC END: %s\n", strerror(errno));
+			np_debug_log("[wayland] DMA_BUF_SYNC END: %s\n", strerror(errno));
 	}
 	gpu->cpu_reads--;
 	gpu_unref(gpu);
@@ -660,8 +661,7 @@ static int open_render_node(char **path_out)
 			*path_out = strdup(configured);
 			return fd;
 		}
-		fprintf(stderr, "[wayland] cannot open REMOTEPIPE_RENDER_NODE=%s: %s\n",
-		        configured, strerror(errno));
+		np_user_text("RENDER_NODE_FAILED", "Couldn’t open the render node %s set in REMOTEPIPE_RENDER_NODE: %s.", configured, strerror(errno));
 	}
 
 	glob_t nodes = {0};
@@ -709,11 +709,11 @@ void np_dmabuf_advertise(struct wl_display *display, int drm_fd)
 		display, &zwp_linux_dmabuf_v1_interface,
 		dmabuf->importer ? 4 : 3, dmabuf, dmabuf_bind);
 	if (dmabuf->importer)
-		fprintf(stderr,
+		np_debug_log(
 		        "[wayland] linux-dmabuf v4 EGL feedback device=%s\n",
 		        dmabuf->render_node ? dmabuf->render_node : "inherited drm fd");
 	else
-		fprintf(stderr,
+		np_debug_log(
 		        "[wayland] no render node; linux-dmabuf v3 linear fallback\n");
 }
 

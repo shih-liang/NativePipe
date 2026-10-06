@@ -10,8 +10,8 @@ enum RemoteCompositorInstaller {
           --connect-timeout 10 --max-time 30 "${release:?NativePipe release URL was not resolved.}/install-compositor.sh" &&
         printf complete > "$download_status"; } | sh -s -- --release "$release"
     )
-    [ -s "$download_status" ] || { echo 'NativePipe installer download did not complete.' >&2; exit 1; }
-    [ -n "$compositor" ] && [ -x "$compositor" ] || { echo 'NativePipe installer did not return an executable.' >&2; exit 1; }
+    [ -s "$download_status" ] || { printf '%s\n' "${NATIVEPIPE_TEXT_INSTALL_DOWNLOAD_INCOMPLETE:-The NativePipe installer didn’t download completely. Check the Linux computer’s internet connection, then try again.}" >&2; exit 1; }
+    [ -n "$compositor" ] && [ -x "$compositor" ] || { printf '%s\n' "${NATIVEPIPE_TEXT_INSTALL_FAILED:-The NativePipe compositor couldn’t be installed.}" >&2; exit 1; }
     rm -f "$download_status"
     trap - EXIT HUP INT TERM
     """#
@@ -24,16 +24,16 @@ enum RemoteCompositorInstaller {
     trap 'exit 1' HUP INT TERM
     printf 'NATIVEPIPE INSTALLER\n'
     IFS= read -r size
-    case "$size" in ''|*[!0-9]*) echo 'Invalid NativePipe installer size.' >&2; exit 1;; esac
+    case "$size" in ''|*[!0-9]*) printf '%s\n' "${NATIVEPIPE_TEXT_INSTALL_INVALID_UPLOAD:-The NativePipe files received from this Mac are invalid. Try again.}" >&2; exit 1;; esac
     [ "${#size}" -le 5 ] && [ "$size" -gt 0 ] && [ "$size" -le 65536 ] || {
-      echo 'NativePipe installer exceeds the size limit.' >&2; exit 1;
+      printf '%s\n' "${NATIVEPIPE_TEXT_INSTALL_INVALID_UPLOAD:-The NativePipe files received from this Mac are invalid. Try again.}" >&2; exit 1;
     }
     head -c "$size" > "$installer"
-    [ "$(wc -c < "$installer")" -eq "$size" ] || { echo 'NativePipe installer upload was interrupted.' >&2; exit 1; }
+    [ "$(wc -c < "$installer")" -eq "$size" ] || { printf '%s\n' "${NATIVEPIPE_TEXT_INSTALL_INTERRUPTED:-The NativePipe upload was interrupted. Try again.}" >&2; exit 1; }
     exec 3>&1
     compositor=$(sh "$installer" --upload)
     exec 3>&-
-    [ -n "$compositor" ] && [ -x "$compositor" ] || { echo 'NativePipe installer did not return an executable.' >&2; exit 1; }
+    [ -n "$compositor" ] && [ -x "$compositor" ] || { printf '%s\n' "${NATIVEPIPE_TEXT_INSTALL_FAILED:-The NativePipe compositor couldn’t be installed.}" >&2; exit 1; }
     rm -f "$installer"
     trap - EXIT HUP INT TERM
     """#

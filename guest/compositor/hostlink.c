@@ -2,6 +2,7 @@
 
 #include "hostlink.h"
 #include "host_transport.h"
+#include "user_text.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -55,7 +56,7 @@ void np_host_accept(struct np_host *host) {
 	host->out_len = 0;
 	host->input_enabled = true;
 	host->output_enabled = true;
-	fprintf(stderr, "[wayland] host attached on port %u\n", host->port);
+	np_debug_log("[wayland] host attached on port %u\n", host->port);
 }
 
 void np_host_disconnect(struct np_host *host) {
@@ -70,7 +71,7 @@ void np_host_disconnect(struct np_host *host) {
 	host->output_enabled = false;
 	host->input_enabled = false;
 	if (was_connected)
-		fprintf(stderr, "[wayland] host detached from port %u\n", host->port);
+		np_debug_log("[wayland] host detached from port %u\n", host->port);
 }
 
 /* One maximum-sized NPIP frame must always fit.  The queue cap is otherwise
@@ -123,7 +124,7 @@ bool np_host_send_binary(struct np_host *host, const void *payload, size_t lengt
 		/* Structural and presentation messages are ordered state.  Dropping one
 		 * would leave the two peers permanently divergent; reconnect instead so
 		 * the compositor's normal replay sends one authoritative snapshot. */
-		fprintf(stderr, "[wayland] window channel backlog full; reconnecting\n");
+		np_debug_log("[wayland] window channel backlog full; reconnecting\n");
 		np_host_disconnect(host);
 		return false;
 	}
@@ -196,7 +197,7 @@ void np_host_pump(struct np_host *host,
 	while (host->buffer_len - offset >= NP_HEADER) {
 		const unsigned char *frame = host->buffer + offset;
 		if (memcmp(frame, NP_MAGIC, 4) != 0 || frame[4] != NP_VERSION) {
-			fprintf(stderr, "[wayland] bad frame on the window channel\n");
+			np_debug_log("[wayland] bad frame on the window channel\n");
 			np_host_disconnect(host);
 			return;
 		}
@@ -210,12 +211,12 @@ void np_host_pump(struct np_host *host,
 
 		const unsigned char *payload = frame + NP_HEADER;
 		if (!binary_handler || length < 4) {
-			fprintf(stderr, "[wayland] invalid binary window payload\n");
+			np_debug_log("[wayland] invalid binary window payload\n");
 			np_host_disconnect(host);
 			return;
 		}
 		if (!binary_handler(payload, length, user_data)) {
-			fprintf(stderr, "[wayland] malformed binary window payload\n");
+			np_debug_log("[wayland] malformed binary window payload\n");
 			np_host_disconnect(host);
 			return;
 		}

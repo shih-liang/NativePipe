@@ -12,6 +12,8 @@
 #include <unistd.h>
 #include <poll.h>
 
+bool np_trace_enabled(void) { return false; }
+
 static int count;
 static bool command(const unsigned char *payload, size_t size, void *data)
 {

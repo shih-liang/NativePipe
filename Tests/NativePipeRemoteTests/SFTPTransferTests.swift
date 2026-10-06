@@ -35,8 +35,19 @@ final class SFTPTransferTests: XCTestCase {
                 try await transfer.run(command: command, direction: .upload, local: directory.appendingPathComponent("unused"),
                     remote: "unused", environment: ["TEST_AUTH_READY": ready.path, "TEST_CANCEL_AUTH": cancelPrompt ? "1" : "0"])
             }
-            let deadline = ContinuousClock.now + .seconds(2)
+            // Bounds only a broken run: a working one continues the moment the
+            // stand-in starts. Two seconds was too tight for spawning sftp and
+            // the shell fixture while the rest of the suite loads the machine,
+            // and on expiry the read below failed with a misleading "no such
+            // file" instead of saying what actually never happened.
+            let deadline = ContinuousClock.now + .seconds(15)
             while !files.fileExists(atPath: ready.path), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+            guard files.fileExists(atPath: ready.path) else {
+                XCTFail("The SSH stand-in never reached its authentication prompt (cancelPrompt=\(cancelPrompt))")
+                transfer.cancel()
+                _ = try? await task.value
+                return
+            }
             let path = try String(contentsOf: ready, encoding: .utf8)
             if !cancelPrompt {
                 transfer.cancel()

@@ -72,12 +72,13 @@ public struct SSHCommand: Codable, Sendable, Equatable {
         elif [ -x "$HOME/.local/share/nativepipe/compositor/nativepipe-wayland" ]; then
           compositor="$HOME/.local/share/nativepipe/compositor/nativepipe-wayland"
         else
-          echo 'NativePipe compositor is not installed. Reconnect with --install-compositor.' >&2
+          printf '%s\\n' \(Self.quote(NPText("The NativePipe compositor isn’t installed on %@. Run nativepipe again with --install-compositor.", destination))) >&2
           exit 127
         fi
         """
         return """
         set -eu
+        \(RemoteText.exports)
         \(reportStartup ? "printf 'NATIVEPIPE PHASE INSTALLING\\n' >&2" : "")
         export NATIVEPIPE_HOST_H264_HARDWARE=\(hardwareH264 ? "1" : "0")
         compositor=\(Self.quote(compositor))

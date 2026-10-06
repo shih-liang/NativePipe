@@ -1,10 +1,22 @@
 import CoreMedia
 import CoreVideo
 import Foundation
+import NativePipeStrings
 import VideoToolbox
 
 /// Incremental H.264 Annex-B → CVPixelBuffer decoder (VideoToolbox).
 final class H264Decoder {
+    /// Decoder internals, printed only with NATIVEPIPE_FRAME_TRACE set. They
+    /// mean nothing outside a debugger, so they stay untranslated and off by
+    /// default; a decode that actually fails ends the session with a localized
+    /// error of its own.
+    private static let tracing = ProcessInfo.processInfo.environment["NATIVEPIPE_FRAME_TRACE"] != nil
+    private static func trace(_ message: @autoclosure () -> String) {
+        guard tracing else { return }
+        fputs(message(), stderr)
+        fflush(stderr)
+    }
+
     // With no asynchronous flag, VT completes the output handler before
     // DecodeFrame returns. All state and delivery stay on the decode queue.
     private final class DecodeResult: @unchecked Sendable {
@@ -59,7 +71,7 @@ final class H264Decoder {
 
         let nals = Self.splitAnnexB(annexB)
         guard !nals.isEmpty else {
-            fputs("nativepipe-remote: H264: 0 NALs in \(annexB.count) bytes\n", stderr)
+            Self.trace("nativepipe-remote: H264: 0 NALs in \(annexB.count) bytes\n")
             fflush(stderr)
             onFailure?(resourceID)
             return
@@ -85,7 +97,7 @@ final class H264Decoder {
         if formatChanged, !rebuildFormatIfPossible() { onFailure?(resourceID); return }
         guard !vcl.isEmpty else { onFailure?(resourceID); return }
         guard session != nil else {
-            fputs("nativepipe-remote: H264: VCL without VT session\n", stderr)
+            Self.trace("nativepipe-remote: H264: VCL without VT session\n")
             fflush(stderr)
             onFailure?(resourceID)
             return
@@ -116,7 +128,7 @@ final class H264Decoder {
             }
         }
         if status != noErr {
-            fputs("nativepipe-remote: H264 format desc failed status=\(status)\n", stderr)
+            Self.trace("nativepipe-remote: H264 format desc failed status=\(status)\n")
             fflush(stderr)
             reset(); return false
         }
@@ -161,15 +173,14 @@ final class H264Decoder {
             usingHardware = checked == noErr && hardware?.boolValue == true
             guard !requiresHardware || usingHardware else {
                 VTDecompressionSessionInvalidate(session)
-                fputs("nativepipe-remote: H264 hardware decoder is unavailable\n", stderr)
+                fputs("nativepipe: " + NPText("Hardware H.264 decoding isn’t available on this Mac.") + "\n", stderr)
                 return
             }
             self.session = session
             VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-            fputs("nativepipe-remote: H264 VideoToolbox \(usingHardware ? "hardware" : "software") session ready\n", stderr)
-            fflush(stderr)
+            Self.trace("nativepipe-remote: H264 VideoToolbox \(usingHardware ? "hardware" : "software") session ready\n")
         } else {
-            fputs("nativepipe-remote: VT session create status=\(status)\n", stderr)
+            Self.trace("nativepipe-remote: VT session create status=\(status)\n")
             fflush(stderr)
         }
     }

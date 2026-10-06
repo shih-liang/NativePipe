@@ -66,4 +66,65 @@ final class LocalizationTests: XCTestCase {
         }
         XCTAssertEqual(NPText("Cancel"), NPStrings.text("Cancel", language: language))
     }
+
+    /// The test above keeps the translation tables in step with one another,
+    /// but not with the code. Keys are the English sentences themselves, so
+    /// editing a sentence in Swift without editing the tables still shows
+    /// correct English -- an unknown key falls back to itself -- while every
+    /// other language silently reverts to English for that message. This reads
+    /// each literal NPText key out of the sources and requires it in the table.
+    func testEverySourceKeyIsInTheEnglishTable() throws {
+        let english = Set(try dictionary("en").keys)
+        let sources = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources")
+        let call = try NSRegularExpression(pattern: #"NPText\(\s*"((?:[^"\\]|\\.)*)""#)
+        let files = try XCTUnwrap(FileManager.default.enumerator(at: sources, includingPropertiesForKeys: nil))
+        var checked = 0
+        for case let file as URL in files where file.pathExtension == "swift" {
+            let text = try String(contentsOf: file, encoding: .utf8)
+            let range = NSRange(text.startIndex..., in: text)
+            for match in call.matches(in: text, range: range) {
+                let literal = String(text[Range(match.range(at: 1), in: text)!])
+                let key = try XCTUnwrap(Self.unescape(literal),
+                    "\(file.lastPathComponent): interpolation in an NPText key cannot be translated: \(literal)")
+                XCTAssertTrue(english.contains(key), "\(file.lastPathComponent): missing from en.lproj: \(key)")
+                checked += 1
+            }
+        }
+        // Guards the scan itself: a moved Sources directory or a broken pattern
+        // would otherwise make this pass by checking nothing.
+        XCTAssertGreaterThan(checked, 100)
+    }
+
+    /// Swift string-literal escapes, enough for localization keys. Returns nil
+    /// for interpolation, which makes a key dynamic and so untranslatable.
+    private static func unescape(_ literal: String) -> String? {
+        var result = "", characters = Array(literal), index = 0
+        while index < characters.count {
+            let character = characters[index]
+            guard character == "\\", index + 1 < characters.count else {
+                result.append(character); index += 1; continue
+            }
+            let next = characters[index + 1]
+            switch next {
+            case "n": result.append("\n")
+            case "t": result.append("\t")
+            case "r": result.append("\r")
+            case "0": result.append("\0")
+            case "\"", "'", "\\": result.append(next)
+            case "(": return nil
+            case "u":
+                guard let close = characters[index...].firstIndex(of: "}"),
+                      let scalar = UInt32(String(characters[(index + 3)..<close]), radix: 16)
+                        .flatMap(Unicode.Scalar.init) else { return nil }
+                result.unicodeScalars.append(scalar)
+                index = close + 1
+                continue
+            default: return nil
+            }
+            index += 2
+        }
+        return result
+    }
 }

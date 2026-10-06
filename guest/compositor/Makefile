@@ -53,7 +53,7 @@ FRONTEND_SOURCES := compositor.c applications.c applications_worker.c applicatio
 	subcompositor.c input.c keymap.c decoration.c scale.c scene.c region.c perf.c \
 	windowwire.c window_events.c \
 	xdg_shell.c text_input.c fifo.c \
-	data_device.c cursor_shape.c xwayland.c \
+	data_device.c cursor_shape.c xwayland.c user_text.c \
 	cursor-shape-v1-protocol.c xdg-shell-protocol.c viewporter-protocol.c \
 	fractional-scale-v1-protocol.c xdg-decoration-protocol.c \
 	text-input-v3-protocol.c linux-dmabuf-unstable-v1-protocol.c \
@@ -111,7 +111,7 @@ test-remote-transport: | $(BUILD_DIR)
 		backends/remote/host_transport.c backends/remote/medialink.c -pthread
 	$(BUILD_DIR)/remote-transport-test
 
-.PHONY: test-applications test-file-drag test-remote-encoder
+.PHONY: test-applications test-file-drag test-remote-encoder test-scene-damage test-user-text
 test-remote-encoder: | $(BUILD_DIR) check-deps-remote
 	$(CC) -O2 -Wall -Wextra -Werror -std=gnu11 $(REMOTE_CFLAGS) $$(pkg-config --cflags dav1d) \
 		tests/remote_encoder_test.c ../encoder/encoder.c ../encoder/encoder_vaapi.c ../encoder/encoder_nvenc.c ../encoder/alpha.c \
@@ -143,8 +143,25 @@ bench-remote-encoder: | $(BUILD_DIR) check-deps-remote
 test-file-drag: | $(BUILD_DIR)
 	$(CC) -O0 -g -Wall -Wextra -Werror -Wno-unused-parameter -std=gnu11 -I. \
 		$$(pkg-config --cflags wayland-server xkbcommon) \
-		tests/file_drag_test.c windowwire.c $$(pkg-config --libs wayland-server xkbcommon) -lm -o $(BUILD_DIR)/file-drag-test
+		tests/file_drag_test.c windowwire.c user_text.c $$(pkg-config --libs wayland-server xkbcommon) -lm -o $(BUILD_DIR)/file-drag-test
 	$(BUILD_DIR)/file-drag-test
+
+# The damage contract between scene construction and the host's drawable pool.
+# Needs only libwayland: the backends are fixtures, so it runs anywhere the
+# compositor builds, without a GPU or a host session.
+test-scene-damage: | $(BUILD_DIR)
+	$(CC) -O0 -g -Wall -Wextra -Werror -Wno-unused-parameter -std=gnu11 -I. \
+		$$(pkg-config --cflags wayland-server) \
+		tests/scene_damage_test.c $$(pkg-config --libs wayland-server) -lm \
+		-o $(BUILD_DIR)/scene-damage-test
+	$(BUILD_DIR)/scene-damage-test
+
+# Messages printed for the user arrive translated through the environment, so
+# the text must never be interpreted as a printf format. libc only.
+test-user-text: | $(BUILD_DIR)
+	$(CC) -O0 -g -Wall -Wextra -Werror -std=gnu11 -I. \
+		tests/user_text_test.c user_text.c -o $(BUILD_DIR)/user-text-test
+	$(BUILD_DIR)/user-text-test
 
 test-applications: | $(BUILD_DIR)
 	$(CC) -O0 -g -Wall -Wextra -Werror -std=gnu11 -I. \

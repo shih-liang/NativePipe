@@ -184,9 +184,9 @@ public final class DockWindowSwitcherController: NSObject, NSPopoverDelegate,
     private func reloadEntries() {
         heading.stringValue = title
         heading.toolTip = title
-        heading.setAccessibilityLabel(NPText("Machine: %@", String(describing: (title))))
-        searchField.setAccessibilityLabel(NPText("Search open windows on %@", String(describing: (title))))
-        tableView.setAccessibilityLabel(NPText("Open windows on %@", String(describing: (title))))
+        heading.setAccessibilityLabel(NPText("Machine: %@", title))
+        searchField.setAccessibilityLabel(NPText("Search open windows on %@", title))
+        tableView.setAccessibilityLabel(NPText("Open windows on %@", title))
         let bridge = presentedBridge
         entries = (bridge?.dockWindows ?? []).map { window in
             let app = window.applicationName ?? window.applicationID ?? NPText("Application")
@@ -331,7 +331,8 @@ public final class DockWindowSwitcherController: NSObject, NSPopoverDelegate,
             metadata.widthAnchor.constraint(equalTo: text.widthAnchor),
         ])
         cell.toolTip = "\(item.title)\n\(item.subtitle)\n\(title)"
-        cell.setAccessibilityLabel("\(item.title), \(item.subtitle), \(title)")
+        // VoiceOver reads this as one phrase; the list separator is language-specific.
+        cell.setAccessibilityLabel(NPText("%@, %@, %@", item.title, item.subtitle, title))
         cell.setAccessibilityHelp(NPText("Click to switch to this window. Window controls are available as labeled icon buttons."))
         return cell
     }
@@ -368,7 +369,7 @@ public final class DockWindowSwitcherController: NSObject, NSPopoverDelegate,
         if !utilities.isEmpty {
             if menu.items.count > 1 { menu.addItem(.separator()) }
             for utility in utilities {
-                addAction(NPText("Open %@", String(describing: (utility.title))), to: menu, enabled: utility.enabled) { [weak self] in
+                addAction(NPText("Open %@", utility.title), to: menu, enabled: utility.enabled) { [weak self] in
                     guard let self, self.bridgeProvider() === self.presentedBridge,
                           self.presentedBridge?.computerSessionID == self.presentedSession,
                           let current = self.utilitiesProvider().first(where: { $0.title == utility.title }), current.enabled else { return }
@@ -389,7 +390,7 @@ public final class DockWindowSwitcherController: NSObject, NSPopoverDelegate,
             button.bezelStyle = .inline
             button.isBordered = false
             button.toolTip = label
-            button.setAccessibilityLabel(NPText("%@: %@ on %@", String(describing: (label)), String(describing: (entry.title)), String(describing: (title))))
+            button.setAccessibilityLabel(NPText("%@: %@ on %@", label, entry.title, title))
             button.perform = action; button.target = button
             button.action = #selector(SwitcherActionButton.invoke)
             button.translatesAutoresizingMaskIntoConstraints = false
@@ -451,8 +452,8 @@ public final class DockWindowSwitcherController: NSObject, NSPopoverDelegate,
         closeSwitcher()
         let alert = NSAlert()
         alert.alertStyle = .critical
-        alert.messageText = NPText("Force Quit %@?", String(describing: (window.applicationName ?? window.applicationID ?? window.title)))
-        alert.informativeText = NPText("All windows of this application on %@ will close. Unsaved changes will be lost.", String(describing: (title)))
+        alert.messageText = NPText("Force Quit %@?", window.applicationName ?? window.applicationID ?? window.title)
+        alert.informativeText = NPText("All windows of this application on %@ will close. Unsaved changes will be lost.", title)
         alert.addButton(withTitle: NPText("Cancel"))
         alert.addButton(withTitle: NPText("Force Quit"))
         guard alert.runModal() == .alertSecondButtonReturn,

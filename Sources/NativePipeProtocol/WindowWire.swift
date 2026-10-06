@@ -35,12 +35,13 @@ public enum WindowWire {
 
         public var errorDescription: String? {
             switch self {
-            case .unsupportedWindowVersion:
-                NPText("The Linux window service is not compatible with this version. Update NativePipe on the Linux computer and reconnect.")
-            case .unsupportedVersion:
-                NPText("The Linux window service sent an unsupported scene version.")
+            // Neither version error says which side is newer, so neither
+            // guesses: the fix is the same either way.
+            case .unsupportedWindowVersion, .unsupportedVersion:
+                NPText("The NativePipe compositor on Linux doesn’t match this version of NativePipe. Update NativePipe on both computers to the same version, then reconnect.")
+
             case .notBinaryScene, .truncated, .malformed:
-                NPText("The Linux window service sent an invalid display message.")
+                NPText("The NativePipe compositor sent display data that this Mac couldn’t read. Reconnect to continue.")
             }
         }
     }

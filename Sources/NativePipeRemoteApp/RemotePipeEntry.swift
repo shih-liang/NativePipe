@@ -20,17 +20,37 @@ struct RemotePipeMain {
             let app = NSApplication.shared
             app.setActivationPolicy(.regular)
             let delegate = RemoteApplicationDelegate(command: command)
+            delegate.aboutPanelOptions = [
+                .applicationName: "NativePipe",
+                .applicationVersion: NativePipeVersion.current,
+            ]
             let showProgress = options.progress && isatty(STDERR_FILENO) != 0
-            if showProgress { fputs("nativepipe: connecting over SSH; waiting for authentication and the Linux display helper…\n", stderr) }
+            let destination = command.destination
+            let application = RemotePipeCLI.applicationName(command)
+            func say(_ line: String) { fputs("nativepipe: " + line + "\n", stderr) }
+            if showProgress { say(NPText("Connecting to %@…", destination)) }
             delegate.onConnected = { [weak delegate] in
                 delegate?.hostIntegration.sync()
-                if showProgress { fputs("nativepipe: connected; waiting for Linux application windows.\n", stderr) }
+                if showProgress {
+                    say(NPText("Connected. Waiting for %@ to open a window. Press Ctrl-C to disconnect.", application))
+                }
             }
-            delegate.onFailure = { _ in
-                fputs("Next: check ordinary SSH login with the same connection options. If the Linux helper is missing, retry with --install-compositor. See nativepipe --help and the session diagnostics below.\n", stderr)
+            // The outcome is always printed, progress or not: a redirected
+            // stderr still needs to say why the session ended.
+            delegate.reportsFailureToStderr = false
+            delegate.onFailure = { [weak delegate] error in
+                say(RemotePipeCLI.failureLine(
+                    destination: destination, application: application,
+                    connected: delegate?.hasConnected ?? false,
+                    remoteExitStatus: delegate?.display.session.remoteExitStatus, error: error))
+            }
+            // Silence after dismissing the sign-in prompt reads as a hang or a bug.
+            delegate.onDisconnected = { [weak delegate] in
+                if delegate?.signInCancelled == true { say(NPText("Sign-in cancelled.")) }
             }
             delegate.onTerminate = { [weak delegate] in
-                exit(delegate?.display.session.exitStatus ?? 0)
+                exit(RemotePipeCLI.exitCode(signInCancelled: delegate?.signInCancelled ?? false,
+                                            sessionStatus: delegate?.display.session.exitStatus))
             }
             app.delegate = delegate
             withExtendedLifetime(delegate) { app.run() }
