@@ -3,6 +3,8 @@
 #include "../xwayland.c"
 #include <assert.h>
 
+bool np_trace_enabled(void) { return false; }
+
 static void prepare(struct np_server *server, int display)
 {
 	struct np_xwayland *xw = calloc(1, sizeof(*xw));
