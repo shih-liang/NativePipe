@@ -22,6 +22,31 @@ final class SharedFileVolumeBrokerTests: XCTestCase {
         return SharedFileVolumeBroker(directory: parent.appendingPathComponent("v"), name: "Test Machine",
             mount: { _ in URL(fileURLWithPath: "/Volumes/LinPortal-Fixture-" + UUID().uuidString) }, unmount: { _ in })
     }
+    func testDefaultMountRejectsUnentitledProcessBeforePublishingOrReadingFiles() async throws {
+        let parent = URL(fileURLWithPath: "/tmp/lpfs-" + UUID().uuidString.prefix(8))
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let access = SharedRangeFixture()
+        let broker = SharedFileVolumeBroker(directory: parent.appendingPathComponent("v"), name: "Unauthorized")
+        defer { broker.stop() }
+        var publications = 0
+        broker.publicationDidChange = { publications += 1 }
+        let file = URL(fileURLWithPath: "/selected/file")
+        access.add(file)
+        do { _ = try await broker.publish([file], using: access); XCTFail("The XCTest process has no FSKit mount authorization") }
+        catch {
+            let error = error as NSError
+            XCTAssertEqual(error.domain, "NativePipe.FileSharing")
+            XCTAssertEqual(error.code, Int(EACCES))
+            XCTAssertTrue(error.localizedDescription.contains("FSKit"))
+        }
+        XCTAssertFalse(broker.hasPublishedFiles)
+        XCTAssertEqual(publications, 0)
+        XCTAssertTrue(access.reads.isEmpty)
+        XCTAssertEqual(access.exports, 0)
+        let entries = try await SharedFileVolumeClient(directory: broker.directory).children(id: 2)
+        XCTAssertTrue(entries.isEmpty, "Rejected selections must be removed from the catalog")
+    }
     func testShareOnlyPublishesMetadataAndReadTransfersRequestedBytesOfLargeFile() async throws {
         let access = SharedRangeFixture(), broker = try broker(access)
         defer { broker.stop() }

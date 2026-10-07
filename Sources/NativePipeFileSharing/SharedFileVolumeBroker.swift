@@ -1,6 +1,7 @@
 import AppKit
 import FSKit
 import Darwin
+import Security
 import NativePipeProtocol
 import NativePipeStrings
 
@@ -50,6 +51,15 @@ public final class SharedFileVolumeBroker {
         while volumeName.utf8.count > 255 { volumeName.removeLast() }
         descriptor = .init(id: UUID(), name: volumeName.isEmpty ? moduleDisplayName : volumeName, token: UUID())
         self.mount = mount ?? { directory in
+            var code: SecCode?, staticCode: SecStaticCode?, information: CFDictionary?
+            guard SecCodeCopySelf([], &code) == errSecSuccess, let code,
+                  SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode,
+                  SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
+                  let entitlements = (information as? [String: Any])?[kSecCodeInfoEntitlementsDict as String] as? [String: Any],
+                  entitlements["com.apple.developer.fskit.mount"] as? Bool == true else {
+                throw NSError(domain: "NativePipe.FileSharing", code: Int(EACCES), userInfo: [NSLocalizedDescriptionKey:
+                    NPText("This build lacks FSKit mount authorization. Virtual file sharing requires an application signed with an authorized provisioning profile.")])
+            }
             let modules = try await FSClient.shared.installedExtensions
             guard modules.contains(where: { $0.bundleIdentifier == filesystemBundleIdentifier && $0.isEnabled }) else {
                 throw NSError(domain: "NativePipe.FileSharing", code: Int(ENODEV), userInfo: [NSLocalizedDescriptionKey:

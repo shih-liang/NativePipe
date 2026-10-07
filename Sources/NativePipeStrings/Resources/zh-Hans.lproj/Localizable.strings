@@ -289,3 +289,5 @@
 "Shared File" = "共享文件";
 
 "The virtual file sharing backend is not available." = "虚拟文件分享后端不可用。";
+
+"This build lacks FSKit mount authorization. Virtual file sharing requires an application signed with an authorized provisioning profile." = "此构建未获 FSKit 挂载授权。虚拟文件共享需要使用具有相应授权描述文件签名的应用。";

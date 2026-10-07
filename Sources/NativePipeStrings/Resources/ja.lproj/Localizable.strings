@@ -289,3 +289,5 @@
 "Shared File" = "共有ファイル";
 
 "The virtual file sharing backend is not available." = "仮想ファイル共有のバックエンドを利用できません。";
+
+"This build lacks FSKit mount authorization. Virtual file sharing requires an application signed with an authorized provisioning profile." = "このビルドには FSKit のマウント権限がありません。仮想ファイル共有には、権限を持つプロビジョニングプロファイルで署名されたアプリが必要です。";

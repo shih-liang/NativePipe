@@ -289,3 +289,5 @@
 "Shared File" = "Общий файл";
 
 "The virtual file sharing backend is not available." = "Служба виртуального обмена файлами недоступна.";
+
+"This build lacks FSKit mount authorization. Virtual file sharing requires an application signed with an authorized provisioning profile." = "У этой сборки нет разрешения FSKit на подключение томов. Для виртуального обмена файлами требуется приложение, подписанное с использованием авторизованного профиля подготовки.";

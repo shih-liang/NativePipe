@@ -289,3 +289,5 @@
 "Shared File" = "Geteilte Datei";
 
 "The virtual file sharing backend is not available." = "Das virtuelle Dateifreigabe-Backend ist nicht verfügbar.";
+
+"This build lacks FSKit mount authorization. Virtual file sharing requires an application signed with an authorized provisioning profile." = "Dieser Build verfügt nicht über die FSKit-Berechtigung zum Einbinden. Die virtuelle Dateifreigabe erfordert eine App, die mit einem autorisierten Bereitstellungsprofil signiert wurde.";
