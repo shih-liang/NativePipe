@@ -8,6 +8,13 @@ private final class FileProgressRecorder: @unchecked Sendable {
     var values: [FileTransferProgress] { lock.lock(); defer { lock.unlock() }; return recorded }
     func append(_ sample: FileTransferProgress) { lock.lock(); recorded.append(sample); lock.unlock() }
 }
+private final class UploadTaskCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: Task<Void, Error>?
+    func set(_ task: Task<Void, Error>) { lock.lock(); self.task = task; lock.unlock() }
+    func cancel() { lock.lock(); let task = task; lock.unlock(); task?.cancel() }
+}
+
 @testable import NativePipeProtocol
 
 final class FileRPCTests: XCTestCase {
@@ -84,12 +91,18 @@ final class FileRPCTests: XCTestCase {
     private final class Server: @unchecked Sendable {
         let root: URL
         let workers = DispatchGroup()
-        init() throws {
+        let readOnly: Bool
+        private let countLock = NSLock()
+        private var count = 0
+        var connections: Int { countLock.lock(); defer { countLock.unlock() }; return count }
+        init(readOnly: Bool = false) throws {
+            self.readOnly = readOnly
             root = FileManager.default.temporaryDirectory.appendingPathComponent("file-rpc-\(UUID())")
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
         }
         deinit { try? FileManager.default.removeItem(at: root) }
         func connect() throws -> FileHandle {
+            countLock.lock(); count += 1; countLock.unlock()
             var fds: [Int32] = [-1, -1]
             guard socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0 else { throw POSIXError(.EIO) }
             let server = fds[0], client = fds[1]
@@ -99,11 +112,160 @@ final class FileRPCTests: XCTestCase {
                 let fd = open(root.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
                 guard fd >= 0 else { return }
                 defer { close(fd) }
-                _ = np_file_serve(server, fd, 0)
+                _ = np_file_serve(server, fd, readOnly ? 1 : 0)
             }
             return FileHandle(fileDescriptor: client, closeOnDealloc: true)
         }
         var rpc: FileRPC { FileRPC { [self] in try connect() } }
+    }
+
+
+    func testDirectoryBrowserReturnsAllMetadataInOneConnectionWithoutFollowingLinks() async throws {
+        let server = try Server()
+        let folder = server.root.appendingPathComponent("many")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        for index in 0..<600 {
+            let name = String(repeating: "x", count: 200) + String(format: "%04d", index)
+            try Data("metadata".utf8).write(to: folder.appendingPathComponent(name))
+        }
+        try FileManager.default.createDirectory(at: folder.appendingPathComponent("empty"), withIntermediateDirectories: false)
+        try FileManager.default.createSymbolicLink(at: folder.appendingPathComponent("link"), withDestinationURL: URL(fileURLWithPath: "/etc/passwd"))
+        XCTAssertEqual(mkfifo(folder.appendingPathComponent("fifo").path, 0o600), 0)
+        let count = server.connections
+        let listing = try await server.rpc.browse("/many")
+        XCTAssertEqual(server.connections, count + 1)
+        XCTAssertEqual(listing.path, "/many")
+        XCTAssertTrue(listing.home.hasPrefix("/"))
+        XCTAssertEqual(listing.entries.count, 603)
+        for entry in listing.entries {
+            var expected = stat()
+            XCTAssertEqual(lstat(folder.appendingPathComponent(entry.name).path, &expected), 0)
+            XCTAssertEqual(entry.metadata.mode, UInt32(expected.st_mode))
+            XCTAssertEqual(entry.metadata.size, UInt64(expected.st_size))
+            XCTAssertEqual(entry.metadata.mtime, Int64(expected.st_mtimespec.tv_sec))
+            XCTAssertEqual(entry.metadata.path, "/many/" + entry.name)
+        }
+        let link = try XCTUnwrap(listing.entries.first(where: { $0.name == "link" }))
+        XCTAssertTrue(link.metadata.isSymlink)
+        do { _ = try await server.rpc.browse("/many/link"); XCTFail("Must not follow a symbolic link") } catch { }
+        try FileManager.default.createSymbolicLink(at: server.root.appendingPathComponent("parent-link"), withDestinationURL: folder)
+        do { _ = try await server.rpc.browse("/parent-link/empty"); XCTFail("Must not follow an intermediate link") } catch { }
+        XCTAssertEqual(server.workers.wait(timeout: .now() + 2), .success)
+    }
+
+    func testDirectoryBrowserDefaultPathUsesTheWorkerHome() async throws {
+        let server = try Server()
+        let initial = try await server.rpc.browse("/")
+        try FileManager.default.createDirectory(at: server.root.appendingPathComponent(String(initial.home.dropFirst())), withIntermediateDirectories: true)
+        let listing = try await server.rpc.browse()
+        XCTAssertEqual(listing.path, initial.home)
+        XCTAssertEqual(listing.home, initial.home)
+        XCTAssertTrue(listing.entries.isEmpty)
+        XCTAssertEqual(server.connections, 2)
+    }
+
+
+    func testLostStagingAcknowledgementStillAllowsOwnedCleanup() async throws {
+        let server = try Server()
+        let rpc = FileRPC {
+            let connection = try server.connect()
+            if server.connections == 1 { shutdown(connection.fileDescriptor, SHUT_RD) }
+            return connection
+        }
+        do {
+            _ = try await rpc.createUploadStaging("/.nativepipe-upload-12345678-1234-1234-1234-123456789abc")
+            XCTFail("Lost response cannot acknowledge creation")
+        } catch { }
+        XCTAssertEqual(server.workers.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(server.connections, 2)
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: server.root.path).isEmpty)
+    }
+
+    @MainActor
+    func testExactTargetUploadPublishesFilesFoldersAndEmptyDirectories() async throws {
+        let server = try Server(), files = FileRPCUserAccess(rpc: server.rpc)
+        let local = FileManager.default.temporaryDirectory.appendingPathComponent("exact-upload-\(UUID())")
+        try FileManager.default.createDirectory(at: local, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: local) }
+        try FileManager.default.createDirectory(at: local.appendingPathComponent("empty"), withIntermediateDirectories: false)
+        let data = Data(repeating: 0x42, count: 1024 * 1024 + 3)
+        try data.write(to: local.appendingPathComponent("hello # 世界"))
+        try Data().write(to: local.appendingPathComponent(".nativepipe-owner"))
+        let recorder = FileProgressRecorder()
+        try await files.uploadFile(local, to: RemoteFileURL.make("/different folder"), progress: { recorder.append($0) })
+        let folder = server.root.appendingPathComponent("different folder")
+        XCTAssertEqual(try Data(contentsOf: folder.appendingPathComponent("hello # 世界")), data)
+        var directory: ObjCBool = false
+        XCTAssertTrue(FileManager.default.fileExists(atPath: folder.appendingPathComponent("empty").path, isDirectory: &directory))
+        XCTAssertTrue(directory.boolValue)
+        XCTAssertEqual(recorder.values.last?.isComplete, true)
+        XCTAssertEqual(recorder.values.last?.bytesTransferred, UInt64(data.count))
+        XCTAssertEqual(recorder.values.map(\.bytesTransferred), recorder.values.map(\.bytesTransferred).sorted())
+        try await files.uploadFile(local.appendingPathComponent("hello # 世界"), to: RemoteFileURL.make("/renamed"))
+        XCTAssertEqual(try Data(contentsOf: server.root.appendingPathComponent("renamed")), data)
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: server.root.path).contains { $0.hasPrefix(".nativepipe-upload-") })
+    }
+
+    @MainActor
+    func testExactUploadConflictAndUnsupportedTreeLeaveNoPartialDestinationOrStaging() async throws {
+        let server = try Server(), files = FileRPCUserAccess(rpc: server.rpc)
+        let local = FileManager.default.temporaryDirectory.appendingPathComponent("failed-upload-\(UUID())")
+        try FileManager.default.createDirectory(at: local, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: local) }
+        try Data("new".utf8).write(to: local.appendingPathComponent("file"))
+        let target = server.root.appendingPathComponent("target")
+        try Data("old".utf8).write(to: target)
+        do { try await files.uploadFile(local, to: RemoteFileURL.make("/target")); XCTFail("Never overwrite an existing file") } catch { }
+        XCTAssertEqual(try Data(contentsOf: target), Data("old".utf8))
+        try FileManager.default.createSymbolicLink(at: local.appendingPathComponent("unsupported-link"), withDestinationURL: target)
+        let progress = FileProgressRecorder()
+        do {
+            try await files.uploadFile(local, to: RemoteFileURL.make("/absent"), progress: { progress.append($0) })
+            XCTFail("Symbolic links cannot be recursively uploaded")
+        } catch { }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: server.root.appendingPathComponent("absent").path))
+        XCTAssertFalse(progress.values.contains(where: \.isComplete))
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: server.root.path).contains { $0.hasPrefix(".nativepipe-upload-") })
+        XCTAssertEqual(server.workers.wait(timeout: .now() + 2), .success)
+    }
+
+    @MainActor
+    func testExactUploadCancellationCleansOwnedPartialTree() async throws {
+        let server = try Server(), files = FileRPCUserAccess(rpc: server.rpc)
+        let local = FileManager.default.temporaryDirectory.appendingPathComponent("cancel-upload-\(UUID())")
+        try Data(repeating: 0x33, count: 8 * 1024 * 1024).write(to: local)
+        defer { try? FileManager.default.removeItem(at: local) }
+        let cancellation = UploadTaskCancellation(), progress = FileProgressRecorder()
+        let task = Task {
+            try await files.uploadFile(local, to: RemoteFileURL.make("/cancelled")) { sample in
+                progress.append(sample)
+                if sample.bytesTransferred > 0 { cancellation.cancel() }
+            }
+        }
+        cancellation.set(task)
+        do { try await task.value; XCTFail("Cancelled upload must fail") } catch is CancellationError { }
+        XCTAssertEqual(server.workers.wait(timeout: .now() + 2), .success)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: server.root.appendingPathComponent("cancelled").path))
+        XCTAssertFalse(progress.values.contains(where: \.isComplete))
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: server.root.path).isEmpty)
+    }
+
+    @MainActor
+    func testExactUploadRejectsReadOnlyAndSymlinkedRemoteParents() async throws {
+        let local = FileManager.default.temporaryDirectory.appendingPathComponent("readonly-upload-\(UUID())")
+        try Data("bytes".utf8).write(to: local)
+        defer { try? FileManager.default.removeItem(at: local) }
+        let readOnly = try Server(readOnly: true)
+        let listing = try await readOnly.rpc.browse("/")
+        XCTAssertTrue(listing.entries.isEmpty)
+        do { try await FileRPCUserAccess(rpc: readOnly.rpc).uploadFile(local, to: RemoteFileURL.make("/denied")); XCTFail("Read-only writes fail") }
+        catch FileRPC.Failure.remote(let code) { XCTAssertEqual(code, 30) }
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: readOnly.root.path).isEmpty)
+        let server = try Server()
+        try FileManager.default.createSymbolicLink(at: server.root.appendingPathComponent("link"), withDestinationURL: readOnly.root)
+        do { try await FileRPCUserAccess(rpc: server.rpc).uploadFile(local, to: RemoteFileURL.make("/link/escape")); XCTFail("No parent link following") } catch { }
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: readOnly.root.path).isEmpty)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: server.root.path), ["link"])
     }
 
     func testSwiftClientWithSharedCServer() async throws {

@@ -238,8 +238,35 @@ public final class FileRPCUserAccess: UserFileRangeAccess {
         return result
     }
 
+    /// Upload to an exact destination; publication never overwrites or merges.
+    public func uploadFile(_ local: URL, to remote: URL,
+                           progress: @escaping @Sendable (FileTransferProgress) -> Void = { _ in }) async throws {
+        try UserFileRange.validate(remote)
+        guard local.isFileURL, !["", "/", ".", ".."].contains(remote.lastPathComponent) else { throw FileRPC.Failure.invalidPath }
+        let scoped = local.startAccessingSecurityScopedResource()
+        defer { if scoped { local.stopAccessingSecurityScopedResource() } }
+        let parent = remote.deletingLastPathComponent()
+        let stagingURL = try RemoteFileURL.appending(".nativepipe-upload-" + UUID().uuidString, to: parent, isDirectory: true)
+        let staging = try await rpc.createUploadStaging(stagingURL.path)
+        let tracker = FileTransferProgressTracker(progress: progress)
+        do {
+            try await upload(local, to: staging.path + "/.payload", relativePath: local.lastPathComponent,
+                             depth: 0, noFollow: true, tracker: tracker)
+            try Task.checkCancellation()
+            let rpc = rpc
+            // Once complete, finish the atomic commit and report its real result.
+            try await Task.detached(priority: .utility) { try await rpc.publishStaging(staging, to: remote.path) }.value
+        } catch {
+            let rpc = rpc
+            // Cleanup is a fresh operation so cancellation cannot cancel it.
+            await Task.detached(priority: .utility) { try? await rpc.discardStaging(staging) }.value
+            throw error
+        }
+        tracker.finish()
+    }
+
     private func upload(_ local: URL, to remote: String, relativePath: String, depth: Int,
-                        tracker: FileTransferProgressTracker) async throws {
+                        noFollow: Bool = false, tracker: FileTransferProgressTracker) async throws {
         try Task.checkCancellation()
         guard depth < 64 else { throw FileRPC.Failure.invalidPath }
         let info = try await FileTransferLocalIO.perform {
@@ -248,17 +275,19 @@ public final class FileRPCUserAccess: UserFileRangeAccess {
         }
         guard !info.2 else { throw FileRPC.Failure.invalidPath }
         if info.0 {
-            try await rpc.createDirectory(remote)
+            try await rpc.createDirectory(remote, noFollow: noFollow)
             let children = try await FileTransferLocalIO.perform { try FileManager.default.contentsOfDirectory(at: local, includingPropertiesForKeys: nil) }
             for child in children {
                 try await upload(child, to: remote + "/" + child.lastPathComponent,
                                  relativePath: relativePath + "/" + child.lastPathComponent,
-                                 depth: depth + 1, tracker: tracker)
+                                 depth: depth + 1, noFollow: noFollow, tracker: tracker)
             }
         } else {
             guard info.1 else { throw FileRPC.Failure.invalidPath }
             let (file, mode) = try await FileTransferLocalIO.perform {
-                let file = try FileHandle(forReadingFrom: local)
+                let descriptor = open(local.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW)
+                guard descriptor >= 0 else { throw FileRPC.Failure.local(errno) }
+                let file = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
                 var info = stat()
                 guard fstat(file.fileDescriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else {
                     try? file.close(); throw FileRPC.Failure.invalidPath
@@ -267,7 +296,7 @@ public final class FileRPCUserAccess: UserFileRangeAccess {
             }
             defer { try? file.close() }
             tracker.report(0, relativePath: relativePath)
-            try await rpc.upload(file, to: remote, mode: mode) { completed, _ in
+            try await rpc.upload(file, to: remote, mode: mode, noFollow: noFollow) { completed, _ in
                 tracker.report(completed, relativePath: relativePath)
             }
             tracker.finishFile()

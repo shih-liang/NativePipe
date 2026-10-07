@@ -26,7 +26,7 @@ All integers are little-endian. The 16-byte frame header is:
 | 0 | `NPFR` (4 bytes) |
 | 4 | version = 1 (u8) |
 | 5 | type (u8) |
-| 6 | flags (u16; WRITE may set REPLACE=1, otherwise zero) |
+| 6 | flags (u16; WRITE: REPLACE=1, NOFOLLOW=2; MKDIR: NOFOLLOW=2; other types: zero) |
 | 8 | payload size (u32, at most 65536) |
 | 12 | errno status (u32, zero for success) |
 
@@ -58,6 +58,44 @@ Offsets and offset+length must fit signed 64-bit file offsets. A revision
 mismatch before or after reading returns status 116; the client discards all
 bytes from that request. DIRECTORY pins a no-link directory and returns the
 same METADATA/ENTRIES/END listing format as LIST.
+
+Directory browsing uses BROWSE=13. Its path may be empty to open the worker's
+actual home (`HOME`, then the effective user's passwd entry); no host username
+or root-shell command is involved. It rejects symbolic links throughout the
+requested path. The first METADATA carries path_length:u32, home_length:u32,
+path bytes, home bytes. Each ENTRIES batch contains name_length:u16 followed by
+the 28-byte stat metadata and name bytes. Attributes come from
+`fstatat(AT_SYMLINK_NOFOLLOW)`, so links and special files can be displayed
+without opening them. A name and its metadata never cross a frame boundary.
+END carries the total entry count:u64. This is one connection per directory,
+without an additional stat request per entry. The server streams 64 KiB
+batches; the Swift client bounds accumulated listing metadata at 64 MiB, which
+is separate from file content and does not limit transferred file sizes.
+
+Exact-destination uploads use CREATE_STAGING=14, PUBLISH_STAGING=15 and
+DISCARD_STAGING=16. All three obey the service's read-only policy and reject
+symbolic links in their paths. CREATE_STAGING appends a random 32-byte ownership
+token chosen by the client before sending the request. It exclusively creates a
+private 0700 sibling directory named `.nativepipe-upload-UUID` and a 0600
+`.nativepipe-owner` marker that binds the token to the directory's device and
+inode. Its METADATA response echoes the token. Knowing the token before CREATE
+allows cleanup even if cancellation loses that acknowledgement.
+
+The existing recursive upload writes a file or directory tree into `.payload`
+inside this directory, using WRITE/MKDIR with NOFOLLOW. PUBLISH_STAGING appends
+the token, destination_length:u32 and full destination path. The target must
+be in the same pinned parent directory. A native exclusive rename publishes
+`.payload` atomically (`renameat2(RENAME_NOREPLACE)` on Linux,
+`renameatx_np(RENAME_EXCL)` on macOS); unavailable native support fails closed.
+An existing file, folder or symbolic link is never overwritten or merged.
+Cancellation is checked before commit; the short commit finishes independently
+so the reported result reflects publication. DISCARD_STAGING appends the token
+and removes only the verified owned tree, without following any nested link.
+Both return an empty END. Arbitrary paths, markerless directories and copied
+markers cannot authorize cleanup. On transfer failure/cancellation, the client
+uses a fresh cancellation-independent operation for cleanup. An unreachable
+service can leave an unpublished private staging directory; no unrelated file
+is removed to compensate. Progress becomes complete only after publication.
 
 For reads and directory listings, DATA=5 contains at most 64 KiB. ENTRIES=6 contains a batch of
 `type:u8, name_length:u16, name_bytes` records; names are never split. END=7

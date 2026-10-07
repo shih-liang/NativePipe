@@ -200,6 +200,104 @@ public struct FileRPC: Sendable {
         }
     }
 
+    public struct DirectoryEntry: Sendable {
+        public let name: String
+        public let metadata: PathStat
+        public init(name: String, metadata: PathStat) { self.name = name; self.metadata = metadata }
+    }
+    public struct DirectoryListing: Sendable {
+        public let path: String
+        public let home: String
+        public let entries: [DirectoryEntry]
+        public init(path: String, home: String, entries: [DirectoryEntry]) {
+            self.path = path; self.home = home; self.entries = entries
+        }
+    }
+
+    /// One stream returns the path, actual worker home and lstat for each name.
+    /// Entry frames remain bounded, and no per-entry connection is necessary.
+    public func browse(_ path: String? = nil) async throws -> DirectoryListing {
+        if let path { try UserFileRange.validate(RemoteFileURL.make(path)) }
+        return try await operation { socket in
+            try socket.request(NP_FILE_BROWSE, path: path ?? "")
+            let frame = try socket.receive()
+            guard frame.type == NP_FILE_METADATA.rawValue, frame.data.count >= 8 else { throw Failure.protocolError }
+            let pathLength = Int(socket.integer(frame.data, 0, as: UInt32.self))
+            let homeLength = Int(socket.integer(frame.data, 4, as: UInt32.self))
+            guard pathLength > 0, pathLength <= 4095, homeLength > 0, homeLength <= 4095,
+                  frame.data.count == 8 + pathLength + homeLength,
+                  let resolved = String(data: frame.data[8..<(8 + pathLength)], encoding: .utf8),
+                  let home = String(data: frame.data[(8 + pathLength)..<frame.data.count], encoding: .utf8)
+            else { throw Failure.protocolError }
+            try UserFileRange.validate(RemoteFileURL.make(resolved)); try UserFileRange.validate(RemoteFileURL.make(home))
+            var entries: [DirectoryEntry] = [], names = Set<Data>(), metadataBytes = 0
+            while true {
+                let batch = try socket.receive()
+                if batch.type == NP_FILE_END.rawValue {
+                    try socket.checkEnd(batch, total: UInt64(entries.count))
+                    return DirectoryListing(path: resolved, home: home, entries: entries)
+                }
+                guard batch.type == NP_FILE_ENTRIES.rawValue, !batch.data.isEmpty else { throw Failure.protocolError }
+                metadataBytes += batch.data.count
+                guard metadataBytes <= 64 * 1024 * 1024 else { throw Failure.tooLarge }
+                var offset = 0
+                while offset < batch.data.count {
+                    guard batch.data.count - offset >= 30 else { throw Failure.protocolError }
+                    let count = Int(batch.data[offset]) | Int(batch.data[offset + 1]) << 8
+                    guard count > 0, count <= 255, count <= batch.data.count - offset - 30 else { throw Failure.protocolError }
+                    let bytes = batch.data.subdata(in: (offset + 30)..<(offset + 30 + count))
+                    guard names.insert(bytes).inserted, let name = String(data: bytes, encoding: .utf8),
+                          name != ".", name != "..", !name.contains("/"), !name.contains("\0") else { throw Failure.protocolError }
+                    let child = try RemoteFileURL.appending(name, to: RemoteFileURL.make(resolved, isDirectory: true))
+                    let stat = PathStat(path: child.path, mode: socket.integer(batch.data, offset + 2),
+                        uid: socket.integer(batch.data, offset + 6), gid: socket.integer(batch.data, offset + 10),
+                        size: socket.integer(batch.data, offset + 14), mtime: socket.integer(batch.data, offset + 22))
+                    entries.append(.init(name: name, metadata: stat)); offset += 30 + count
+                }
+            }
+        }
+    }
+
+    public struct UploadStaging: Sendable {
+        public let path: String
+        let token: Data
+    }
+    public func createUploadStaging(_ path: String) async throws -> UploadStaging {
+        try UserFileRange.validate(RemoteFileURL.make(path))
+        var token = Data(repeating: 0, count: Int(NP_FILE_STAGING_TOKEN))
+        token.withUnsafeMutableBytes { arc4random_buf($0.baseAddress, $0.count) }
+        let staging = UploadStaging(path: path, token: token)
+        do {
+            return try await operation { socket in
+                try socket.request(NP_FILE_CREATE_STAGING, path: path, suffix: staging.token)
+                let reply = try socket.receive()
+                guard reply.type == NP_FILE_METADATA.rawValue, reply.data == staging.token else { throw Failure.protocolError }
+                return staging
+            }
+        } catch {
+            // The capability is known before CREATE, including when its reply
+            // is lost. Only that capability can remove the owned private tree.
+            let rpc = self
+            await Task.detached(priority: .utility) { try? await rpc.discardStaging(staging) }.value
+            throw error
+        }
+    }
+    public func publishStaging(_ staging: UploadStaging, to destination: String) async throws {
+        try UserFileRange.validate(RemoteFileURL.make(destination))
+        try await operation { socket in
+            let name = Data(destination.utf8)
+            var suffix = staging.token; suffix.append(Socket.encode(UInt32(name.count))); suffix.append(name)
+            try socket.request(NP_FILE_PUBLISH_STAGING, path: staging.path, suffix: suffix)
+            try socket.checkEnd(socket.receive(), total: nil)
+        }
+    }
+    public func discardStaging(_ staging: UploadStaging) async throws {
+        try await operation { socket in
+            try socket.request(NP_FILE_DISCARD_STAGING, path: staging.path, suffix: staging.token)
+            try socket.checkEnd(socket.receive(), total: nil)
+        }
+    }
+
     public func stat(_ path: String) async throws -> PathStat {
         try await operation { socket in
             try socket.request(NP_FILE_STAT, path: path)
@@ -253,9 +351,9 @@ public struct FileRPC: Sendable {
         } catch Failure.remote(let code) where code == Int32(NP_FILE_STALE) { throw Failure.sourceChanged(path) }
     }
 
-    public func createDirectory(_ path: String) async throws {
+    public func createDirectory(_ path: String, noFollow: Bool = false) async throws {
         try await operation { socket in
-            try socket.request(NP_FILE_MKDIR, path: path)
+            try socket.request(NP_FILE_MKDIR, path: path, noFollow: noFollow)
             try socket.checkEnd(socket.receive(), total: nil)
         }
     }
@@ -282,12 +380,12 @@ public struct FileRPC: Sendable {
     }
 
     public func upload(_ source: FileHandle, to path: String, mode: UInt32 = 0o600,
-                       replace: Bool = false, progress: @escaping Progress = { _, _ in }) async throws {
+                       replace: Bool = false, noFollow: Bool = false, progress: @escaping Progress = { _, _ in }) async throws {
         try await operation { socket in
             var st = Darwin.stat()
             guard fstat(source.fileDescriptor, &st) == 0 else { throw Failure.local(errno) }
             guard st.st_mode & S_IFMT == S_IFREG else { throw Failure.local(EINVAL) }
-            try socket.request(NP_FILE_WRITE, path: path, mode: mode, replace: replace)
+            try socket.request(NP_FILE_WRITE, path: path, mode: mode, replace: replace, noFollow: noFollow)
             _ = try socket.metadata(path)
             var total: UInt64 = 0
             while let bytes = try source.read(upToCount: Int(NP_FILE_CHUNK)), !bytes.isEmpty {
@@ -366,13 +464,13 @@ public struct FileRPC: Sendable {
             let rc = data.withUnsafeBytes { np_file_send(fd, UInt8(type.rawValue), flags, 0, $0.baseAddress, $0.count) }
             guard rc == 0 else { throw Failure.local(errno) }
         }
-        func request(_ type: np_file_type, path: String, mode: UInt32 = 0, replace: Bool = false, suffix: Data = Data()) throws {
+        func request(_ type: np_file_type, path: String, mode: UInt32 = 0, replace: Bool = false, noFollow: Bool = false, suffix: Data = Data()) throws {
             let bytes = Data(path.utf8)
-            guard path.hasPrefix("/"), !path.contains("\0"), bytes.count <= 4095 else { throw Failure.invalidPath }
+            guard (path.hasPrefix("/") || (type == NP_FILE_BROWSE && path.isEmpty)), !path.contains("\0"), bytes.count <= 4095 else { throw Failure.invalidPath }
             var body = Self.encode(UInt32(bytes.count)); body.append(bytes)
             if type == NP_FILE_WRITE { body.append(Self.encode(mode)) }
             body.append(suffix)
-            try send(type, body, flags: replace ? UInt16(NP_FILE_REPLACE) : 0)
+            try send(type, body, flags: (replace ? UInt16(NP_FILE_REPLACE) : 0) | (noFollow ? UInt16(NP_FILE_NOFOLLOW) : 0))
         }
         func receive() throws -> Frame {
             let frame = UnsafeMutablePointer<np_file_frame>.allocate(capacity: 1)
