@@ -27,12 +27,12 @@ public final class RemoteDisplayController {
     public var applications: [GuestApplication] { session.applicationClient.cached ?? [] }
 
     public init(command: SSHCommand, environment: [String: String]? = nil,
-                localCompositorDirectory: URL? = nil, clipboardFileDirectory: URL? = nil) {
+                localCompositorDirectory: URL? = nil) {
         notificationIdentity = "ssh:" + command.credentialID
         session = RemoteSession(command: command, environment: environment,
                                 localCompositorDirectory: localCompositorDirectory)
         frames = RemoteFrameSource()
-        bridge = WindowBridge(frameSource: frames, clipboardFileDirectory: clipboardFileDirectory)
+        bridge = WindowBridge(frameSource: frames)
         bridge.fileAccess = RemoteUserFileAccess(command: command, environment: environment)
         bridge.applicationIconProvider = { [weak self] id in
             self?.applications.first(where: { $0.matches(applicationID: id) })
@@ -167,7 +167,8 @@ public final class RemoteDisplayController {
         }
         if hostOpen == nil {
             hostOpen = GuestOpenCoordinator(machineName: bridge.machineName,
-                isEnabled: { [weak self] in self?.hostOpenEnabled() ?? false }, fileAccess: access)
+                isEnabled: { [weak self] in self?.hostOpenEnabled() ?? false }, fileAccess: access,
+                publishGuestFiles: bridge.publishGuestFiles)
         }
         guard let coordinator = hostOpen else { return }
         let generation = hostOpenGeneration

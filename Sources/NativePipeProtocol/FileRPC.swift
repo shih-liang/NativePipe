@@ -114,12 +114,13 @@ public struct FileRPC: Sendable {
     }
 
     public enum Failure: LocalizedError {
-        case protocolError, invalidPath, tooLarge, local(Int32), remote(Int32)
+        case protocolError, invalidPath, tooLarge, sourceChanged(String), local(Int32), remote(Int32)
         public var errorDescription: String? {
             switch self {
             case .protocolError: return NPText("The file transfer returned an invalid response.")
             case .invalidPath: return NPText("The file path is invalid.")
             case .tooLarge: return NPText("Use streaming transfer to read this file.")
+            case .sourceChanged(let path): return NPText("The source changed during the transfer: %@.", path)
             case .local(let code): return NPText("File transfer failed: %@ (%@).", String(cString: strerror(code)), String(code))
             case .remote(let code):
                 // NPFR peers are Linux; Darwin's errno numbering is different.
@@ -152,8 +153,17 @@ public struct FileRPC: Sendable {
     /// Small-file convenience for configuration/procfs. Large file consumers
     /// use download/upload, not this bounded in-memory API.
     public func read(_ path: String, maximum: Int = 8 * 1024 * 1024) async throws -> PathContents {
-        try await operation { socket in
-            try socket.request(NP_FILE_READ, path: path)
+        try await readContents(path, request: NP_FILE_READ, maximum: maximum)
+    }
+    /// A lazy directory listing pins the same no-symlink root as range reads.
+    public func directoryEntries(_ path: String, maximum: Int = 8 * 1024 * 1024) async throws -> [DirEntry] {
+        try UserFileRange.validate(RemoteFileURL.make(path))
+        return try await readContents(path, request: NP_FILE_DIRECTORY, maximum: maximum).entries
+    }
+    private func readContents(_ path: String, request: np_file_type, maximum: Int) async throws -> PathContents {
+        guard maximum >= 0 else { throw Failure.protocolError }
+        return try await operation { socket in
+            try socket.request(request, path: path)
             let info = try socket.metadata(path)
             var contents = PathContents(path: path, isDirectory: info.isDirectory)
             var total: UInt64 = 0
@@ -195,6 +205,52 @@ public struct FileRPC: Sendable {
             try socket.request(NP_FILE_STAT, path: path)
             return try socket.metadata(path)
         }
+    }
+
+    /// A pinned-file revision includes inode, device, size, and nanosecond
+    /// modification/change times. No file contents are read by this request.
+    public func snapshot(_ path: String) async throws -> UserFileMetadata {
+        try UserFileRange.validate(RemoteFileURL.make(path))
+        return try await operation { socket in
+            try socket.request(NP_FILE_SNAPSHOT, path: path)
+            let frame = try socket.receive()
+            guard frame.type == NP_FILE_METADATA.rawValue, frame.data.count == 28 + Int(NP_FILE_REVISION) else {
+                throw Failure.protocolError
+            }
+            let mode: UInt32 = socket.integer(frame.data, 0)
+            let kind: UserFileMetadata.Kind = switch mode & 0o170000 {
+            case 0o100000: .file
+            case 0o040000: .directory
+            case 0o120000: .symbolicLink
+            default: .other
+            }
+            let mtime: Int64 = socket.integer(frame.data, 20)
+            return UserFileMetadata(url: try RemoteFileURL.make(path, isDirectory: kind == .directory), kind: kind,
+                size: socket.integer(frame.data, 12), modified: Date(timeIntervalSince1970: Double(mtime)), permissions: mode,
+                version: frame.data.subdata(in: 28..<frame.data.count))
+        }
+    }
+
+    public func readRange(_ path: String, offset: UInt64, length: Int, expectedVersion: Data) async throws -> Data {
+        try UserFileRange.validate(RemoteFileURL.make(path), offset: offset, length: length)
+        guard expectedVersion.count == Int(NP_FILE_REVISION) else { throw Failure.protocolError }
+        do {
+            return try await operation { socket in
+                var range = Socket.encode(offset); range.append(Socket.encode(UInt32(length))); range.append(expectedVersion)
+                try socket.request(NP_FILE_RANGE, path: path, suffix: range)
+                var bytes = Data()
+                while true {
+                    let frame = try socket.receive()
+                    if frame.type == NP_FILE_END.rawValue {
+                        try socket.checkEnd(frame, total: UInt64(bytes.count))
+                        return bytes
+                    }
+                    guard frame.type == NP_FILE_DATA.rawValue, !frame.data.isEmpty,
+                          frame.data.count <= length - bytes.count else { throw Failure.protocolError }
+                    bytes.append(frame.data)
+                }
+            }
+        } catch Failure.remote(let code) where code == Int32(NP_FILE_STALE) { throw Failure.sourceChanged(path) }
     }
 
     public func createDirectory(_ path: String) async throws {
@@ -310,11 +366,12 @@ public struct FileRPC: Sendable {
             let rc = data.withUnsafeBytes { np_file_send(fd, UInt8(type.rawValue), flags, 0, $0.baseAddress, $0.count) }
             guard rc == 0 else { throw Failure.local(errno) }
         }
-        func request(_ type: np_file_type, path: String, mode: UInt32 = 0, replace: Bool = false) throws {
+        func request(_ type: np_file_type, path: String, mode: UInt32 = 0, replace: Bool = false, suffix: Data = Data()) throws {
             let bytes = Data(path.utf8)
             guard path.hasPrefix("/"), !path.contains("\0"), bytes.count <= 4095 else { throw Failure.invalidPath }
             var body = Self.encode(UInt32(bytes.count)); body.append(bytes)
             if type == NP_FILE_WRITE { body.append(Self.encode(mode)) }
+            body.append(suffix)
             try send(type, body, flags: replace ? UInt16(NP_FILE_REPLACE) : 0)
         }
         func receive() throws -> Frame {

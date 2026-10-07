@@ -1,10 +1,10 @@
 import AppKit
+import Darwin
 import NativePipeProtocol
 import UniformTypeIdentifiers
 
 // Published by the task before signalling, read only after the worker waits.
 private final class PromiseResult: @unchecked Sendable { var error: Error? }
-
 /// AppKit chooses one representation per pasteboard item. Prefer promises over
 /// URLs when an item offers both, while retaining ordinary files in mixed drops.
 /// Start receivers synchronously, then keep their staging alive through import.
@@ -81,7 +81,9 @@ final class IncomingFilePromises {
 @MainActor
 public final class LinuxFilePromise: NSObject, NSFilePromiseProviderDelegate {
     let remote: URL
-    let access: any UserFileAccess
+    private let write: @MainActor (URL) async throws -> Void
+    private var transfers: [UUID: Task<Void, Never>] = [:]
+    private var cancelled = false
     public var completed: ((Error?) -> Void)?
     private weak var cachedProvider: NSFilePromiseProvider?
     public var provider: NSFilePromiseProvider {
@@ -101,7 +103,22 @@ public final class LinuxFilePromise: NSObject, NSFilePromiseProviderDelegate {
         return queue
     }()
 
-    public init(remote: URL, access: any UserFileAccess) { self.remote = remote; self.access = access }
+    public init(remote: URL, write: @escaping @MainActor (URL) async throws -> Void) {
+        self.remote = remote; self.write = write
+    }
+
+    public convenience init(remote: URL, access: any UserFileAccess, publishGuestFiles: GuestFilePublisher? = nil) {
+        self.init(remote: remote) { destination in
+            guard let publish = publishGuestFiles else { throw GuestFileSharingError.unavailable }
+            let files = try await publish([remote], access, .drag)
+            try Task.checkCancellation()
+            guard files.count == 1, let source = files.first else { throw FileRPC.Failure.protocolError }
+            _ = try FileTransferURLs.decode(FileTransferURLs.encode(files))
+            try await FileTransferLocalIO.copy(source: source, to: destination)
+        }
+    }
+
+    func cancel() { cancelled = true; transfers.values.forEach { $0.cancel() } }
 
     public func filePromiseProvider(_ filePromiseProvider: NSFilePromiseProvider, fileNameForType fileType: String) -> String {
         remote.lastPathComponent
@@ -115,8 +132,17 @@ public final class LinuxFilePromise: NSObject, NSFilePromiseProviderDelegate {
         // AppKit already coordinates this write. A new coordinator here waits
         // for AppKit's claim, which cannot finish until this delegate returns.
         Task { @MainActor in
-            do { try await self.access.exportFile(self.remote, to: url) }
-            catch { result.error = error }
+            let id = UUID()
+            let transfer = Task { @MainActor in
+                do {
+                    try Task.checkCancellation()
+                    try await self.write(url)
+                } catch { result.error = error }
+            }
+            self.transfers[id] = transfer
+            if self.cancelled { transfer.cancel() }
+            await transfer.value
+            self.transfers[id] = nil
             done.signal()
         }
         // Keep AppKit's claim alive until the async transfer completes. Only
@@ -126,4 +152,5 @@ public final class LinuxFilePromise: NSObject, NSFilePromiseProviderDelegate {
         completionHandler(error)
         Task { @MainActor in self.completed?(error) }
     }
+
 }

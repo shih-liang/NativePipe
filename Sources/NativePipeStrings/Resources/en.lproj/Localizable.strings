@@ -281,3 +281,11 @@
 "Choose where to save %@." = "Choose where to save %@.";
 "Save" = "Save";
 "Use a path on the connected Linux machine to receive files." = "Use a path on the connected Linux machine to receive files.";
+
+"Enable %@ in System Settings → General → Login Items & Extensions → File System Extensions before sharing files." = "Enable %@ in System Settings → General → Login Items & Extensions → File System Extensions before sharing files.";
+
+"The shared volume could not be ejected: %@" = "The shared volume could not be ejected: %@";
+
+"Shared File" = "Shared File";
+
+"The virtual file sharing backend is not available." = "The virtual file sharing backend is not available.";

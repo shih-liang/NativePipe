@@ -281,3 +281,11 @@
 "Choose where to save %@." = "Выберите, куда сохранить %@.";
 "Save" = "Сохранить";
 "Use a path on the connected Linux machine to receive files." = "Для получения файлов используйте путь на подключённой машине Linux.";
+
+"Enable %@ in System Settings → General → Login Items & Extensions → File System Extensions before sharing files." = "Перед передачей файлов включите %@: Системные настройки → Основные → Объекты входа и расширения → Расширения файловой системы.";
+
+"The shared volume could not be ejected: %@" = "Не удалось извлечь общий том: %@";
+
+"Shared File" = "Общий файл";
+
+"The virtual file sharing backend is not available." = "Служба виртуального обмена файлами недоступна.";

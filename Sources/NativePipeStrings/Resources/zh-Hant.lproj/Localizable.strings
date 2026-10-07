@@ -281,3 +281,11 @@
 "Choose where to save %@." = "選擇儲存 %@ 的位置。";
 "Save" = "儲存";
 "Use a path on the connected Linux machine to receive files." = "請使用已連線 Linux 機器中的路徑來接收檔案。";
+
+"Enable %@ in System Settings → General → Login Items & Extensions → File System Extensions before sharing files." = "分享檔案前，請在「系統設定 → 一般 → 登入項目與延伸功能 → 檔案系統延伸功能」中啟用 %@。";
+
+"The shared volume could not be ejected: %@" = "無法退出共享卷宗：%@";
+
+"Shared File" = "共享檔案";
+
+"The virtual file sharing backend is not available." = "虛擬檔案分享後端無法使用。";

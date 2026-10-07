@@ -30,6 +30,8 @@ nativepipe --install-compositor user@linux-host gtk4-demo
 - Install and update the NativePipe compositor on Linux from GitHub Releases with one option.
 - Use `np-open` inside the Linux session to request opening links or receiving
   files and folders on your Mac, with your approval for each request.
+- Share Linux files and folders in a read-only macOS virtual folder. Clipboard,
+  drag and drop, and approved file-open requests fetch bytes as Mac apps read them.
 
 ## Contents
 
@@ -49,6 +51,8 @@ nativepipe --install-compositor user@linux-host gtk4-demo
 
 - macOS 14 or later, on Apple Silicon or Intel.
 - A graphical macOS login session and the system OpenSSH client.
+- File sharing requires macOS 27 or later and the enabled NativePipe Shared Files
+  filesystem extension. Display and text clipboard work on macOS 14 or later.
 
 ### Linux host
 
@@ -73,8 +77,9 @@ software encoding remains available.
 
 Download `nativepipe-macos-universal.tar.gz` from
 [Releases](https://github.com/shih-liang/NativePipe/releases). It contains the
-command for both Apple Silicon and Intel, its UI translations, and license notices.
-Keep the resource bundle beside the command; the symlink below preserves that layout.
+command for both Apple Silicon and Intel, its signed application and FSKit
+extension, UI translations, and license notices. Keep the extracted layout intact;
+the symlink below preserves it.
 
 From the directory containing the downloaded archive:
 
@@ -88,12 +93,15 @@ nativepipe --version
 ```
 
 Add the `export PATH` line to your shell's startup file to make the command
-available in future terminals. Release binaries are ad-hoc signed, rather than
-Apple Developer ID notarized.
+available in future terminals. Open the included **NativePipe.app** once, then
+enable **NativePipe Shared Files** in System Settings → General → Login Items &
+Extensions → File System Extensions to share files. Packaged builds require an
+Apple signing identity and issued FSKit profiles; they cannot use ad-hoc signing.
+Signing requirements are described in [FSKit signing](docs/fskit-signing.md).
 
 ### Build the command from source
 
-Building requires Xcode with Swift 6, Git, Python 3, CMake, Meson, Ninja, and NASM.
+Building requires Xcode with the macOS 27 SDK, Git, Python 3, CMake, Meson, Ninja, and NASM.
 The build downloads and compiles its pinned codec dependencies.
 
 ```sh
@@ -104,7 +112,9 @@ make nativepipe
 ```
 
 Use `.build/release/nativepipe` in place of `nativepipe` in the examples below,
-or install that executable in a directory on your `PATH`.
+or install that executable in a directory on your `PATH`. A raw source-built
+executable supports display but file sharing requires the signed app and extension
+package described above.
 
 ## Quick start
 

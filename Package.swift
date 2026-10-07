@@ -8,9 +8,25 @@ let products: [Product] = [
     .library(name: "NativePipeProtocol", targets: ["NativePipeProtocol"]),
     .library(name: "NativePipeWindowing", targets: ["NativePipeWindowing"]),
     .library(name: "NativePipeRemote", targets: ["NativePipeRemote"]),
+    .library(name: "NativePipeFileSharing", targets: ["NativePipeFileSharing"]),
+    .library(name: "NativePipeFileSystem", targets: ["NativePipeFileSystem"]),
+    .executable(name: "NativePipeFileSystemExtension", targets: ["NativePipeFileSystemExtension"]),
     .executable(name: "nativepipe", targets: ["NativePipeRemoteApp"]),
 ]
+// The display CLI continues to support macOS 14. FSKit is optional at launch;
+// only filesystem publication and the extension require macOS 27.
+let fsKitLink: [LinkerSetting] = [.unsafeFlags(["-Xlinker", "-weak_framework", "-Xlinker", "FSKit"])]
 let targets: [Target] = [
+        .target(name: "NativePipeFileSharing", dependencies: ["NativePipeStrings", "NativePipeProtocol"],
+                swiftSettings: [.swiftLanguageMode(.v5)], linkerSettings: fsKitLink),
+        .target(name: "NativePipeFileSystem", dependencies: ["NativePipeFileSharing"],
+                swiftSettings: [.swiftLanguageMode(.v5)], linkerSettings: fsKitLink),
+        .executableTarget(name: "NativePipeFileSystemExtension", dependencies: ["NativePipeFileSystem"],
+                swiftSettings: [.swiftLanguageMode(.v5)], linkerSettings: fsKitLink),
+        .testTarget(name: "NativePipeFileSharingTests", dependencies: ["NativePipeFileSharing", "NativePipeProtocol"],
+                swiftSettings: [.swiftLanguageMode(.v5)], linkerSettings: fsKitLink),
+        .testTarget(name: "NativePipeFileSystemTests", dependencies: ["NativePipeFileSystem", "NativePipeFileSharing", "NativePipeProtocol"],
+                swiftSettings: [.swiftLanguageMode(.v5)], linkerSettings: fsKitLink),
         .testTarget(name: "NativePipeStringsTests", dependencies: ["NativePipeStrings"], swiftSettings: [.swiftLanguageMode(.v5)]),
         .target(name: "NativePipeStrings", resources: [.process("Resources")], swiftSettings: [.swiftLanguageMode(.v5)]),
         .target(name: "CNativePipeAV1", path: "common/av1_decoder", publicHeadersPath: ".",
@@ -51,7 +67,7 @@ let targets: [Target] = [
         ),
         .executableTarget(
             name: "NativePipeRemoteApp",
-            dependencies: ["NativePipeStrings",
+            dependencies: ["NativePipeStrings", "NativePipeFileSharing", "NativePipeWindowing",
                 "NativePipeRemote",
                 "NativePipeProtocol",
             ],

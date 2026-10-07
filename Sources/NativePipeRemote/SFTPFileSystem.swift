@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import CryptoKit
 import NativePipeProtocol
 import NativePipeStrings
 
@@ -180,6 +181,111 @@ public final class SFTPFileSystem {
             return SFTPFileEntry(name: (destination as NSString).lastPathComponent, path: destination,
                                  kind: attributes.kind, size: attributes.size, modified: attributes.modified)
         }
+    }
+    /// SFTP v3 exposes size and second-resolution mtime, but no inode or ctime.
+    /// This revision detects observable changes; same-size edits within the
+    /// same second, or replacements preserving these attributes, cannot be
+    /// distinguished by a v3 server's attributes. v3 also lacks atomic no-follow
+    /// OPEN; pre/post path checks cannot eliminate a hostile symlink race.
+    public func snapshot(path: String) async throws -> UserFileMetadata {
+        try UserFileRange.validate(RemoteFileURL.make(path))
+        return try await perform { connection in
+            try Self.validateRangePath(path, connection: connection)
+            return try Self.rangeMetadata(path, attributes: connection.attributes(path))
+        }
+    }
+    public func rangeContents(path: String) async throws -> [UserFileMetadata] {
+        try UserFileRange.validate(RemoteFileURL.make(path))
+        return try await perform { connection in
+            try Self.validateRangePath(path, connection: connection)
+            let parent = try Self.rangeMetadata(path, attributes: connection.attributes(path))
+            guard parent.kind == .directory else { throw SFTPFileSystemError.unsupportedFile(path) }
+            let children = try connection.entries(path).compactMap { name, attributes -> UserFileMetadata? in
+                let child = try SFTPPath.child(path, name)
+                let value = try attributes.hasKind ? attributes : connection.attributes(child)
+                guard value.kind == .file || value.kind == .directory else { return nil }
+                return try Self.rangeMetadata(child, attributes: value)
+            }
+            try Self.validateRangePath(path, connection: connection)
+            guard try Self.rangeMetadata(path, attributes: connection.attributes(path)).version == parent.version else {
+                throw SFTPFileSystemError.sourceChanged(path)
+            }
+            return children
+        }
+    }
+    public func readRange(path: String, offset: UInt64, length: Int, expectedVersion: Data) async throws -> Data {
+        try UserFileRange.validate(RemoteFileURL.make(path), offset: offset, length: length)
+        return try await perform { connection in
+            try Self.validateRangePath(path, connection: connection)
+            let listed = try Self.rangeMetadata(path, attributes: connection.attributes(path))
+            guard listed.kind == .file else { throw SFTPFileSystemError.unsupportedFile(path) }
+            guard listed.version == expectedVersion else { throw SFTPFileSystemError.sourceChanged(path) }
+            let handle = try connection.openFile(path, writing: false)
+            var closeAttempted = false
+            defer { if !closeAttempted { try? connection.closeHandle(handle) } }
+            let before = try Self.rangeMetadata(path, attributes: connection.fileAttributes(handle))
+            guard before.version == expectedVersion else { throw SFTPFileSystemError.sourceChanged(path) }
+            var data = Data()
+            let expected = offset >= before.size ? 0 : Int(min(UInt64(length), before.size - offset))
+            while data.count < expected {
+                var pending: [(UInt32, UInt64, Int)] = []
+                var requested = data.count
+                while pending.count < 16, requested < expected {
+                    let count = min(SFTPWire.chunkSize, expected - requested)
+                    let position = offset + UInt64(requested)
+                    pending.append((try connection.enqueueRead(handle, offset: position, count: count), position, count))
+                    requested += count
+                }
+                var replies: [Data] = []
+                for (id, _, count) in pending {
+                    guard let bytes = try connection.receiveRead(id, count: count) else { throw SFTPFileSystemError.sourceChanged(path) }
+                    replies.append(bytes)
+                }
+                // Drain the read window before filling legal short v3 replies,
+                // so no pending reply is stranded in this retained session.
+                for (index, request) in pending.enumerated() {
+                    var bytes = replies[index]
+                    while bytes.count < request.2 {
+                        guard let tail = try connection.readFile(handle, offset: request.1 + UInt64(bytes.count),
+                                                                 count: request.2 - bytes.count) else { throw SFTPFileSystemError.sourceChanged(path) }
+                        bytes.append(tail)
+                    }
+                    data.append(bytes)
+                }
+            }
+            let after = try Self.rangeMetadata(path, attributes: connection.fileAttributes(handle))
+            try Self.validateRangePath(path, connection: connection)
+            let current = try Self.rangeMetadata(path, attributes: connection.attributes(path))
+            guard after.version == expectedVersion, current.version == expectedVersion else {
+                throw SFTPFileSystemError.sourceChanged(path)
+            }
+            try connection.checkCancellation()
+            closeAttempted = true
+            try connection.closeHandle(handle)
+            return data
+        }
+    }
+    private nonisolated static func validateRangePath(_ path: String, connection: SFTPConnection) throws {
+        // v3 has no no-follow OPEN flag. Check every ancestor and compare the
+        // canonical path before and after each handle read, rather than
+        // silently following a selected folder's links into another tree.
+        var ancestor = ""
+        for component in path.split(separator: "/").dropLast() {
+            ancestor += "/" + component
+            guard try connection.attributes(ancestor).kind == .directory else { throw SFTPFileSystemError.unsupportedFile(ancestor) }
+        }
+        guard try connection.realpath(path) == path else { throw SFTPFileSystemError.unsupportedFile(path) }
+    }
+    private nonisolated static func rangeMetadata(_ path: String, attributes: SFTPAttributes) throws -> UserFileMetadata {
+        guard attributes.kind == .file || attributes.kind == .directory,
+              let size = attributes.size, let modified = attributes.modified, let permissions = attributes.permissions else {
+            throw SFTPFileSystemError.unsupportedFile(path)
+        }
+        var revision = Data(); revision.sftpString(path); revision.sftpUInt64(size)
+        revision.sftpUInt32(permissions); revision.sftpUInt64(UInt64(modified.timeIntervalSince1970))
+        return UserFileMetadata(url: try RemoteFileURL.make(path, isDirectory: attributes.kind == .directory),
+            kind: attributes.kind == .directory ? .directory : .file, size: size, modified: modified,
+            permissions: permissions, version: Data(SHA256.hash(data: revision)))
     }
     public func createDirectory(path: String) async throws {
         try await perform { connection in

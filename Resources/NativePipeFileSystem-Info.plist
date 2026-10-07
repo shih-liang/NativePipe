@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.nativepipe.cli.filesystem</string>
+	<key>CFBundleExecutable</key>
+	<string>NativePipeFileSystemExtension</string>
+	<key>CFBundleName</key>
+	<string>NativePipe Shared Files</string>
+	<key>CFBundleDisplayName</key>
+	<string>NativePipe Shared Files</string>
+	<key>CFBundlePackageType</key>
+	<string>XPC!</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.2.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.2.0</string>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleLocalizations</key>
+	<array>
+		<string>en</string>
+		<string>zh-Hans</string>
+		<string>zh-Hant</string>
+		<string>ja</string>
+		<string>ko</string>
+		<string>fr</string>
+		<string>de</string>
+		<string>es</string>
+		<string>pt-BR</string>
+		<string>it</string>
+		<string>ru</string>
+	</array>
+	<key>LSMinimumSystemVersion</key>
+	<string>27.0</string>
+	<key>EXAppExtensionAttributes</key>
+	<dict>
+		<key>EXExtensionPointIdentifier</key>
+		<string>com.apple.fskit.fsmodule</string>
+		<key>FSShortName</key>
+		<string>nativepipe</string>
+		<key>FSSupportsBlockResources</key>
+		<false/>
+		<key>FSSupportsPathURLs</key>
+		<true/>
+		<key>FSRequiresSecurityScopedPathURLResources</key>
+		<true/>
+		<key>FSMediaTypes</key>
+		<dict/>
+		<key>FSPersonalities</key>
+		<dict/>
+	</dict>
+</dict>
+</plist>

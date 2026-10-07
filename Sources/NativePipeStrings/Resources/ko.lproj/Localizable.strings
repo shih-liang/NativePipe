@@ -281,3 +281,11 @@
 "Choose where to save %@." = "%@을(를) 저장할 위치를 선택하세요.";
 "Save" = "저장";
 "Use a path on the connected Linux machine to receive files." = "파일을 받으려면 연결된 Linux 시스템의 경로를 사용하세요.";
+
+"Enable %@ in System Settings → General → Login Items & Extensions → File System Extensions before sharing files." = "파일을 공유하기 전에 시스템 설정 → 일반 → 로그인 항목 및 확장 프로그램 → 파일 시스템 확장 프로그램에서 %@을(를) 활성화하세요.";
+
+"The shared volume could not be ejected: %@" = "공유 볼륨을 추출할 수 없습니다: %@";
+
+"Shared File" = "공유 파일";
+
+"The virtual file sharing backend is not available." = "가상 파일 공유 백엔드를 사용할 수 없습니다.";

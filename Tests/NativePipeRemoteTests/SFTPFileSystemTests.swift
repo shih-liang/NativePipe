@@ -5,6 +5,37 @@ import Darwin
 import NativePipeProtocol
 @testable import NativePipeRemote
 
+private final class SFTPReadGate: SFTPTransport, @unchecked Sendable {
+    private let base: SFTPTransport
+    private let condition = NSCondition()
+    private var waiting = false, released = false, canceled = false
+    init(_ base: SFTPTransport) { self.base = base }
+    var readIsWaiting: Bool { condition.lock(); defer { condition.unlock() }; return waiting }
+    var wasCanceled: Bool { condition.lock(); defer { condition.unlock() }; return canceled }
+    func releaseRead() { condition.lock(); released = true; condition.broadcast(); condition.unlock() }
+    func start() throws { try base.start() }
+    func write(_ data: Data) throws {
+        if data.count > 4, data[4] == 5 {
+            condition.lock()
+            if !waiting {
+                waiting = true
+                while !released { condition.wait() }
+            }
+            condition.unlock()
+        }
+        try base.write(data)
+    }
+    func readPacket() throws -> Data { try base.readPacket() }
+    func checkCancellation() throws { try base.checkCancellation() }
+    func beginPublication() throws { try base.beginPublication() }
+    func endPublication() { base.endPublication() }
+    func cancel() {
+        condition.lock(); canceled = true; released = true; condition.broadcast(); condition.unlock()
+        base.cancel()
+    }
+    func close() { releaseRead(); base.close() }
+}
+
 final class SFTPFileSystemTests: XCTestCase {
     private func temporaryDirectory() throws -> URL {
         let result = FileManager.default.temporaryDirectory.appendingPathComponent("nativepipe-sftp-protocol-" + UUID().uuidString)
@@ -74,6 +105,121 @@ final class SFTPFileSystemTests: XCTestCase {
         system.close()
         _ = try await system.list()
         XCTAssertEqual(transports.count, 2)
+        system.close()
+    }
+    @MainActor func testLazyRangesUseRealSFTPReadsWithoutDownloadingLargePrefixes() async throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("sparse")
+        let descriptor = open(source.path, O_CREAT | O_EXCL | O_RDWR, 0o751)
+        XCTAssertGreaterThanOrEqual(descriptor, 0); defer { close(descriptor) }
+        let offset: UInt64 = 1 << 40, bytes = Array("selected range".utf8)
+        XCTAssertEqual(bytes.withUnsafeBytes { pwrite(descriptor, $0.baseAddress, $0.count, off_t(offset)) }, bytes.count)
+        let canonical = try canonicalPath(source)
+        let system = try realServer(root, reuseConnection: true)
+        let info = try await system.snapshot(path: canonical)
+        XCTAssertEqual(info.size, offset + UInt64(bytes.count)); XCTAssertEqual(info.permissions, 0o751)
+        XCTAssertEqual(info.version.count, 32, "The opaque revision must not disclose the remote source path")
+        let range = try await system.readRange(path: canonical, offset: offset + 2, length: 5, expectedVersion: info.version)
+        XCTAssertEqual(range, Data("lecte".utf8))
+        let eof = try await system.readRange(path: canonical, offset: info.size, length: 100, expectedVersion: info.version)
+        XCTAssertTrue(eof.isEmpty)
+        let empty = try await system.readRange(path: canonical, offset: offset, length: 0, expectedVersion: info.version)
+        XCTAssertTrue(empty.isEmpty)
+        let listing = try await system.rangeContents(path: (canonical as NSString).deletingLastPathComponent)
+        XCTAssertEqual(listing.map(\.url.lastPathComponent), ["sparse"])
+        let pipeline = Data((0..<(UserFileRange.maximumReadLength + 64)).map { UInt8(truncatingIfNeeded: $0 * 37) })
+        let pipelineURL = root.appendingPathComponent("pipeline")
+        try pipeline.write(to: pipelineURL)
+        let pipelinePath = try canonicalPath(pipelineURL), pipelineInfo = try await system.snapshot(path: pipelinePath)
+        let window = try await system.readRange(path: pipelinePath, offset: 23, length: UserFileRange.maximumReadLength,
+                                               expectedVersion: pipelineInfo.version)
+        XCTAssertEqual(window, pipeline.subdata(in: 23..<(23 + UserFileRange.maximumReadLength)))
+        XCTAssertEqual(ftruncate(descriptor, off_t(info.size + 1)), 0)
+        do { _ = try await system.readRange(path: canonical, offset: offset, length: 1, expectedVersion: info.version); XCTFail("Changed source accepted") }
+        catch SFTPFileSystemError.sourceChanged { }
+        system.close()
+    }
+    @MainActor func testUserRangeAdapterQueuesOverlappingReadsOnOnePersistentSession() async throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        try Data("0123456789".utf8).write(to: root.appendingPathComponent("file"))
+        let recorder = SFTPTransportRecorder()
+        let system = try realServer(root, reuseConnection: true, transportObserver: { recorder.append($0) })
+        let access: any UserFileRangeAccess = RemoteUserFileAccess(makeSession: { system })
+        let remote = URL(fileURLWithPath: try canonicalPath(root.appendingPathComponent("file")))
+        let info = try await access.metadata(for: remote)
+        async let first = access.read(remote, offset: 0, length: 4, expectedVersion: info.version)
+        async let second = access.read(remote, offset: 6, length: 4, expectedVersion: info.version)
+        async let stat = access.metadata(for: remote)
+        let (a, b, current) = try await (first, second, stat)
+        XCTAssertEqual(a, Data("0123".utf8)); XCTAssertEqual(b, Data("6789".utf8))
+        XCTAssertEqual(current.version, info.version)
+        XCTAssertEqual(recorder.count, 1, "FSKit reads must not reconnect SSH per requested range")
+        access.closeRangeAccess()
+        _ = try await access.metadata(for: remote)
+        XCTAssertEqual(recorder.count, 2)
+        access.closeRangeAccess()
+    }
+    @MainActor func testCancelingQueuedRangeReturnsPromptlyWithoutCancelingItsPredecessor() async throws {
+        let root = try temporaryDirectory(), authentication = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root); try? FileManager.default.removeItem(at: authentication) }
+        let executable = URL(fileURLWithPath: "/usr/libexec/sftp-server")
+        guard FileManager.default.isExecutableFile(atPath: executable.path) else { throw XCTSkip("The system SFTP server is unavailable.") }
+        try Data("0123456789".utf8).write(to: root.appendingPathComponent("file"))
+        let gate = SFTPReadGate(SFTPSSHTransport(executable: executable, arguments: ["-d", root.path],
+            environment: ProcessInfo.processInfo.environment, authenticationDirectory: authentication))
+        let watchdog = DispatchWorkItem { gate.releaseRead() }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 2, execute: watchdog)
+        defer { watchdog.cancel(); gate.releaseRead() }
+        let system = SFTPFileSystem(reuseConnection: true, transportFactory: { gate })
+        let access = RemoteUserFileAccess(makeSession: { system })
+        let remote = URL(fileURLWithPath: try canonicalPath(root.appendingPathComponent("file")))
+        let info = try await access.metadata(for: remote)
+        let first = Task { try await access.read(remote, offset: 0, length: 4, expectedVersion: info.version) }
+        for _ in 0..<100 {
+            if gate.readIsWaiting { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(gate.readIsWaiting)
+        let queued = Task { try await access.read(remote, offset: 6, length: 4, expectedVersion: info.version) }
+        try await Task.sleep(for: .milliseconds(20))
+        queued.cancel()
+        let started = ProcessInfo.processInfo.systemUptime
+        do { _ = try await queued.value; XCTFail("Canceled queued read succeeded") }
+        catch is CancellationError { }
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - started, 0.5)
+        XCTAssertFalse(gate.wasCanceled, "Canceling a queued request must preserve the earlier handle read")
+        gate.releaseRead()
+        let bytes = try await first.value
+        XCTAssertEqual(bytes, Data("0123".utf8))
+        access.closeRangeAccess()
+    }
+    @MainActor func testLazySFTPPathsRejectFinalAndAncestorSymlinks() async throws {
+        let root = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("folder"), withIntermediateDirectories: false)
+        try Data("contents".utf8).write(to: root.appendingPathComponent("folder/file"))
+        try FileManager.default.createSymbolicLink(atPath: root.appendingPathComponent("folder/link").path, withDestinationPath: "file")
+        try FileManager.default.createSymbolicLink(atPath: root.appendingPathComponent("directory-link").path, withDestinationPath: "folder")
+        let system = try realServer(root, reuseConnection: true), canonical = try canonicalPath(root)
+        let listing = try await system.rangeContents(path: canonical + "/folder")
+        XCTAssertEqual(listing.map(\.url.lastPathComponent), ["file"])
+        for suffix in ["/folder/link", "/directory-link/file"] {
+            do { _ = try await system.snapshot(path: canonical + suffix); XCTFail("Lazy access followed symlink") }
+            catch SFTPFileSystemError.unsupportedFile { }
+        }
+        do { _ = try await system.rangeContents(path: canonical + "/directory-link"); XCTFail("Lazy listing followed symlink") }
+        catch SFTPFileSystemError.unsupportedFile { }
+        system.close()
+    }
+    @MainActor func testLazySFTPMetadataKeepsByteDistinctNFCAndNFDFilenames() async throws {
+        let names = ["\u{e9}.txt", "e\u{301}.txt"]
+        let transport = SFTPListingFixture(names: names, includeTimes: true, preserveCanonicalPaths: true)
+        let system = SFTPFileSystem(reuseConnection: true, transportFactory: { transport })
+        let entries = try await system.rangeContents(path: "/fixture")
+        XCTAssertEqual(Set(entries.map { Data($0.url.path.utf8) }), Set(names.map { Data(("/fixture/" + $0).utf8) }))
+        XCTAssertEqual(Set(entries.map(\.version)).count, 2)
+        XCTAssertTrue(entries.allSatisfy { $0.version.count == 32 })
+        let snapshot = try await system.snapshot(path: "/fixture/\u{e9}.txt")
+        XCTAssertEqual(Data(snapshot.url.path.utf8), Data("/fixture/\u{e9}.txt".utf8))
         system.close()
     }
     @MainActor func testIsolatedOperationsStillUseSeparateRealConnections() async throws {
@@ -745,6 +891,8 @@ private final class SFTPListingFixture: SFTPTransport, @unchecked Sendable {
     let missingType: Bool
     let directoryPath: String
     let emptyFiles: Bool
+    let includeTimes: Bool
+    let preserveCanonicalPaths: Bool
     private var response = Data()
     private var responses: [Data] = []
     private var sentEntries = false
@@ -764,11 +912,12 @@ private final class SFTPListingFixture: SFTPTransport, @unchecked Sendable {
     var pendingReplies: Int { responses.count }
     init(names: [String], missingType: Bool = false, directoryPath: String = "/fixture", emptyFiles: Bool = false,
          pages: [[String]?]? = nil, reverseResponses: Bool = false, closeFailure: CloseFailure? = nil,
-         failStat: Bool = false) {
+         failStat: Bool = false, includeTimes: Bool = false, preserveCanonicalPaths: Bool = false) {
         self.names = names; self.missingType = missingType; self.directoryPath = directoryPath; self.emptyFiles = emptyFiles
         self.pages = pages; self.reverseResponses = reverseResponses
         self.closeFailure = closeFailure
         self.failStat = failStat
+        self.includeTimes = includeTimes; self.preserveCanonicalPaths = preserveCanonicalPaths
     }
     func start() throws { }
     func checkCancellation() throws { }
@@ -776,8 +925,10 @@ private final class SFTPListingFixture: SFTPTransport, @unchecked Sendable {
     func close() { closed = true }
     func failNextRequest() { failNext = true }
     private func attributes(directory: Bool, missingType: Bool = false) -> Data {
-        var value = Data(); value.sftpUInt32(missingType ? 1 : 5); value.sftpUInt64(directory || emptyFiles ? 0 : 5)
-        if !missingType { value.sftpUInt32(directory ? 0o040700 : 0o100600) }; return value
+        var value = Data(); value.sftpUInt32((missingType ? 1 : 5) | (includeTimes ? 8 : 0)); value.sftpUInt64(directory || emptyFiles ? 0 : 5)
+        if !missingType { value.sftpUInt32(directory ? 0o040700 : 0o100600) }
+        if includeTimes { value.sftpUInt32(1_700_000_000); value.sftpUInt32(1_700_000_000) }
+        return value
     }
     private func status(_ id: UInt32, _ code: UInt32) -> Data {
         var result = Data([101]); result.sftpUInt32(id); result.sftpUInt32(code); result.sftpString(""); result.sftpString(""); return result
@@ -791,8 +942,10 @@ private final class SFTPListingFixture: SFTPTransport, @unchecked Sendable {
         switch type {
         case 16:
             realpathCount += 1
+            let requested = try reader.string()
             response = Data([104]); response.sftpUInt32(id); response.sftpUInt32(1)
-            response.sftpString("/fixture"); response.sftpString(""); response.append(attributes(directory: true))
+            response.sftpString(preserveCanonicalPaths && requested != "." ? requested : "/fixture")
+            response.sftpString(""); response.append(attributes(directory: true))
         case 7:
             lstatCount += 1; let path = try reader.string()
             if failStat { response = status(id, 2); return }

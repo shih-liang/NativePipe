@@ -25,6 +25,14 @@ static void request(int fd, int type, const char *path, int replace) {
     if (type == NP_FILE_WRITE) np_file_put32(body + 4 + n, 0600);
     assert(np_file_send(fd, type, replace, 0, body, n + 4 + (type == NP_FILE_WRITE ? 4 : 0)) == 0);
 }
+static void range_request(int fd, const char *path, uint64_t offset, uint32_t count,
+                          const unsigned char revision[NP_FILE_REVISION]) {
+    unsigned char body[4096 + 4 + 12 + NP_FILE_REVISION]; size_t n = strlen(path);
+    np_file_put32(body, (uint32_t)n); memcpy(body + 4, path, n);
+    np_file_put64(body + 4 + n, offset); np_file_put32(body + 12 + n, count);
+    memcpy(body + 16 + n, revision, NP_FILE_REVISION);
+    assert(np_file_send(fd, NP_FILE_RANGE, 0, 0, body, n + 16 + NP_FILE_REVISION) == 0);
+}
 static int start(struct server *s, pthread_t *thread) {
     int sockets[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
     s->socket = sockets[0];
@@ -84,6 +92,46 @@ int main(void) {
         assert(!memcmp(frame.data, block, sizeof(block))); blocks++;
     }
     assert(blocks == 160); finish(fd, thread);
+    /* Reads transfer exactly a requested sparse-file range, never its prefix
+     * or the entire multi-terabyte apparent size. The revision pins identity. */
+    int sparse = openat(root, "sparse", O_CREAT | O_EXCL | O_RDWR, 0751); assert(sparse >= 0);
+    uint64_t large_offset = UINT64_C(1) << 40;
+    assert(pwrite(sparse, "range-bytes", 11, (off_t)large_offset) == 11);
+    fd = start(&s, &thread); request(fd, NP_FILE_SNAPSHOT, "/sparse", 0);
+    assert(np_file_receive(fd, &frame) == 0 && !frame.status && frame.length == 28 + NP_FILE_REVISION);
+    assert(np_file_u64(frame.data + 12) == large_offset + 11);
+    unsigned char version[NP_FILE_REVISION]; memcpy(version, frame.data + 28, sizeof(version)); finish(fd, thread);
+    fd = start(&s, &thread); range_request(fd, "/sparse", large_offset + 2, 5, version);
+    assert(np_file_receive(fd, &frame) == 0 && !frame.status && frame.type == NP_FILE_DATA && frame.length == 5);
+    assert(!memcmp(frame.data, "nge-b", 5));
+    assert(np_file_receive(fd, &frame) == 0 && !frame.status && frame.type == NP_FILE_END && np_file_u64(frame.data) == 5);
+    finish(fd, thread);
+    fd = start(&s, &thread); range_request(fd, "/sparse", large_offset + 9, 8, version);
+    assert(np_file_receive(fd, &frame) == 0 && !frame.status && frame.type == NP_FILE_DATA && frame.length == 2);
+    assert(!memcmp(frame.data, "es", 2));
+    assert(np_file_receive(fd, &frame) == 0 && !frame.status && np_file_u64(frame.data) == 2); finish(fd, thread);
+    for (unsigned i = 0; i < 2; i++) {
+        fd = start(&s, &thread); range_request(fd, "/sparse", large_offset + 11, i ? 0 : 10, version);
+        assert(np_file_receive(fd, &frame) == 0 && !frame.status && frame.type == NP_FILE_END && !np_file_u64(frame.data));
+        finish(fd, thread);
+    }
+    fd = start(&s, &thread); range_request(fd, "/sparse", UINT64_MAX, 1, version);
+    assert(np_file_receive(fd, &frame) == 0 && frame.status == EINVAL); finish(fd, thread);
+    fd = start(&s, &thread); range_request(fd, "/sparse", 0, NP_FILE_RANGE_MAX + 1, version);
+    assert(np_file_receive(fd, &frame) == 0 && frame.status == EINVAL); finish(fd, thread);
+    assert(symlinkat("sparse", root, "sparse-link") == 0);
+    fd = start(&s, &thread); range_request(fd, "/sparse-link", large_offset, 5, version);
+    assert(np_file_receive(fd, &frame) == 0 && frame.status); finish(fd, thread);
+    assert(symlinkat(".", root, "folder-link") == 0);
+    fd = start(&s, &thread); range_request(fd, "/folder-link/sparse", large_offset, 5, version);
+    assert(np_file_receive(fd, &frame) == 0 && frame.status); finish(fd, thread);
+    fd = start(&s, &thread); request(fd, NP_FILE_DIRECTORY, "/folder-link", 0);
+    assert(np_file_receive(fd, &frame) == 0 && frame.status); finish(fd, thread);
+    assert(pwrite(sparse, "changed", 7, (off_t)large_offset) == 7);
+    fd = start(&s, &thread); range_request(fd, "/sparse", large_offset, 7, version);
+    assert(np_file_receive(fd, &frame) == 0 && frame.type == NP_FILE_END && frame.status == NP_FILE_STALE); finish(fd, thread);
+    assert(unlinkat(root, "sparse-link", 0) == 0); assert(unlinkat(root, "folder-link", 0) == 0);
+    close(sparse); assert(unlinkat(root, "sparse", 0) == 0);
     /* No silent overwrite, special-file blocking or read-only bypass. */
     fd = start(&s, &thread); request(fd, NP_FILE_WRITE, "/uploaded", 0);
     assert(np_file_receive(fd, &frame) == 0 && frame.status == EEXIST); finish(fd, thread);

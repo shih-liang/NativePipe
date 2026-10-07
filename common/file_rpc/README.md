@@ -42,6 +42,23 @@ STAT ends at METADATA. READ also accepts directories and selects the appropriate
 stream after METADATA. Regular files are read to EOF, including size-zero procfs
 files; `st_size` is a progress hint, not a transfer bound.
 
+Lazy filesystem access adds SNAPSHOT=10, RANGE=11 and DIRECTORY=12. These
+operations reject `.`/`..` components and every symbolic link, including
+ancestors. They use `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS)`; the Rosetta
+fallback keeps the existing actual-process-root restriction and walks without
+following links. Ordinary STAT/READ/WRITE retain their original semantics.
+
+SNAPSHOT returns METADATA plus a 48-byte opaque revision: device:u64, inode:u64,
+size:u64, mtime_seconds:i64, mtime_nanoseconds:u32, ctime_seconds:i64,
+ctime_nanoseconds:u32. RANGE appends offset:u64, length:u32, and that revision
+to its path request. It transfers at most the requested length using `pread`,
+then END with the actual byte count. Individual requests are limited to 1 MiB;
+there is no aggregate file-size limit. EOF returns a short or empty range.
+Offsets and offset+length must fit signed 64-bit file offsets. A revision
+mismatch before or after reading returns status 116; the client discards all
+bytes from that request. DIRECTORY pins a no-link directory and returns the
+same METADATA/ENTRIES/END listing format as LIST.
+
 For reads and directory listings, DATA=5 contains at most 64 KiB. ENTRIES=6 contains a batch of
 `type:u8, name_length:u16, name_bytes` records; names are never split. END=7
 contains the transferred byte count (u64) for files, and no body for directories.

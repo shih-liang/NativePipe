@@ -281,3 +281,11 @@
 "Choose where to save %@." = "%@ の保存先を選択してください。";
 "Save" = "保存";
 "Use a path on the connected Linux machine to receive files." = "ファイルを受信するには、接続中の Linux マシンのパスを使用してください。";
+
+"Enable %@ in System Settings → General → Login Items & Extensions → File System Extensions before sharing files." = "ファイルを共有する前に、「システム設定 → 一般 → ログイン項目と機能拡張 → ファイルシステム機能拡張」で %@ を有効にしてください。";
+
+"The shared volume could not be ejected: %@" = "共有ボリュームを取り出せませんでした：%@";
+
+"Shared File" = "共有ファイル";
+
+"The virtual file sharing backend is not available." = "仮想ファイル共有のバックエンドを利用できません。";

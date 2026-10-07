@@ -58,8 +58,8 @@ public enum GuestOpenPolicy {
                 }
                 share = current
             }
-            // Always transfer a snapshot via the user-level file transport.
-            // Never validate a host path and later reopen a guest-mutable path.
+            // Use the user-level transport for private copies or versioned
+            // range reads. Never reopen a guest-mutable Mac shared path.
             return .receiveFile(path: path, name: String(name), share: share)
         }
     }

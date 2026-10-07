@@ -18,7 +18,8 @@ public enum GuestOpenAction: Equatable {
 }
 
 /// The same approval and transfer workflow serves VM vsock and SSH stdio.
-/// All local items are stable private copies, including items in a VM share.
+/// All guest files are published through the virtual filesystem; explicit
+/// Save copies the mounted item to the user-selected destination.
 @MainActor
 public final class GuestOpenCoordinator {
     private let machineName: String
@@ -28,8 +29,8 @@ public final class GuestOpenCoordinator {
     private let confirm: @MainActor (GuestOpenPrompt) async -> GuestOpenAction
     private let open: @MainActor (URL) async -> Bool
     private let quarantine: @MainActor (URL) async throws -> Void
-    private let scratch: URL
     private let transferProgress: (@Sendable (FileTransferProgress) -> Void)?
+    private let publishGuestFiles: GuestFilePublisher?
     private var active: Task<HostOpenWire.Response, Never>?
     private var activeID: UUID?
     private var stopped = false
@@ -38,15 +39,16 @@ public final class GuestOpenCoordinator {
     public init(machineName: String, isEnabled: @escaping () -> Bool = { true },
                 shares: @escaping () -> [GuestOpenPolicy.SharedFolder] = { [] },
                 fileAccess: UserFileAccess,
-                scratch: URL = FileManager.default.temporaryDirectory.appendingPathComponent("nativepipe-received", isDirectory: true),
                 confirm: @escaping @MainActor (GuestOpenPrompt) async -> GuestOpenAction = GuestOpenDialogs.confirm,
                 open: @escaping @MainActor (URL) async -> Bool = GuestOpenCoordinator.openWithWorkspace,
                 quarantine: @escaping @MainActor (URL) async throws -> Void = GuestOpenCoordinator.markAsDownloaded,
-                transferProgress: (@Sendable (FileTransferProgress) -> Void)? = nil) {
+                transferProgress: (@Sendable (FileTransferProgress) -> Void)? = nil,
+                publishGuestFiles: GuestFilePublisher? = nil) {
         self.machineName = machineName; self.isEnabled = isEnabled; self.shares = shares
-        self.fileAccess = fileAccess; self.scratch = scratch; self.confirm = confirm
+        self.fileAccess = fileAccess; self.confirm = confirm
         self.open = open; self.quarantine = quarantine
         self.transferProgress = transferProgress
+        self.publishGuestFiles = publishGuestFiles
     }
 
     public func handle(_ request: HostOpenWire.Request) async -> HostOpenWire.Response {
@@ -99,73 +101,56 @@ public final class GuestOpenCoordinator {
     private func receiveFile(path: String, name: String, share: GuestOpenPolicy.SharedFolder?) async -> HostOpenWire.Response {
         let action = await confirm(.receive(machine: machineName, path: path))
         guard action != .cancel else { return cancelled() }
-        var cleanup: URL?
-        var retained = false
+        var savedCopy: URL?
+        var scopedDestination: URL?
         var progressWindow: GuestOpenTransferWindow?
-        var lease: Int32 = -1
-        defer { if lease >= 0 { Darwin.close(lease) } }
-        let response: HostOpenWire.Response
+        defer { progressWindow?.close(); scopedDestination?.stopAccessingSecurityScopedResource() }
         do {
             try check(share)
-            await removeOldCopies()
+            guard let publishGuestFiles else { throw GuestFileSharingError.unavailable }
+            // Consent precedes registration and all range reads. Opening does
+            // not crawl or mutate the read-only volume's quarantine attributes.
+            let files = try await publishGuestFiles([RemoteFileURL.make(path)], fileAccess, .open)
             try check(share)
-            let file: URL
+            guard files.count == 1, let source = files.first else { throw FileRPC.Failure.protocolError }
+            _ = try FileTransferURLs.decode(FileTransferURLs.encode(files))
             if case .save(let destination) = action {
-                file = destination
-                guard !FileManager.default.fileExists(atPath: file.path) else { throw FileRPC.Failure.local(EEXIST) }
-            } else {
-                let directory = scratch.appendingPathComponent(UUID().uuidString, isDirectory: true)
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
-                                                        attributes: [.posixPermissions: 0o700])
-                cleanup = directory
-                lease = Darwin.open(directory.appendingPathComponent(".lease").path,
-                    O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0o600)
-                guard lease >= 0, flock(lease, LOCK_EX | LOCK_NB) == 0 else { throw FileRPC.Failure.local(errno) }
-                let payload = directory.appendingPathComponent("item", isDirectory: true)
-                try FileManager.default.createDirectory(at: payload, withIntermediateDirectories: false,
-                                                        attributes: [.posixPermissions: 0o700])
-                file = payload.appendingPathComponent(GuestOpenPolicy.safeFileName(name))
-            }
-            let scoped = file.deletingLastPathComponent().startAccessingSecurityScopedResource()
-            defer { if scoped { file.deletingLastPathComponent().stopAccessingSecurityScopedResource() } }
-            // The shared transport streams and publishes atomically on the
-            // target volume. No whole-file allocation or second copy is needed.
-            progressWindow = transferProgress == nil ? GuestOpenTransferWindow(name: name, machine: machineName,
-                cancel: { [weak self] in self?.active?.cancel() }) : nil
-            let window = progressWindow, externalProgress = transferProgress, requestID = activeID
-            try await fileAccess.exportFile(URL(fileURLWithPath: path), to: file, progress: { [weak self] progress in
-                externalProgress?(progress)
-                Task { @MainActor in
-                    guard let self, self.activeID == requestID else { return }
-                    do { try self.check(share) }
-                    catch { self.active?.cancel() }
-                    window?.update(progress)
+                let parent = destination.deletingLastPathComponent()
+                if parent.startAccessingSecurityScopedResource() { scopedDestination = parent }
+                progressWindow = transferProgress == nil ? GuestOpenTransferWindow(name: name, machine: machineName,
+                    cancel: { [weak self] in self?.active?.cancel() }) : nil
+                let window = progressWindow, externalProgress = transferProgress, requestID = activeID
+                try await FileTransferLocalIO.copy(source: source, to: destination) { [weak self] progress in
+                    externalProgress?(progress)
+                    Task { @MainActor in
+                        guard let self, self.activeID == requestID else { return }
+                        do { try self.check(share) }
+                        catch { self.active?.cancel() }
+                        window?.update(progress)
+                    }
                 }
-            })
-            if case .save = action { cleanup = file }
-            try check(share)
-            try await quarantine(file)
-            try check(share)
-            if case .save = action {
-                retained = true
-                response = .init(status: .opened, message: NPText("Saved on the Mac."))
-            } else {
-                if try GuestOpenPolicy.mayExecute(file) {
-                    guard await confirm(.execute(machine: machineName, file: file)) == .open else { throw CancellationError() }
-                    try check(share)
-                }
-                response = await opened(file)
-                retained = response.status == .opened
+                savedCopy = destination
+                try check(share)
+                try await quarantine(destination)
+                try check(share)
+                return .init(status: .opened, message: NPText("Saved on the Mac."))
             }
-        } catch is CancellationError { response = cancelled() }
-        catch { response = .init(status: .failed, message: NPText("The item could not be received or opened on the Mac: %@", error.localizedDescription)) }
-        progressWindow?.close()
-        if let cleanup, !retained {
-            // Cleanup must finish even if the request was cancelled, while the
-            // main actor remains available for windows and other connections.
-            await Task.detached(priority: .utility) { try? FileManager.default.removeItem(at: cleanup) }.value
+            let executable = try await inspectExecutionRisk(source)
+            try check(share)
+            if executable {
+                guard await confirm(.execute(machine: machineName, file: source)) == .open else { return cancelled() }
+                try check(share)
+            }
+            return await opened(source)
+        } catch {
+            if let savedCopy {
+                // Only our successfully published destination is removed. A
+                // rejected existing destination must remain untouched.
+                await FileTransferLocalIO.removeFailedCopy(at: savedCopy)
+            }
+            if error is CancellationError { return cancelled() }
+            return .init(status: .failed, message: NPText("The item could not be received or opened on the Mac: %@", error.localizedDescription))
         }
-        return response
     }
 
     private func opened(_ url: URL) async -> HostOpenWire.Response {
@@ -174,28 +159,12 @@ public final class GuestOpenCoordinator {
             : .init(status: .failed, message: NPText("The Mac could not open it."))
     }
 
-    /// Runtime cleanup, with no aggregate size quota that would secretly impose
-    /// a single-file limit. Pending/refused/failed copies are removed immediately.
-    public func removeOldCopies(olderThan age: TimeInterval = 24 * 3600) async {
-        let scratch = scratch
-        let cleanup = Task.detached(priority: .utility) {
-            let cutoff = Date().addingTimeInterval(-age)
-            guard let items = try? FileManager.default.contentsOfDirectory(at: scratch,
-                includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
-            for item in items {
-                guard !Task.isCancelled else { return }
-                guard let modified = try? item.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
-                      modified < cutoff else { continue }
-                let lease = Darwin.open(item.appendingPathComponent(".lease").path, O_RDWR | O_CLOEXEC | O_NOFOLLOW)
-                guard lease >= 0 else { continue }
-                defer { Darwin.close(lease) }
-                // An approval/transfer can legitimately last more than a day.
-                // flock also protects concurrent owners in another VM process.
-                guard flock(lease, LOCK_EX | LOCK_NB) == 0 else { continue }
-                try? FileManager.default.removeItem(at: item)
-            }
+    private func inspectExecutionRisk(_ file: URL) async throws -> Bool {
+        // FSKit may ask this same process's main actor for metadata or four
+        // magic bytes. Synchronous Foundation IO must not block its owner.
+        return try await FileTransferLocalIO.perform {
+            try GuestOpenPolicy.mayExecute(file)
         }
-        await withTaskCancellationHandler(operation: { await cleanup.value }, onCancel: { cleanup.cancel() })
     }
 
     nonisolated public static func markAsDownloaded(_ file: URL) async throws {

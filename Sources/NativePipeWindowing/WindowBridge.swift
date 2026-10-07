@@ -527,6 +527,13 @@ public final class WindowBridge: NSObject {
     public var fileAccess: (any UserFileAccess)? {
         didSet { clipboard.fileAccess = fileAccess }
     }
+    public var publishGuestFiles: GuestFilePublisher? {
+        didSet { clipboard.publishGuestFiles = publishGuestFiles }
+    }
+    public var onGuestFileSharingRevoked: (() -> Void)?
+    public var onClipboardFileSharingRevoked: (() -> Void)? {
+        didSet { clipboard.onFileSharingRevoked = onClipboardFileSharingRevoked }
+    }
     lazy var fileDrag = FileDragBridge(bridge: self)
 
     func containsGuestWindow(at point: NSPoint) -> Bool {
@@ -535,9 +542,9 @@ public final class WindowBridge: NSObject {
     func hideDragIcon() { dragIcon.hide() }
     func reportFileTransferError(_ error: Error) { NSApp.presentError(error) }
 
-    public init(frameSource: FrameSource?, clipboardFileDirectory: URL? = nil) {
+    public init(frameSource: FrameSource?) {
         self.frameSource = frameSource
-        clipboard = ClipboardBridge(fileDirectory: clipboardFileDirectory)
+        clipboard = ClipboardBridge()
 		super.init()
         clipboard.output = { [weak self] command in self?.send(command) }
         clipboard.onError = { [weak self] error in self?.reportFileTransferError(error) }
@@ -1044,6 +1051,7 @@ public final class WindowBridge: NSObject {
         case .notificationBacklogReset: onGuestNotificationBacklogReset?()
         case .channelReady:
             onChannelReady?()
+            onGuestFileSharingRevoked?()
             connectionGeneration &+= 1
             // Consumed by WindowChannel as the transport generation boundary.
 			lastDisplays.removeAll(keepingCapacity: true)
@@ -1833,6 +1841,7 @@ public final class WindowBridge: NSObject {
         connectionGeneration &+= 1
         fileDrag.disconnect()
         clipboard.disconnect()
+        onGuestFileSharingRevoked?()
         for (surface, frame) in pendingSurfaceFrames {
             completeCopiedPresentation(
                 surface: surface, presentationID: frame.presentationID)

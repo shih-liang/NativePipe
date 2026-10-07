@@ -47,7 +47,8 @@ for name in sorted(payloads):
         elif name.startswith("nativepipe-compositor-"):
             required = ["nativepipe-wayland", "libexec/nativepipe-wayland", "libexec/np-open"]
         else:
-            required = ["bin/nativepipe", "NativePipe.app/Contents/MacOS/nativepipe"]
+            required = ["bin/nativepipe", "NativePipe.app/Contents/MacOS/nativepipe",
+                        "NativePipe.app/Contents/Extensions/NativePipeFileSystemExtension.appex/Contents/MacOS/NativePipeFileSystemExtension"]
             metadata = "NativePipe.app/Contents/Info.plist"
             assert metadata in members and members[metadata].isfile(), f"Missing application metadata in {name}"
             with archive.extractfile(members[metadata]) as handle:
@@ -57,6 +58,25 @@ for name in sorted(payloads):
             assert info.get("CFBundleShortVersionString") == version and info.get("CFBundleVersion") == version, "NativePipe application version differs from release"
             with archive.extractfile(members["bin/nativepipe"]) as handle:
                 assert b'exec "$root/NativePipe.app/Contents/MacOS/nativepipe" "$@"' in handle.read(), "CLI entry does not execute its signed application"
+            assert info.get("LSMinimumSystemVersion") == "14.0", "CLI deployment target must remain macOS 14"
+            extension = "NativePipe.app/Contents/Extensions/NativePipeFileSystemExtension.appex/Contents/"
+            module_metadata = extension + "Info.plist"
+            assert module_metadata in members and members[module_metadata].isfile(), "Missing FSKit module metadata"
+            with archive.extractfile(members[module_metadata]) as handle:
+                module = plistlib.load(handle)
+            assert (module.get("CFBundleIdentifier") == "com.nativepipe.cli.filesystem" and
+                    module.get("CFBundleExecutable") == "NativePipeFileSystemExtension" and
+                    module.get("CFBundlePackageType") == "XPC!"), "Invalid NativePipe FSKit module identity"
+            assert module.get("CFBundleShortVersionString") == version and module.get("CFBundleVersion") == version, "FSKit module version differs from release"
+            assert module.get("LSMinimumSystemVersion") == "27.0", "FSKit module must require macOS 27"
+            attributes = module.get("EXAppExtensionAttributes", {})
+            assert attributes.get("EXExtensionPointIdentifier") == "com.apple.fskit.fsmodule" and attributes.get("FSShortName") == "nativepipe", "Invalid FSKit module registration"
+            assert attributes.get("FSSupportsPathURLs") is True and attributes.get("FSRequiresSecurityScopedPathURLResources") is True and attributes.get("FSSupportsBlockResources") is False, "Invalid FSKit resource policy"
+            # This Linux-compatible archive check does not prove CMS or code
+            # signature validity. The macOS packager checks the actual issued
+            # profiles and signatures before it creates this archive.
+            for profile in ("NativePipe.app/Contents/embedded.provisionprofile", extension + "embedded.provisionprofile"):
+                assert profile in members and members[profile].isfile() and members[profile].size > 0, "Missing FSKit provisioning profile: " + profile
         for path in required:
             assert path in members and members[path].isfile() and members[path].mode & 0o111, f"Missing executable {path} in {name}"
         for path in license_files:

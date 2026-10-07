@@ -1,6 +1,8 @@
 import AppKit
 import NativePipeRemote
 import NativePipeStrings
+import NativePipeFileSharing
+import NativePipeWindowing
 
 @main
 struct RemotePipeMain {
@@ -20,6 +22,18 @@ struct RemotePipeMain {
             let app = NSApplication.shared
             app.setActivationPolicy(.regular)
             let delegate = RemoteApplicationDelegate(command: command)
+            var stopSharing: () -> Void = {}
+            if #available(macOS 27.0, *) {
+                let sharing = SharedFileVolumeBroker(
+                    directory: FileManager.default.temporaryDirectory.appendingPathComponent("npfs-" + UUID().uuidString.prefix(8)),
+                    name: command.destination)
+                delegate.display.bridge.publishGuestFiles = { try await sharing.publish($0, using: $1, purpose: $2) }
+                delegate.display.bridge.onGuestFileSharingRevoked = { sharing.revoke() }
+                delegate.display.bridge.onClipboardFileSharingRevoked = { sharing.revoke(purpose: .clipboard) }
+                stopSharing = { sharing.stop() }
+            } else {
+                delegate.display.bridge.publishGuestFiles = { _, _, _ in throw GuestFileSharingError.unavailable }
+            }
             delegate.aboutPanelOptions = [
                 .applicationName: "NativePipe",
                 .applicationVersion: NativePipeVersion.current,
@@ -49,6 +63,7 @@ struct RemotePipeMain {
                 if delegate?.signInCancelled == true { say(NPText("Sign-in cancelled.")) }
             }
             delegate.onTerminate = { [weak delegate] in
+                stopSharing()
                 exit(RemotePipeCLI.exitCode(signInCancelled: delegate?.signInCancelled ?? false,
                                             sessionStatus: delegate?.display.session.exitStatus))
             }

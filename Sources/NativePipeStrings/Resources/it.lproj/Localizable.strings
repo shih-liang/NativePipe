@@ -281,3 +281,11 @@
 "Choose where to save %@." = "Scegli dove salvare %@.";
 "Save" = "Salva";
 "Use a path on the connected Linux machine to receive files." = "Per ricevere file, usa un percorso sulla macchina Linux connessa.";
+
+"Enable %@ in System Settings → General → Login Items & Extensions → File System Extensions before sharing files." = "Prima di condividere file, abilita %@ in Impostazioni di Sistema → Generali → Elementi login ed estensioni → Estensioni del file system.";
+
+"The shared volume could not be ejected: %@" = "Impossibile espellere il volume condiviso: %@";
+
+"Shared File" = "File condiviso";
+
+"The virtual file sharing backend is not available." = "Il servizio di condivisione dei file virtuali non è disponibile.";

@@ -11,6 +11,42 @@ private final class FileProgressRecorder: @unchecked Sendable {
 @testable import NativePipeProtocol
 
 final class FileRPCTests: XCTestCase {
+    func testRemoteFileURLsPreserveByteDistinctLinuxUnicodeNamesAndPunctuation() throws {
+        let names = ["\u{e9}.txt", "e\u{301}.txt", "a #?% \n.txt"]
+        let directory = try RemoteFileURL.make("/guest/\u{e9}", isDirectory: true)
+        let urls = try names.map { try RemoteFileURL.appending($0, to: directory) }
+        for (name, url) in zip(names, urls) {
+            XCTAssertEqual(Data(url.path.utf8), Data(("/guest/\u{e9}/" + name).utf8))
+            XCTAssertEqual(Data(try FileTransferURLs.decode(FileTransferURLs.encode([url]))[0].path.utf8), Data(url.path.utf8))
+        }
+        XCTAssertNotEqual(Data(urls[0].path.utf8), Data(urls[1].path.utf8))
+        XCTAssertThrowsError(try RemoteFileURL.make("relative"))
+        XCTAssertThrowsError(try RemoteFileURL.appending("../escape", to: directory))
+        XCTAssertThrowsError(try RemoteFileURL.appending("file", to: XCTUnwrap(URL(string: "file://foreign/guest"))))
+    }
+
+    func testSnapshotPreservesTheRequestedLinuxPathBytesInItsMetadataURL() async throws {
+        let path = "/guest/\u{e9}.txt"
+        var descriptors: [Int32] = [-1, -1]
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors), 0)
+        let peer = descriptors[0], client = FileHandle(fileDescriptor: descriptors[1], closeOnDealloc: true)
+        let finished = DispatchGroup(); finished.enter()
+        DispatchQueue.global().async {
+            defer { close(peer); finished.leave() }
+            let frame = UnsafeMutablePointer<np_file_frame>.allocate(capacity: 1)
+            defer { frame.deallocate() }
+            guard np_file_receive(peer, frame) == 0 else { return }
+            XCTAssertEqual(frame.pointee.type, UInt8(NP_FILE_SNAPSHOT.rawValue))
+            let payload = Data(bytes: np_file_frame_data(frame), count: Int(frame.pointee.length))
+            XCTAssertEqual(payload.dropFirst(4), Data(path.utf8))
+            var metadata = [UInt8](repeating: 0, count: 28 + Int(NP_FILE_REVISION))
+            np_file_put32(&metadata, 0o100600)
+            _ = np_file_send(peer, UInt8(NP_FILE_METADATA.rawValue), 0, 0, &metadata, metadata.count)
+        }
+        let info = try await FileRPC { client }.snapshot(path)
+        XCTAssertEqual(Data(info.url.path.utf8), Data(path.utf8))
+        XCTAssertEqual(finished.wait(timeout: .now() + 2), .success)
+    }
     func testAsyncRecordDecoderRejectsMalformedAndTruncatedFrames() async throws {
         func header(type: UInt8 = UInt8(NP_FILE_DATA.rawValue), length: UInt32, flags: UInt8 = 0) -> Data {
             var bytes = Data([78, 80, 70, 82, UInt8(NP_FILE_VERSION), type, flags, 0])
@@ -107,6 +143,82 @@ final class FileRPCTests: XCTestCase {
         task.cancel()
         do { _ = try await task.value; XCTFail("cancelled operation succeeded") }
         catch is CancellationError {}
+    }
+
+    @MainActor
+    func testClosingRangeAccessCancelsAnActiveVMRead() async throws {
+        var descriptors: [Int32] = [-1, -1]
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors), 0)
+        let client = FileHandle(fileDescriptor: descriptors[0], closeOnDealloc: true), peer = descriptors[1]
+        defer { close(peer) }
+        let requestArrived = expectation(description: "Range request reached the server")
+        DispatchQueue.global().async {
+            let frame = UnsafeMutablePointer<np_file_frame>.allocate(capacity: 1)
+            defer { frame.deallocate() }
+            if np_file_receive(peer, frame) == 0, frame.pointee.type == UInt8(NP_FILE_RANGE.rawValue) { requestArrived.fulfill() }
+        }
+        let access = FileRPCUserAccess(rpc: FileRPC { client })
+        let task = Task { try await access.read(URL(fileURLWithPath: "/waiting"), offset: 0, length: 1,
+                                               expectedVersion: Data(repeating: 0, count: Int(NP_FILE_REVISION))) }
+        await fulfillment(of: [requestArrived], timeout: 2)
+        let started = ProcessInfo.processInfo.systemUptime
+        access.closeRangeAccess()
+        do { _ = try await task.value; XCTFail("Revoked VM range succeeded") }
+        catch is CancellationError { }
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - started, 0.5)
+    }
+
+    @MainActor
+    func testLazyRangeAccessReadsOnlyRequestedBytesAndRejectsChangedSources() async throws {
+        let server = try Server(), source = server.root.appendingPathComponent("large")
+        let file = open(source.path, O_RDWR | O_CREAT | O_EXCL, 0o751)
+        XCTAssertGreaterThanOrEqual(file, 0); defer { close(file) }
+        let offset: UInt64 = 1 << 40
+        let contents = Array("requested-bytes".utf8)
+        XCTAssertEqual(contents.withUnsafeBytes { pwrite(file, $0.baseAddress, $0.count, off_t(offset)) }, contents.count)
+        let access: any UserFileRangeAccess = FileRPCUserAccess(rpc: server.rpc)
+        let remote = URL(fileURLWithPath: "/large")
+        let info = try await access.metadata(for: remote)
+        XCTAssertEqual(info.size, offset + UInt64(contents.count)); XCTAssertEqual(info.kind, .file)
+        XCTAssertEqual(info.permissions, 0o751)
+        XCTAssertEqual(try JSONDecoder().decode(UserFileMetadata.self, from: JSONEncoder().encode(info)), info)
+        let bytes = try await access.read(remote, offset: offset + 2, length: 4, expectedVersion: info.version)
+        XCTAssertEqual(bytes, Data("ques".utf8))
+        let tail = try await access.read(remote, offset: info.size - 2, length: 10, expectedVersion: info.version)
+        XCTAssertEqual(tail, Data("es".utf8))
+        let eof = try await access.read(remote, offset: info.size, length: 10, expectedVersion: info.version)
+        XCTAssertTrue(eof.isEmpty)
+        let empty = try await access.read(remote, offset: 0, length: 0, expectedVersion: info.version)
+        XCTAssertTrue(empty.isEmpty)
+        for (position, length) in [(UInt64.max, 1), (0, UserFileRange.maximumReadLength + 1), (0, -1)] {
+            do { _ = try await access.read(remote, offset: position, length: length, expectedVersion: info.version); XCTFail("Invalid range") }
+            catch FileRPC.Failure.invalidPath {}
+        }
+        let listing = try await access.contents(of: URL(fileURLWithPath: "/"))
+        XCTAssertEqual(listing.map(\.url.lastPathComponent), ["large"])
+        XCTAssertEqual(contents.withUnsafeBytes { pwrite(file, $0.baseAddress, 1, off_t(offset)) }, 1)
+        do { _ = try await access.read(remote, offset: offset, length: 1, expectedVersion: info.version); XCTFail("Stale source accepted") }
+        catch FileRPC.Failure.sourceChanged(let path) { XCTAssertEqual(path, "/large") }
+        XCTAssertEqual(server.workers.wait(timeout: .now() + 2), .success)
+    }
+
+    @MainActor
+    func testLazyRangeAccessNeverFollowsSelectedFolderSymlinks() async throws {
+        let server = try Server()
+        try FileManager.default.createDirectory(at: server.root.appendingPathComponent("folder"), withIntermediateDirectories: false)
+        try Data("contents".utf8).write(to: server.root.appendingPathComponent("folder/file"))
+        try FileManager.default.createSymbolicLink(atPath: server.root.appendingPathComponent("link").path, withDestinationPath: "folder")
+        try FileManager.default.createSymbolicLink(atPath: server.root.appendingPathComponent("folder/file-link").path, withDestinationPath: "file")
+        let access = FileRPCUserAccess(rpc: server.rpc)
+        let listing = try await access.contents(of: URL(fileURLWithPath: "/folder"))
+        XCTAssertEqual(listing.map(\.url.lastPathComponent), ["file"])
+        for path in ["/link/file", "/folder/file-link", "/folder/../folder/file"] {
+            do { _ = try await access.metadata(for: URL(fileURLWithPath: path)); XCTFail("Lazy access followed unsafe path: \(path)") }
+            catch { }
+        }
+        do { _ = try await access.contents(of: URL(fileURLWithPath: "/link")); XCTFail("Linked folder was listed") }
+        catch { }
+        XCTAssertEqual(server.workers.wait(timeout: .now() + 2), .success)
     }
 
     @MainActor

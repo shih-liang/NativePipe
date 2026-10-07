@@ -57,7 +57,7 @@ int np_file_receive(int socket, struct np_file_frame *frame) {
     unsigned char header[NP_FILE_HEADER];
     if (read_all(socket, header, sizeof(header)) < 0) return -1;
     if (memcmp(header, "NPFR", 4) || header[4] != NP_FILE_VERSION ||
-        header[5] < NP_FILE_STAT || header[5] > NP_FILE_MKDIR) {
+        header[5] < NP_FILE_STAT || header[5] > NP_FILE_DIRECTORY) {
         errno = EPROTO; return -1;
     }
     frame->type = header[5]; frame->flags = header[6] | (uint16_t)header[7] << 8;
