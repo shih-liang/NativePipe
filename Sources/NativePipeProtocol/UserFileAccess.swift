@@ -7,11 +7,46 @@ import Darwin
 public protocol UserFileAccess: AnyObject {
     func importFiles(_ urls: [URL], shareDirectories: Bool) async throws -> [URL]
     func exportFile(_ remote: URL, to local: URL) async throws
+    func importFiles(_ urls: [URL], shareDirectories: Bool,
+                     progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws -> [URL]
+    func exportFile(_ remote: URL, to local: URL,
+                    progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws
 }
 
 public extension UserFileAccess {
     func importFiles(_ urls: [URL]) async throws -> [URL] {
         try await importFiles(urls, shareDirectories: true)
+    }
+    func importFiles(_ urls: [URL], shareDirectories: Bool,
+                     progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws -> [URL] {
+        let result = try await importFiles(urls, shareDirectories: shareDirectories)
+        progress(.init(bytesTransferred: 0, isComplete: true))
+        return result
+    }
+    func exportFile(_ remote: URL, to local: URL,
+                    progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws {
+        try await exportFile(remote, to: local)
+        progress(.init(bytesTransferred: 0, isComplete: true))
+    }
+    /// One destination per selected item; duplicates fail before any transfer.
+    func exportFiles(_ remotes: [URL], to directory: URL,
+                     progress: @escaping @Sendable (FileTransferProgress) -> Void = { _ in }) async throws -> [URL] {
+        _ = try FileTransferURLs.decode(FileTransferURLs.encode(remotes))
+        var names = Set<String>()
+        guard remotes.allSatisfy({ names.insert($0.lastPathComponent).inserted }) else { throw FileRPC.Failure.invalidPath }
+        let tracker = FileTransferProgressTracker(progress: progress)
+        var result: [URL] = []
+        for remote in remotes {
+            try Task.checkCancellation()
+            let local = directory.appendingPathComponent(remote.lastPathComponent)
+            try await exportFile(remote, to: local) { sample in
+                tracker.report(sample.bytesTransferred, relativePath: remote.lastPathComponent +
+                               (sample.relativePath.isEmpty ? "" : "/" + sample.relativePath))
+            }
+            tracker.finishFile(); result.append(local)
+        }
+        tracker.finish()
+        return result
     }
 }
 
@@ -49,6 +84,12 @@ public final class FileRPCUserAccess: UserFileAccess {
     public init(rpc: FileRPC) { self.rpc = rpc }
 
     public func importFiles(_ urls: [URL], shareDirectories: Bool = true) async throws -> [URL] {
+        try await importFiles(urls, shareDirectories: shareDirectories, progress: { _ in })
+    }
+    public func importFiles(_ urls: [URL], shareDirectories: Bool,
+                            progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws -> [URL] {
+        _ = try FileTransferURLs.decode(FileTransferURLs.encode(urls))
+        let tracker = FileTransferProgressTracker(progress: progress)
         var result: [URL] = []
         var directory: String?
         for url in urls {
@@ -68,13 +109,15 @@ public final class FileRPCUserAccess: UserFileAccess {
             let parent = directory! + "/" + String(result.count)
             try await rpc.createDirectory(parent)
             let target = parent + "/" + url.lastPathComponent
-            try await upload(url, to: target, depth: 0)
+            try await upload(url, to: target, relativePath: url.lastPathComponent, depth: 0, tracker: tracker)
             result.append(URL(fileURLWithPath: target, isDirectory: isDirectory))
         }
+        tracker.finish()
         return result
     }
 
-    private func upload(_ local: URL, to remote: String, depth: Int) async throws {
+    private func upload(_ local: URL, to remote: String, relativePath: String, depth: Int,
+                        tracker: FileTransferProgressTracker) async throws {
         try Task.checkCancellation()
         guard depth < 64 else { throw FileRPC.Failure.invalidPath }
         let info = try local.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey])
@@ -82,7 +125,9 @@ public final class FileRPCUserAccess: UserFileAccess {
         if info.isDirectory == true {
             try await rpc.createDirectory(remote)
             for child in try FileManager.default.contentsOfDirectory(at: local, includingPropertiesForKeys: nil) {
-                try await upload(child, to: remote + "/" + child.lastPathComponent, depth: depth + 1)
+                try await upload(child, to: remote + "/" + child.lastPathComponent,
+                                 relativePath: relativePath + "/" + child.lastPathComponent,
+                                 depth: depth + 1, tracker: tracker)
             }
         } else {
             guard info.isRegularFile == true else { throw FileRPC.Failure.invalidPath }
@@ -92,16 +137,48 @@ public final class FileRPCUserAccess: UserFileAccess {
             guard fstat(file.fileDescriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else {
                 throw FileRPC.Failure.invalidPath
             }
-            try await rpc.upload(file, to: remote, mode: UInt32(info.st_mode & 0o777))
+            tracker.report(0, relativePath: relativePath)
+            try await rpc.upload(file, to: remote, mode: UInt32(info.st_mode & 0o777)) { completed, _ in
+                tracker.report(completed, relativePath: relativePath)
+            }
+            tracker.finishFile()
         }
     }
 
     public func exportFile(_ remote: URL, to local: URL) async throws {
+        try await exportFile(remote, to: local, progress: { _ in })
+    }
+    public func exportFile(_ remote: URL, to local: URL,
+                           progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws {
         _ = try FileTransferURLs.decode(FileTransferURLs.encode([remote]))
-        try await download(remote.path, to: local, depth: 0)
+        guard local.isFileURL, !["", "/", ".", ".."].contains(local.lastPathComponent) else { throw FileRPC.Failure.invalidPath }
+        let parent = local.deletingLastPathComponent()
+        let scoped = parent.startAccessingSecurityScopedResource()
+        defer { if scoped { parent.stopAccessingSecurityScopedResource() } }
+        var destination = stat()
+        if lstat(local.path, &destination) == 0 { throw FileRPC.Failure.local(EEXIST) }
+        guard errno == ENOENT else { throw FileRPC.Failure.local(errno) }
+        let info = try await rpc.stat(remote.path)
+        let tracker = FileTransferProgressTracker(totalBytes: info.isRegular ? info.size : nil, progress: progress)
+        let staging = local.deletingLastPathComponent().appendingPathComponent(".nativepipe-transfer-" + UUID().uuidString)
+        do {
+            try await download(remote.path, to: staging, relativePath: "", depth: 0, tracker: tracker)
+            try Task.checkCancellation()
+            guard renamex_np(staging.path, local.path, UInt32(RENAME_EXCL)) == 0 else { throw FileRPC.Failure.local(errno) }
+        } catch {
+            // Removing a large failed tree must not block the UI. Detached
+            // cleanup finishes even when its transfer was cancelled, and the
+            // original transport/publication error remains the result.
+            await Task.detached(priority: .utility) {
+                try? FileManager.default.removeItem(at: staging)
+            }.value
+            throw error
+        }
+        tracker.finish()
     }
 
-    private func download(_ remote: String, to local: URL, depth: Int) async throws {
+    private func download(_ remote: String, to local: URL, relativePath: String, depth: Int,
+                          tracker: FileTransferProgressTracker) async throws {
         try Task.checkCancellation()
         guard depth < 64 else { throw FileRPC.Failure.invalidPath }
         let info = try await rpc.stat(remote)
@@ -110,7 +187,9 @@ public final class FileRPCUserAccess: UserFileAccess {
             guard mkdir(local.path, 0o700) == 0 else { throw FileRPC.Failure.local(errno) }
             for entry in try await rpc.read(remote).entries {
                 try await download(remote + "/" + entry.name,
-                    to: local.appendingPathComponent(entry.name), depth: depth + 1)
+                    to: local.appendingPathComponent(entry.name),
+                    relativePath: relativePath.isEmpty ? entry.name : relativePath + "/" + entry.name,
+                    depth: depth + 1, tracker: tracker)
             }
             guard chmod(local.path, mode_t(info.permissions & 0o777)) == 0 else { throw FileRPC.Failure.local(errno) }
         } else {
@@ -119,8 +198,12 @@ public final class FileRPCUserAccess: UserFileAccess {
             guard fd >= 0 else { throw FileRPC.Failure.local(errno) }
             let file = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
             defer { try? file.close() }
-            try await rpc.download(remote, to: file)
+            tracker.report(0, relativePath: relativePath)
+            try await rpc.download(remote, to: file) { completed, _ in
+                tracker.report(completed, relativePath: relativePath)
+            }
             guard fchmod(fd, mode_t(info.permissions & 0o777)) == 0 else { throw FileRPC.Failure.local(errno) }
+            tracker.finishFile()
         }
     }
 }

@@ -48,7 +48,66 @@ extension Windowing {
 	}
 
     /// Things the guest's translator reports upward.
+    /// A desktop notification a guest application posted through
+    /// `org.freedesktop.Notifications`. The guest compositor bounds every field
+    /// before sending; the host must still treat all of it as untrusted text.
+    public struct GuestNotification: Equatable, Sendable {
+        public enum Urgency: UInt8, Sendable { case low = 0, normal = 1, critical = 2 }
+        public struct Action: Equatable, Sendable {
+            public var key: String
+            public var label: String
+            public init(key: String, label: String) { self.key = key; self.label = label }
+        }
+        public var id: UInt32
+        /// Changes on every Notify replacement. Host replies must name the
+        /// revision the user saw, rather than a later notification with this ID.
+        public var revision: UInt64
+        public var urgency: Urgency
+        /// Milliseconds. -1 asks for the server default, 0 for never expiring.
+        public var timeoutMilliseconds: Int
+        public var appName: String
+        public var desktopEntry: String
+        public var summary: String
+        public var body: String
+        public var actions: [Action]
+
+        public init(
+            id: UInt32, revision: UInt64 = 1, urgency: Urgency = .normal, timeoutMilliseconds: Int = -1,
+            appName: String = "", desktopEntry: String = "",
+            summary: String, body: String = "", actions: [Action] = []
+        ) {
+            self.id = id; self.revision = revision; self.urgency = urgency
+            self.timeoutMilliseconds = timeoutMilliseconds
+            self.appName = appName; self.desktopEntry = desktopEntry
+            self.summary = summary; self.body = body; self.actions = actions
+        }
+    }
+
+    /// Why the host closed a notification, with the values of the
+    /// `NotificationClosed` D-Bus signal.
+    public enum NotificationCloseReason: UInt32, Sendable {
+        case expired = 1, dismissed = 2, closedByCall = 3, undefined = 4
+    }
+
     public enum GuestEvent: Sendable {
+        /// One bounded np-open request on the private remote session socket.
+        case hostOpenRequested(token: UInt32, request: HostOpenWire.Request)
+        /// Its caller disconnected before the Mac completed the operation.
+        case hostOpenCancelled(token: UInt32)
+        /// Malformed optional content inside an intact window frame. A fully
+        /// read token can be refused without disconnecting the display.
+        case hostOpenRejected(token: UInt32?)
+        /// A guest application posted or updated a notification.
+        case notificationPosted(GuestNotification)
+        /// The guest application withdrew a notification.
+        case notificationClosed(id: UInt32, revision: UInt64)
+        /// Optional notification content failed validation inside an intact
+        /// window frame. Only a fully read, nonzero ID/revision may be retired.
+        /// This is an internal decoded event, never a guest wire opcode.
+        case notificationRejected(id: UInt32?, revision: UInt64?)
+        /// Bounded-queue recovery: retire optional banners while
+        /// preserving the authoritative surface graph and transport session.
+        case notificationBacklogReset
         case fileDrag(FileDragMessage)
         /// The compositor sends this before replaying its authoritative state
         /// on every new transport connection. A connected vsock alone is not
@@ -91,7 +150,10 @@ extension Windowing {
 
         /// A wl_pointer.set_cursor surface and hotspot, or nil for the default
         /// pointer. Semantic cursor-shape-v1 cursors use the separate case.
-        case cursorChanged(surface: UInt32?, hotspotX: Int, hotspotY: Int)
+        /// `pixelScale` is above 1 when the image is in physical pixels rather
+        /// than logical points, which is how X11 clients draw their cursors: the
+        /// host divides size and hotspot by it. 1 leaves the image as supplied.
+        case cursorChanged(surface: UInt32?, hotspotX: Int, hotspotY: Int, pixelScale: Int = 1)
         case cursorShapeChanged(shape: CursorShape)
 
         case titleChanged(window: UInt32, title: String)
@@ -445,6 +507,12 @@ extension Windowing {
     /// Instructions the host sends down. Geometry, focus and lifetime are macOS
     /// decisions; the guest applies them to the Wayland objects.
     public enum HostCommand: Sendable {
+        case hostOpenResponse(token: UInt32, response: HostOpenWire.Response)
+        /// The user dismissed, or the host expired, a guest notification.
+        case notificationClosed(id: UInt32, revision: UInt64, reason: NotificationCloseReason)
+        /// The user chose an action on a guest notification. The key is the one
+        /// the guest application supplied; `default` is a click on the banner.
+        case notificationAction(id: UInt32, revision: UInt64, key: String)
         case fileDrag(FileDragMessage)
         /// The window changed size or state. `size` is in logical window-
         /// geometry coordinates (AppKit points), never backing pixels. The

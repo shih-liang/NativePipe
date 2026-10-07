@@ -590,9 +590,11 @@ static void apply_surface_update_now(struct np_surface_update *update) {
 				surface->id,
 				(uint32_t)surface->server->cursor_hotspot_x,
 				(uint32_t)surface->server->cursor_hotspot_y,
+				surface->server->cursor_pixel_scale
+					? surface->server->cursor_pixel_scale : 1u,
 			};
 			np_window_event_send(surface->server, NP_GUEST_CURSOR_CHANGED,
-			                     fields, 3);
+			                     fields, 4);
 		}
 	}
 	if (update->input_region_changed) {

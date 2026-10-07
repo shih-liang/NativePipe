@@ -12,6 +12,7 @@ out=${3:?output directory}
 }
 mkdir -p "$out/libexec" "$out/lib/pixbuf" "$out/LICENSES"
 install -m0755 "$binary" "$out/libexec/nativepipe-wayland"
+install -m0755 "guest/session/dist/nativepipe-open-$arch-$libc" "$out/libexec/np-open"
 collect_license() (
     object=$(readlink -f "$1")
     package= origin= license= version=

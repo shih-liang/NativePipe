@@ -104,7 +104,6 @@
 "NativePipe SSH" = "NativePipe SSH";
 "NativePipe SSH — %@" = "NativePipe SSH — %@";
 "NativePipe archive changed during upload." = "L’archive NativePipe a changé pendant l’envoi.";
-"NativePipe archive exceeds the size limit." = "L’archive NativePipe dépasse la limite de taille.";
 "NativePipe archive is empty: %@." = "L’archive NativePipe est vide : %@.";
 "NativePipe doesn’t support this Linux computer’s architecture (%@). Supported architectures: aarch64 and x86_64." = "NativePipe ne prend pas en charge l’architecture de cet ordinateur Linux (%@). Architectures prises en charge : aarch64 et x86_64.";
 "NativePipe installation did not finish in time. Check the remote connection and available disk space." = "L’installation de NativePipe n’a pas terminé à temps. Vérifiez la connexion distante et l’espace disque disponible.";
@@ -210,7 +209,6 @@
 "Zoom" = "Réduire/agrandir";
 "agent wire: bad magic" = "protocole de l’agent : signature magique incorrecte";
 "agent wire: name too long" = "protocole de l’agent : nom trop long";
-"agent wire: payload too large" = "protocole de l’agent : charge utile trop grande";
 "agent wire: truncated frame" = "protocole de l’agent : trame tronquée";
 "agent wire: unsupported version" = "protocole de l’agent : version non prise en charge";
 "agent wire: version too long" = "protocole de l’agent : version trop longue";
@@ -256,3 +254,30 @@
 "Couldn’t match the Linux applications to the macOS appearance: %@" = "Impossible d’adapter l’apparence des applications Linux à celle de macOS : %@";
 "NativePipe couldn’t accept local connections: %@" = "NativePipe n’a pas pu accepter les connexions locales : %@";
 "A local NativePipe connection failed: %@" = "Une connexion locale NativePipe a échoué : %@";
+
+"That request was not understood." = "Cette demande n’a pas pu être comprise.";
+"That link is not valid." = "Ce lien n’est pas valide.";
+"That file path is not valid." = "Ce chemin de fichier n’est pas valide.";
+"That shared folder is no longer available." = "Ce dossier partagé n’est plus disponible.";
+"Open a link from %@?" = "Ouvrir un lien provenant de %@ ?";
+"The application for this link will open on your Mac. Mail links may include attachments; review the draft before sending." = "L’application associée à ce lien s’ouvrira sur votre Mac. Les liens de messagerie peuvent inclure des pièces jointes ; vérifiez le brouillon avant de l’envoyer.";
+"This link includes sign-in credentials, which are hidden here." = "Ce lien contient des identifiants de connexion, masqués ici.";
+"Open" = "Ouvrir";
+"Receive an item from %@?" = "Recevoir un élément de %@ ?";
+"Save a copy without opening it, or receive and open it on your Mac. Programs, scripts and installers need a separate confirmation before opening." = "Enregistrez une copie sans l’ouvrir, ou recevez-la et ouvrez-la sur votre Mac. Les programmes, les scripts et les installateurs nécessitent une confirmation distincte avant l’ouverture.";
+"Save…" = "Enregistrer…";
+"Open this program or installer?" = "Ouvrir ce programme ou cet installateur ?";
+"%@ was received from %@. Opening it may run code or change your Mac. Allow this item to open?" = "%@ a été reçu de %@. Son ouverture peut exécuter du code ou modifier votre Mac. Autoriser l’ouverture de cet élément ?";
+"Save Received Item" = "Enregistrer l’élément reçu";
+"Receiving from %@" = "Réception depuis %@";
+"Another request is waiting. Try again in a moment." = "Une autre demande est en attente. Réessayez dans un instant.";
+"Opening on the Mac is switched off." = "L’ouverture sur le Mac est désactivée.";
+"The request was cancelled." = "La demande a été annulée.";
+"Saved on the Mac." = "Enregistré sur le Mac.";
+"The item could not be received or opened on the Mac: %@" = "L’élément n’a pas pu être reçu ou ouvert sur le Mac : %@";
+"The Mac could not open it." = "Le Mac n’a pas pu ouvrir cet élément.";
+"The NativePipe release doesn’t contain np-open." = "Cette version de NativePipe ne contient pas np-open.";
+
+"Choose where to save %@." = "Choisissez où enregistrer %@.";
+"Save" = "Enregistrer";
+"Use a path on the connected Linux machine to receive files." = "Pour recevoir des fichiers, utilisez un chemin sur la machine Linux connectée.";

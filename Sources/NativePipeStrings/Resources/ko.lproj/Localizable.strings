@@ -104,7 +104,6 @@
 "NativePipe SSH" = "NativePipe SSH";
 "NativePipe SSH — %@" = "NativePipe SSH — %@";
 "NativePipe archive changed during upload." = "업로드 중 NativePipe 아카이브가 변경되었습니다.";
-"NativePipe archive exceeds the size limit." = "NativePipe 아카이브가 크기 제한을 초과합니다.";
 "NativePipe archive is empty: %@." = "NativePipe 아카이브가 비어 있습니다: %@.";
 "NativePipe doesn’t support this Linux computer’s architecture (%@). Supported architectures: aarch64 and x86_64." = "NativePipe는 이 Linux 컴퓨터의 아키텍처(%@)를 지원하지 않습니다. 지원되는 아키텍처: aarch64, x86_64.";
 "NativePipe installation did not finish in time. Check the remote connection and available disk space." = "NativePipe 설치가 제시간에 완료되지 않았습니다. 원격 연결과 디스크 여유 공간을 확인하세요.";
@@ -210,7 +209,6 @@
 "Zoom" = "확대/축소";
 "agent wire: bad magic" = "에이전트 통신: 잘못된 매직 값";
 "agent wire: name too long" = "에이전트 통신: 이름이 너무 깁니다";
-"agent wire: payload too large" = "에이전트 통신: 페이로드가 너무 큽니다";
 "agent wire: truncated frame" = "에이전트 통신: 프레임이 잘렸습니다";
 "agent wire: unsupported version" = "에이전트 통신: 지원하지 않는 버전";
 "agent wire: version too long" = "에이전트 통신: 버전이 너무 깁니다";
@@ -256,3 +254,30 @@
 "Couldn’t match the Linux applications to the macOS appearance: %@" = "Linux 앱의 모양을 macOS에 맞출 수 없습니다: %@";
 "NativePipe couldn’t accept local connections: %@" = "NativePipe가 로컬 연결을 수락할 수 없습니다: %@";
 "A local NativePipe connection failed: %@" = "로컬 NativePipe 연결에 실패했습니다: %@";
+
+"That request was not understood." = "이 요청을 해석할 수 없습니다.";
+"That link is not valid." = "이 링크는 유효하지 않습니다.";
+"That file path is not valid." = "이 파일 경로는 유효하지 않습니다.";
+"That shared folder is no longer available." = "이 공유 폴더는 더 이상 사용할 수 없습니다.";
+"Open a link from %@?" = "%@에서 온 링크를 여시겠습니까?";
+"The application for this link will open on your Mac. Mail links may include attachments; review the draft before sending." = "이 링크에 해당하는 앱이 Mac에서 열립니다. 메일 링크에는 첨부 파일이 포함될 수 있으므로 보내기 전에 초안을 확인하세요.";
+"This link includes sign-in credentials, which are hidden here." = "이 링크에는 로그인 인증 정보가 포함되어 있으며, 여기서는 숨겨져 있습니다.";
+"Open" = "열기";
+"Receive an item from %@?" = "%@에서 항목을 받으시겠습니까?";
+"Save a copy without opening it, or receive and open it on your Mac. Programs, scripts and installers need a separate confirmation before opening." = "열지 않고 사본을 저장하거나, 받은 후 Mac에서 열 수 있습니다. 프로그램, 스크립트 및 설치 프로그램을 열기 전에는 별도로 확인해야 합니다.";
+"Save…" = "저장…";
+"Open this program or installer?" = "이 프로그램 또는 설치 프로그램을 여시겠습니까?";
+"%@ was received from %@. Opening it may run code or change your Mac. Allow this item to open?" = "%@ 항목을 %@에서 받았습니다. 이 항목을 열면 코드가 실행되거나 Mac이 변경될 수 있습니다. 이 항목을 열도록 허용하시겠습니까?";
+"Save Received Item" = "받은 항목 저장";
+"Receiving from %@" = "%@에서 받는 중";
+"Another request is waiting. Try again in a moment." = "다른 요청이 대기 중입니다. 잠시 후 다시 시도하세요.";
+"Opening on the Mac is switched off." = "Mac에서 열기 기능이 꺼져 있습니다.";
+"The request was cancelled." = "요청이 취소되었습니다.";
+"Saved on the Mac." = "Mac에 저장했습니다.";
+"The item could not be received or opened on the Mac: %@" = "Mac에서 항목을 받거나 열 수 없습니다: %@";
+"The Mac could not open it." = "Mac에서 이 항목을 열 수 없습니다.";
+"The NativePipe release doesn’t contain np-open." = "이 NativePipe 릴리스에는 np-open이 포함되어 있지 않습니다.";
+
+"Choose where to save %@." = "%@을(를) 저장할 위치를 선택하세요.";
+"Save" = "저장";
+"Use a path on the connected Linux machine to receive files." = "파일을 받으려면 연결된 Linux 시스템의 경로를 사용하세요.";

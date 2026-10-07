@@ -3,6 +3,42 @@ import XCTest
 import NativePipeProtocol
 
 final class LocalSocketTests: XCTestCase {
+    @MainActor func testIdleRetirementProtectsAnUnparsedCallerAndNotifiesAfterReplyCloses() async throws {
+        let directory = URL(fileURLWithPath: "/tmp/ipc-idle-\(UUID().uuidString)")
+        let url = directory.appendingPathComponent("socket")
+        let server = LocalSocketServer(url: url)
+        let completed = expectation(description: "last accepted caller completed")
+        var counts: [Int] = []
+        var completedNotified = false
+        server.activityDidChange = {
+            counts.append(server.statistics.active)
+            if server.statistics.completed == 1, !completedNotified {
+                completedNotified = true; completed.fulfill()
+            }
+        }
+        try server.start { connection in
+            if let data = try? await connection.readExactly(1) { try? await connection.write(data) }
+        }
+        defer { server.stop(); try? FileManager.default.removeItem(at: directory) }
+        // This caller has not sent even one byte. Retirement must protect it
+        // before the operation router knows anything about the request.
+        let peer = try LocalSocket.connect(url)
+        defer { try? peer.close() }
+        XCTAssertFalse(server.stopAcceptingIfIdle())
+        XCTAssertTrue(server.isListening)
+        XCTAssertEqual(server.statistics.active, 1)
+        try peer.write(contentsOf: Data([42]))
+        let reply = try await Task.detached { try peer.read(upToCount: 1) }.value
+        XCTAssertEqual(reply, Data([42]))
+        await fulfillment(of: [completed], timeout: 2)
+        XCTAssertTrue(counts.contains(0), "completion notification arrives after statistics have been decremented")
+        XCTAssertFalse(server.stopAcceptingIfIdle(expectedAccepted: 0), "an async scan predating this caller is stale even after it finishes")
+        XCTAssertTrue(server.isListening)
+        XCTAssertTrue(server.stopAcceptingIfIdle(expectedAccepted: 1))
+        XCTAssertFalse(server.isListening)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
     @MainActor func testStopCancelsPartialAndIdlePeersWithoutBlockingHealthyRequest() async throws {
         let directory = URL(fileURLWithPath: "/tmp/ipc-stop-\(UUID().uuidString)")
         let url = directory.appendingPathComponent("socket")

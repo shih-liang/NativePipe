@@ -6,7 +6,10 @@
 COMMON_PKGS   := wayland-server xkbcommon gio-unix-2.0 gdk-pixbuf-2.0 librsvg-2.0
 REMOTE_PKGS   := egl glesv2 gbm libdrm libva
 CLIENT_PKGS   := wayland-client
-BASE_CFLAGS   := -O2 -Wall -Wextra -Wno-unused-parameter -std=gnu11 -I.
+PRODUCT_VERSION_FILE := $(abspath ../../Sources/NativePipeStrings/Resources/VERSION)
+PRODUCT_VERSION := $(shell cat $(PRODUCT_VERSION_FILE))
+PRODUCT_VERSION_DEFINE := -DNATIVEPIPE_PRODUCT_VERSION=\"$(PRODUCT_VERSION)\"
+BASE_CFLAGS   := -O2 -Wall -Wextra -Wno-unused-parameter -std=gnu11 -I. $(PRODUCT_VERSION_DEFINE)
 STRIP         ?= strip
 COMMON_CFLAGS := $(shell pkg-config --cflags $(COMMON_PKGS) 2>/dev/null)
 COMMON_LIBS   := $(shell pkg-config --libs $(COMMON_PKGS) 2>/dev/null) -lm
@@ -49,7 +52,7 @@ GENERATED := xdg-shell-server-protocol.h xdg-shell-client-protocol.h xdg-shell-p
 
 ENTRY_SOURCE := main.c
 
-FRONTEND_SOURCES := compositor.c applications.c applications_worker.c application_icons.c surface.c surface_commit.c presentation.c \
+FRONTEND_SOURCES := compositor.c applications.c applications_worker.c application_icons.c notifications.c notify_dbus.c host_open.c surface.c surface_commit.c presentation.c \
 	subcompositor.c input.c keymap.c decoration.c scale.c scene.c region.c perf.c \
 	windowwire.c window_events.c \
 	xdg_shell.c text_input.c fifo.c \
@@ -111,7 +114,20 @@ test-remote-transport: | $(BUILD_DIR)
 		backends/remote/host_transport.c backends/remote/medialink.c -pthread
 	$(BUILD_DIR)/remote-transport-test
 
-.PHONY: test-applications test-file-drag test-remote-encoder test-scene-damage test-user-text
+.PHONY: test-applications test-file-drag test-notify-dbus test-host-open test-xwayland-session test-remote-encoder test-scene-damage test-user-text
+test-xwayland-session: | $(BUILD_DIR)
+	$(CC) -O0 -g -Wall -Wextra -Werror -std=gnu11 -I. \
+		$$(pkg-config --cflags wayland-server) tests/xwayland_session_test.c user_text.c \
+		$$(pkg-config --libs wayland-server) -o $(BUILD_DIR)/xwayland-session-test
+	$(BUILD_DIR)/xwayland-session-test
+
+test-host-open: | $(BUILD_DIR)
+	$(CC) -O0 -g -Wall -Wextra -Werror -std=gnu11 -I. \
+		$$(pkg-config --cflags wayland-server glib-2.0) \
+		tests/host_open_test.c host_open.c windowwire.c window_events.c \
+		$$(pkg-config --libs wayland-server glib-2.0) -o $(BUILD_DIR)/host-open-test
+	$(BUILD_DIR)/host-open-test
+
 test-remote-encoder: | $(BUILD_DIR) check-deps-remote
 	$(CC) -O2 -Wall -Wextra -Werror -std=gnu11 $(REMOTE_CFLAGS) $$(pkg-config --cflags dav1d) \
 		tests/remote_encoder_test.c ../encoder/encoder.c ../encoder/encoder_vaapi.c ../encoder/encoder_nvenc.c ../encoder/alpha.c \
@@ -162,6 +178,23 @@ test-user-text: | $(BUILD_DIR)
 	$(CC) -O0 -g -Wall -Wextra -Werror -std=gnu11 -I. \
 		tests/user_text_test.c user_text.c -o $(BUILD_DIR)/user-text-test
 	$(BUILD_DIR)/user-text-test
+
+# org.freedesktop.Notifications over a point-to-point D-Bus connection: real
+# method calls and signals with no bus daemon and no Wayland, so GIO is enough.
+test-notify-dbus: $(PRODUCT_VERSION_FILE) | $(BUILD_DIR)
+	$(CC) -O0 -g -Wall -Wextra -Werror -std=gnu11 -I. \
+		$(PRODUCT_VERSION_DEFINE) $$(pkg-config --cflags gio-unix-2.0) \
+		tests/notify_dbus_test.c notify_dbus.c $$(pkg-config --libs gio-unix-2.0) \
+		-o $(BUILD_DIR)/notify-dbus-test
+	$(BUILD_DIR)/notify-dbus-test
+	$(CC) -O0 -g -Wall -Wextra -Werror -std=gnu11 -I. \
+		$(PRODUCT_VERSION_DEFINE) -DNP_NOTIFICATIONS_LIFECYCLE_TEST \
+		$$(pkg-config --cflags gio-unix-2.0 wayland-server) \
+		tests/notify_dbus_test.c notify_dbus.c windowwire.c \
+		$$(pkg-config --libs gio-unix-2.0 wayland-server) \
+		-o $(BUILD_DIR)/notifications-lifecycle-test
+	$(BUILD_DIR)/notifications-lifecycle-test
+	dbus-run-session -- $(BUILD_DIR)/notifications-lifecycle-test --session-bus
 
 test-applications: | $(BUILD_DIR)
 	$(CC) -O0 -g -Wall -Wextra -Werror -std=gnu11 -I. \
@@ -236,7 +269,8 @@ linux-drm-syncobj-v1-protocol.c: $(SYNCOBJ_XML)
 	wayland-scanner private-code $(SYNCOBJ_XML) $@
 
 $(REMOTE_BINARY): $(GENERATED) $(COMMON_SOURCES) $(REMOTE_SOURCES) $(wildcard *.h backends/remote/*.h ../encoder/*.h ../encoder/vendor/*.h) \
-	$(SOURCE_HASH) Makefile $(wildcard $(CODEC_PREFIX)/lib/libaom.a $(CODEC_PREFIX)/lib/libyuv.a) \
+	../session/np-open-wire.h \
+	$(SOURCE_HASH) Makefile $(PRODUCT_VERSION_FILE) $(wildcard $(CODEC_PREFIX)/lib/libaom.a $(CODEC_PREFIX)/lib/libyuv.a) \
 	../../scripts/build-codecs.py | $(BUILD_DIR) check-deps-remote
 	$(CC) $(BASE_CFLAGS) $(COMMON_CFLAGS) $(REMOTE_CFLAGS) \
 		-Ibackends/remote $(SOURCE_DEFINE) -o $@ \
@@ -246,7 +280,8 @@ $(FILE_RPC_LIB): $(FILE_RPC_SOURCES) $(FILE_RPC_DIR)/np_file_rpc.h $(FILE_RPC_DI
 	$(MAKE) -C $(FILE_RPC_DIR) CC="$(CC)" AR="$(AR)" BUILD="$(CURDIR)/$(BUILD_DIR)/file-rpc"
 
 $(VM_BINARY): $(GENERATED) $(COMMON_SOURCES) $(VM_SOURCES) $(FILE_RPC_LIB) $(wildcard *.h backends/vmpipe/*.h) \
-	$(SOURCE_HASH) Makefile | $(BUILD_DIR) check-deps-vmpipe
+	../session/np-open-wire.h \
+	$(SOURCE_HASH) Makefile $(PRODUCT_VERSION_FILE) | $(BUILD_DIR) check-deps-vmpipe
 	$(CC) $(BASE_CFLAGS) $(COMMON_CFLAGS) $(VM_CFLAGS) $(VULKAN_CFLAGS) \
 		-Ibackends/vmpipe -I$(FILE_RPC_DIR) $(SOURCE_DEFINE) -o $@ \
 		$(COMMON_SOURCES) $(VM_SOURCES) $(FILE_RPC_LIB) $(COMMON_LIBS) $(VULKAN_LIBS) -pthread

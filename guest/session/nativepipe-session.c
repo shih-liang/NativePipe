@@ -119,11 +119,56 @@ static void start_audio_services(void) {
     }
 }
 
+/* WirePlumber gives every newly seen sink 0.064 of full scale, which is 0.4
+ * cubed: 40% on the volume slider. Through the virtual sound card that is
+ * quiet, and users do not know to raise it. Set 100% once per user. The marker
+ * keeps later changes theirs: WirePlumber persists them. The default sink only
+ * appears after WirePlumber has started, so retry for a minute; when sound
+ * output is off it never appears, no marker is written and the next session
+ * tries again. $1 is the wpctl path. */
+static const char default_volume_script[] =
+    "D=\"${XDG_STATE_HOME:-$HOME/.local/state}/nativepipe\"\n"
+    "M=\"$D/default-volume-v1\"\n"
+    "[ -e \"$M\" ] && exit 0\n"
+    "i=0\n"
+    "while [ \"$i\" -lt 60 ]; do\n"
+    "  if \"$1\" set-volume @DEFAULT_AUDIO_SINK@ 1.0 >/dev/null 2>&1; then\n"
+    "    mkdir -p \"$D\" && : > \"$M\"\n"
+    "    exit 0\n"
+    "  fi\n"
+    "  i=$((i + 1))\n"
+    "  sleep 1\n"
+    "done\n";
+
+static void apply_default_audio_volume(void) {
+    static const char *const wpctl[] = {"/usr/bin/wpctl", "/bin/wpctl", NULL};
+    const char *program = first_executable(wpctl);
+    if (!program)
+        return;
+    pid_t pid = fork();
+    if (pid < 0)
+        return;
+    if (pid == 0) {
+        /* Detach completely: the session neither waits for nor reaps the helper. */
+        if (setsid() < 0)
+            _exit(1);
+        pid_t helper = fork();
+        if (helper != 0)
+            _exit(helper < 0 ? 1 : 0);
+        char *argv[] = {"/bin/sh", "-c", (char *)default_volume_script, "sh",
+                        (char *)program, NULL};
+        execv("/bin/sh", argv);
+        _exit(127);
+    }
+    (void)waitpid(pid, NULL, 0);
+}
+
 /* Runs inside dbus-run-session after privileges have already been dropped.
  * On non-systemd guests, own the ordinary audio processes for this session. */
 static int user_session_main(void) {
     setenv("NP_PRIVATE_APPLICATION_BUS", "1", 1);
     start_audio_services();
+    apply_default_audio_volume();
     apply_desktop_preferences();
 
     child_pid = fork();

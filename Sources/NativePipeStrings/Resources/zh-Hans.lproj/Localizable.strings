@@ -104,7 +104,6 @@
 "NativePipe SSH" = "NativePipe SSH";
 "NativePipe SSH — %@" = "NativePipe SSH — %@";
 "NativePipe archive changed during upload." = "NativePipe 归档在上传期间发生了变化。";
-"NativePipe archive exceeds the size limit." = "NativePipe 归档超过大小限制。";
 "NativePipe archive is empty: %@." = "NativePipe 归档为空：%@。";
 "NativePipe doesn’t support this Linux computer’s architecture (%@). Supported architectures: aarch64 and x86_64." = "NativePipe 不支持此 Linux 计算机的架构（%@）。支持的架构：aarch64 和 x86_64。";
 "NativePipe installation did not finish in time. Check the remote connection and available disk space." = "NativePipe 安装未在规定时间内完成。请检查远程连接和可用磁盘空间。";
@@ -210,7 +209,6 @@
 "Zoom" = "缩放";
 "agent wire: bad magic" = "代理协议：标记错误";
 "agent wire: name too long" = "代理协议：名称过长";
-"agent wire: payload too large" = "代理协议：数据过大";
 "agent wire: truncated frame" = "代理协议：数据帧不完整";
 "agent wire: unsupported version" = "代理协议：不支持此版本";
 "agent wire: version too long" = "代理协议：版本字段过长";
@@ -256,3 +254,30 @@
 "Couldn’t match the Linux applications to the macOS appearance: %@" = "无法使 Linux 应用的外观与 macOS 保持一致：%@";
 "NativePipe couldn’t accept local connections: %@" = "NativePipe 无法接受本地连接：%@";
 "A local NativePipe connection failed: %@" = "本地 NativePipe 连接失败：%@";
+
+"That request was not understood." = "无法识别该请求。";
+"That link is not valid." = "该链接无效。";
+"That file path is not valid." = "该文件路径无效。";
+"That shared folder is no longer available." = "该共享文件夹已不可用。";
+"Open a link from %@?" = "打开来自 %@ 的链接？";
+"The application for this link will open on your Mac. Mail links may include attachments; review the draft before sending." = "此链接对应的应用将在 Mac 上打开。邮件链接可能包含附件，请在发送前检查邮件草稿。";
+"This link includes sign-in credentials, which are hidden here." = "此链接包含登录凭据，此处已将其隐藏。";
+"Open" = "打开";
+"Receive an item from %@?" = "接收来自 %@ 的项目？";
+"Save a copy without opening it, or receive and open it on your Mac. Programs, scripts and installers need a separate confirmation before opening." = "可以保存副本而不打开，也可以接收后在 Mac 上打开。程序、脚本和安装包在打开前需要单独确认。";
+"Save…" = "保存…";
+"Open this program or installer?" = "打开此程序或安装包？";
+"%@ was received from %@. Opening it may run code or change your Mac. Allow this item to open?" = "项目 %@ 已从 %@ 接收。打开它可能运行代码或更改你的 Mac。允许打开此项目吗？";
+"Save Received Item" = "保存接收的项目";
+"Receiving from %@" = "正在从 %@ 接收";
+"Another request is waiting. Try again in a moment." = "另一个请求正在等待。请稍后重试。";
+"Opening on the Mac is switched off." = "已关闭在 Mac 上打开的功能。";
+"The request was cancelled." = "请求已取消。";
+"Saved on the Mac." = "已保存到 Mac。";
+"The item could not be received or opened on the Mac: %@" = "无法在 Mac 上接收或打开该项目：%@";
+"The Mac could not open it." = "Mac 无法打开该项目。";
+"The NativePipe release doesn’t contain np-open." = "此 NativePipe 发布版本不包含 np-open。";
+
+"Choose where to save %@." = "选择保存 %@ 的位置。";
+"Save" = "保存";
+"Use a path on the connected Linux machine to receive files." = "请使用所连接 Linux 机器中的路径来接收文件。";

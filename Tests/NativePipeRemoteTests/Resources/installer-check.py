@@ -120,10 +120,11 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-installer-") as directory:
                 check = f'if [ "${{1:-}}" = --check-runtime ]; then exit {status}; fi\n'
                 check += 'read marker\n[ "$marker" = AFTER_ARCHIVE ] || exit 97\n'
                 files["nativepipe-wayland"] = ("#!/bin/sh\n" + check + "printf '%s\\n' '" + version + "'\n").encode()
+                files["libexec/np-open"] = b"#!/bin/sh\nexit 0\n"
             for name, data in files.items():
                 info = tarfile.TarInfo(name)
                 info.size = len(data)
-                info.mode = 0o755 if name == "nativepipe-wayland" else 0o644
+                info.mode = 0o755 if name in ("nativepipe-wayland", "libexec/np-open") else 0o644
                 archive.addfile(info, io.BytesIO(data))
         digest = hashlib.sha256((target / asset).read_bytes()).hexdigest()
         (target / "SHA256SUMS").write_text(digest + "  " + asset + "\n")
@@ -134,7 +135,7 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-installer-") as directory:
         release_url = "https://github.com/shih-liang/nativepipe/releases/download/" + (fixture / "latest").read_text()
         return "release=" + shlex.quote(release_url) + "\n" + script
 
-    def invoke(success=True, cached=None, truncate=False):
+    def invoke(success=True, cached=None, truncate=False, declaration=None, leading_zeros=False):
         if upload:
             process = subprocess.Popen(["/bin/sh", "-c", script], env=env,
                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -146,7 +147,10 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-installer-") as directory:
             directory = fixture / (fixture / 'latest').read_text()
             data = (directory / asset).read_bytes()
             digest = (directory / 'SHA256SUMS').read_text().split()[0]
-            process.stdin.write(f'{digest} {len(data)}\n'.encode())
+            declared_size = str(len(data)) if declaration is None else declaration
+            if leading_zeros:
+                declared_size = '000' + declared_size
+            process.stdin.write(f'{digest} {declared_size}\n'.encode())
             process.stdin.flush()
             response = process.stdout.readline()
             if cached is not None:
@@ -169,7 +173,7 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-installer-") as directory:
     (binary / "nativepipe-wayland").write_text("#!/bin/sh\nexit 99\n")
     (binary / "nativepipe-wayland").chmod(0o755)
     first = release("v1")
-    invoke(cached=False)
+    invoke(cached=False, leading_zeros=upload)
     first_path = current.resolve()
     assert first_path.name == first
     requests_before = 0 if upload else (fixture / "requests").read_text().count(asset)
@@ -200,6 +204,16 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-installer-") as directory:
     if upload:
         release('truncated')
         assert 'interrupted' in invoke(success=False, truncate=True).stderr
+        # Large declarations reach the streaming reader; no fixture allocates
+        # their declared bytes. The tiny payload must then fail completeness.
+        for size in ('536870913', '2147483648', '9223372036854775808'):
+            failure = invoke(success=False, cached=False, truncate=True, declaration=size)
+            assert 'interrupted' in failure.stderr, (size, failure)
+            assert current.resolve().name == second
+        for size in ('', '0', '000', '-1', '+1', '1.0', '0x20', '1 extra', '9' * 300):
+            failure = invoke(success=False, declaration=size)
+            assert 'invalid' in failure.stderr, (size, failure)
+            assert current.resolve().name == second
         for data in (b'0\n', b'65537\n', b'invalid\n', b'100\nshort script'):
             result = subprocess.run(["/bin/sh", "-c", script], env=env, input=data,
                                     capture_output=True, timeout=20)

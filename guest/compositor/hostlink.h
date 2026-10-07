@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "notification_outbox.h"
 
 #define NP_WINDOW_EVENT_PORT 4096
 #define NP_WINDOW_CONTROL_PORT 4097
@@ -28,6 +29,7 @@ struct np_host {
 	size_t out_cap;
 	bool output_enabled;
 	bool input_enabled;
+	struct np_notification_outbox notifications;
 };
 
 bool np_host_listen(struct np_host *host, uint32_t port);
@@ -40,7 +42,7 @@ void np_host_pump(struct np_host *host,
 
 static inline bool np_host_has_backlog(const struct np_host *host)
 {
-	return host->out_len > host->out_head;
+	return host->out_len > host->out_head || np_notification_outbox_pending(&host->notifications);
 }
 
 void np_host_flush(struct np_host *host);

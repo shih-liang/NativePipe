@@ -104,7 +104,6 @@
 "NativePipe SSH" = "NativePipe SSH";
 "NativePipe SSH — %@" = "NativePipe SSH — %@";
 "NativePipe archive changed during upload." = "アップロード中に NativePipe アーカイブが変更されました。";
-"NativePipe archive exceeds the size limit." = "NativePipe アーカイブがサイズ制限を超えています。";
 "NativePipe archive is empty: %@." = "NativePipe アーカイブが空です: %@。";
 "NativePipe doesn’t support this Linux computer’s architecture (%@). Supported architectures: aarch64 and x86_64." = "NativePipe はこの Linux コンピュータのアーキテクチャ（%@）に対応していません。対応アーキテクチャ: aarch64 と x86_64。";
 "NativePipe installation did not finish in time. Check the remote connection and available disk space." = "NativePipe のインストールが時間内に完了しませんでした。リモート接続と空きディスク容量を確認してください。";
@@ -210,7 +209,6 @@
 "Zoom" = "拡大／縮小";
 "agent wire: bad magic" = "エージェント通信: マジック値が不正です";
 "agent wire: name too long" = "エージェント通信: 名前が長すぎます";
-"agent wire: payload too large" = "エージェント通信: ペイロードが大きすぎます";
 "agent wire: truncated frame" = "エージェント通信: フレームが途中で切れています";
 "agent wire: unsupported version" = "エージェント通信: 未対応のバージョンです";
 "agent wire: version too long" = "エージェント通信: バージョンが長すぎます";
@@ -256,3 +254,30 @@
 "Couldn’t match the Linux applications to the macOS appearance: %@" = "Linux アプリケーションの外観を macOS に合わせられませんでした: %@";
 "NativePipe couldn’t accept local connections: %@" = "NativePipe はローカル接続を受け付けられませんでした: %@";
 "A local NativePipe connection failed: %@" = "ローカルの NativePipe 接続に失敗しました: %@";
+
+"That request was not understood." = "この要求を解釈できませんでした。";
+"That link is not valid." = "このリンクは無効です。";
+"That file path is not valid." = "このファイルパスは無効です。";
+"That shared folder is no longer available." = "この共有フォルダは利用できなくなりました。";
+"Open a link from %@?" = "%@ からのリンクを開きますか？";
+"The application for this link will open on your Mac. Mail links may include attachments; review the draft before sending." = "このリンクに対応するアプリが Mac で開きます。メールリンクには添付ファイルが含まれる場合があります。送信前に下書きを確認してください。";
+"This link includes sign-in credentials, which are hidden here." = "このリンクにはログイン認証情報が含まれていますが、ここでは非表示にしています。";
+"Open" = "開く";
+"Receive an item from %@?" = "%@ から項目を受信しますか？";
+"Save a copy without opening it, or receive and open it on your Mac. Programs, scripts and installers need a separate confirmation before opening." = "開かずにコピーを保存するか、受信して Mac で開くことができます。プログラム、スクリプト、インストーラを開く前には、別途確認が必要です。";
+"Save…" = "保存…";
+"Open this program or installer?" = "このプログラムまたはインストーラを開きますか？";
+"%@ was received from %@. Opening it may run code or change your Mac. Allow this item to open?" = "「%@」は %@ から受信した項目です。開くとコードが実行されたり、Mac が変更されたりする可能性があります。この項目を開くことを許可しますか？";
+"Save Received Item" = "受信した項目を保存";
+"Receiving from %@" = "%@ から受信中";
+"Another request is waiting. Try again in a moment." = "別の要求が待機中です。しばらくしてからもう一度試してください。";
+"Opening on the Mac is switched off." = "Mac で開く機能はオフになっています。";
+"The request was cancelled." = "要求はキャンセルされました。";
+"Saved on the Mac." = "Mac に保存しました。";
+"The item could not be received or opened on the Mac: %@" = "Mac で項目を受信または開くことができませんでした：%@";
+"The Mac could not open it." = "Mac でこの項目を開くことができませんでした。";
+"The NativePipe release doesn’t contain np-open." = "この NativePipe リリースには np-open が含まれていません。";
+
+"Choose where to save %@." = "%@ の保存先を選択してください。";
+"Save" = "保存";
+"Use a path on the connected Linux machine to receive files." = "ファイルを受信するには、接続中の Linux マシンのパスを使用してください。";

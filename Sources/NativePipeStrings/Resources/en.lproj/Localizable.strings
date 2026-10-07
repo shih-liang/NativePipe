@@ -104,7 +104,6 @@
 "NativePipe SSH" = "NativePipe SSH";
 "NativePipe SSH — %@" = "NativePipe SSH — %@";
 "NativePipe archive changed during upload." = "NativePipe archive changed during upload.";
-"NativePipe archive exceeds the size limit." = "NativePipe archive exceeds the size limit.";
 "NativePipe archive is empty: %@." = "NativePipe archive is empty: %@.";
 "NativePipe doesn’t support this Linux computer’s architecture (%@). Supported architectures: aarch64 and x86_64." = "NativePipe doesn’t support this Linux computer’s architecture (%@). Supported architectures: aarch64 and x86_64.";
 "NativePipe installation did not finish in time. Check the remote connection and available disk space." = "NativePipe installation did not finish in time. Check the remote connection and available disk space.";
@@ -210,7 +209,6 @@
 "Zoom" = "Zoom";
 "agent wire: bad magic" = "agent wire: bad magic";
 "agent wire: name too long" = "agent wire: name too long";
-"agent wire: payload too large" = "agent wire: payload too large";
 "agent wire: truncated frame" = "agent wire: truncated frame";
 "agent wire: unsupported version" = "agent wire: unsupported version";
 "agent wire: version too long" = "agent wire: version too long";
@@ -256,3 +254,30 @@
 "Couldn’t match the Linux applications to the macOS appearance: %@" = "Couldn’t match the Linux applications to the macOS appearance: %@";
 "NativePipe couldn’t accept local connections: %@" = "NativePipe couldn’t accept local connections: %@";
 "A local NativePipe connection failed: %@" = "A local NativePipe connection failed: %@";
+
+"That request was not understood." = "That request was not understood.";
+"That link is not valid." = "That link is not valid.";
+"That file path is not valid." = "That file path is not valid.";
+"That shared folder is no longer available." = "That shared folder is no longer available.";
+"Open a link from %@?" = "Open a link from %@?";
+"The application for this link will open on your Mac. Mail links may include attachments; review the draft before sending." = "The application for this link will open on your Mac. Mail links may include attachments; review the draft before sending.";
+"This link includes sign-in credentials, which are hidden here." = "This link includes sign-in credentials, which are hidden here.";
+"Open" = "Open";
+"Receive an item from %@?" = "Receive an item from %@?";
+"Save a copy without opening it, or receive and open it on your Mac. Programs, scripts and installers need a separate confirmation before opening." = "Save a copy without opening it, or receive and open it on your Mac. Programs, scripts and installers need a separate confirmation before opening.";
+"Save…" = "Save…";
+"Open this program or installer?" = "Open this program or installer?";
+"%@ was received from %@. Opening it may run code or change your Mac. Allow this item to open?" = "%@ was received from %@. Opening it may run code or change your Mac. Allow this item to open?";
+"Save Received Item" = "Save Received Item";
+"Receiving from %@" = "Receiving from %@";
+"Another request is waiting. Try again in a moment." = "Another request is waiting. Try again in a moment.";
+"Opening on the Mac is switched off." = "Opening on the Mac is switched off.";
+"The request was cancelled." = "The request was cancelled.";
+"Saved on the Mac." = "Saved on the Mac.";
+"The item could not be received or opened on the Mac: %@" = "The item could not be received or opened on the Mac: %@";
+"The Mac could not open it." = "The Mac could not open it.";
+"The NativePipe release doesn’t contain np-open." = "The NativePipe release doesn’t contain np-open.";
+
+"Choose where to save %@." = "Choose where to save %@.";
+"Save" = "Save";
+"Use a path on the connected Linux machine to receive files." = "Use a path on the connected Linux machine to receive files.";

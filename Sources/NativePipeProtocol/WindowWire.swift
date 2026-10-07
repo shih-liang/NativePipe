@@ -6,7 +6,7 @@ import Foundation
 /// NPIP supplies only bounded length framing. Integer fields are explicitly
 /// little endian; this is a wire format, never a Swift struct memory dump.
 public enum WindowWire {
-    public static let windowProtocolVersion: UInt32 = 10
+    public static let windowProtocolVersion: UInt32 = 12
     public static let motionMagic: [UInt8] = Array("NPMO".utf8)
     public static let motionPayloadSize = 16
     public static let scrollMagic: [UInt8] = Array("NPSC".utf8)
@@ -24,6 +24,13 @@ public enum WindowWire {
     /// eight-MiB message limit. The guest compositor uses the same ceiling.
     public static let maximumClipboardDataSize = 7 * 1024 * 1024
     public static let maximumCollectionCount = 4096
+    /// A notification has at most this many actions; more is malformed.
+    public static let maximumNotificationActions = 8
+    /// UTF-8 byte budgets shared with guest/compositor/notify_dbus.h.
+    public static let maximumNotificationNameSize = 128
+    public static let maximumNotificationSummarySize = 512
+    public static let maximumNotificationBodySize = 4096
+    public static let maximumNotificationActionSize = 128
     public static let maximumMIMETypes = 24
 
     public enum DecodeError: LocalizedError, Equatable {
@@ -218,9 +225,11 @@ public enum WindowWire {
             let surface: UInt32 = try reader.integer()
             let hotspotX = Int(try reader.integer() as Int32)
             let hotspotY = Int(try reader.integer() as Int32)
+            let pixelScale = Int(try reader.integer() as UInt32)
+            guard (1...8).contains(pixelScale) else { throw DecodeError.malformed }
             return try finished(.cursorChanged(
                 surface: surface == 0 ? nil : surface,
-                hotspotX: hotspotX, hotspotY: hotspotY))
+                hotspotX: hotspotX, hotspotY: hotspotY, pixelScale: pixelScale))
         case 15:
             let raw: UInt32 = try reader.integer()
             guard let shape = Windowing.CursorShape(rawValue: raw) else {
@@ -338,6 +347,60 @@ public enum WindowWire {
         case 36:
             return try finished(.forceQuitCapabilityChanged(
                 window: reader.integer(), supported: reader.boolean()))
+        case 38, 39:
+            var id: UInt32?, revision: UInt64?
+            do {
+                let value: UInt32 = try reader.integer()
+                id = value == 0 ? nil : value
+                let serial: UInt64 = try reader.integer()
+                revision = serial == 0 ? nil : serial
+                guard let id, let revision else { throw DecodeError.malformed }
+                if opcode == 39 { return try finished(.notificationClosed(id: id, revision: revision)) }
+                let rawUrgency: UInt8 = try reader.integer()
+                guard let urgency = Windowing.GuestNotification.Urgency(rawValue: rawUrgency) else {
+                    throw DecodeError.malformed
+                }
+                let timeout = Int(try reader.integer() as Int32)
+                guard timeout >= -1 else { throw DecodeError.malformed }
+                let appName = try reader.string(maximumBytes: maximumNotificationNameSize)
+                let desktopEntry = try reader.string(maximumBytes: maximumNotificationNameSize)
+                let summary = try reader.string(maximumBytes: maximumNotificationSummarySize)
+                let body = try reader.string(maximumBytes: maximumNotificationBodySize)
+                let count = Int(try reader.integer() as UInt32)
+                guard count <= maximumNotificationActions else { throw DecodeError.malformed }
+                var actions: [Windowing.GuestNotification.Action] = []
+                for _ in 0..<count {
+                    actions.append(.init(
+                        key: try reader.string(maximumBytes: maximumNotificationActionSize),
+                        label: try reader.string(maximumBytes: maximumNotificationActionSize)))
+                }
+                return try finished(.notificationPosted(.init(
+                    id: id, revision: revision, urgency: urgency, timeoutMilliseconds: timeout,
+                    appName: appName, desktopEntry: desktopEntry,
+                    summary: summary, body: body, actions: actions)))
+            } catch {
+                // Notifications do not own the surface graph. Their text or
+                // actions may be refused without reconnecting the display.
+                return .notificationRejected(id: id, revision: revision)
+            }
+        case 42:
+            do { return try finished(.notificationBacklogReset) }
+            catch { return .notificationRejected(id: nil, revision: nil) }
+        case 40, 41:
+            var token: UInt32?
+            do {
+                let value: UInt32 = try reader.integer()
+                token = value == 0 ? nil : value
+                guard let token else { throw DecodeError.malformed }
+                if opcode == 41 { return try finished(.hostOpenCancelled(token: token)) }
+                guard let frame = try reader.data(maximumSize: HostOpenWire.headerSize + HostOpenWire.maximumPayload) else {
+                    throw DecodeError.malformed
+                }
+                let request = try HostOpenWire.decodeRequest(from: frame)
+                return try finished(.hostOpenRequested(token: token, request: request))
+            } catch {
+                return .hostOpenRejected(token: token)
+            }
         default:
             throw DecodeError.malformed
         }
@@ -351,6 +414,9 @@ public enum WindowWire {
         let opcode: UInt8
         switch command {
         case .fileDrag: opcode = 28
+        case .notificationClosed: opcode = 29
+        case .notificationAction: opcode = 30
+        case .hostOpenResponse: opcode = 31
         case .configure: opcode = 1
         case .close: opcode = 2
         case .dismissPopup: opcode = 3
@@ -384,6 +450,20 @@ public enum WindowWire {
         append(UInt16(0), to: &payload)
 
         switch command {
+        case .hostOpenResponse(let token, let response):
+            guard token != 0 else { throw EncodeError.invalidValue }
+            append(token, to: &payload)
+            try append(HostOpenWire.encode(response), to: &payload)
+        case .notificationClosed(let id, let revision, let reason):
+            guard id != 0, revision != 0 else { throw EncodeError.invalidValue }
+            append(id, to: &payload)
+            append(revision, to: &payload)
+            append(reason.rawValue, to: &payload)
+        case .notificationAction(let id, let revision, let key):
+            guard id != 0, revision != 0, key.utf8.count <= maximumNotificationActionSize else { throw EncodeError.invalidValue }
+            append(id, to: &payload)
+            append(revision, to: &payload)
+            try append(key, to: &payload)
         case .fileDrag(let message):
             guard message.action.rawValue < 101, message.token != 0,
                   message.x.isFinite, message.y.isFinite, (message.data?.count ?? 0) <= 1024 * 1024 else { throw EncodeError.invalidValue }
@@ -673,10 +753,10 @@ public enum WindowWire {
             return value
         }
 
-        mutating func data(optional: Bool = false) throws -> Data? {
+        mutating func data(optional: Bool = false, maximumSize: Int = maximumFieldSize) throws -> Data? {
             let count: UInt32 = try integer()
             if optional && count == .max { return nil }
-            guard count != .max, count <= maximumFieldSize,
+            guard count != .max, count <= maximumSize,
                   Int(count) <= data.count - offset
             else { throw DecodeError.malformed }
             let result = data.subdata(in: offset..<(offset + Int(count)))
@@ -688,8 +768,8 @@ public enum WindowWire {
             try data(optional: true)
         }
 
-        mutating func string() throws -> String {
-            guard let bytes = try data(), !bytes.contains(0),
+        mutating func string(maximumBytes: Int = maximumFieldSize) throws -> String {
+            guard let bytes = try data(maximumSize: maximumBytes), !bytes.contains(0),
                   let value = String(data: bytes, encoding: .utf8)
             else { throw DecodeError.malformed }
             return value

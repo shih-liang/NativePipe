@@ -31,14 +31,19 @@ static void fail_writer(struct np_media *m)
     pthread_cond_signal(&m->ready);
 }
 
-static bool write_bytes(struct np_media *m, const unsigned char *bytes, size_t size)
+enum write_result { WRITE_FAILED, WRITE_COMPLETE, WRITE_YIELD };
+static enum write_result write_bytes(struct np_media *m, const unsigned char *bytes, size_t size, bool optional)
 {
     size_t offset = 0;
     while (offset < size) {
         pthread_mutex_lock(&m->lock);
         bool stop = m->stopping;
+        bool control_waiting = optional && !offset && m->head[0];
         pthread_mutex_unlock(&m->lock);
-        if (stop) return false;
+        if (stop) return WRITE_FAILED;
+        /* A blocked optional frame with no bytes written can still yield to a
+         * newly arrived control record. Once started, its NPIP boundary wins. */
+        if (control_waiting) return WRITE_YIELD;
         ssize_t n = write(m->conn_fd, bytes + offset, size - offset);
         if (n > 0) { offset += (size_t)n; continue; }
         if (n < 0 && errno == EINTR) continue;
@@ -49,9 +54,9 @@ static bool write_bytes(struct np_media *m, const unsigned char *bytes, size_t s
             if (ready >= 0 && !(p.revents & (POLLERR | POLLHUP | POLLNVAL)))
                 continue;
         }
-        return false;
+        return WRITE_FAILED;
     }
-    return true;
+    return WRITE_COMPLETE;
 }
 static void put32(unsigned char *p, uint32_t value) { memcpy(p, &value, 4); }
 static double now_seconds(void)
@@ -63,15 +68,21 @@ static double now_seconds(void)
 static int ready_lane(struct np_media *m)
 {
     if (m->head[0]) return 0;
+    int ready = -1;
     for (unsigned i = 0; i < 2; i++) {
         /* Give interactive pixels three turns, then one background turn. */
         unsigned preferred = m->next_lane == 3 ? 2 : 1;
         unsigned lane = i ? 3 - preferred : preferred;
         struct np_media_frame *f = m->head[lane];
         if (!f) continue;
-        if (np_flow_allow(&m->flow, f->size - f->offset)) return (int)lane;
+        if (np_flow_allow(&m->flow, f->size - f->offset)) { ready = (int)lane; break; }
     }
-    return -1;
+    /* One bounded notification turn per eight bulk fragments prevents ongoing
+     * animation/catalog traffic from starving notifications. They do not use
+     * video credit and remain below independent control in priority. */
+    if (np_notification_outbox_pending(&m->notifications) &&
+        (ready < 0 || m->notification_turns >= 8)) return 3;
+    return ready;
 }
 static void *writer(void *data)
 {
@@ -82,12 +93,14 @@ static void *writer(void *data)
         while (!m->stopping && !m->failed && (lane = ready_lane(m)) < 0)
             pthread_cond_wait(&m->ready, &m->lock);
         if (m->stopping || m->failed) break;
-        struct np_media_frame *f = m->head[lane];
-        size_t count = f->size - f->offset;
+        struct np_media_frame *f = lane < 3 ? m->head[lane] : NULL;
+        size_t count = 0;
         unsigned char chunk[28 + NP_FRAGMENT_SIZE];
-        const unsigned char *bytes = f->bytes;
+        const unsigned char *bytes;
+        if (lane == 3) bytes = np_notification_outbox_next(&m->notifications, &count);
+        else { count = f->size - f->offset; bytes = f->bytes; }
         size_t size = count;
-        if (lane) {
+        if (lane == 1 || lane == 2) {
             count = np_flow_allow(&m->flow, count);
             memcpy(chunk, "NPIP\1\0\0\0", 8);
             put32(chunk + 8, (uint32_t)(16 + count));
@@ -101,18 +114,25 @@ static void *writer(void *data)
             m->next_lane = (m->next_lane + 1) % 4;
         }
         pthread_mutex_unlock(&m->lock);
-        bool ok = write_bytes(m, bytes, size);
+        enum write_result result = write_bytes(m, bytes, size, lane == 3);
         pthread_mutex_lock(&m->lock);
-        f->offset += count;
-        m->queued_bytes -= count;
-        if (lane == 1) m->display_bytes -= count;
-        if (f->offset == f->size) {
-            m->head[lane] = f->next;
-            if (!m->head[lane]) m->tail[lane] = NULL;
-            free(f);
+        if (result == WRITE_YIELD) continue;
+        if (lane == 3) {
+            np_notification_outbox_consume(&m->notifications, count);
+            m->notification_turns = 0;
+        } else {
+            f->offset += count;
+            m->queued_bytes -= count;
+            if (lane == 1) m->display_bytes -= count;
+            if (lane && m->notification_turns < 8) ++m->notification_turns;
+            if (f->offset == f->size) {
+                m->head[lane] = f->next;
+                if (!m->head[lane]) m->tail[lane] = NULL;
+                free(f);
+            }
         }
         np_media_wake(m);
-        if (!ok) {
+        if (result != WRITE_COMPLETE) {
             fail_writer(m);
             break;
         }
@@ -167,6 +187,7 @@ void np_media_finish(struct np_media *m)
             free(m->head[lane]); m->head[lane] = next;
         }
     }
+    np_notification_outbox_clear(&m->notifications);
     close(m->conn_fd);
     close(m->error_fd);
     pthread_cond_destroy(&m->ready);
@@ -210,6 +231,7 @@ static bool send_binary(struct np_media *m, unsigned lane, const void *payload, 
 }
 bool np_media_send_binary(struct np_media *m, const void *payload, size_t length)
 {
+    if (np_notification_payload(payload, length)) return np_media_send_notification(m, payload, length);
     const unsigned char *p = payload;
     /* A catalog end marker must follow every batch, even though it is short.
      * Other replies have independent request tokens and may bypass the catalog. */
@@ -219,7 +241,18 @@ bool np_media_send_binary(struct np_media *m, const void *payload, size_t length
 }
 bool np_media_send_display(struct np_media *m, const void *payload, size_t length)
 {
+    if (np_notification_payload(payload, length)) return np_media_send_notification(m, payload, length);
     return send_binary(m, 1, payload, length);
+}
+bool np_media_send_notification(struct np_media *m, const void *payload, size_t length)
+{
+    if (!m->initialized) return false;
+    pthread_mutex_lock(&m->lock);
+    bool accepted = !m->failed && !m->stopping &&
+        np_notification_outbox_send(&m->notifications, payload, length);
+    pthread_cond_signal(&m->ready);
+    pthread_mutex_unlock(&m->lock);
+    return accepted;
 }
 bool np_media_can_encode(struct np_media *m)
 {

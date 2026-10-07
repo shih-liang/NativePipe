@@ -151,6 +151,7 @@ jobs:
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-remote-transport test-remote-encoder test-remote-scheduler
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-applications
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-file-drag test-scene-damage
+              make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-host-open test-notify-dbus test-xwayland-session
               make -C common/file_rpc test-linux
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" dist-vmpipe
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" dist-remote
@@ -174,6 +175,9 @@ jobs:
           install -Dm0755 \
             "guest/session/dist/nativepipe-session-$ARCHITECTURE-$LIBC" \
             "$root/guest/session/dist/nativepipe-session-$ARCHITECTURE-$LIBC"
+          install -Dm0755 \
+            "guest/session/dist/nativepipe-open-$ARCHITECTURE-$LIBC" \
+            "$root/guest/session/dist/nativepipe-open-$ARCHITECTURE-$LIBC"
           install -Dm0755 \
             "guest/session/dist/nativepipe-align-blob-$ARCHITECTURE-$LIBC.so" \
             "$root/guest/session/dist/nativepipe-align-blob-$ARCHITECTURE-$LIBC.so"

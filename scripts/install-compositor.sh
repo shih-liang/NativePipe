@@ -43,9 +43,16 @@ install_compositor() {
 
     if [ "$mode" = --upload ]; then
         printf 'NATIVEPIPE TARGET %s %s\n' "$arch" "$libc" >&3
-        IFS=' ' read -r digest size
+        IFS= read -r upload_record
+        [ "${#upload_record}" -le 256 ] || { say INSTALL_INVALID_UPLOAD "The NativePipe files received from this Mac are invalid. Try again."; exit 1; }
+        case "$upload_record" in *' '*) ;; *) say INSTALL_INVALID_UPLOAD "The NativePipe files received from this Mac are invalid. Try again."; exit 1 ;; esac
+        digest=${upload_record%% *}
+        size=${upload_record#* }
         case "$size" in ''|*[!0-9]*) say INSTALL_INVALID_UPLOAD "The NativePipe files received from this Mac are invalid. Try again."; exit 1 ;; esac
-        [ "${#size}" -le 9 ] && [ "$size" -gt 0 ] && [ "$size" -le 536870912 ] || {
+        # The record is bounded, the file is not. Keep its byte count as decimal
+        # text: shell integer arithmetic can overflow on 32- or 64-bit systems.
+        while [ "${size#0}" != "$size" ]; do size=${size#0}; done
+        [ -n "$size" ] || {
             say INSTALL_INVALID_UPLOAD "The NativePipe files received from this Mac are invalid. Try again."; exit 1;
         }
     else
@@ -59,25 +66,27 @@ install_compositor() {
     [ "${#digest}" = 64 ] || { say INSTALL_NO_CHECKSUM "The NativePipe release has no valid checksum for %s." "$asset"; exit 1; }
     installed="$root/releases/$digest"
 
-    if [ ! -x "$installed/nativepipe-wayland" ] || [ "$(cat "$installed/.sha256" 2>/dev/null || :)" != "$digest" ]; then
+    if [ ! -x "$installed/nativepipe-wayland" ] || [ ! -x "$installed/libexec/np-open" ] || [ "$(cat "$installed/.sha256" 2>/dev/null || :)" != "$digest" ]; then
         say INSTALL_INSTALLING "Installing the NativePipe compositor for %s (%s)…" "$arch" "$libc"
         if [ "$mode" = --upload ]; then
             printf 'NATIVEPIPE UPLOAD\n' >&3
             head -c "$size" > "$tmp/$asset"
-            [ "$(wc -c < "$tmp/$asset")" -eq "$size" ] || { say INSTALL_INTERRUPTED "The NativePipe upload was interrupted. Try again."; exit 1; }
+            actual_size=$(wc -c < "$tmp/$asset" | tr -d '[:space:]')
+            [ "$actual_size" = "$size" ] || { say INSTALL_INTERRUPTED "The NativePipe upload was interrupted. Try again."; exit 1; }
         else
             curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
-                --connect-timeout 10 --max-time 120 "$base/$asset" -o "$tmp/$asset"
+                --connect-timeout 10 --speed-time 120 --speed-limit 1 "$base/$asset" -o "$tmp/$asset"
         fi
         printf '%s  %s\n' "$digest" "$asset" > "$tmp/checksum"
         (cd "$tmp" && sha256sum -c checksum >&2)
         mkdir "$tmp/unpacked"
         tar -xzf "$tmp/$asset" -C "$tmp/unpacked"
         [ -x "$tmp/unpacked/nativepipe-wayland" ] || { say INSTALL_INCOMPLETE_RELEASE "The NativePipe release doesn’t contain nativepipe-wayland."; exit 1; }
+        [ -x "$tmp/unpacked/libexec/np-open" ] || { say INSTALL_INCOMPLETE_OPEN_RELEASE "The NativePipe release doesn’t contain np-open."; exit 1; }
         printf '%s\n' "$digest" > "$tmp/unpacked/.sha256"
         # Never overwrite a directory still used by another connection.
         if ! mv -T "$tmp/unpacked" "$installed" 2>/dev/null; then
-            [ -x "$installed/nativepipe-wayland" ] && [ "$(cat "$installed/.sha256" 2>/dev/null || :)" = "$digest" ] || {
+            [ -x "$installed/nativepipe-wayland" ] && [ -x "$installed/libexec/np-open" ] && [ "$(cat "$installed/.sha256" 2>/dev/null || :)" = "$digest" ] || {
                 say INSTALL_PUBLISH_FAILED "Couldn’t finish installing the NativePipe compositor. Check the permissions and free space in ~/.local/share/nativepipe."; exit 1;
             }
         fi

@@ -28,6 +28,8 @@ nativepipe --install-compositor user@linux-host gtk4-demo
   `xwayland-satellite` and Xwayland installed.
 - Hardware-accelerated video when supported, with software fallback.
 - Install and update the NativePipe compositor on Linux from GitHub Releases with one option.
+- Use `np-open` inside the Linux session to request opening links or receiving
+  files and folders on your Mac, with your approval for each request.
 
 ## Contents
 
@@ -37,6 +39,7 @@ nativepipe --install-compositor user@linux-host gtk4-demo
 - [Usage](#usage)
 - [Examples](#examples)
 - [Updating](#updating)
+- [Opening links and receiving files on the Mac](#opening-links-and-receiving-files-on-the-mac)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
 
@@ -307,6 +310,33 @@ specific executable when several are installed.
 To update the macOS command, download a new CLI release and repeat the
 [installation steps](#download-the-macos-command). The `--install-compositor` option updates
 only the NativePipe compositor.
+
+## Opening links and receiving files on the Mac
+
+From a Linux terminal launched by NativePipe:
+
+```sh
+np-open https://example.com
+np-open ~/Documents/report.pdf ~/Projects/data
+np-open ~/Downloads/install.pkg
+```
+
+The compositor package includes `np-open` and puts it on the session's `PATH`.
+It uses the existing encrypted NativePipe connection; a separate SSH port
+forward is not needed. An unrelated SSH session does not inherit this connection.
+
+Your Mac asks before opening each link or receiving each item. Choose **Save…**
+to receive a file or folder without opening it, or **Open** to receive and open
+a copy. Programs, scripts and installers need another approval before opening;
+macOS security checks still apply. Cancelling before approval transfers no files.
+
+File contents stream to disk, with progress and cancellation, without an
+application-defined file-size limit. Available storage and filesystem limits
+still apply. Links with sign-in credentials or mail attachments can be approved;
+mail links open the mail application for you to review, rather than sending mail.
+
+`np-open` returns `0` on success, `1` if a request is refused or fails, `2` for
+invalid usage, and `3` if it cannot reach the Mac.
 
 ## Troubleshooting
 

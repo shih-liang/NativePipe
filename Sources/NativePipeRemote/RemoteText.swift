@@ -36,6 +36,7 @@ enum RemoteText {
         ("INSTALL_INSTALLING", NPText("Installing the NativePipe compositor for %@ (%@)…")),
         ("INSTALL_INTERRUPTED", NPText("The NativePipe upload was interrupted. Try again.")),
         ("INSTALL_INCOMPLETE_RELEASE", NPText("The NativePipe release doesn’t contain nativepipe-wayland.")),
+        ("INSTALL_INCOMPLETE_OPEN_RELEASE", NPText("The NativePipe release doesn’t contain np-open.")),
         ("INSTALL_PUBLISH_FAILED", NPText("Couldn’t finish installing the NativePipe compositor. Check the permissions and free space in ~/.local/share/nativepipe.")),
         ("INSTALL_UP_TO_DATE", NPText("The NativePipe compositor is up to date.")),
         ("INSTALL_INVALID_UPLOAD", NPText("The NativePipe files received from this Mac are invalid. Try again.")),

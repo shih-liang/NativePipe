@@ -21,13 +21,14 @@ VULKAN_CFLAGS := $(shell pkg-config --cflags vulkan 2>/dev/null)
 DRM_CFLAGS    := $(shell pkg-config --cflags libdrm 2>/dev/null)
 
 SESSION := dist/nativepipe-session-$(ARCH)-$(LIBC)
+OPEN    := dist/nativepipe-open-$(ARCH)-$(LIBC)
 ALIGN   := dist/nativepipe-align-blob-$(ARCH)-$(LIBC).so
 LAYER   := dist/nativepipe-vulkan-layer-$(ARCH)-$(LIBC).so
 
-.PHONY: all dist-target check-arch check-deps test test-runtime clean
+.PHONY: all dist-target check-arch check-deps test test-runtime test-np-open test-np-open-cli clean
 
 all: dist-target
-dist-target: check-arch check-deps $(SESSION) $(ALIGN) $(LAYER)
+dist-target: check-arch check-deps $(SESSION) $(OPEN) $(ALIGN) $(LAYER)
 
 check-arch:
 	@actual="$$(uname -m | sed 's/^arm64$$/aarch64/')"; \
@@ -47,6 +48,11 @@ $(SESSION): nativepipe-session.c $(COMMON_SOURCE) | dist
 	$(CC) $(BASE_CFLAGS) -I../common $(SESSION_LINK) -o $@ $^
 	$(STRIP) $@
 
+# np-open asks the Mac to open a URL or file. Static on musl like the session.
+$(OPEN): np-open.c np-open-wire.h $(COMMON_SOURCE) | dist
+	$(CC) $(BASE_CFLAGS) -I../common $(SESSION_LINK) -o $@ np-open.c $(COMMON_SOURCE)
+	$(STRIP) $@
+
 $(ALIGN): $(ALIGN_SOURCE) | dist
 	$(CC) $(BASE_CFLAGS) $(DRM_CFLAGS) -shared -fPIC -fvisibility=hidden \
 		-o $@ $< -ldl
@@ -60,10 +66,23 @@ $(LAYER): $(LAYER_SOURCE) | dist
 test-runtime: dist/test-runtime
 	dist/test-runtime
 
+# Wire format and argument handling of np-open; needs no guest or vsock.
+test-np-open: dist/test-np-open
+	dist/test-np-open
+
+dist/test-np-open: test-np-open.c np-open-wire.h ../common/np.h | dist
+	$(CC) $(BASE_CFLAGS) -I../common -o $@ test-np-open.c
+
+test-np-open-cli: dist/test-np-open-cli
+	dist/test-np-open-cli
+
+dist/test-np-open-cli: test-np-open-cli.c np-open.c np-open-wire.h ../common/np.h | dist
+	$(CC) $(BASE_CFLAGS) -I../common -o $@ test-np-open-cli.c
+
 dist/test-runtime: test-runtime.c nativepipe-session.c ../common/np.h $(COMMON_SOURCE) | dist
 	$(CC) $(BASE_CFLAGS) -I../common -o $@ test-runtime.c $(COMMON_SOURCE)
 
-test: $(ALIGN) test-runtime
+test: $(ALIGN) test-runtime test-np-open test-np-open-cli
 	$(CC) $(BASE_CFLAGS) -shared -fPIC -DTEST_IOCTL_BACKEND \
 		-o dist/test-blob-backend.so test-blob-interposition.c
 	$(CC) $(BASE_CFLAGS) -o dist/test-blob-client test-blob-interposition.c -ldl

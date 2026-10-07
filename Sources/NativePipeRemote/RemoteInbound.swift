@@ -19,6 +19,7 @@ final class RemoteInbound: @unchecked Sendable {
     private var scheduled = false
     private var pending: [(event: Event, bytes: Int)] = []
     private var bytes = 0
+    private var notificationInbox = GuestNotificationInbox()
 
     init(writer: WindowCommandWriter,
          media: (@Sendable (MediaWire.Header, Data) -> Bool)?,
@@ -39,6 +40,9 @@ final class RemoteInbound: @unchecked Sendable {
             if media?(header, data) == false {
                 failLocked(RemoteError.message(NPText("Remote media was rejected by the decoder.")))
             }
+        case .event(let event):
+            writer.observeGuestNotification(event)
+            if !notificationInbox.offer(event) { appendLocked(.packet(packet), bytes: bytes) }
         default: appendLocked(.packet(packet), bytes: bytes)
         }
         let accepting = active
@@ -59,6 +63,7 @@ final class RemoteInbound: @unchecked Sendable {
         lock.lock()
         active = false
         pending.removeAll()
+        notificationInbox.clear()
         bytes = 0
         lock.unlock()
     }
@@ -74,12 +79,13 @@ final class RemoteInbound: @unchecked Sendable {
     private func failLocked(_ error: Error) {
         active = false
         pending = [(.failed(error), 0)]
+        notificationInbox.clear()
         bytes = 0
         writer.disconnect()
     }
 
     private func scheduleLocked() {
-        guard !scheduled, !pending.isEmpty else { return }
+        guard !scheduled, !pending.isEmpty || !notificationInbox.isEmpty else { return }
         scheduled = true
         MainRunLoop.perform { self.drain() }
     }
@@ -89,8 +95,18 @@ final class RemoteInbound: @unchecked Sendable {
         let batch = Array(pending.prefix(64))
         pending.removeFirst(batch.count)
         bytes -= batch.reduce(0) { $0 + $1.bytes }
+        // Drain notifications only after the structural FIFO, including its
+        // initial handshake. No optional traffic spends the scene/byte budget.
+        let notifications = pending.isEmpty ? notificationInbox.drain() : []
         lock.unlock()
         for item in batch { deliver(item.event) }
+        for event in notifications {
+            lock.lock()
+            let accepting = active
+            lock.unlock()
+            guard accepting else { break }
+            deliver(.packet(.event(event)))
+        }
         lock.lock()
         scheduled = false
         scheduleLocked()

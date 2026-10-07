@@ -4,6 +4,7 @@
 #include "window_events.h"
 #include "windowwire.h"
 #include "xwayland.h"
+#include "notifications.h"
 
 static void send_replay_string(
 	struct np_server *server, uint8_t opcode, uint32_t window,
@@ -20,6 +21,7 @@ static void send_replay_string(
 void np_host_session_replay_metadata(struct np_server *server)
 {
 	struct np_surface *surface;
+	np_notifications_reset(server);
 
 	/* Create every surface before replaying roles and parent references. */
 	wl_list_for_each_reverse(surface, &server->surfaces, link) {
@@ -82,6 +84,7 @@ void np_host_session_watch(
 		}
 		return;
 	}
+	if (*watched_fd >= 0) np_notifications_reset(server);
 	if (*source) {
 		wl_event_source_remove(*source);
 		*source = NULL;

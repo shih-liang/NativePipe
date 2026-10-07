@@ -220,9 +220,10 @@ static void surface_resource_destroy(struct wl_resource *resource) {
 		surface->server->drag_icon = NULL;
 	}
 	if (surface->server->cursor_surface == resource) {
-		uint32_t fields[] = {0, 0, 0};
-		np_window_event_send(surface->server, NP_GUEST_CURSOR_CHANGED, fields, 3);
+		uint32_t fields[] = {0, 0, 0, 1};
+		np_window_event_send(surface->server, NP_GUEST_CURSOR_CHANGED, fields, 4);
 		surface->server->cursor_surface = NULL;
+		surface->server->cursor_pixel_scale = 1;
 	}
 	if (surface->server->pointer_surface == surface->id) {
 		surface->server->pointer_surface = 0;

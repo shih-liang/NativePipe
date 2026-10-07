@@ -94,7 +94,8 @@ final class ClipboardFileBroker {
         let staging = try Receipt.create(in: directory, prefix: "p-")
         // Monitor EOF concurrently with export: cancelling a paste must also
         // cancel its SFTP/vsock operation, not just abandon its eventual reply.
-        try await withThrowingTaskGroup(of: Void.self) { group in
+        enum TransferEvent: Sendable { case exported, acknowledged }
+        try await withThrowingTaskGroup(of: TransferEvent.self) { group in
             group.addTask { @MainActor in
                 do {
                     for (index, file) in selection.files.enumerated() {
@@ -106,6 +107,7 @@ final class ClipboardFileBroker {
                     try Task.checkCancellation()
                     try await FileRPC.sendRecord(try JSONEncoder().encode(Reply.ready(staging.directory.lastPathComponent)),
                         to: connection, deadline: .now() + .seconds(5))
+                    return .exported
                 } catch {
                     try? await FileRPC.sendRecord(try JSONEncoder().encode(Reply.failed(String(error.localizedDescription.prefix(8192)))),
                         to: connection, deadline: .now() + .seconds(5))
@@ -113,13 +115,29 @@ final class ClipboardFileBroker {
                 }
             }
             group.addTask {
-                // Bounded stalled clients, including those that never claim the
-                // reply. Source transfers already have their own IO deadlines.
-                let ack = try await connection.readExactly(1, deadline: .now() + .seconds(600))
+                // EOF cancels an active transfer. A large file is allowed to
+                // keep streaming; the acknowledgement deadline starts only
+                // once the complete receipt has been sent.
+                let ack = try await connection.readExactly(1, deadline: .distantFuture)
                 guard ack == Data([1]) else { throw FileRPC.Failure.protocolError }
+                return .acknowledged
             }
             defer { group.cancelAll() }
-            while try await group.next() != nil {}
+            var exported = false, acknowledged = false
+            while let event = try await group.next() {
+                switch event {
+                case .exported:
+                    exported = true
+                    if !acknowledged {
+                        group.addTask {
+                            try await Task.sleep(for: .seconds(600))
+                            throw FileRPC.Failure.protocolError
+                        }
+                    }
+                case .acknowledged: acknowledged = true
+                }
+                if exported && acknowledged { break }
+            }
         }
         withExtendedLifetime(staging) {}
     }
@@ -132,7 +150,9 @@ final class ClipboardFileBroker {
         defer { connection.close() }
         try await FileRPC.sendRecord(try JSONEncoder().encode(offer.token), to: connection, deadline: .now() + .seconds(5))
         let data: Data
-        do { data = try await FileRPC.receiveRecord(from: connection, maximum: 64 * 1024, deadline: .now() + .seconds(600)) }
+        // The receipt arrives after all files have streamed. Its small metadata
+        // limit remains, but a large file has no whole-transfer time limit.
+        do { data = try await FileRPC.receiveRecord(from: connection, maximum: 64 * 1024, deadline: .distantFuture) }
         catch is SocketConnection.Failure { throw Failure.unavailable }
         let name: String
         switch try JSONDecoder().decode(Reply.self, from: data) {

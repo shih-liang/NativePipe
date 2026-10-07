@@ -29,6 +29,7 @@ hash_file()
 		-o -name Makefile -o -name source-hash.sh \) \
 		! -path './.build/*' ! -path './dist/*'
 	  printf '%s\n' ../../scripts/build-codecs.py
+	  printf '%s\n' ../session/np-open-wire.h
 	} | LC_ALL=C sort |
 	while IFS= read -r file; do
 		printf '%s  %s\n' "$(hash_file "$file")" "$file"

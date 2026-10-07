@@ -39,6 +39,7 @@ void np_host_finish(struct np_host *host) {
 	if (host->listen_fd >= 0) close(host->listen_fd);
 	free(host->buffer);
 	free(host->out);
+	np_notification_outbox_clear(&host->notifications);
 	memset(host, 0, sizeof(*host));
 	host->listen_fd = -1;
 	host->conn_fd = -1;
@@ -54,6 +55,7 @@ void np_host_accept(struct np_host *host) {
 	host->buffer_len = 0;
 	host->out_head = 0;
 	host->out_len = 0;
+	np_notification_outbox_clear(&host->notifications);
 	host->input_enabled = true;
 	host->output_enabled = true;
 	np_debug_log("[wayland] host attached on port %u\n", host->port);
@@ -68,6 +70,7 @@ void np_host_disconnect(struct np_host *host) {
 	host->buffer_len = 0;
 	host->out_head = 0;
 	host->out_len = 0;
+	np_notification_outbox_clear(&host->notifications);
 	host->output_enabled = false;
 	host->input_enabled = false;
 	if (was_connected)
@@ -80,14 +83,28 @@ void np_host_disconnect(struct np_host *host) {
 
 /// Pushes as much of the outbound buffer as the socket will take.
 static void flush_outbound(struct np_host *host) {
-	while (host->out_head < host->out_len) {
+	while (host->conn_fd >= 0) {
+		/* Finish a partially written notification before changing queues. At a
+		 * frame boundary the authoritative structural FIFO always goes first. */
+		bool optional = np_notification_outbox_started(&host->notifications) ||
+		                host->out_head == host->out_len;
+		size_t size;
+		const unsigned char *bytes;
+		if (optional) {
+			bytes = np_notification_outbox_next(&host->notifications, &size);
+			if (!bytes) break;
+		} else {
+			bytes = host->out + host->out_head;
+			size = host->out_len - host->out_head;
+		}
 		ssize_t written = send(
-			host->conn_fd, host->out + host->out_head,
-			host->out_len - host->out_head, MSG_NOSIGNAL);
+			host->conn_fd, bytes, size, MSG_NOSIGNAL);
 		if (written > 0) {
-			host->out_head += (size_t)written;
+			if (optional) np_notification_outbox_consume(&host->notifications, (size_t)written);
+			else host->out_head += (size_t)written;
 			continue;
 		}
+		if (written < 0 && errno == EINTR) continue;
 		if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
 		np_host_disconnect(host);
 		return;
@@ -119,6 +136,11 @@ bool np_host_send_binary(struct np_host *host, const void *payload, size_t lengt
 	if (!host || !payload || !length || length > NP_MAX_PAYLOAD ||
 	    host->conn_fd < 0 || !host->output_enabled)
 		return false;
+	if (np_notification_payload(payload, length)) {
+		bool accepted = np_notification_outbox_send(&host->notifications, payload, length);
+		flush_outbound(host);
+		return accepted && host->conn_fd >= 0;
+	}
 	size_t frame_size = NP_HEADER + length;
 	if (!reserve_outbound(host, frame_size)) {
 		/* Structural and presentation messages are ordered state.  Dropping one

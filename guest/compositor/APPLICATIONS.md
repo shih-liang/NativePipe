@@ -26,7 +26,7 @@ user's physical desktop bus.
 
 ## Wire protocol
 
-Window protocol version 10 requires a matching host and compositor. The
+Window protocol version 12 requires a matching host and compositor. The
 existing NPIP framing and host control/event lanes are retained; there is no
 new listener, JSON object or per-application process in the host.
 

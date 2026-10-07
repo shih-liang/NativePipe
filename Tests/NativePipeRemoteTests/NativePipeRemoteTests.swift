@@ -59,6 +59,26 @@ final class NativePipeRemoteTests: XCTestCase {
         let packet = RemoteWire.fragment(record, offset: RemoteWire.fragmentSize, lane: 1)
         XCTAssertThrowsError(try fragments.receive(Data(packet.dropFirst(WireFormat.headerSize)), maximumSize: 60_000))
     }
+    func testMalformedOpenRequestPreservesFollowingWindowAndMediaRecords() throws {
+        // A complete optional request has a token but an invalid nested frame.
+        let malformed = Data(WindowWire.lifecycleMagic + [1, 40, 0, 0,
+            9, 0, 0, 0, 1, 0, 0, 0, 0])
+        let created = Data(WindowWire.lifecycleMagic + [1, 2, 0, 0, 17, 0, 0, 0])
+        let header = MediaWire.Header(surfaceID: 17, resourceID: 2,
+            width: 1, height: 1, ptsNanos: 0, payloadLength: 3)
+        var decoder = RemoteStreamDecoder()
+        decoder.append(try ready() + WireFormat.frame(payload: malformed)
+            + WireFormat.frame(payload: created)
+            + RemoteWire.fragment(header.encoded() + Data([1, 2, 3]), offset: 0, lane: 1))
+        guard case .event(.channelReady) = try decoder.next() else { return XCTFail("Missing handshake") }
+        guard case .event(.hostOpenRejected(token: 9)) = try decoder.next() else { return XCTFail("Missing optional refusal") }
+        guard case .event(.surfaceCreated(surface: 17)) = try decoder.next() else { return XCTFail("Window record was lost") }
+        guard case .acknowledge = try decoder.next() else { return XCTFail("Missing credit") }
+        guard case .media(_, let bytes) = try decoder.next() else { return XCTFail("Display was disconnected") }
+        XCTAssertEqual(bytes, Data([1, 2, 3]))
+        XCTAssertNil(try decoder.next())
+        try decoder.finish()
+    }
     func testRejectsWrongHandshakeTruncationAndOversizedMedia() throws {
         var invalid = RemoteStreamDecoder()
         invalid.append(Data("login banner".utf8))
@@ -247,6 +267,26 @@ final class NativePipeRemoteTests: XCTestCase {
             session.disconnect()
             XCTAssertFalse(session.isConnected)
         }
+    }
+
+    @MainActor func testInstallationTimesOutOnlyWhenProgressStops() async throws {
+        let encoded = try ready().base64EncodedString()
+        let active = RemoteSession(testExecutable: "/bin/sh", arguments: ["-c", """
+            printf 'NATIVEPIPE PHASE INSTALLING\\n' >&2
+            for i in 1 2 3 4 5 6; do sleep 0.06; printf 'Installing…\\n' >&2; done
+            printf 'NATIVEPIPE PHASE READY\\n' >&2
+            printf '%s' '\(encoded)' | /usr/bin/base64 -D
+            read reply
+            """], reportsStartup: true, installationTimeout: .milliseconds(200))
+        defer { active.disconnect() }
+        try await active.connect()
+        XCTAssertTrue(active.isConnected, "Progressing installation may last longer than the idle timeout")
+        let stalled = RemoteSession(testExecutable: "/bin/sh", arguments: ["-c",
+            "printf 'NATIVEPIPE PHASE INSTALLING\\n' >&2; sleep 5"], reportsStartup: true,
+            installationTimeout: .milliseconds(200))
+        defer { stalled.disconnect() }
+        do { try await stalled.connect(); XCTFail("A stalled installer must fail") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("installation did not finish in time")) }
     }
 
     @MainActor func testFailureStageIsRealAndRetryDoesNotNeedManualDisconnect() async throws {

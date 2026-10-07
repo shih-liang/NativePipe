@@ -204,7 +204,13 @@ bool np_backend_send_binary(struct np_server *server, const void *payload, size_
         case NP_GUEST_SELECTION_OFFERED:
         case NP_GUEST_SELECTION_DATA:
         case NP_GUEST_HOST_SELECTION_REQUEST:
+        case NP_GUEST_HOST_OPEN_REQUESTED:
+        case NP_GUEST_HOST_OPEN_CANCELLED:
             break; /* Independent input/clipboard transactions stay responsive. */
+        case NP_GUEST_NOTIFICATION_POSTED:
+        case NP_GUEST_NOTIFICATION_CLOSED:
+        case NP_GUEST_NOTIFICATION_BACKLOG_RESET:
+            return np_media_send_notification(&np_remote_backend(server)->media, payload, length);
         default: {
             struct np_remote_backend *b = np_remote_backend(server);
             if (length >= 12 &&

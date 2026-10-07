@@ -5,6 +5,8 @@
 #include "compositor_internal.h"
 #include "data_device.h"
 #include "keymap.h"
+#include "host_open.h"
+#include "notifications.h"
 #include "scale.h"
 #include "scene.h"
 #include "text_input.h"
@@ -142,6 +144,7 @@ static void pointer_set_cursor(struct wl_client *client, struct wl_resource *res
 	if (!entry || serial != entry->last_enter_serial) return;
 	struct np_server *server = entry->server;
 	uint32_t surface_id = 0;
+	uint32_t pixel_scale = 1;
 	if (surface) {
 		struct np_surface *cursor = wl_resource_get_user_data(surface);
 		if (!cursor || !np_surface_assign_role(cursor, NP_SURFACE_ROLE_CURSOR)) {
@@ -153,15 +156,26 @@ static void pointer_set_cursor(struct wl_client *client, struct wl_resource *res
 			server, server->pointer_surface);
 		struct np_surface *root = np_scene_root(pointer);
 		if (root) np_scale_changed(cursor, root->preferred_scale);
+		/* xwayland-satellite hides the display scale from Xwayland, so an X11
+		 * client draws its cursor in physical pixels with buffer_scale 1 and
+		 * satellite forwards the surface unchanged. Tell the host so it can
+		 * convert the size and hotspot to points; a toolkit that asks X for a
+		 * 48 pixel cursor on a 2x display would otherwise show 48 points. */
+		if (np_xwayland_owns_client(server, client)) {
+			int scale = root && root->preferred_scale > 0
+				? root->preferred_scale : server->output_scale;
+			if (scale > 1) pixel_scale = scale > 8 ? 8u : (uint32_t)scale;
+		}
 		surface_id = cursor->id;
 	}
 	server->cursor_surface = surface;
 	server->cursor_hotspot_x = hotspot_x;
 	server->cursor_hotspot_y = hotspot_y;
+	server->cursor_pixel_scale = pixel_scale;
 	uint32_t fields[] = {
-		surface_id, (uint32_t)hotspot_x, (uint32_t)hotspot_y,
+		surface_id, (uint32_t)hotspot_x, (uint32_t)hotspot_y, pixel_scale,
 	};
-	np_window_event_send(server, NP_GUEST_CURSOR_CHANGED, fields, 3);
+	np_window_event_send(server, NP_GUEST_CURSOR_CHANGED, fields, 4);
 }
 
 static void pointer_release(struct wl_client *client, struct wl_resource *resource) {
@@ -571,12 +585,24 @@ static void pointer_send_wheel_axis(
 static void handle_pointer_scroll(struct np_server *server, uint32_t window_id,
                                   double dx, double dy, bool precise) {
 	struct np_surface *surface = np_surface_by_id(server, server->pointer_surface);
-	if (!surface || server->pointer_window != window_id) return;
+	if (!surface || server->pointer_window != window_id) {
+		if (np_trace_enabled())
+			fprintf(stderr,
+			        "[wayland] scroll dropped: pointer_surface=%u pointer_window=%u event_window=%u\n",
+			        server->pointer_surface, server->pointer_window, window_id);
+		return;
+	}
 	struct np_input *entry;
 	uint32_t time = input_now_ms();
+	int delivered = 0;
 	wl_list_for_each(entry, &server->pointers, link) {
 		if (!same_client(entry->resource, surface->resource)) continue;
+		delivered++;
 		uint32_t version = (uint32_t)wl_resource_get_version(entry->resource);
+		if (np_trace_enabled())
+			fprintf(stderr,
+			        "[wayland] scroll window=%u surface=%u dx=%.2f dy=%.2f precise=%d wl_pointer_v=%u\n",
+			        window_id, surface->id, dx, dy, precise, version);
 		if (version >= WL_POINTER_AXIS_SOURCE_SINCE_VERSION)
 			wl_pointer_send_axis_source(
 				entry->resource, precise ? WL_POINTER_AXIS_SOURCE_FINGER
@@ -613,6 +639,9 @@ static void handle_pointer_scroll(struct np_server *server, uint32_t window_id,
 		}
 		pointer_frame(entry->resource);
 	}
+	if (!delivered && np_trace_enabled())
+		fprintf(stderr, "[wayland] scroll not delivered: no wl_pointer belongs to surface %u's client\n",
+		        surface->id);
 	wl_display_flush_clients(server->display);
 }
 
@@ -1094,6 +1123,11 @@ bool np_input_handle_host_binary(const unsigned char *payload, size_t length,
 		np_presentation_flush(server);
 		return true;
 	}
+	case NP_HOST_NOTIFICATION_CLOSED:
+	case NP_HOST_NOTIFICATION_ACTION:
+		return np_notifications_handle_command(server, &reader);
+	case NP_HOST_OPEN_RESPONSE:
+		return np_host_open_handle_command(server, &reader);
 	default:
 		return false;
 	}

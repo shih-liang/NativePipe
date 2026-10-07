@@ -2,6 +2,7 @@ import Foundation
 import XCTest
 import NativePipeStrings
 import Darwin
+import NativePipeProtocol
 @testable import NativePipeRemote
 
 final class SFTPFileSystemTests: XCTestCase {
@@ -203,13 +204,13 @@ final class SFTPFileSystemTests: XCTestCase {
         }
         for recorder in [upload, download] {
             let samples = recorder.samples
-            XCTAssertEqual(samples.first?.completedBytes, 0)
-            XCTAssertEqual(samples.first?.totalBytes, Int64(bytes.count))
-            XCTAssertEqual(samples.last?.completedBytes, Int64(bytes.count))
+            XCTAssertEqual(samples.first?.bytesTransferred, 0)
+            XCTAssertEqual(samples.first?.totalBytes, UInt64(bytes.count))
+            XCTAssertEqual(samples.last?.bytesTransferred, UInt64(bytes.count))
             XCTAssertEqual(samples.last?.isComplete, true)
             XCTAssertTrue(samples.dropLast().allSatisfy { !$0.isComplete })
-            XCTAssertEqual(samples.map(\.completedBytes), samples.map(\.completedBytes).sorted())
-            XCTAssertEqual(samples.first { $0.completedBytes > 0 }?.completedBytes, 32_768)
+            XCTAssertEqual(samples.map(\.bytesTransferred), samples.map(\.bytesTransferred).sorted())
+            XCTAssertEqual(samples.first { $0.bytesTransferred > 0 }?.bytesTransferred, 32_768)
             XCTAssertTrue(samples.count >= 3 && samples.count < 10, "Progress callbacks should be throttled while byte accounting stays exact")
         }
         XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: root.path).contains { $0.hasPrefix(".nativepipe-") })
@@ -292,13 +293,13 @@ final class SFTPFileSystemTests: XCTestCase {
         do {
             try await system.transfer(direction: .upload, local: source, remote: "target", overwrite: true, progress: { sample in
                 recorder.append(sample)
-                if sample.completedBytes >= 32_768 { holder.cancel() }
+                if sample.bytesTransferred >= 32_768 { holder.cancel() }
             })
             XCTFail("Cancellation must throw")
         } catch is CancellationError { }
         XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "original")
         XCTAssertTrue(recorder.samples.allSatisfy { !$0.isComplete })
-        XCTAssertLessThan(recorder.samples.last?.completedBytes ?? .max, 4_194_304)
+        XCTAssertLessThan(recorder.samples.last?.bytesTransferred ?? .max, 4_194_304)
         // A new operation owns a new transport and can immediately retry.
         let listing = try await system.list()
         XCTAssertEqual(listing.entries.first { $0.name == "target" }?.size, 8)
@@ -317,7 +318,7 @@ final class SFTPFileSystemTests: XCTestCase {
         let operation = Task {
             try await system.transfer(direction: .upload, local: source, remote: "target", overwrite: true, progress: { sample in
                 recorder.append(sample)
-                if sample.completedBytes >= 32_768 { holder.cancel() }
+                if sample.bytesTransferred >= 32_768 { holder.cancel() }
             })
         }
         holder.set(operation)
@@ -355,7 +356,7 @@ final class SFTPFileSystemTests: XCTestCase {
         do {
             try await system.transfer(direction: .upload, local: source, remote: "target", overwrite: true, progress: { sample in
                 recorder.append(sample)
-                if sample.completedBytes >= 32_768 { holder.cancel() }
+                if sample.bytesTransferred >= 32_768 { holder.cancel() }
             })
             XCTFail("Failed cleanup must remain an actionable failure")
         } catch SFTPFileSystemError.transferCleanupRequired(let staging, let reason) {
@@ -542,7 +543,7 @@ final class SFTPFileSystemTests: XCTestCase {
             XCTAssertEqual(try String(contentsOf: target.appendingPathComponent("new"), encoding: .utf8), "new")
             XCTAssertEqual(try String(contentsOfFile: backup + "/old", encoding: .utf8), "original")
             XCTAssertEqual(recorder.samples.last?.isComplete, true)
-            XCTAssertEqual(recorder.samples.last?.completedBytes, 3)
+            XCTAssertEqual(recorder.samples.last?.bytesTransferred, 3)
         case .restore:
             guard let serverFailure = failure as? SFTPFailure, case .status(let code, _) = serverFailure else {
                 XCTFail("The rejected publication must remain a server failure"); return
@@ -619,6 +620,29 @@ final class SFTPFileSystemTests: XCTestCase {
         XCTAssertEqual(kill(pid, 0), -1, "A child ignoring TERM must still exit")
         XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - began, 3)
     }
+    @MainActor func testRemoteDesktopUserFilesUseTheBrowserStreamingEngine() async throws {
+        let root = try temporaryDirectory(), local = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root); try? FileManager.default.removeItem(at: local) }
+        let system = try realServer(root, reuseConnection: true)
+        let files = RemoteUserFileAccess(makeSession: { system })
+        let source = local.appendingPathComponent("selected folder")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: false)
+        let bytes = Data(repeating: 0x51, count: 32 * 1024 * 1024 + 13)
+        try bytes.write(to: source.appendingPathComponent("payload"))
+        let imported = try await files.importFiles([source], shareDirectories: false)
+        defer { try? FileManager.default.removeItem(at: imported[0].deletingLastPathComponent()) }
+        let destination = local.appendingPathComponent("received")
+        let recorder = SFTPProgressRecorder()
+        try await files.exportFile(imported[0], to: destination, progress: { recorder.append($0) })
+        XCTAssertEqual(try Data(contentsOf: destination.appendingPathComponent("payload")), bytes)
+        XCTAssertEqual(recorder.samples.last?.bytesTransferred, UInt64(bytes.count))
+        XCTAssertEqual(recorder.samples.last?.totalBytes, UInt64(bytes.count))
+        XCTAssertEqual(recorder.samples.last?.isComplete, true)
+        XCTAssertTrue(recorder.samples.contains { $0.relativePath == "payload" })
+        do { try await files.exportFile(imported[0], to: destination); XCTFail("An existing destination must not be replaced") }
+        catch SFTPFileSystemError.destinationExists { }
+    }
+
     @MainActor func testFailedWritePreservesOriginalAndReportsOnlySuccessfulAcknowledgments() async throws {
         let root = try temporaryDirectory(), local = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root); try? FileManager.default.removeItem(at: local) }
@@ -633,8 +657,8 @@ final class SFTPFileSystemTests: XCTestCase {
         let recorder = SFTPProgressRecorder()
         do { try await system.transfer(direction: .upload, local: source, remote: "target", overwrite: true, progress: { [recorder] sample in recorder.append(sample) }); XCTFail("Server failure must throw") }
         catch SFTPFailure.status(let code, _) { XCTAssertEqual(code, 3) }
-        XCTAssertEqual(recorder.samples.first { $0.completedBytes > 0 }?.completedBytes, 32_768)
-        XCTAssertEqual(recorder.samples.last?.completedBytes, 3 * 32_768, "Failure must flush acknowledged bytes suppressed by throttling")
+        XCTAssertEqual(recorder.samples.first { $0.bytesTransferred > 0 }?.bytesTransferred, 32_768)
+        XCTAssertEqual(recorder.samples.last?.bytesTransferred, 3 * 32_768, "Failure must flush acknowledged bytes suppressed by throttling")
         XCTAssertTrue(recorder.samples.allSatisfy { !$0.isComplete })
         XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "old")
         XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: root.path).contains { $0.hasPrefix(".nativepipe-transfer-") })
@@ -643,9 +667,9 @@ final class SFTPFileSystemTests: XCTestCase {
 
 private final class SFTPProgressRecorder: @unchecked Sendable {
     private let lock = NSLock()
-    private var values: [SFTPTransferProgress] = []
-    var samples: [SFTPTransferProgress] { lock.lock(); defer { lock.unlock() }; return values }
-    func append(_ value: SFTPTransferProgress) { lock.lock(); values.append(value); lock.unlock() }
+    private var values: [FileTransferProgress] = []
+    var samples: [FileTransferProgress] { lock.lock(); defer { lock.unlock() }; return values }
+    func append(_ value: FileTransferProgress) { lock.lock(); values.append(value); lock.unlock() }
 }
 
 private final class SFTPTransportHolder: @unchecked Sendable {

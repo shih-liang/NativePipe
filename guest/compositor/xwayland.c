@@ -109,9 +109,6 @@ static bool create_auth_file(struct np_xwayland *xw)
 	    snprintf(temporary, sizeof(temporary),
 	             "%s/.nativepipe-Xauthority-XXXXXX", runtime) >=
 	        (int)sizeof(temporary) ||
-	    snprintf(xw->auth_path, sizeof(xw->auth_path),
-	             "%s/nativepipe-Xauthority", runtime) >=
-	        (int)sizeof(xw->auth_path) ||
 	    !random_bytes(cookie, sizeof(cookie)))
 		return false;
 
@@ -127,12 +124,64 @@ static bool create_auth_file(struct np_xwayland *xw)
 	          write_be16(fd, sizeof(cookie)) &&
 	          write_all(fd, cookie, sizeof(cookie)) && fsync(fd) == 0;
 	if (close(fd) < 0) ok = false;
-	if (ok) ok = rename(temporary, xw->auth_path) == 0;
+	/* Each compositor owns its cookie file. A second SSH session must not
+	 * replace this one, and closing either session must not delete the other. */
+	if (ok) snprintf(xw->auth_path, sizeof(xw->auth_path), "%s", temporary);
 	if (!ok) {
 		unlink(temporary);
 		xw->auth_path[0] = '\0';
 	}
 	return ok;
+}
+
+/* X11 pixels are physical pixels on a scaled display. xterm's default bitmap
+ * font ignores Xft.dpi, so it stays tiny while GTK and Qt applications scale.
+ * Xft fonts honour the Xft.dpi that xwayland-satellite sets from the display
+ * scale, so make them xterm's default. XAPPLRESDIR holds per-user application
+ * defaults: they sit below the user's own resources and need no change to
+ * distribution packages, and they apply to machines installed earlier too. */
+static const char xterm_defaults[] =
+	"! Written by NativePipe; replaced at every session start.\n"
+	"XTerm*renderFont: true\n"
+	"XTerm*faceName: Monospace\n"
+	"XTerm*faceSize: 11\n";
+
+#define XWAYLAND_APPDEFAULTS_DIRECTORY "nativepipe-app-defaults-XXXXXX"
+#define XWAYLAND_APPDEFAULTS_FILE "XTerm"
+
+static bool install_app_defaults(struct np_xwayland *xw)
+{
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+	char directory[256], temporary[300], path[300];
+	if (!runtime || runtime[0] != '/' ||
+	    snprintf(directory, sizeof(directory), "%s/%s", runtime,
+	             XWAYLAND_APPDEFAULTS_DIRECTORY) >= (int)sizeof(directory) ||
+	    snprintf(temporary, sizeof(temporary), "%s/.%s-XXXXXX", directory,
+	             XWAYLAND_APPDEFAULTS_FILE) >= (int)sizeof(temporary) ||
+	    snprintf(path, sizeof(path), "%s/%s", directory,
+	             XWAYLAND_APPDEFAULTS_FILE) >= (int)sizeof(path))
+		return false;
+	if (!mkdtemp(directory)) return false;
+	/* mkdtemp changes the suffix; derive names from the selected directory. */
+	snprintf(temporary, sizeof(temporary), "%s/.%s-XXXXXX", directory,
+	         XWAYLAND_APPDEFAULTS_FILE);
+	snprintf(path, sizeof(path), "%s/%s", directory, XWAYLAND_APPDEFAULTS_FILE);
+
+	int fd = mkstemp(temporary);
+	if (fd < 0) { rmdir(directory); return false; }
+	bool ok = fchmod(fd, 0644) == 0 &&
+	          write_all(fd, xterm_defaults, sizeof(xterm_defaults) - 1) &&
+	          fsync(fd) == 0;
+	if (close(fd) < 0) ok = false;
+	if (ok) ok = rename(temporary, path) == 0;
+	if (!ok) {
+		unlink(temporary);
+		rmdir(directory);
+		return false;
+	}
+	snprintf(xw->server->xwayland_appdefaults,
+	         sizeof(xw->server->xwayland_appdefaults), "%s", directory);
+	return true;
 }
 
 static int make_unix_listener(const char *path, bool abstract)
@@ -336,6 +385,9 @@ bool np_xwayland_init(struct np_server *server)
 	}
 	snprintf(server->xwayland_auth, sizeof(server->xwayland_auth), "%s",
 	         xw->auth_path);
+	/* Cosmetic: X11 applications still work without these defaults. */
+	if (!install_app_defaults(xw))
+		np_debug_log("[xwayland] could not install application defaults\n");
 
 	struct wl_event_loop *loop = wl_display_get_event_loop(server->display);
 	xw->sigchld_source = wl_event_loop_add_signal(
@@ -388,9 +440,17 @@ void np_xwayland_finish(struct np_server *server)
 	}
 	if (xw->socket_path[0]) unlink(xw->socket_path);
 	if (xw->auth_path[0]) unlink(xw->auth_path);
+	if (server->xwayland_appdefaults[0]) {
+		char path[300];
+		if (snprintf(path, sizeof(path), "%s/%s", server->xwayland_appdefaults,
+		             XWAYLAND_APPDEFAULTS_FILE) < (int)sizeof(path))
+			unlink(path);
+		rmdir(server->xwayland_appdefaults);
+	}
 	server->xwayland = NULL;
 	server->xwayland_display[0] = '\0';
 	server->xwayland_auth[0] = '\0';
+	server->xwayland_appdefaults[0] = '\0';
 	free(xw);
 }
 

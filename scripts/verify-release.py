@@ -2,6 +2,7 @@
 """Reject incomplete releases and unintended sidecar files before publishing."""
 import hashlib
 import json
+import plistlib
 from pathlib import Path
 import sys
 import tarfile
@@ -41,11 +42,21 @@ for name in sorted(payloads):
             arch = name.removeprefix("nativepipe-vm-compositor-").removesuffix(".tar.gz")
             required = [f"guest/compositor/dist/vmpipe-wayland-{arch}-{libc}" for libc in ("gnu", "musl")]
             required += [f"guest/session/dist/nativepipe-session-{arch}-{libc}" for libc in ("gnu", "musl")]
+            required += [f"guest/session/dist/nativepipe-open-{arch}-{libc}" for libc in ("gnu", "musl")]
             assert not any(p.startswith("guest/compositor/dist/nativepipe-wayland-") for p in members), "Remote compositor duplicated in VM archive"
         elif name.startswith("nativepipe-compositor-"):
-            required = ["nativepipe-wayland", "libexec/nativepipe-wayland"]
+            required = ["nativepipe-wayland", "libexec/nativepipe-wayland", "libexec/np-open"]
         else:
-            required = ["bin/nativepipe"]
+            required = ["bin/nativepipe", "NativePipe.app/Contents/MacOS/nativepipe"]
+            metadata = "NativePipe.app/Contents/Info.plist"
+            assert metadata in members and members[metadata].isfile(), f"Missing application metadata in {name}"
+            with archive.extractfile(members[metadata]) as handle:
+                info = plistlib.load(handle)
+            version = (source / "Sources/NativePipeStrings/Resources/VERSION").read_text().strip()
+            assert info.get("CFBundleIdentifier") == "com.nativepipe.cli" and info.get("CFBundleExecutable") == "nativepipe" and info.get("CFBundlePackageType") == "APPL", "Invalid NativePipe application identity"
+            assert info.get("CFBundleShortVersionString") == version and info.get("CFBundleVersion") == version, "NativePipe application version differs from release"
+            with archive.extractfile(members["bin/nativepipe"]) as handle:
+                assert b'exec "$root/NativePipe.app/Contents/MacOS/nativepipe" "$@"' in handle.read(), "CLI entry does not execute its signed application"
         for path in required:
             assert path in members and members[path].isfile() and members[path].mode & 0o111, f"Missing executable {path} in {name}"
         for path in license_files:

@@ -296,8 +296,8 @@ static gpointer run(gpointer data)
             GVariantBuilder environment;
             g_variant_builder_init(&environment, G_VARIANT_TYPE("a{ss}"));
             const char *names[] = {"WAYLAND_DISPLAY", "DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR",
-                "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "GDK_BACKEND", "QT_QPA_PLATFORM",
-                "MOZ_ENABLE_WAYLAND", "LD_LIBRARY_PATH", "LD_PRELOAD"};
+                "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "XAPPLRESDIR", "GDK_BACKEND", "QT_QPA_PLATFORM",
+                "MOZ_ENABLE_WAYLAND", "LD_LIBRARY_PATH", "LD_PRELOAD", "PATH", "NATIVEPIPE_OPEN_SOCKET"};
             for (unsigned i = 0; i < G_N_ELEMENTS(names); ++i)
                 g_variant_builder_add(&environment, "{ss}", names[i], getenv(names[i]) ? getenv(names[i]) : "");
             GVariant *result = g_dbus_connection_call_sync(bus, "org.freedesktop.DBus",

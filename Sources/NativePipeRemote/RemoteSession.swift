@@ -46,6 +46,8 @@ public final class RemoteSession {
     }
     private var startupTimeout: Task<Void, Never>?
     private var readyTimeout: Duration = .seconds(15)
+    private var installationTimeout: Duration = .seconds(600)
+    private var lastInstallationActivity = TimeInterval.zero
     private var reportsStartup = true
 
     public init(command: SSHCommand, environment: [String: String]? = nil,
@@ -60,11 +62,13 @@ public final class RemoteSession {
 
     // Uses real pipes and the same lifecycle in transport tests.
     init(testExecutable: String, arguments: [String], localCompositorDirectory: URL? = nil,
-         readyTimeout: Duration = .seconds(15), reportsStartup: Bool = false) {
+         readyTimeout: Duration = .seconds(15), reportsStartup: Bool = false,
+         installationTimeout: Duration = .seconds(600)) {
         command = SSHCommand(destination: "test", application: ["true"], installCompositor: localCompositorDirectory != nil)
         environment = nil
         allowHardwareH264 = false
         self.localCompositorDirectory = localCompositorDirectory
+        self.installationTimeout = installationTimeout
         executable = testExecutable
         argumentsOverride = arguments
         self.readyTimeout = readyTimeout
@@ -174,7 +178,10 @@ public final class RemoteSession {
                             var prepared = true
                             if let localCompositor, let uploadInput {
                                 prepared = try RemoteCompositorUpload.prepare(directory: localCompositor,
-                                    input: uploadInput, output: output.fileHandleForReading, write: Self.writeAll)
+                                    input: uploadInput, output: output.fileHandleForReading, write: Self.writeAll,
+                                    activity: { Task { @MainActor [weak self] in
+                                        if let self, self.generation == token { self.lastInstallationActivity = ProcessInfo.processInfo.systemUptime }
+                                    } })
                                 try uploadInput.close()
                             }
                             while prepared {
@@ -249,6 +256,7 @@ public final class RemoteSession {
 
     private func receive(_ packet: RemoteStreamDecoder.Packet, token: Int) {
         guard token == generation else { return }
+        if startupPhase == .installing { lastInstallationActivity = ProcessInfo.processInfo.systemUptime }
         switch packet {
         case .event(let event):
             if case .channelReady = event {
@@ -271,6 +279,7 @@ public final class RemoteSession {
 
     private func diagnostic(_ text: String, token: Int) {
         guard token == generation else { return }
+        if startupPhase == .installing, !text.isEmpty { lastInstallationActivity = ProcessInfo.processInfo.systemUptime }
         diagnostics = String((diagnostics + text).suffix(65_536))
         if !isReady, diagnostics.contains(SSHAuthentication.cancelledDiagnostic) {
             // Stop before OpenSSH can offer another authentication method and
@@ -279,8 +288,8 @@ public final class RemoteSession {
             return
         }
         // stderr reads can split a marker. Accumulated diagnostics preserve its
-        // boundary; phase transitions are monotonic, so later logs cannot reset
-        // the deadline. No timer runs while SSH asks the user to authenticate.
+        // boundary; phase transitions are monotonic. Installation uses an idle
+        // timeout, so steady transfer progress is not mistaken for a hang.
         if reportsStartup {
             if diagnostics.contains("NATIVEPIPE PHASE READY\n") { advanceStartup(to: .ready, token: token) }
             else if diagnostics.contains("NATIVEPIPE PHASE INSTALLING\n") {
@@ -314,11 +323,25 @@ public final class RemoteSession {
               startupPhase == .connecting || startupPhase == .authenticating || (startupPhase == .installing && phase == .ready) else { return }
         startupPhase = phase
         startupTimeout?.cancel()
-        // Upload and runtime validation have a separate generous deadline.
+        // Upload and runtime validation have an idle deadline, not a limit on
+        // how much data may be transferred over a slow but progressing link.
         // Once exec is imminent, only the compositor handshake gets 15 seconds.
-        let timeout: Duration = phase == .ready ? readyTimeout : .seconds(600)
+        let timeout: Duration = phase == .ready ? readyTimeout : installationTimeout
+        let components = timeout.components
+        let seconds = Double(components.seconds) + Double(components.attoseconds) / 1e18
+        lastInstallationActivity = ProcessInfo.processInfo.systemUptime
         startupTimeout = Task { [weak self] in
-            do { try await Task.sleep(for: timeout) } catch { return }
+            do {
+                var wait = timeout
+                while true {
+                    try await Task.sleep(for: wait)
+                    guard let self, self.generation == token, !self.isReady else { return }
+                    if phase == .ready { break }
+                    let elapsed = ProcessInfo.processInfo.systemUptime - self.lastInstallationActivity
+                    if elapsed >= seconds { break }
+                    wait = .seconds(seconds - elapsed)
+                }
+            } catch { return }
             guard let self, self.generation == token, !self.isReady else { return }
             let message = phase == .ready
                 ? NPText("The NativePipe compositor didn’t start in time. The connection messages may show why.")

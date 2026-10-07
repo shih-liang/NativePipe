@@ -12,6 +12,8 @@
 #include "data_device.h"
 #include "decoration.h"
 #include "fifo.h"
+#include "host_open.h"
+#include "notifications.h"
 #include "scale.h"
 #include "text_input.h"
 #include "xdg_shell.h"
@@ -140,10 +142,28 @@ int np_frontend_run(int argc, char **argv, void *backend_state)
     if (server.xwayland_display[0]) {
         setenv("DISPLAY", server.xwayland_display, 1);
         setenv("XAUTHORITY", server.xwayland_auth, 1);
+        /* Keep a directory the user already chose (overwrite = 0). */
+        if (server.xwayland_appdefaults[0])
+            setenv("XAPPLRESDIR", server.xwayland_appdefaults, 0);
     } else { unsetenv("DISPLAY"); unsetenv("XAUTHORITY"); }
+    bool remote_stdio = false;
+    for (int i = 1; i < argc && strcmp(argv[i], "--"); i++)
+        if (!strcmp(argv[i], "--stdio")) remote_stdio = true;
+    if (remote_stdio && !np_host_open_init(&server)) {
+        np_user_text("STARTUP_FAILED", "The NativePipe compositor couldn’t start (%s).", "cannot start the host open socket", NULL);
+        np_backend_session_finish(&server);
+        np_xwayland_finish(&server);
+        wl_display_destroy(server.display);
+        np_backend_finish(&server);
+        return 1;
+    }
     struct wl_event_loop *loop = wl_display_get_event_loop(server.display);
     server.application_generation = 1;
     bool applications_started = np_applications_init(&server);
+    /* Desktop notifications are optional: without a session bus there is simply
+     * nothing for applications to call. */
+    if (!np_notifications_init(&server))
+        np_debug_log("[notifications] not started\n");
     if (!applications_started) {
         np_user_text("STARTUP_FAILED", "The NativePipe compositor couldn’t start (%s).", "cannot start the application service", NULL);
         server.terminate = true;
@@ -158,6 +178,8 @@ int np_frontend_run(int argc, char **argv, void *backend_state)
 		np_backend_session_sync(&server);
 	}
 
+    np_host_open_finish(&server);
+    np_notifications_finish(&server);
     np_applications_finish(&server);
 	wl_display_destroy_clients(server.display);
 	np_backend_session_finish(&server);

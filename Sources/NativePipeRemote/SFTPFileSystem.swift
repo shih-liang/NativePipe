@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import NativePipeProtocol
 import NativePipeStrings
 
 public struct SFTPFileEntry: Codable, Sendable, Hashable {
@@ -19,17 +20,6 @@ public struct SFTPDirectory: Codable, Sendable, Hashable {
     public var home: String
     public var entries: [SFTPFileEntry]
     public init(path: String, home: String, entries: [SFTPFileEntry]) { self.path = path; self.home = home; self.entries = entries }
-}
-
-public struct SFTPTransferProgress: Codable, Sendable, Hashable {
-    public var completedBytes: Int64
-    public var totalBytes: Int64?
-    public var bytesPerSecond: Double?
-    public var isComplete: Bool
-    public init(completedBytes: Int64, totalBytes: Int64?, bytesPerSecond: Double? = nil, isComplete: Bool = false) {
-        self.completedBytes = completedBytes; self.totalBytes = totalBytes
-        self.bytesPerSecond = bytesPerSecond; self.isComplete = isComplete
-    }
 }
 
 public enum SFTPFileSystemError: LocalizedError {
@@ -199,7 +189,7 @@ public final class SFTPFileSystem {
         }
     }
     public func transfer(direction: SFTPTransfer.Direction, local: URL, remote: String, recursive: Bool = true,
-                         overwrite: Bool = false, progress: @escaping @Sendable (SFTPTransferProgress) -> Void) async throws {
+                         overwrite: Bool = false, progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws {
         guard local.isFileURL else { throw SFTPFileSystemError.invalidPath(local.absoluteString) }
         if direction == .download, local.standardizedFileURL.path == "/" { throw SFTPFileSystemError.invalidPath(local.path) }
         do {
@@ -243,24 +233,26 @@ private struct SFTPTreeNode {
 
 private final class SFTPTransferWorker {
     let connection: SFTPConnection
-    let progress: @Sendable (SFTPTransferProgress) -> Void
+    let progress: @Sendable (FileTransferProgress) -> Void
     private var completed: Int64 = 0
     private var total: Int64 = 0
     private var started = ProcessInfo.processInfo.systemUptime
     private var localRootDescriptor: Int32 = -1
+    private var relativePath = ""
     private var lastReportTime: TimeInterval = 0
     private var lastReportedBytes: Int64 = -1
-    init(connection: SFTPConnection, progress: @escaping @Sendable (SFTPTransferProgress) -> Void) {
+    private var lastReportedPath: String?
+    init(connection: SFTPConnection, progress: @escaping @Sendable (FileTransferProgress) -> Void) {
         self.connection = connection; self.progress = progress
     }
     private func report(complete: Bool = false, force: Bool = false) {
         let now = ProcessInfo.processInfo.systemUptime
         let firstAcknowledgment = completed > 0 && lastReportedBytes <= 0
-        guard force || complete || lastReportedBytes < 0 || firstAcknowledgment || now - lastReportTime >= 0.1 else { return }
+        guard force || complete || lastReportedBytes < 0 || lastReportedPath != relativePath || firstAcknowledgment || now - lastReportTime >= 0.1 else { return }
         let elapsed = now - started
-        progress(SFTPTransferProgress(completedBytes: completed, totalBytes: total,
+        progress(FileTransferProgress(bytesTransferred: UInt64(max(0, completed)), totalBytes: UInt64(max(0, total)), relativePath: relativePath,
             bytesPerSecond: elapsed > 0 && completed > 0 ? Double(completed) / elapsed : nil, isComplete: complete))
-        lastReportTime = now; lastReportedBytes = completed
+        lastReportTime = now; lastReportedBytes = completed; lastReportedPath = relativePath
     }
     private func localAttributes(_ url: URL) throws -> SFTPAttributes {
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
@@ -423,7 +415,10 @@ private final class SFTPTransferWorker {
                 try connection.checkCancellation()
                 let target = try remotePath(staging, node.components)
                 if node.kind == .directory { try connection.mkdir(target) }
-                else { try uploadFile(localPath(local, node.components), destination: target, node: node) }
+                else {
+                    relativePath = node.components.joined(separator: "/")
+                    try uploadFile(localPath(local, node.components), destination: target, node: node)
+                }
             }
             for node in nodes.reversed() {
                 try connection.setAttributes(remotePath(staging, node.components), permissions: node.permissions,
@@ -531,7 +526,10 @@ private final class SFTPTransferWorker {
                     if errno == EEXIST { throw SFTPFileSystemError.localNameCollision(source) }
                     throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
                 }
-            } else { try downloadFile(remotePath(source, node.components), destination: target, node: node) }
+            } else {
+                relativePath = node.components.joined(separator: "/")
+                try downloadFile(remotePath(source, node.components), destination: target, node: node)
+            }
         }
         for node in nodes.reversed() { try setLocalAttributes(localRawPath(staging, node.components), node: node) }
         try connection.checkCancellation()

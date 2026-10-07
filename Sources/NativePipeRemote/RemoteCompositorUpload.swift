@@ -1,4 +1,5 @@
 import NativePipeStrings
+import NativePipeProtocol
 import CryptoKit
 import Darwin
 import Foundation
@@ -6,10 +7,10 @@ import Foundation
 /// The bounded SSH prelude ends before RemoteStreamDecoder receives any bytes.
 /// All disk hashing and pipe I/O run on the connection reader, off the UI actor.
 enum RemoteCompositorUpload {
-    static let maximumArchiveSize = 512 * 1024 * 1024
-
     static func prepare(directory: URL, input: FileHandle, output: FileHandle,
-                        write: (FileHandle, Data) throws -> Void) throws -> Bool {
+                        write: (FileHandle, Data) throws -> Void,
+                        activity: @escaping @Sendable () -> Void = {}) throws -> Bool {
+        let progress = FileTransferProgressTracker { _ in activity() }
         guard let request = try readLine(output) else { return false }
         guard request == "NATIVEPIPE INSTALLER" else {
             throw RemoteError.message(NPText("Invalid NativePipe installation response: %@", request))
@@ -36,8 +37,8 @@ enum RemoteCompositorUpload {
         var hash = SHA256(), size = 0
         while let chunk = try archive.read(upToCount: 1_048_576), !chunk.isEmpty {
             size += chunk.count
-            guard size <= maximumArchiveSize else { throw RemoteError.message(NPText("NativePipe archive exceeds the size limit.")) }
             hash.update(data: chunk)
+            progress.report(UInt64(size), relativePath: "hash")
         }
         guard size > 0 else { throw RemoteError.message(NPText("NativePipe archive is empty: %@.", name)) }
         let digest = hash.finalize().map { String(format: "%02x", $0) }.joined()
@@ -47,18 +48,16 @@ enum RemoteCompositorUpload {
         case "NATIVEPIPE CACHED": return true
         case "NATIVEPIPE UPLOAD":
             try archive.seek(toOffset: 0)
-            let deadline = ProcessInfo.processInfo.systemUptime + 300
             var remaining = size
             while remaining > 0 {
-                guard ProcessInfo.processInfo.systemUptime < deadline else {
-                    throw RemoteError.message(NPText("NativePipe upload timed out."))
-                }
                 guard let chunk = try archive.read(upToCount: min(65_536, remaining)), !chunk.isEmpty else {
                     throw RemoteError.message(NPText("NativePipe archive changed during upload."))
                 }
                 try write(input, chunk)
                 remaining -= chunk.count
+                progress.report(UInt64(size - remaining), relativePath: "upload")
             }
+            progress.finish()
             return true
         default: throw RemoteError.message(NPText("Invalid NativePipe upload response: %@", response))
         }

@@ -104,7 +104,6 @@
 "NativePipe SSH" = "NativePipe SSH";
 "NativePipe SSH — %@" = "NativePipe SSH — %@";
 "NativePipe archive changed during upload." = "L’archivio NativePipe è cambiato durante il caricamento.";
-"NativePipe archive exceeds the size limit." = "L’archivio NativePipe supera il limite di dimensione.";
 "NativePipe archive is empty: %@." = "L’archivio NativePipe è vuoto: %@.";
 "NativePipe doesn’t support this Linux computer’s architecture (%@). Supported architectures: aarch64 and x86_64." = "NativePipe non supporta l’architettura di questo computer Linux (%@). Architetture supportate: aarch64 e x86_64.";
 "NativePipe installation did not finish in time. Check the remote connection and available disk space." = "L’installazione di NativePipe non è terminata in tempo. Controlla connessione remota e spazio libero.";
@@ -210,7 +209,6 @@
 "Zoom" = "Zoom";
 "agent wire: bad magic" = "protocollo agente: identificatore magico errato";
 "agent wire: name too long" = "protocollo agente: nome troppo lungo";
-"agent wire: payload too large" = "protocollo agente: payload troppo grande";
 "agent wire: truncated frame" = "protocollo agente: frame troncato";
 "agent wire: unsupported version" = "protocollo agente: versione non supportata";
 "agent wire: version too long" = "protocollo agente: versione troppo lunga";
@@ -256,3 +254,30 @@
 "Couldn’t match the Linux applications to the macOS appearance: %@" = "Impossibile adattare l’aspetto delle applicazioni Linux a quello di macOS: %@";
 "NativePipe couldn’t accept local connections: %@" = "NativePipe non ha potuto accettare connessioni locali: %@";
 "A local NativePipe connection failed: %@" = "Una connessione locale di NativePipe non è riuscita: %@";
+
+"That request was not understood." = "Impossibile interpretare questa richiesta.";
+"That link is not valid." = "Questo link non è valido.";
+"That file path is not valid." = "Questo percorso di file non è valido.";
+"That shared folder is no longer available." = "Questa cartella condivisa non è più disponibile.";
+"Open a link from %@?" = "Aprire un link da %@?";
+"The application for this link will open on your Mac. Mail links may include attachments; review the draft before sending." = "L’app associata a questo link si aprirà sul Mac. I link email possono includere allegati; controlla la bozza prima di inviarla.";
+"This link includes sign-in credentials, which are hidden here." = "Questo link include credenziali di accesso, nascoste qui.";
+"Open" = "Apri";
+"Receive an item from %@?" = "Ricevere un elemento da %@?";
+"Save a copy without opening it, or receive and open it on your Mac. Programs, scripts and installers need a separate confirmation before opening." = "Salva una copia senza aprirla oppure ricevi e apri l’elemento sul Mac. Programmi, script e programmi di installazione richiedono una conferma separata prima dell’apertura.";
+"Save…" = "Salva…";
+"Open this program or installer?" = "Aprire questo programma o programma di installazione?";
+"%@ was received from %@. Opening it may run code or change your Mac. Allow this item to open?" = "%@ è stato ricevuto da %@. L’apertura può eseguire codice o modificare il Mac. Consentire l’apertura di questo elemento?";
+"Save Received Item" = "Salva elemento ricevuto";
+"Receiving from %@" = "Ricezione da %@";
+"Another request is waiting. Try again in a moment." = "Un’altra richiesta è in attesa. Riprova tra poco.";
+"Opening on the Mac is switched off." = "L’apertura sul Mac è disattivata.";
+"The request was cancelled." = "La richiesta è stata annullata.";
+"Saved on the Mac." = "Salvato sul Mac.";
+"The item could not be received or opened on the Mac: %@" = "Impossibile ricevere o aprire l’elemento sul Mac: %@";
+"The Mac could not open it." = "Il Mac non ha potuto aprire questo elemento.";
+"The NativePipe release doesn’t contain np-open." = "Questa versione di NativePipe non contiene np-open.";
+
+"Choose where to save %@." = "Scegli dove salvare %@.";
+"Save" = "Salva";
+"Use a path on the connected Linux machine to receive files." = "Per ricevere file, usa un percorso sulla macchina Linux connessa.";

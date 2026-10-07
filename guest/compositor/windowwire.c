@@ -84,11 +84,15 @@ void np_window_put_i32(struct np_window_message *message, int32_t value) {
 	np_window_put_u32(message, (uint32_t)value);
 }
 
+void np_window_put_u64(struct np_window_message *message, uint64_t value) {
+	np_window_put_u32(message, (uint32_t)value);
+	np_window_put_u32(message, (uint32_t)(value >> 32));
+}
+
 void np_window_put_f64(struct np_window_message *message, double value) {
 	uint64_t bits;
 	memcpy(&bits, &value, sizeof(bits));
-	np_window_put_u32(message, (uint32_t)bits);
-	np_window_put_u32(message, (uint32_t)(bits >> 32));
+	np_window_put_u64(message, bits);
 }
 
 void np_window_put_bytes(struct np_window_message *message,
@@ -221,13 +225,17 @@ int32_t np_window_read_i32(struct np_window_reader *reader) {
 	return (int32_t)np_window_read_u32(reader);
 }
 
+uint64_t np_window_read_u64(struct np_window_reader *reader) {
+	uint64_t value = np_window_read_u32(reader);
+	return value | ((uint64_t)np_window_read_u32(reader) << 32);
+}
+
 double np_window_read_fixed(struct np_window_reader *reader) {
 	return (double)np_window_read_i32(reader) / 256.0;
 }
 
 double np_window_read_f64(struct np_window_reader *reader) {
-	uint64_t bits = np_window_read_u32(reader);
-	bits |= (uint64_t)np_window_read_u32(reader) << 32;
+	uint64_t bits = np_window_read_u64(reader);
 	double value = 0;
 	memcpy(&value, &bits, sizeof(value));
 	return value;

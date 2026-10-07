@@ -8,6 +8,8 @@ public enum NativePipePort {
     public static let portal: UInt32 = 1027
     public static let pasteboard: UInt32 = 1028
     public static let agent: UInt32 = 1029
+    /// Guest-initiated requests to open a URL or file on the Mac (np-open).
+    public static let hostOpen: UInt32 = 1030
 
     public static let sessionFirst: UInt32 = 2048
     public static let sessionLast: UInt32 = 2303

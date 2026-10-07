@@ -7,7 +7,7 @@
 
 #define NP_WINDOW_MAX_FIELD (8u * 1024u * 1024u)
 #define NP_WINDOW_MAX_COLLECTION 4096u
-#define NP_WINDOW_PROTOCOL_VERSION 10u
+#define NP_WINDOW_PROTOCOL_VERSION 12u
 
 enum np_window_direction {
 	NP_WINDOW_GUEST_TO_HOST = 1,
@@ -49,6 +49,11 @@ enum np_window_guest_opcode {
 	NP_GUEST_POPUP_PLACEMENT_REQUESTED = 35,
 	NP_GUEST_FORCE_QUIT_CAPABILITY_CHANGED = 36,
 	NP_GUEST_FILE_DRAG = 37,
+	NP_GUEST_NOTIFICATION_POSTED = 38,
+	NP_GUEST_NOTIFICATION_CLOSED = 39,
+	NP_GUEST_HOST_OPEN_REQUESTED = 40,
+	NP_GUEST_HOST_OPEN_CANCELLED = 41,
+	NP_GUEST_NOTIFICATION_BACKLOG_RESET = 42,
 };
 
 enum np_window_host_opcode {
@@ -80,6 +85,9 @@ enum np_window_host_opcode {
 	NP_HOST_CAPTURE_FRAME,
 	NP_HOST_APPLICATION_REQUEST = 27,
 	NP_HOST_FILE_DRAG = 28,
+	NP_HOST_NOTIFICATION_CLOSED = 29,
+	NP_HOST_NOTIFICATION_ACTION = 30,
+	NP_HOST_OPEN_RESPONSE = 31,
 };
 
 enum np_window_pixel_format {
@@ -144,6 +152,7 @@ void np_window_put_u8(struct np_window_message *message, uint8_t value);
 void np_window_put_bool(struct np_window_message *message, bool value);
 void np_window_put_u16(struct np_window_message *message, uint16_t value);
 void np_window_put_u32(struct np_window_message *message, uint32_t value);
+void np_window_put_u64(struct np_window_message *message, uint64_t value);
 void np_window_put_i32(struct np_window_message *message, int32_t value);
 void np_window_put_f64(struct np_window_message *message, double value);
 void np_window_put_string(struct np_window_message *message, const char *value);
@@ -162,6 +171,7 @@ uint8_t np_window_read_u8(struct np_window_reader *reader);
 bool np_window_read_bool(struct np_window_reader *reader);
 uint16_t np_window_read_u16(struct np_window_reader *reader);
 uint32_t np_window_read_u32(struct np_window_reader *reader);
+uint64_t np_window_read_u64(struct np_window_reader *reader);
 int32_t np_window_read_i32(struct np_window_reader *reader);
 double np_window_read_fixed(struct np_window_reader *reader);
 double np_window_read_f64(struct np_window_reader *reader);

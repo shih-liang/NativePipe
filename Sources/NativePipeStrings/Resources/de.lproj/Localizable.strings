@@ -104,7 +104,6 @@
 "NativePipe SSH" = "NativePipe SSH";
 "NativePipe SSH — %@" = "NativePipe SSH — %@";
 "NativePipe archive changed during upload." = "NativePipe-Archiv wurde während des Uploads geändert.";
-"NativePipe archive exceeds the size limit." = "NativePipe-Archiv überschreitet die Größenbegrenzung.";
 "NativePipe archive is empty: %@." = "NativePipe-Archiv ist leer: %@.";
 "NativePipe doesn’t support this Linux computer’s architecture (%@). Supported architectures: aarch64 and x86_64." = "NativePipe unterstützt die Architektur dieses Linux-Computers nicht (%@). Unterstützt: aarch64 und x86_64.";
 "NativePipe installation did not finish in time. Check the remote connection and available disk space." = "NativePipe-Installation wurde nicht rechtzeitig abgeschlossen. Prüfe Remoteverbindung und freien Speicherplatz.";
@@ -210,7 +209,6 @@
 "Zoom" = "Zoomen";
 "agent wire: bad magic" = "Agent-Protokoll: ungültige Kennung";
 "agent wire: name too long" = "Agent-Protokoll: Name zu lang";
-"agent wire: payload too large" = "Agent-Protokoll: Nutzlast zu groß";
 "agent wire: truncated frame" = "Agent-Protokoll: Frame abgeschnitten";
 "agent wire: unsupported version" = "Agent-Protokoll: nicht unterstützte Version";
 "agent wire: version too long" = "Agent-Protokoll: Version zu lang";
@@ -256,3 +254,30 @@
 "Couldn’t match the Linux applications to the macOS appearance: %@" = "Das Erscheinungsbild der Linux-Anwendungen konnte nicht an macOS angepasst werden: %@";
 "NativePipe couldn’t accept local connections: %@" = "NativePipe konnte keine lokalen Verbindungen annehmen: %@";
 "A local NativePipe connection failed: %@" = "Eine lokale NativePipe-Verbindung ist fehlgeschlagen: %@";
+
+"That request was not understood." = "Diese Anfrage konnte nicht verarbeitet werden.";
+"That link is not valid." = "Dieser Link ist ungültig.";
+"That file path is not valid." = "Dieser Dateipfad ist ungültig.";
+"That shared folder is no longer available." = "Dieser geteilte Ordner ist nicht mehr verfügbar.";
+"Open a link from %@?" = "Link von %@ öffnen?";
+"The application for this link will open on your Mac. Mail links may include attachments; review the draft before sending." = "Die zu diesem Link gehörende App wird auf deinem Mac geöffnet. E-Mail-Links können Anhänge enthalten. Prüfe den Entwurf vor dem Senden.";
+"This link includes sign-in credentials, which are hidden here." = "Dieser Link enthält Anmeldedaten, die hier ausgeblendet sind.";
+"Open" = "Öffnen";
+"Receive an item from %@?" = "Objekt von %@ empfangen?";
+"Save a copy without opening it, or receive and open it on your Mac. Programs, scripts and installers need a separate confirmation before opening." = "Speichere eine Kopie, ohne sie zu öffnen, oder empfange und öffne sie auf deinem Mac. Programme, Skripte und Installationsprogramme erfordern vor dem Öffnen eine weitere Bestätigung.";
+"Save…" = "Sichern…";
+"Open this program or installer?" = "Dieses Programm oder Installationsprogramm öffnen?";
+"%@ was received from %@. Opening it may run code or change your Mac. Allow this item to open?" = "%@ wurde von %@ empfangen. Beim Öffnen kann Code ausgeführt oder dein Mac verändert werden. Darf dieses Objekt geöffnet werden?";
+"Save Received Item" = "Empfangenes Objekt sichern";
+"Receiving from %@" = "Empfang von %@";
+"Another request is waiting. Try again in a moment." = "Eine andere Anfrage wartet bereits. Versuche es gleich noch einmal.";
+"Opening on the Mac is switched off." = "Das Öffnen auf dem Mac ist deaktiviert.";
+"The request was cancelled." = "Die Anfrage wurde abgebrochen.";
+"Saved on the Mac." = "Auf dem Mac gesichert.";
+"The item could not be received or opened on the Mac: %@" = "Das Objekt konnte auf dem Mac nicht empfangen oder geöffnet werden: %@";
+"The Mac could not open it." = "Der Mac konnte dieses Objekt nicht öffnen.";
+"The NativePipe release doesn’t contain np-open." = "Diese NativePipe-Version enthält np-open nicht.";
+
+"Choose where to save %@." = "Wähle aus, wo %@ gesichert werden soll.";
+"Save" = "Sichern";
+"Use a path on the connected Linux machine to receive files." = "Verwende einen Pfad auf dem verbundenen Linux-Rechner, um Dateien zu empfangen.";

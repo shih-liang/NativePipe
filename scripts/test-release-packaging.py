@@ -3,6 +3,7 @@
 import io
 import hashlib
 import json
+import plistlib
 from pathlib import Path
 import subprocess
 import tarfile
@@ -18,9 +19,15 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-release-check-") as folder:
 
     def archive(path, executables):
         with tarfile.open(path, "w:gz") as output:
-            for name in executables + license_files + ["VERSION"]:
+            extra = ["NativePipe.app/Contents/Info.plist"] if path.name == "nativepipe-macos-universal.tar.gz" else []
+            for name in executables + license_files + ["VERSION"] + extra:
                 if name == "VERSION":
                     data = (source / "Sources/NativePipeStrings/Resources/VERSION").read_bytes()
+                elif name == "NativePipe.app/Contents/Info.plist":
+                    version = (source / "Sources/NativePipeStrings/Resources/VERSION").read_text().strip()
+                    data = plistlib.dumps({"CFBundleExecutable": "nativepipe", "CFBundleIdentifier": "com.nativepipe.cli", "CFBundlePackageType": "APPL", "CFBundleShortVersionString": version, "CFBundleVersion": version})
+                elif name == "bin/nativepipe":
+                    data = b'#!/bin/sh\nroot=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)\nexec "$root/NativePipe.app/Contents/MacOS/nativepipe" "$@"\n'
                 else:
                     data = (source / name).read_bytes() if name in license_files else b"build fixture\n"
                 item = tarfile.TarInfo(name)
@@ -32,13 +39,14 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-release-check-") as folder:
             artifact = linux / f"nativepipe-linux-{arch}-{libc}"
             for path in (f"guest/compositor/dist/vmpipe-wayland-{arch}-{libc}",
                          f"guest/session/dist/nativepipe-session-{arch}-{libc}",
+                         f"guest/session/dist/nativepipe-open-{arch}-{libc}",
                          f"guest/session/dist/nativepipe-align-blob-{arch}-{libc}.so",
                          f"guest/session/dist/nativepipe-vulkan-layer-{arch}-{libc}.so"):
                 target = artifact / path
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(b"build fixture")  # Artifacts lose their executable mode.
-            archive(artifact / f"nativepipe-compositor-{arch}-{libc}.tar.gz", ["nativepipe-wayland", "libexec/nativepipe-wayland"])
-    archive(macos / "nativepipe-macos-universal.tar.gz", ["bin/nativepipe"])
+            archive(artifact / f"nativepipe-compositor-{arch}-{libc}.tar.gz", ["nativepipe-wayland", "libexec/nativepipe-wayland", "libexec/np-open"])
+    archive(macos / "nativepipe-macos-universal.tar.gz", ["bin/nativepipe", "NativePipe.app/Contents/MacOS/nativepipe"])
     subprocess.run(["sh", "scripts/package-release.sh", str(linux), str(macos), str(root / "release")], check=True)
     subprocess.run(["python3", "scripts/verify-release.py", str(root / "release")], check=True)
 
@@ -54,7 +62,12 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-release-check-") as folder:
         with tarfile.open(bundle) as content:
             entries = [(member, content.extractfile(member).read() if member.isfile() else b"")
                        for member in content.getmembers()]
-        for missing in license_files + ["VERSION"]:
+        required_helpers = ["libexec/np-open"] if name.startswith("nativepipe-compositor-") else []
+        required_metadata = []
+        if name == "nativepipe-macos-universal.tar.gz":
+            required_helpers = ["NativePipe.app/Contents/MacOS/nativepipe"]
+            required_metadata = ["NativePipe.app/Contents/Info.plist"]
+        for missing in license_files + ["VERSION"] + required_helpers + required_metadata:
             with tarfile.open(bundle, "w:gz") as output:
                 for member, data in entries:
                     if member.name.removeprefix("./") != missing:
@@ -64,7 +77,10 @@ with tempfile.TemporaryDirectory(prefix="nativepipe-release-check-") as folder:
                 f"{digest}  {name}\n" if line.split("  ", 1)[1] == name else line + "\n"
                 for line in original_sums.decode().splitlines()))
             rejected = subprocess.run(["python3", "scripts/verify-release.py", str(root / "release")], capture_output=True)
-            expected = "Missing release version" if missing == "VERSION" else f"Missing project license file {missing}"
+            expected = ("Missing release version" if missing == "VERSION" else
+                        "Missing application metadata" if missing in required_metadata else
+                        f"Missing executable {missing}" if missing in required_helpers else
+                        f"Missing project license file {missing}")
             assert rejected.returncode != 0 and expected.encode() in rejected.stderr, (name, missing, rejected.stderr)
 
         with tarfile.open(bundle, "w:gz") as output:

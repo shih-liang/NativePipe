@@ -239,18 +239,35 @@ public final class WindowBridge: NSObject {
             contentsScale: frame.pixelDensity(for: logical))
     }
 
+    /// The smallest long edge, in points, of a cursor that was divided down from
+    /// physical pixels. A bitmap core cursor of 16 pixels would otherwise
+    /// become 8 points, smaller than any macOS pointer.
+    static let minimumPhysicalPixelCursorEdge: CGFloat = 16
+
+    /// `pixelScale` above 1 means the client drew the cursor in physical pixels
+    /// (an X11 client behind xwayland-satellite, which hides the display scale
+    /// from Xwayland). Its size and hotspot are converted to points; without
+    /// this a 48-pixel cursor requested by a scaled toolkit showed 48 points tall.
     static func customCursorGeometry(
-        frame: Windowing.Frame, hotSpot requestedHotSpot: CGPoint
+        frame: Windowing.Frame, hotSpot requestedHotSpot: CGPoint, pixelScale: Int = 1
     ) -> CustomCursorGeometry {
         let logical = frame.appKitPointSize
-        let width = max(logical.width, 1)
-        let height = max(logical.height, 1)
+        var factor: CGFloat = 1
+        if pixelScale > 1 {
+            factor = 1 / CGFloat(pixelScale)
+            let edge = max(logical.width, logical.height) * factor
+            if edge > 0, edge < minimumPhysicalPixelCursorEdge {
+                factor *= minimumPhysicalPixelCursorEdge / edge
+            }
+        }
+        let width = max(logical.width * factor, 1)
+        let height = max(logical.height * factor, 1)
         return CustomCursorGeometry(
             imageSize: CGSize(width: width, height: height),
             sourcePixels: frame.fullViewportBufferPixelRect.integral,
             hotSpot: CGPoint(
-                x: min(max(requestedHotSpot.x, 0), max(0, width - 1)),
-                y: min(max(requestedHotSpot.y, 0), max(0, height - 1))))
+                x: min(max(requestedHotSpot.x * factor, 0), max(0, width - 1)),
+                y: min(max(requestedHotSpot.y * factor, 0), max(0, height - 1))))
     }
 
     static func topDownCursorImage(_ image: CIImage, source: CGRect) -> CIImage {
@@ -428,6 +445,7 @@ public final class WindowBridge: NSObject {
     private var pointerCursor = NSCursor.arrow
     private var cursorSurface: UInt32?
     private var cursorHotSpot = CGPoint.zero
+    private var cursorPixelScale = 1
     private var cursorContext: CIContext?
 
     private var windows: [UInt32: NativeWindow] = [:]
@@ -465,6 +483,15 @@ public final class WindowBridge: NSObject {
     /// Fired once when a toplevel has both an app id and a materialized
     /// NSWindow. This is the launcher's end-to-end success signal.
     public var onApplicationWindowMapped: ((String) -> Void)?
+    /// A guest application posted or updated a desktop notification. The
+    /// embedding app decides whether and how to present it; unset drops it.
+    public var onGuestNotification: ((Windowing.GuestNotification) -> Void)?
+    /// A guest application withdrew a notification it posted earlier.
+    public var onGuestNotificationClosed: ((UInt32, UInt64) -> Void)?
+    public var onGuestNotificationBacklogReset: (() -> Void)?
+    /// A compositor handshake starts a new notification ID namespace as well
+    /// as a new window graph, including a reconnect inside a running VM.
+    public var onChannelReady: (() -> Void)?
     /// Mapped toplevel presence, independent of app IDs, occlusion and
     /// minimization. Hosts use this to own their Dock activation policy.
     public var onWindowPresenceChanged: ((Bool) -> Void)? {
@@ -1005,8 +1032,18 @@ public final class WindowBridge: NSObject {
         }
 
         switch event {
+        case .hostOpenRequested, .hostOpenCancelled, .hostOpenRejected: break // owned by the remote host-open coordinator
         case .fileDrag: break // handled above, before rendering
+        case .notificationPosted(let notification): onGuestNotification?(notification)
+        case .notificationClosed(let id, let revision): onGuestNotificationClosed?(id, revision)
+        case .notificationRejected(let id, let revision):
+            if let id, let revision {
+                onGuestNotificationClosed?(id, revision)
+                output?(.notificationClosed(id: id, revision: revision, reason: .undefined))
+            }
+        case .notificationBacklogReset: onGuestNotificationBacklogReset?()
         case .channelReady:
+            onChannelReady?()
             connectionGeneration &+= 1
             // Consumed by WindowChannel as the transport generation boundary.
 			lastDisplays.removeAll(keepingCapacity: true)
@@ -1131,9 +1168,10 @@ public final class WindowBridge: NSObject {
                 presentDragIcon(texture, frame: frame, surface: surface)
             }
 
-        case .cursorChanged(let surface, let hotspotX, let hotspotY):
+        case .cursorChanged(let surface, let hotspotX, let hotspotY, let pixelScale):
             cursorSurface = surface
             cursorHotSpot = CGPoint(x: hotspotX, y: hotspotY)
+            cursorPixelScale = pixelScale
             guard let surface else {
                 pointerCursor = .arrow
                 refreshPointerCursor()
@@ -1438,7 +1476,7 @@ public final class WindowBridge: NSObject {
         let texture = resolved.texture
         defer { withExtendedLifetime(resolved.owner) {} }
         let geometry = Self.customCursorGeometry(
-            frame: frame, hotSpot: cursorHotSpot)
+            frame: frame, hotSpot: cursorHotSpot, pixelScale: cursorPixelScale)
         let source = geometry.sourcePixels.intersection(
             CGRect(x: 0, y: 0, width: texture.width, height: texture.height))
         guard !source.isEmpty,

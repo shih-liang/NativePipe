@@ -23,7 +23,7 @@ extension Windowing.HostCommand {
             return .input
         case .frameReleased:
             return .feedback
-        case .applicationRequest, .fileDrag:
+        case .applicationRequest, .fileDrag, .notificationClosed, .notificationAction, .hostOpenResponse:
             return .control
         }
     }
@@ -45,6 +45,17 @@ public final class WindowCommandWriter: @unchecked Sendable {
     private let queue: DispatchQueue
     private var handle: FileHandle?
     private var pending: [Windowing.HostCommand] = []
+    private struct NotificationFeedback {
+        let revision: UInt64
+        var action: Windowing.HostCommand?
+        var closed: Windowing.HostCommand?
+    }
+    /// The guest admits at most 64 active notifications. Optional feedback
+    /// never consumes the lossless window/input/frame-command budget.
+    private var guestNotifications: [UInt32: UInt64] = [:]
+    private var notificationFeedback: [UInt32: NotificationFeedback] = [:]
+    private var notificationOrder: [UInt32] = []
+    private static let maximumNotifications = 64
     private var head = 0
     private var writerScheduled = false
     private let remote: Bool
@@ -75,6 +86,7 @@ public final class WindowCommandWriter: @unchecked Sendable {
         let old = self.handle
         self.handle = handle
         pending.removeAll(keepingCapacity: true)
+        guestNotifications.removeAll(); notificationFeedback.removeAll(); notificationOrder.removeAll()
         head = 0
         writerScheduled = false
         bulk = nil; bulkOffset = 0; flow = .init(); receivedBytes = 0; remoteFeedback.removeAll()
@@ -87,6 +99,7 @@ public final class WindowCommandWriter: @unchecked Sendable {
         let old = handle
         handle = nil
         pending.removeAll(keepingCapacity: true)
+        guestNotifications.removeAll(); notificationFeedback.removeAll(); notificationOrder.removeAll()
         head = 0
         writerScheduled = false
         bulk = nil; bulkOffset = 0; flow = .init(); receivedBytes = 0; remoteFeedback.removeAll()
@@ -102,6 +115,13 @@ public final class WindowCommandWriter: @unchecked Sendable {
             return
         }
         compactConsumed()
+		if enqueueNotification(command) {
+			let shouldSchedule = !writerScheduled && !notificationOrder.isEmpty
+			if shouldSchedule { writerScheduled = true }
+			lock.unlock()
+			if shouldSchedule { queue.async { self.drain() } }
+			return
+		}
 		guard pending.count < Self.maximumPendingCommands else {
 			let callback = failure
 			lock.unlock()
@@ -113,6 +133,63 @@ public final class WindowCommandWriter: @unchecked Sendable {
         writerScheduled = true
         lock.unlock()
         if shouldSchedule { queue.async { self.drain() } }
+    }
+
+    /// Called on the connection's reader before UI delivery. A replacement or
+    /// guest withdrawal retires queued responses to the old revision, including
+    /// a click whose native callback reaches the main actor late.
+    public func observeGuestNotification(_ event: Windowing.GuestEvent) {
+        lock.lock(); defer { lock.unlock() }
+        guard handle != nil else { return }
+        switch event {
+        case .channelReady:
+            guestNotifications.removeAll(); notificationFeedback.removeAll(); notificationOrder.removeAll()
+        case .notificationPosted(let notification):
+            observeNotification(id: notification.id, revision: notification.revision)
+        case .notificationRejected(let id, let revision):
+            if let id, let revision { observeNotification(id: id, revision: revision) }
+        case .notificationClosed(let id, let revision):
+            if let current = guestNotifications[id], current <= revision {
+                guestNotifications[id] = nil
+                removeNotificationFeedback(id: id)
+            }
+        default: break
+        }
+    }
+
+    private func observeNotification(id: UInt32, revision: UInt64) {
+        guard id != 0, revision != 0,
+              guestNotifications[id] != nil || guestNotifications.count < Self.maximumNotifications,
+              revision >= (guestNotifications[id] ?? 0) else { return }
+        if guestNotifications[id] != revision { removeNotificationFeedback(id: id) }
+        guestNotifications[id] = revision
+    }
+
+    private func removeNotificationFeedback(id: UInt32) {
+        notificationFeedback[id] = nil
+        notificationOrder.removeAll { $0 == id }
+    }
+
+    /// Return true for optional commands, even when refused: they can never
+    /// turn a malformed action or pressure burst into a transport failure.
+    private func enqueueNotification(_ command: Windowing.HostCommand) -> Bool {
+        let id: UInt32, revision: UInt64, action: Bool
+        switch command {
+        case .notificationAction(let value, let serial, let key):
+            guard !key.isEmpty, !key.contains("\0"), key.utf8.count <= WindowWire.maximumNotificationActionSize else { return true }
+            id = value; revision = serial; action = true
+        case .notificationClosed(let value, let serial, _):
+            id = value; revision = serial; action = false
+        default: return false
+        }
+        guard guestNotifications[id] == revision else { return true }
+        if notificationFeedback[id] == nil {
+            notificationFeedback[id] = .init(revision: revision)
+            notificationOrder.append(id)
+        }
+        if action { notificationFeedback[id]?.action = command }
+        else { notificationFeedback[id]?.closed = command }
+        return true
     }
 
     /// Remote transport credits are not Wayland presentation feedback. A
@@ -240,6 +317,20 @@ public final class WindowCommandWriter: @unchecked Sendable {
                 outbound = .command(pending.remove(at: index))
             }
             if head == pending.count { pending.removeAll(keepingCapacity: true); head = 0 }
+        } else if let id = notificationOrder.first, var feedback = notificationFeedback[id] {
+            // A click and its close are a pair. Coalescing the close must not
+            // swallow the action, and an action is always written first.
+            if let action = feedback.action {
+                outbound = .command(action); feedback.action = nil
+            } else if let closed = feedback.closed {
+                outbound = .command(closed); feedback.closed = nil
+                // The guest closes the D-Bus ID on this reply without echoing
+                // another wire event. Retire only the revision selected here;
+                // a reader may already have observed its replacement.
+                if guestNotifications[id] == feedback.revision { guestNotifications[id] = nil }
+            } else { preconditionFailure("empty notification feedback") }
+            if feedback.action == nil && feedback.closed == nil { removeNotificationFeedback(id: id) }
+            else { notificationFeedback[id] = feedback }
         } else if let bytes = bulk, case let count = flow.allowance(remaining: bytes.count - bulkOffset), count > 0 {
             outbound = .fragment(RemoteWire.fragment(bytes, offset: bulkOffset, lane: 2, count: count))
             flow.sent(count, now: ProcessInfo.processInfo.systemUptime)
@@ -254,6 +345,7 @@ public final class WindowCommandWriter: @unchecked Sendable {
         guard descriptor >= 0 else {
             self.handle = nil
             pending.removeAll(keepingCapacity: true)
+            guestNotifications.removeAll(); notificationFeedback.removeAll(); notificationOrder.removeAll()
             head = 0
             writerScheduled = false
             let callback = failure
@@ -298,6 +390,7 @@ public final class WindowCommandWriter: @unchecked Sendable {
                 if isCurrent {
                     self.handle = nil
                     pending.removeAll(keepingCapacity: true)
+                    guestNotifications.removeAll(); notificationFeedback.removeAll(); notificationOrder.removeAll()
                     head = 0
                     writerScheduled = false
                 }

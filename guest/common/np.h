@@ -1,6 +1,6 @@
 /*
- * Shared guest-side helpers: vsock I/O and NPAG named-file transfer.
- * Linked into both nativepipe-bootstrap and nativepipe-guestd.
+ * Shared NativePipe guest-runtime helpers: filesystem access, vsock I/O and
+ * NPIP session messages. Guest installation and file transfer live in LinuxKit.
  */
 #ifndef NATIVEPIPE_NP_H
 #define NATIVEPIPE_NP_H
@@ -13,20 +13,18 @@
 #define NP_CID_ANY 0xFFFFFFFFu
 #define NP_PORT_CONTROL 1024u
 #define NP_PORT_AGENT 1029u
+#define NP_PORT_HOST_OPEN 1030u
 #define NP_PORT_SESSION_FIRST 2048u
 #define NP_PORT_SESSION_LAST 2303u
 
-#define NP_AGENT_MAGIC "NPAG"
 #define NP_NPIP_MAGIC "NPIP"
 #define NP_WIRE_VERSION 1
-
-#define NP_STATUS_FILE 0
-#define NP_STATUS_UPTODATE 1
-#define NP_STATUS_NOTFOUND 2
 
 #define NP_GUESTD_NAME "nativepipe-guestd"
 #define NP_INSTALLED_BIN "/usr/libexec/nativepipe/nativepipe-guestd"
 #define NP_INSTALLED_VERSION "/usr/libexec/nativepipe/VERSION"
+#define NP_OPEN_NAME "nativepipe-open"
+#define NP_INSTALLED_OPEN "/usr/local/bin/np-open"
 #define NP_SESSION_NAME "nativepipe-session"
 #define NP_INSTALLED_SESSION "/usr/libexec/nativepipe/nativepipe-session"
 #define NP_COMPOSITOR_MUSL_NAME "vmpipe-wayland-musl"
@@ -45,8 +43,6 @@
 #define NP_SESSION_USER_FILE "/var/lib/nativepipe/session-user"
 #define NP_DESKTOP_PREFERENCES_FILE "/var/lib/nativepipe/desktop-preferences"
 #define NP_MAX_VERSION 256
-#define NP_MAX_NAME 256
-#define NP_MAX_AGENT_PAYLOAD (512ULL * 1024ULL * 1024ULL)
 #define NP_MAX_NPIP_PAYLOAD (8u * 1024u * 1024u)
 
 int np_read_full(int fd, void *buf, size_t n);
@@ -65,35 +61,6 @@ int np_run(char *const argv[]);
 /* Connect to host CID 2. retries is attempts with 1s sleep; 0 means once. */
 int np_vsock_connect_host(uint32_t port, int retries);
 int np_vsock_listen(uint32_t port, int backlog);
-
-typedef struct {
-    uint8_t status;
-    char version[NP_MAX_VERSION];
-    uint64_t payload_len;
-} np_agent_hdr;
-
-int np_agent_send_request(int fd, const char *name, const char *ver);
-int np_agent_recv_hdr(int fd, np_agent_hdr *hdr);
-int np_agent_recv_payload_file(int fd, uint64_t len, const char *path, int mode);
-int np_agent_recv_payload_mem(int fd, uint64_t len, uint8_t **out, size_t *out_len);
-int np_agent_discard_payload(int fd, uint64_t len);
-
-/*
- * One-shot pull: connect, request, receive, disconnect.
- * dest_path: write payload here (0755). NULL = memory in *mem.
- * Returns 0 (file written), 1 (uptodate), 2 (notfound), -1 error.
- */
-int np_agent_pull_file(const char *name, const char *ver, const char *dest_path,
-                       char *host_ver, size_t host_ver_cap);
-int np_agent_pull_mem(const char *name, const char *ver, uint8_t **mem, size_t *len,
-                      char *host_ver, size_t host_ver_cap);
-int np_agent_pull_file_n(const char *name, const char *ver, const char *dest_path,
-                         char *host_ver, size_t host_ver_cap, int retries);
-int np_agent_pull_file_mode_n(const char *name, const char *ver,
-                              const char *dest_path, int mode,
-                              char *host_ver, size_t host_ver_cap, int retries);
-int np_agent_pull_mem_n(const char *name, const char *ver, uint8_t **mem, size_t *len,
-                        char *host_ver, size_t host_ver_cap, int retries);
 
 int np_npip_send(int fd, const void *payload, size_t payload_len);
 /* Returns payload length, or -1. Caller frees *out. */

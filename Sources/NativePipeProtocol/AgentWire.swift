@@ -21,7 +21,6 @@ public enum AgentWire {
     public static let statusNotFound: UInt8 = 2
     public static let maxNameLength = 256
     public static let maxVersionLength = 256
-    public static let maxPayloadLength: UInt64 = 512 * 1024 * 1024
     public static let guestdName = "nativepipe-guestd"
 
     public struct Request: Equatable {
@@ -47,7 +46,6 @@ public enum AgentWire {
         case nameTooLong
         case versionTooLong
         case truncated
-        case payloadTooLarge
 
         public var errorDescription: String? {
             switch self {
@@ -56,7 +54,6 @@ public enum AgentWire {
             case .nameTooLong: return NPText("agent wire: name too long")
             case .versionTooLong: return NPText("agent wire: version too long")
             case .truncated: return NPText("agent wire: truncated frame")
-            case .payloadTooLarge: return NPText("agent wire: payload too large")
             }
         }
     }
@@ -124,7 +121,6 @@ public enum AgentWire {
         out.append(contentsOf: u16le(UInt16(ver.count)))
         out.append(ver)
         if let payloadLength {
-            guard payloadLength <= maxPayloadLength else { throw Failure.payloadTooLarge }
             out.append(contentsOf: u64le(payloadLength))
         }
         return out

@@ -15,9 +15,9 @@ for arch in aarch64 x86_64; do
         source="$input/nativepipe-linux-$arch-$libc"
         cp "$source/nativepipe-compositor-$arch-$libc.tar.gz" "$out/"
         install -m0755 "$source/guest/compositor/dist/vmpipe-wayland-$arch-$libc" "$root/guest/compositor/dist/"
-        for name in nativepipe-session nativepipe-align-blob nativepipe-vulkan-layer; do
+        for name in nativepipe-session nativepipe-open nativepipe-align-blob nativepipe-vulkan-layer; do
             suffix=
-            [ "$name" = nativepipe-session ] || suffix=.so
+            case "$name" in nativepipe-session|nativepipe-open) ;; *) suffix=.so ;; esac
             install -m0755 "$source/guest/session/dist/$name-$arch-$libc$suffix" "$root/guest/session/dist/"
         done
     done

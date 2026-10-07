@@ -14,6 +14,8 @@ struct np_shm_texture;
 struct np_sync_surface;
 struct np_sync_point;
 struct np_xwayland;
+struct np_notifications;
+struct np_host_open;
 struct np_window_frame;
 struct np_output_state;
 
@@ -81,12 +83,19 @@ struct np_server {
 	uint32_t last_input_serial;
 	struct wl_resource *cursor_surface;
 	int32_t cursor_hotspot_x, cursor_hotspot_y;
+	/* 1 for logical (Wayland) cursor images; the output scale when the image is
+	 * in physical pixels, as X11 clients behind xwayland-satellite draw it. */
+	uint32_t cursor_pixel_scale;
 	uint32_t drag_focus_surface;
 	struct wl_event_source *scene_retry_timer;
 	char session_socket[128];
 	struct np_xwayland *xwayland;
 	char xwayland_display[16];
 	char xwayland_auth[256];
+	/* Directory of application defaults for X11 clients, exported as XAPPLRESDIR. */
+	char xwayland_appdefaults[256];
+	struct np_notifications *notifications;
+	struct np_host_open *host_open;
 };
 
 struct np_input {

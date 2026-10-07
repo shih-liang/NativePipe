@@ -28,6 +28,19 @@ static bool valid_pointer_grab(struct np_surface *surface,
 	       surface->server->pointer_grab_serial == serial;
 }
 
+/* A move or resize is honoured only for the serial of a pointer press still
+ * held by the same client. Say why one was refused: it is otherwise silent. */
+static void trace_rejected_grab(const char *request, struct np_surface *surface,
+	                            struct wl_client *client, uint32_t serial) {
+	if (!np_trace_enabled() || !surface) return;
+	struct np_server *server = surface->server;
+	fprintf(stderr,
+	        "[xdg] %s refused window=%u serial=%u: buttons=%u grab_serial=%u same_client=%d xwayland=%d\n",
+	        request, surface->window_id, serial, server->pointer_buttons,
+	        server->pointer_grab_serial, server->pointer_grab_client == client,
+	        np_xwayland_owns_client(server, client));
+}
+
 static bool popup_has_child(struct np_surface *surface) {
 	struct np_surface *candidate;
 	wl_list_for_each(candidate, &surface->server->surfaces, link) {
@@ -146,7 +159,10 @@ static void toplevel_move(struct wl_client *client, struct wl_resource *resource
 	// Client-side decorations report title-bar drags here, which is why the host
 	// never has to infer a draggable region.
 	struct np_surface *surface = wl_resource_get_user_data(resource);
-	if (!valid_pointer_grab(surface, client, serial)) return;
+	if (!valid_pointer_grab(surface, client, serial)) {
+		trace_rejected_grab("move", surface, client, serial);
+		return;
+	}
 	uint32_t fields[] = {surface->window_id, serial};
 	np_window_event_send(surface->server, NP_GUEST_INTERACTIVE_MOVE_REQUESTED,
 	                     fields, 2);
@@ -155,8 +171,11 @@ static void toplevel_move(struct wl_client *client, struct wl_resource *resource
 static void toplevel_resize(struct wl_client *client, struct wl_resource *resource,
                             struct wl_resource *seat, uint32_t serial, uint32_t edges) {
 	struct np_surface *surface = wl_resource_get_user_data(resource);
-	if (!valid_pointer_grab(surface, client, serial) ||
-	    edges == XDG_TOPLEVEL_RESIZE_EDGE_NONE ||
+	if (!valid_pointer_grab(surface, client, serial)) {
+		trace_rejected_grab("resize", surface, client, serial);
+		return;
+	}
+	if (edges == XDG_TOPLEVEL_RESIZE_EDGE_NONE ||
 	    !xdg_toplevel_resize_edge_is_valid(
 		    edges, wl_resource_get_version(resource)))
 		return;

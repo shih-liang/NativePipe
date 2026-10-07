@@ -15,6 +15,9 @@ trap finish EXIT
 trap 'exit 1' HUP INT TERM
 root=$(CDPATH= cd -- "${1:?bundle directory}" && pwd)
 binary="$root/libexec/nativepipe-wayland"
+step='np-open helper'
+test -x "$root/libexec/np-open"
+"$root/libexec/np-open" --help > /dev/null
 # Compiler "used" alone does not protect unreferenced data from --gc-sections.
 step='embedded binary stamps'
 # ELF data is not locale-dependent text. In particular, the ARM64/musl

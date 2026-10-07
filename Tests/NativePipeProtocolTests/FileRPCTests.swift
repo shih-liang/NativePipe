@@ -1,6 +1,13 @@
 import XCTest
 import Darwin
 import CNativePipeFileRPC
+
+private final class FileProgressRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [FileTransferProgress] = []
+    var values: [FileTransferProgress] { lock.lock(); defer { lock.unlock() }; return recorded }
+    func append(_ sample: FileTransferProgress) { lock.lock(); recorded.append(sample); lock.unlock() }
+}
 @testable import NativePipeProtocol
 
 final class FileRPCTests: XCTestCase {
@@ -109,13 +116,25 @@ final class FileRPCTests: XCTestCase {
         let files = FileRPCUserAccess(rpc: server.rpc)
         let source = server.root.appendingPathComponent("folder")
         try FileManager.default.createDirectory(at: source, withIntermediateDirectories: false)
-        let bytes = Data(repeating: 0xa5, count: 2 * 1024 * 1024 + 3)
+        let bytes = Data(repeating: 0xa5, count: 32 * 1024 * 1024 + 13)
         try bytes.write(to: source.appendingPathComponent("hello # world.txt"))
-        let paths = try await files.importFiles([source])
+        try Data().write(to: source.appendingPathComponent("empty.txt"))
+        let uploadProgress = FileProgressRecorder()
+        let paths = try await files.importFiles([source], shareDirectories: true,
+                                               progress: { uploadProgress.append($0) })
         XCTAssertTrue(paths[0].path.hasPrefix("/tmp/nativepipe-drop-"))
+        XCTAssertTrue(uploadProgress.values.contains { $0.relativePath == "folder/empty.txt" })
         let received = server.root.appendingPathComponent("result")
-        try await files.exportFile(paths[0], to: received)
+        let progress = FileProgressRecorder()
+        try await files.exportFile(paths[0], to: received, progress: { progress.append($0) })
         XCTAssertEqual(try Data(contentsOf: received.appendingPathComponent("hello # world.txt")), bytes)
+        XCTAssertEqual(try Data(contentsOf: received.appendingPathComponent("empty.txt")).count, 0)
+        XCTAssertEqual(progress.values.last?.bytesTransferred, UInt64(bytes.count))
+        XCTAssertEqual(progress.values.last?.totalBytes, UInt64(bytes.count))
+        XCTAssertEqual(progress.values.last?.isComplete, true)
+        XCTAssertTrue(progress.values.contains { $0.relativePath == "hello # world.txt" })
+        XCTAssertTrue(progress.values.contains { $0.relativePath == "empty.txt" })
+        XCTAssertEqual(progress.values.map(\.bytesTransferred), progress.values.map(\.bytesTransferred).sorted())
         do { try await files.exportFile(paths[0], to: received); XCTFail("must not merge") } catch { }
         XCTAssertEqual(try FileTransferURLs.decode(FileTransferURLs.encode(paths)), paths)
         for invalid in ["file:///", "file://foreign/tmp/file", "https://example.com/file", "file:///tmp/file%00"] {
@@ -124,6 +143,46 @@ final class FileRPCTests: XCTestCase {
         XCTAssertTrue(FileRPC.Failure.remote(38).localizedDescription.contains("not implemented"))
         XCTAssertTrue(FileRPC.Failure.remote(40).localizedDescription.contains("symbolic"))
         XCTAssertTrue(FileRPC.Failure.remote(104).localizedDescription.contains("reset"))
+    }
+
+    @MainActor
+    func testFailedTreeExportPublishesNothingAndRemovesStaging() async throws {
+        let server = try Server()
+        let folder = server.root.appendingPathComponent("source")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        try Data("downloaded before failure".utf8).write(to: folder.appendingPathComponent("file"))
+        try FileManager.default.createSymbolicLink(at: folder.appendingPathComponent("link"),
+                                                 withDestinationURL: server.root.appendingPathComponent("outside"))
+        let destination = server.root.appendingPathComponent("destination")
+        let progress = FileProgressRecorder()
+        do {
+            try await FileRPCUserAccess(rpc: server.rpc).exportFile(URL(fileURLWithPath: "/source"),
+                                                                  to: destination, progress: { progress.append($0) })
+            XCTFail("A symbolic link must not be exported")
+        } catch { }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: server.root.path)
+            .contains { $0.hasPrefix(".nativepipe-transfer-") })
+        XCTAssertFalse(progress.values.contains { $0.isComplete })
+    }
+
+    @MainActor
+    func testMultiSelectionExportUsesTheSameStreamingEngine() async throws {
+        let server = try Server()
+        try Data("first".utf8).write(to: server.root.appendingPathComponent("first"))
+        try Data("second".utf8).write(to: server.root.appendingPathComponent("second"))
+        let destination = server.root.appendingPathComponent("downloads")
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
+        let progress = FileProgressRecorder()
+        let exported = try await FileRPCUserAccess(rpc: server.rpc).exportFiles(
+            [URL(fileURLWithPath: "/first"), URL(fileURLWithPath: "/second")],
+            to: destination, progress: { progress.append($0) })
+        XCTAssertEqual(exported.map(\.lastPathComponent), ["first", "second"])
+        XCTAssertEqual(try String(contentsOf: exported[0], encoding: .utf8), "first")
+        XCTAssertEqual(try String(contentsOf: exported[1], encoding: .utf8), "second")
+        XCTAssertEqual(progress.values.last?.bytesTransferred, 11)
+        XCTAssertEqual(progress.values.last?.totalBytes, 11)
+        XCTAssertEqual(progress.values.filter(\.isComplete).count, 1)
     }
 
     func testBootstrapRequiresFramedPayload() throws {

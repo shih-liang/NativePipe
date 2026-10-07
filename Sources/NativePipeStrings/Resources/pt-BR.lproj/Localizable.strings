@@ -104,7 +104,6 @@
 "NativePipe SSH" = "NativePipe SSH";
 "NativePipe SSH — %@" = "NativePipe SSH — %@";
 "NativePipe archive changed during upload." = "O arquivo NativePipe mudou durante o envio.";
-"NativePipe archive exceeds the size limit." = "O arquivo NativePipe excede o limite de tamanho.";
 "NativePipe archive is empty: %@." = "O arquivo NativePipe está vazio: %@.";
 "NativePipe doesn’t support this Linux computer’s architecture (%@). Supported architectures: aarch64 and x86_64." = "O NativePipe não é compatível com a arquitetura deste computador Linux (%@). Arquiteturas compatíveis: aarch64 e x86_64.";
 "NativePipe installation did not finish in time. Check the remote connection and available disk space." = "A instalação do NativePipe não terminou a tempo. Verifique a conexão remota e o espaço livre.";
@@ -210,7 +209,6 @@
 "Zoom" = "Zoom";
 "agent wire: bad magic" = "protocolo do agente: identificador mágico inválido";
 "agent wire: name too long" = "protocolo do agente: nome longo demais";
-"agent wire: payload too large" = "protocolo do agente: carga útil grande demais";
 "agent wire: truncated frame" = "protocolo do agente: quadro truncado";
 "agent wire: unsupported version" = "protocolo do agente: versão não compatível";
 "agent wire: version too long" = "protocolo do agente: versão longa demais";
@@ -256,3 +254,30 @@
 "Couldn’t match the Linux applications to the macOS appearance: %@" = "Não foi possível adaptar a aparência dos aplicativos Linux à do macOS: %@";
 "NativePipe couldn’t accept local connections: %@" = "O NativePipe não pôde aceitar conexões locais: %@";
 "A local NativePipe connection failed: %@" = "Uma conexão local do NativePipe falhou: %@";
+
+"That request was not understood." = "Não foi possível interpretar esta solicitação.";
+"That link is not valid." = "Este link não é válido.";
+"That file path is not valid." = "Este caminho de arquivo não é válido.";
+"That shared folder is no longer available." = "Esta pasta compartilhada não está mais disponível.";
+"Open a link from %@?" = "Abrir um link de %@?";
+"The application for this link will open on your Mac. Mail links may include attachments; review the draft before sending." = "O app associado a este link será aberto no Mac. Links de e-mail podem incluir anexos; confira o rascunho antes de enviar.";
+"This link includes sign-in credentials, which are hidden here." = "Este link contém credenciais de início de sessão, que estão ocultas aqui.";
+"Open" = "Abrir";
+"Receive an item from %@?" = "Receber um item de %@?";
+"Save a copy without opening it, or receive and open it on your Mac. Programs, scripts and installers need a separate confirmation before opening." = "Salve uma cópia sem abri-la ou receba e abra o item no Mac. Programas, scripts e instaladores exigem uma confirmação separada antes de serem abertos.";
+"Save…" = "Salvar…";
+"Open this program or installer?" = "Abrir este programa ou instalador?";
+"%@ was received from %@. Opening it may run code or change your Mac. Allow this item to open?" = "%@ foi recebido de %@. Abri-lo pode executar código ou alterar o Mac. Permitir a abertura deste item?";
+"Save Received Item" = "Salvar Item Recebido";
+"Receiving from %@" = "Recebendo de %@";
+"Another request is waiting. Try again in a moment." = "Outra solicitação está aguardando. Tente novamente em instantes.";
+"Opening on the Mac is switched off." = "A abertura no Mac está desativada.";
+"The request was cancelled." = "A solicitação foi cancelada.";
+"Saved on the Mac." = "Salvo no Mac.";
+"The item could not be received or opened on the Mac: %@" = "Não foi possível receber ou abrir o item no Mac: %@";
+"The Mac could not open it." = "O Mac não conseguiu abrir este item.";
+"The NativePipe release doesn’t contain np-open." = "Esta versão do NativePipe não contém np-open.";
+
+"Choose where to save %@." = "Escolha onde salvar %@.";
+"Save" = "Salvar";
+"Use a path on the connected Linux machine to receive files." = "Use um caminho da máquina Linux conectada para receber arquivos.";

@@ -104,7 +104,6 @@
 "NativePipe SSH" = "NativePipe SSH";
 "NativePipe SSH — %@" = "NativePipe SSH — %@";
 "NativePipe archive changed during upload." = "El archivo NativePipe cambió durante la subida.";
-"NativePipe archive exceeds the size limit." = "El archivo NativePipe supera el límite de tamaño.";
 "NativePipe archive is empty: %@." = "El archivo NativePipe está vacío: %@.";
 "NativePipe doesn’t support this Linux computer’s architecture (%@). Supported architectures: aarch64 and x86_64." = "NativePipe no es compatible con la arquitectura de este ordenador Linux (%@). Arquitecturas compatibles: aarch64 y x86_64.";
 "NativePipe installation did not finish in time. Check the remote connection and available disk space." = "La instalación de NativePipe no terminó a tiempo. Comprueba la conexión remota y el espacio libre.";
@@ -210,7 +209,6 @@
 "Zoom" = "Zoom";
 "agent wire: bad magic" = "protocolo del agente: identificador mágico incorrecto";
 "agent wire: name too long" = "protocolo del agente: nombre demasiado largo";
-"agent wire: payload too large" = "protocolo del agente: carga útil demasiado grande";
 "agent wire: truncated frame" = "protocolo del agente: trama truncada";
 "agent wire: unsupported version" = "protocolo del agente: versión no compatible";
 "agent wire: version too long" = "protocolo del agente: versión demasiado larga";
@@ -256,3 +254,30 @@
 "Couldn’t match the Linux applications to the macOS appearance: %@" = "No se pudo adaptar la apariencia de las aplicaciones de Linux a la de macOS: %@";
 "NativePipe couldn’t accept local connections: %@" = "NativePipe no pudo aceptar conexiones locales: %@";
 "A local NativePipe connection failed: %@" = "Falló una conexión local de NativePipe: %@";
+
+"That request was not understood." = "No se ha podido interpretar esta solicitud.";
+"That link is not valid." = "Este enlace no es válido.";
+"That file path is not valid." = "Esta ruta de archivo no es válida.";
+"That shared folder is no longer available." = "Esta carpeta compartida ya no está disponible.";
+"Open a link from %@?" = "¿Abrir un enlace de %@?";
+"The application for this link will open on your Mac. Mail links may include attachments; review the draft before sending." = "La aplicación asociada a este enlace se abrirá en tu Mac. Los enlaces de correo pueden incluir archivos adjuntos; revisa el borrador antes de enviarlo.";
+"This link includes sign-in credentials, which are hidden here." = "Este enlace contiene credenciales de inicio de sesión, que se ocultan aquí.";
+"Open" = "Abrir";
+"Receive an item from %@?" = "¿Recibir un ítem de %@?";
+"Save a copy without opening it, or receive and open it on your Mac. Programs, scripts and installers need a separate confirmation before opening." = "Guarda una copia sin abrirla o recíbela y ábrela en tu Mac. Los programas, scripts e instaladores requieren otra confirmación antes de abrirse.";
+"Save…" = "Guardar…";
+"Open this program or installer?" = "¿Abrir este programa o instalador?";
+"%@ was received from %@. Opening it may run code or change your Mac. Allow this item to open?" = "%@ se ha recibido de %@. Abrirlo puede ejecutar código o modificar tu Mac. ¿Permitir que se abra este ítem?";
+"Save Received Item" = "Guardar ítem recibido";
+"Receiving from %@" = "Recibiendo de %@";
+"Another request is waiting. Try again in a moment." = "Hay otra solicitud en espera. Inténtalo de nuevo en un momento.";
+"Opening on the Mac is switched off." = "La apertura en el Mac está desactivada.";
+"The request was cancelled." = "La solicitud se ha cancelado.";
+"Saved on the Mac." = "Guardado en el Mac.";
+"The item could not be received or opened on the Mac: %@" = "No se ha podido recibir o abrir el ítem en el Mac: %@";
+"The Mac could not open it." = "El Mac no ha podido abrir este ítem.";
+"The NativePipe release doesn’t contain np-open." = "Esta versión de NativePipe no contiene np-open.";
+
+"Choose where to save %@." = "Elige dónde guardar %@.";
+"Save" = "Guardar";
+"Use a path on the connected Linux machine to receive files." = "Usa una ruta de la máquina Linux conectada para recibir archivos.";

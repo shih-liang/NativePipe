@@ -429,7 +429,7 @@ final class ViewportGeometryTests: XCTestCase {
 
     func testPendingCursorIsNotVisibleBeforeCoalescedInstallation() {
         let bridge = WindowBridge(frameSource: nil)
-        bridge.apply(.cursorChanged(surface: nil, hotspotX: 0, hotspotY: 0))
+        bridge.apply(.cursorChanged(surface: nil, hotspotX: 0, hotspotY: 0, pixelScale: 1))
 
         XCTAssertTrue(bridge.currentPointerCursor() === NSCursor.arrow)
         bridge.closeAll()
@@ -473,6 +473,56 @@ final class ViewportGeometryTests: XCTestCase {
         XCTAssertEqual(
             geometry.sourcePixels, CGRect(x: 0, y: 0, width: 64, height: 64))
         XCTAssertEqual(geometry.hotSpot, CGPoint(x: 6, y: 8))
+    }
+
+    func testPhysicalPixelCursorFromAnXClientIsConvertedToPoints() {
+        // A scaled toolkit asks X for a 48-pixel cursor on a 2x display. X11
+        // pixels are physical, so it must be 24 points, not 48.
+        let frame = Windowing.Frame(
+            resourceID: 15, width: 48, height: 48, bytesPerRow: 192,
+            format: .bgra8888, scale: 1)
+
+        let geometry = WindowBridge.customCursorGeometry(
+            frame: frame, hotSpot: CGPoint(x: 10, y: 6), pixelScale: 2)
+
+        XCTAssertEqual(geometry.imageSize, CGSize(width: 24, height: 24))
+        XCTAssertEqual(geometry.hotSpot, CGPoint(x: 5, y: 3))
+        XCTAssertEqual(geometry.sourcePixels, CGRect(x: 0, y: 0, width: 48, height: 48),
+                       "All source pixels are still sampled.")
+    }
+
+    func testPhysicalPixelCursorNeverShrinksBelowTheMinimumEdge() {
+        let frame = Windowing.Frame(
+            resourceID: 16, width: 16, height: 16, bytesPerRow: 64,
+            format: .bgra8888, scale: 1)
+
+        let geometry = WindowBridge.customCursorGeometry(
+            frame: frame, hotSpot: CGPoint(x: 4, y: 2), pixelScale: 2)
+
+        // 16 px / 2 would be 8 pt, below the floor, so it is restored to 1:1.
+        XCTAssertEqual(geometry.imageSize, CGSize(width: 16, height: 16))
+        XCTAssertEqual(geometry.hotSpot, CGPoint(x: 4, y: 2))
+
+        let tiny = Windowing.Frame(
+            resourceID: 18, width: 8, height: 8, bytesPerRow: 32,
+            format: .bgra8888, scale: 1)
+        let enlarged = WindowBridge.customCursorGeometry(
+            frame: tiny, hotSpot: CGPoint(x: 2, y: 2), pixelScale: 2)
+        XCTAssertEqual(enlarged.imageSize, CGSize(width: 16, height: 16))
+        XCTAssertEqual(enlarged.hotSpot, CGPoint(x: 4, y: 4), "The hotspot scales with the image.")
+    }
+
+    func testLogicalCursorIsUnchangedByTheDefaultPixelScale() {
+        let frame = Windowing.Frame(
+            resourceID: 17, width: 48, height: 48, bytesPerRow: 192,
+            format: .bgra8888, scale: 1)
+
+        XCTAssertEqual(
+            WindowBridge.customCursorGeometry(frame: frame, hotSpot: CGPoint(x: 10, y: 6)).imageSize,
+            CGSize(width: 48, height: 48))
+        XCTAssertEqual(
+            WindowBridge.customCursorGeometry(frame: frame, hotSpot: CGPoint(x: 10, y: 6), pixelScale: 1).imageSize,
+            CGSize(width: 48, height: 48))
     }
 
     func testCustomCursorViewportAndHotspotUseLogicalCoordinates() {

@@ -135,12 +135,29 @@ final class MediaWireSmokeTests: XCTestCase {
         append(UInt32(41), to: &cursor)
         append(Int32(-3), to: &cursor)
         append(Int32(7), to: &cursor)
-        guard case .cursorChanged(let cursorSurface, let hotspotX, let hotspotY) =
+        XCTAssertThrowsError(try WindowWire.guestEvent(from: cursor), "The current protocol requires an explicit pixel scale.")
+        let unscaled = cursor
+        append(UInt32(1), to: &cursor)
+        guard case .cursorChanged(let cursorSurface, let hotspotX, let hotspotY, let logicalScale) =
             try WindowWire.guestEvent(from: cursor)
         else { return XCTFail("not a cursor change") }
         XCTAssertEqual(cursorSurface, 41)
         XCTAssertEqual(hotspotX, -3)
         XCTAssertEqual(hotspotY, 7)
+        XCTAssertEqual(logicalScale, 1)
+
+        var physical = unscaled
+        append(UInt32(2), to: &physical)
+        guard case .cursorChanged(_, _, _, let pixelScale) =
+            try WindowWire.guestEvent(from: physical)
+        else { return XCTFail("not a cursor change with a pixel scale") }
+        XCTAssertEqual(pixelScale, 2)
+
+        for invalid in [UInt32(0), 9] {
+            var malformed = unscaled
+            append(invalid, to: &malformed)
+            XCTAssertThrowsError(try WindowWire.guestEvent(from: malformed), "scale \(invalid)")
+        }
 
         var shape = Data(WindowWire.lifecycleMagic)
         shape.append(contentsOf: [1, 15, 0, 0])

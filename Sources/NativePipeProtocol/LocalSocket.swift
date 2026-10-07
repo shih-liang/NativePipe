@@ -12,6 +12,9 @@ public final class LocalSocketServer {
     private let url: URL
     private let maximumConnections: Int
     private var run: Run?
+    /// Called after accepted/completed counts change. Consumers read the current
+    /// statistics; notifications can be coalesced without losing work.
+    public var activityDidChange: (@MainActor () -> Void)?
     public var isListening: Bool {
         guard let run else { return false }
         return run.queue.sync { run.listening }
@@ -57,7 +60,8 @@ public final class LocalSocketServer {
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
             run = Run(fd: fd, ownership: lock, url: url,
-                      maximumConnections: maximumConnections, receive: receive)
+                      maximumConnections: maximumConnections, receive: receive,
+                      activityDidChange: { [weak self] in self?.activityDidChange?() })
         } catch {
             if fd >= 0 { close(fd) }
             _ = unlink(url.path)
@@ -68,6 +72,11 @@ public final class LocalSocketServer {
 
     /// Unpublish before a retirement acknowledgement, without truncating it.
     public func stopAccepting() { run?.stopAccepting() }
+    /// Retire atomically with the accept queue. Pending connections must be
+    /// accepted and counted before an owner may decide that the server is idle.
+    @discardableResult public func stopAcceptingIfIdle(expectedAccepted: Int? = nil) -> Bool {
+        run?.stopAcceptingIfIdle(expectedAccepted: expectedAccepted) ?? true
+    }
     public func stop() { let previous = run; run = nil; previous?.stop() }
     public func stopAndWait() async {
         let previous = run; run = nil
@@ -78,6 +87,7 @@ public final class LocalSocketServer {
         let queue = DispatchQueue(label: "com.nativepipe.local-listener", qos: .userInitiated)
         let fd: Int32, ownership: Int32, url: URL, maximumConnections: Int
         let receive: @Sendable (SocketConnection) async -> Void
+        let activityDidChange: @MainActor @Sendable () -> Void
         private var source: DispatchSourceRead!
         private var suspended = false
         var listening = true
@@ -86,35 +96,37 @@ public final class LocalSocketServer {
         private let closedListener = DispatchGroup()
 
         init(fd: Int32, ownership: Int32, url: URL, maximumConnections: Int,
-             receive: @escaping @Sendable (SocketConnection) async -> Void) {
+             receive: @escaping @Sendable (SocketConnection) async -> Void,
+             activityDidChange: @escaping @MainActor @Sendable () -> Void) {
             self.fd = fd; self.ownership = ownership; self.url = url
             self.maximumConnections = maximumConnections; self.receive = receive
+            self.activityDidChange = activityDidChange
             source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
-            source.setEventHandler { [weak self] in self?.acceptReady() }
+            source.setEventHandler { [weak self] in _ = self?.acceptReady() }
             closedListener.enter()
             let closedListener = closedListener
             source.setCancelHandler { Darwin.close(fd); closedListener.leave() }
             source.activate()
         }
 
-        private func acceptReady() {
-            guard listening else { return }
+        private func acceptReady() -> Bool {
+            guard listening else { return true }
             var budget = 64
             while clients.count < maximumConnections && budget > 0 {
                 let descriptor = accept(fd, nil, nil)
                 if descriptor < 0 {
                     switch errno {
                     case EINTR, ECONNABORTED: continue
-                    case EAGAIN: return
+                    case EAGAIN: return true
                     case EMFILE, ENFILE, ENOMEM, ENOBUFS:
                         pause()
                         queue.asyncAfter(deadline: .now() + .milliseconds(50)) { [weak self] in self?.resume() }
-                        return
+                        return false
                     default:
                         let code = errno
                         fputs(NPText("NativePipe couldn’t accept local connections: %@", String(cString: strerror(code))) + "\n", stderr)
                         stopAcceptingOnQueue()
-                        return
+                        return false
                     }
                 }
                 budget -= 1
@@ -122,6 +134,7 @@ public final class LocalSocketServer {
                     let connection = try SocketConnection(owning: descriptor)
                     let id = UUID(), receive = receive
                     statistics.accepted += 1; statistics.active += 1
+                    Task { @MainActor [activityDidChange] in activityDidChange() }
                     let task = Task { [self] in
                         await receive(connection)
                         connection.close()
@@ -129,6 +142,7 @@ public final class LocalSocketServer {
                         queue.async { [self] in
                             clients.removeValue(forKey: id)
                             statistics.completed += 1; statistics.active -= 1
+                            Task { @MainActor [activityDidChange] in activityDidChange() }
                             resume()
                         }
                     }
@@ -139,6 +153,7 @@ public final class LocalSocketServer {
                 }
             }
             if clients.count >= maximumConnections { pause() }
+            return false
         }
         private func pause() {
             guard listening, !suspended else { return }
@@ -158,6 +173,17 @@ public final class LocalSocketServer {
             flock(ownership, LOCK_UN); Darwin.close(ownership)
         }
         func stopAccepting() { queue.sync { stopAcceptingOnQueue() } }
+        func stopAcceptingIfIdle(expectedAccepted: Int?) -> Bool {
+            queue.sync {
+                // A connected caller may not have reached the dispatch source's
+                // event handler yet. Drain it before committing retirement.
+                let drained = acceptReady()
+                guard drained, clients.isEmpty,
+                      expectedAccepted == nil || expectedAccepted == statistics.accepted else { return false }
+                stopAcceptingOnQueue()
+                return true
+            }
+        }
         func stop() {
             queue.sync {
                 stopAcceptingOnQueue()
