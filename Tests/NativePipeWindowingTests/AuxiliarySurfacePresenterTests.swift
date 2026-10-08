@@ -212,7 +212,7 @@ final class AuxiliarySurfacePresenterTests: XCTestCase {
     /// source instead of assuming the first attempt must reach the display.
     @MainActor private func checkRuntimePresentation(kind: AuxiliarySurfacePresenter.Kind) async throws {
         _ = NSApplication.shared
-        let screen = try requireVisibleDesktop()
+        let screen = try PhysicalDisplayTestSupport.requireVisibleDisplay()
         guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal unavailable") }
         let auxiliary = AuxiliarySurfacePresenter(kind: kind, displayClock: DisplayClock())
         defer { auxiliary.onNeedsNewPublication = nil; auxiliary.close() }
@@ -266,10 +266,10 @@ final class AuxiliarySurfacePresenterTests: XCTestCase {
         do {
             try await until(timeout: 6, phaseCompleted)
         } catch {
-            _ = try requireVisibleDesktop() // Skip only an observed desktop/lock limitation.
+            _ = try PhysicalDisplayTestSupport.requireVisibleDisplay()
             throw error
         }
-        _ = try requireVisibleDesktop()
+        _ = try PhysicalDisplayTestSupport.requireVisibleDisplay()
         if let publicationError { throw publicationError }
         XCTAssertFalse(retryLimitReached, "Five real publications must establish a displayed result")
         XCTAssertLessThanOrEqual(phaseAttempts, 5)
@@ -300,10 +300,10 @@ final class AuxiliarySurfacePresenterTests: XCTestCase {
         do {
             try await until(timeout: 6, phaseCompleted)
         } catch {
-            _ = try requireVisibleDesktop()
+            _ = try PhysicalDisplayTestSupport.requireVisibleDisplay()
             throw error
         }
-        _ = try requireVisibleDesktop()
+        _ = try PhysicalDisplayTestSupport.requireVisibleDisplay()
         if let publicationError { throw publicationError }
         XCTAssertFalse(retryLimitReached)
         XCTAssertLessThanOrEqual(phaseAttempts, 5)
@@ -316,24 +316,6 @@ final class AuxiliarySurfacePresenterTests: XCTestCase {
         }
         XCTAssertFalse(panel.isKeyWindow)
         XCTAssertFalse(panel.isMainWindow)
-    }
-
-    @MainActor private func requireVisibleDesktop() throws -> NSScreen {
-        if let session = CGSessionCopyCurrentDictionary() as? [String: Any] {
-            if session["CGSSessionScreenIsLocked"] as? Bool == true {
-                throw XCTSkip("The desktop is locked; a real drawable cannot establish visible presentation")
-            }
-            if session["kCGSSessionOnConsoleKey"] as? Bool == false ||
-                session["kCGSessionLoginDoneKey"] as? Bool == false {
-                throw XCTSkip("No logged-in console session can present the real auxiliary window")
-            }
-        }
-        guard let screen = NSScreen.main,
-              let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
-              CGDisplayIsActive(id.uint32Value) != 0 else {
-            throw XCTSkip("No active physical display for the real drawable runtime test")
-        }
-        return screen
     }
 
     @MainActor func testClosedSubmissionGateFencesVisibleLatchesWithoutDrawableAttempt() async throws {

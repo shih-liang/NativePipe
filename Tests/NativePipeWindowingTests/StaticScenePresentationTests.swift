@@ -20,11 +20,11 @@ final class StaticScenePresentationTests: XCTestCase {
     /// leases; each result itself comes from a real WindowServer drawable.
     @MainActor func testStaticRootSceneRetriesKnownZeroAfterAcknowledgementUntilActuallyDisplayed() async throws {
         _ = NSApplication.shared
+        _ = try PhysicalDisplayTestSupport.requireVisibleDisplay()
         let previousPolicy = NSApp.activationPolicy()
         NSApp.setActivationPolicy(.accessory)
         NSApp.finishLaunching()
         defer { NSApp.setActivationPolicy(previousPolicy) }
-        try requireVisibleDesktop()
         guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal unavailable") }
         let source = StaticSceneSource()
         let bridge = WindowBridge(frameSource: source)
@@ -106,7 +106,7 @@ final class StaticScenePresentationTests: XCTestCase {
             }
             try await Task.sleep(for: .milliseconds(5))
         }
-        try requireVisibleDesktop()
+        _ = try PhysicalDisplayTestSupport.requireVisibleDisplay()
         if let protocolFailure { throw protocolFailure }
         let native = try XCTUnwrap(bridge.window(8))
         let displayed = try XCTUnwrap(positives.first,
@@ -122,13 +122,4 @@ final class StaticScenePresentationTests: XCTestCase {
         XCTAssertLessThanOrEqual(nextID, 5)
     }
 
-    @MainActor private func requireVisibleDesktop() throws {
-        if let session = CGSessionCopyCurrentDictionary() as? [String: Any],
-           session["CGSSessionScreenIsLocked"] as? Bool == true {
-            throw XCTSkip("Desktop locked; a real display result cannot be verified")
-        }
-        guard let screen = NSScreen.main,
-              let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
-              CGDisplayIsActive(id.uint32Value) != 0 else { throw XCTSkip("No active display") }
-    }
 }
