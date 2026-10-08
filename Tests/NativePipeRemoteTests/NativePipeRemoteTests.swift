@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import XCTest
 import NativePipeStrings
 import NativePipeProtocol
@@ -271,22 +272,71 @@ final class NativePipeRemoteTests: XCTestCase {
 
     @MainActor func testInstallationTimesOutOnlyWhenProgressStops() async throws {
         let encoded = try ready().base64EncodedString()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let commands = directory.appendingPathComponent("installer-commands")
+        guard mkfifo(commands.path, 0o600) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        let descriptor = Darwin.open(commands.path, O_RDWR | O_NONBLOCK | O_CLOEXEC)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        let control = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? control.close() }
+        let idleTimeout: Duration = .seconds(1)
+        let progressingFor: Duration = .seconds(2)
+        var started: ContinuousClock.Instant?
+        var progressCount = 0
+        var controlFailure: Error?
         let active = RemoteSession(testExecutable: "/bin/sh", arguments: ["-c", """
             printf 'NATIVEPIPE PHASE INSTALLING\\n' >&2
-            for i in 1 2 3 4 5 6; do sleep 0.06; printf 'Installing…\\n' >&2; done
-            printf 'NATIVEPIPE PHASE READY\\n' >&2
-            printf '%s' '\(encoded)' | /usr/bin/base64 -D
-            read reply
-            """], reportsStartup: true, installationTimeout: .milliseconds(200))
-        defer { active.disconnect() }
-        try await active.connect()
+            while IFS= read -r command < \(SSHCommand.quote(commands.path)); do
+                case "$command" in
+                    progress) printf 'Installing…\\n' >&2 ;;
+                    ready)
+                        printf 'NATIVEPIPE PHASE READY\\n' >&2
+                        printf '%s' '\(encoded)' | /usr/bin/base64 -D
+                        read reply
+                        exit ;;
+                esac
+            done
+            """], reportsStartup: true, installationTimeout: idleTimeout)
+        defer {
+            active.onStartupPhaseChange = nil
+            active.onDiagnostic = nil
+            active.disconnect()
+        }
+        func command(_ value: String) {
+            do { try control.write(contentsOf: Data((value + "\n").utf8)) }
+            catch { controlFailure = error; active.disconnect() }
+        }
+        active.onStartupPhaseChange = { phase in
+            if phase == .installing { started = .now; command("progress") }
+        }
+        // A receipt requests the next publication, rather than assuming six
+        // externally scheduled sleeps all finish within a 200 ms idle window.
+        active.onDiagnostic = { text in
+            guard text == "Installing…\n", let started else { return }
+            progressCount += 1
+            command(started.duration(to: .now) < progressingFor ? "progress" : "ready")
+        }
+        let connection = Task { try await active.connect() }
+        let deadline = Task {
+            do { try await Task.sleep(for: .seconds(6)); connection.cancel() }
+            catch { }
+        }
+        defer { deadline.cancel(); connection.cancel() }
+        try await connection.value
+        XCTAssertNil(controlFailure)
+        XCTAssertGreaterThan(progressCount, 1)
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(started).duration(to: .now), progressingFor)
         XCTAssertTrue(active.isConnected, "Progressing installation may last longer than the idle timeout")
         let stalled = RemoteSession(testExecutable: "/bin/sh", arguments: ["-c",
             "printf 'NATIVEPIPE PHASE INSTALLING\\n' >&2; sleep 5"], reportsStartup: true,
-            installationTimeout: .milliseconds(200))
+            installationTimeout: idleTimeout)
         defer { stalled.disconnect() }
         do { try await stalled.connect(); XCTFail("A stalled installer must fail") }
         catch { XCTAssertTrue(error.localizedDescription.contains("installation did not finish in time")) }
+        XCTAssertFalse(stalled.isConnected)
+        XCTAssertEqual(stalled.exitStatus, 1)
     }
 
     @MainActor func testFailureStageIsRealAndRetryDoesNotNeedManualDisconnect() async throws {
