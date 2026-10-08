@@ -125,6 +125,12 @@ public final class RemoteDisplayController {
 
     private func handle(_ event: Windowing.GuestEvent) {
         switch event {
+        case .presentationClockRequested(_, let sessionID, _):
+            // RemoteInbound already sampled and replied before UI delivery.
+            // Keep journal/session ownership on the main actor without adding
+            // another, delayed clock sample to the transport.
+            bridge.didSamplePresentationClock(sessionID: sessionID)
+            return
         case .channelReady:
             if let guestNotifications {
                 // A replacement host handshake has a new guest ID namespace.

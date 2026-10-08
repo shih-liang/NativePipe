@@ -41,6 +41,12 @@ final class RemoteInbound: @unchecked Sendable {
                 failLocked(RemoteError.message(NPText("Remote media was rejected by the decoder.")))
             }
         case .event(let event):
+            if let sample = PresentationClockResponder.sample(for: event) {
+                // The decoder already verified HELLO before accepting this
+                // event. Calibration measures transport RTT, so answer on the
+                // reader rather than measuring startup/UI queue latency too.
+                writer.send(sample)
+            }
             writer.observeGuestNotification(event)
             if !notificationInbox.offer(event) { appendLocked(.packet(packet), bytes: bytes) }
         default: appendLocked(.packet(packet), bytes: bytes)

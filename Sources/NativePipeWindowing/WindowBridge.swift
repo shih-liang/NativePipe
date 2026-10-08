@@ -409,6 +409,13 @@ public final class WindowBridge: NSObject {
         surfaceToWindow[surface].flatMap { windows[$0]?.displayIntervalNanoseconds } ?? 0
     }
 
+    /// A transport may answer calibration on its reader before UI delivery.
+    /// Adopt that sample's session for outcome replay without resampling time.
+    public func didSamplePresentationClock(sessionID: UInt64) {
+        guard reportsPresentationTime else { return }
+        acceptPresentationSession(sessionID)
+    }
+
     private func acceptPresentationSession(_ sessionID: UInt64) {
         guard sessionID != 0 else { return }
         if presentationSessionID != sessionID {
@@ -1414,12 +1421,10 @@ public final class WindowBridge: NSObject {
                 output?(.notificationClosed(id: id, revision: revision, reason: .undefined))
             }
         case .notificationBacklogReset: onGuestNotificationBacklogReset?()
-        case .presentationClockRequested(let token, let sessionID, let clockEpoch):
-            if reportsPresentationTime {
+        case .presentationClockRequested(_, let sessionID, _):
+            if reportsPresentationTime, let sample = PresentationClockResponder.sample(for: event) {
                 acceptPresentationSession(sessionID)
-                let nanoseconds = UInt64((CACurrentMediaTime() * 1_000_000_000).rounded())
-                send(.presentationClockSample(token: token, sessionID: sessionID,
-                     clockEpoch: clockEpoch, hostTimeNanoseconds: nanoseconds))
+                send(sample)
             }
         case .presentationFeedbackAcknowledged(let sessionID, let clockEpoch, let surface, let presentationID):
             let key = PresentationJournal.Key(sessionID: sessionID, clockEpoch: clockEpoch,

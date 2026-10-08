@@ -82,10 +82,14 @@ public final class WindowCommandWriter: @unchecked Sendable {
             label: "com.nativepipe.window.\(String(describing: lane))", qos: .userInteractive)
     }
 
-    public func install(_ handle: FileHandle) {
+    /// A connection-scoped failure callback is installed under the same lock as
+    /// its handle, so a retiring writer cannot observe its successor's callback.
+    /// Omitting the callback preserves the one configured through onFailure.
+    public func install(_ handle: FileHandle, onFailure: ((Error) -> Void)? = nil) {
         lock.lock()
         let old = self.handle
         self.handle = handle
+        if let onFailure { failure = onFailure }
         pending.removeAll(keepingCapacity: true)
         guestNotifications.removeAll(); notificationFeedback.removeAll(); notificationOrder.removeAll()
         head = 0

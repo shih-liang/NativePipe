@@ -1,10 +1,75 @@
 import XCTest
+import AppKit
 import IOSurface
 import Metal
 import NativePipeProtocol
+import QuartzCore
 @testable import NativePipeRemote
 
+private final class ClockReplyCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [Data] = []
+    func append(_ payload: Data) { lock.lock(); values.append(payload); lock.unlock() }
+    var payloads: [Data] { lock.lock(); defer { lock.unlock() }; return values }
+}
+
 final class RemotePipelineTests: XCTestCase {
+    @MainActor func testClockCalibrationRepliesBeforeHelloReachesBlockedUIAndStopsWithReader() throws {
+        let replySent = DispatchSemaphore(value: 0), readerFinished = DispatchSemaphore(value: 0)
+        let replies = ClockReplyCapture()
+        let writer = WindowCommandWriter(remote: true) { _, record in
+            let payload = Data(record.dropFirst(WireFormat.headerSize))
+            replies.append(payload)
+            replySent.signal()
+        }
+        let pipe = Pipe()
+        writer.install(pipe.fileHandleForWriting)
+        defer { writer.disconnect() }
+        var delivered = 0
+        let inbound = RemoteInbound(writer: writer, media: nil) { _ in delivered += 1 }
+        let before = UInt64((CACurrentMediaTime() * 1_000_000_000).rounded())
+        DispatchQueue.global().async {
+            // These are already decoded records: the stream decoder enforces
+            // HELLO before clock requests, independently of main-actor ready.
+            inbound.receive(.event(.channelReady(sessionID: 1, protocolVersion: WindowWire.windowProtocolVersion)), bytes: 16)
+            inbound.receive(.event(.presentationClockRequested(token: 9, sessionID: 7, clockEpoch: 3)), bytes: 28)
+            readerFinished.signal()
+        }
+        // MainActor cannot drain HELLO or create a window during these waits.
+        XCTAssertEqual(readerFinished.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(replySent.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(delivered, 0)
+        let after = UInt64((CACurrentMediaTime() * 1_000_000_000).rounded())
+        let reply = try XCTUnwrap(replies.payloads.first)
+        XCTAssertEqual(reply.count, 36)
+        guard reply.count == 36 else { return }
+        let sampledTime = reply[28..<36].enumerated().reduce(UInt64(0)) { $0 | UInt64($1.element) << ($1.offset * 8) }
+        XCTAssertGreaterThanOrEqual(sampledTime, before)
+        XCTAssertLessThanOrEqual(sampledTime, after)
+        XCTAssertEqual(reply, try WindowWire.commandPayload(for: .presentationClockSample(
+            token: 9, sessionID: 7, clockEpoch: 3, hostTimeNanoseconds: sampledTime)))
+        XCTAssertEqual(replies.payloads.count, 1)
+
+        inbound.stop()
+        XCTAssertFalse(inbound.receive(.event(.presentationClockRequested(token: 10, sessionID: 7, clockEpoch: 3)), bytes: 28))
+        XCTAssertEqual(replySent.wait(timeout: .now()), .timedOut)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        XCTAssertEqual(delivered, 0, "Stopped generation cannot adopt a stale calibration session on the UI")
+        XCTAssertEqual(replies.payloads.count, 1)
+    }
+
+    @MainActor func testUIClockDeliveryAdoptsSessionWithoutAWindowOrDuplicateSample() {
+        _ = NSApplication.shared
+        let display = RemoteDisplayController(command: SSHCommand(destination: "test",
+            application: ["true"], installCompositor: false))
+        defer { display.disconnect() }
+        var commands: [Windowing.HostCommand] = []
+        display.bridge.output = { commands.append($0) }
+        XCTAssertTrue(display.bridge.dockWindows.isEmpty)
+        display.session.onEvent?(.presentationClockRequested(token: 9, sessionID: 7, clockEpoch: 3))
+        XCTAssertTrue(commands.isEmpty, "The reader already sent the exact token/epoch sample; UI delivery only adopts its journal nonce")
+    }
+
     @MainActor func testDecodeFailuresTerminateOnceAndCannotCrossReset() async throws {
         let frames = RemoteFrameSource()
         defer { frames.removeAll() }
