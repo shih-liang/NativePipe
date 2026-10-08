@@ -42,10 +42,23 @@ final class RemoteCompositorUploadTests: XCTestCase {
                 """
                 let session = RemoteSession(testExecutable: "/usr/bin/python3", arguments: ["-c", peer],
                                             localCompositorDirectory: directory)
+                let started = ContinuousClock.now
                 let task = Task { try await session.connect() }
-                let deadline = Task { try? await Task.sleep(for: .seconds(5)); task.cancel() }
-                defer { deadline.cancel(); session.disconnect() }
-                try await task.value
+                var timedOut = false
+                // This checks bytes and protocol handoff, not Python startup
+                // speed on a shared runner. Keep a bounded fixture safety limit.
+                let deadline = Task {
+                    do { try await Task.sleep(for: .seconds(30)) }
+                    catch { return }
+                    timedOut = true
+                    task.cancel()
+                }
+                defer { deadline.cancel(); task.cancel(); session.disconnect() }
+                do { try await task.value }
+                catch {
+                    XCTFail("Upload fixture failed: target=\(target), cached=\(cached), elapsed=\(started.duration(to: .now)), safetyTimeout=\(timedOut), phase=\(session.startupPhase), exit=\(String(describing: session.remoteExitStatus)), error=\(error), diagnostics=\(session.visibleDiagnostics)")
+                    return
+                }
                 XCTAssertTrue(session.isConnected)
             }
         }
