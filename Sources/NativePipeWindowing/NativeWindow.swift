@@ -262,10 +262,6 @@ final class NativeWindow: NSObject {
         window.toggleFullScreen(nil)
     }
 
-    /// The guest compositor sends one already-composited scene per window.
-    /// This is the only content layer at the host boundary.
-    var rootSurfaceLayer: CALayer? { window != nil ? contentView.surfaceLayer : nil }
-
     // MARK: - Metadata
 
     var title: String = "" {
