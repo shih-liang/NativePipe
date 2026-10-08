@@ -25,3 +25,11 @@ Third-party code retains its existing licenses and copyright notices. Alternativ
 licensing of NativePipe-original code does not relicense third-party components.
 See LICENSES/source-inventory.json for checked-in source origins and the other
 notices under LICENSES/ in release bundles for bundled dependencies.
+
+Linux compositor binaries link private Wayland 1.25.0 server/client libraries
+statically. LICENSES/Wayland-COPYING preserves their complete MIT notice.
+The protocol definitions are pinned to wayland-protocols 1.49; their general
+MIT notice is in LICENSES/Wayland-protocols-COPYING, and each checked-in XML
+or generated protocol source retains its individual upstream notice.
+Remote bundles also include the private SDK's LICENSES tree and exact source
+revisions. See LICENSES/source-inventory.json for the build pins.

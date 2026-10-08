@@ -7,7 +7,7 @@
 
 #define NP_WINDOW_MAX_FIELD (8u * 1024u * 1024u)
 #define NP_WINDOW_MAX_COLLECTION 4096u
-#define NP_WINDOW_PROTOCOL_VERSION 12u
+#define NP_WINDOW_PROTOCOL_VERSION 15u
 
 enum np_window_direction {
 	NP_WINDOW_GUEST_TO_HOST = 1,
@@ -54,6 +54,13 @@ enum np_window_guest_opcode {
 	NP_GUEST_HOST_OPEN_REQUESTED = 40,
 	NP_GUEST_HOST_OPEN_CANCELLED = 41,
 	NP_GUEST_NOTIFICATION_BACKLOG_RESET = 42,
+	NP_GUEST_ACTIVATION_REQUESTED = 43,
+	NP_GUEST_PRESENTATION_CLOCK_REQUESTED = 44,
+	NP_GUEST_TEXT_INPUT_CONTENT_TYPE = 46,
+	NP_GUEST_PRESENTATION_RESULT_ACK = 47,
+	NP_GUEST_PRESENTATION_PAUSE_REACHED = 48,
+	NP_GUEST_PRESENTATION_DRAINED = 49,
+	NP_GUEST_PRESENTATION_RESUMED = 50,
 };
 
 enum np_window_host_opcode {
@@ -88,6 +95,14 @@ enum np_window_host_opcode {
 	NP_HOST_NOTIFICATION_CLOSED = 29,
 	NP_HOST_NOTIFICATION_ACTION = 30,
 	NP_HOST_OPEN_RESPONSE = 31,
+	NP_HOST_TEXT_EDIT = 33,
+	NP_HOST_WINDOW_STATE = 32,
+	NP_HOST_PRESENTATION_CLOCK_SAMPLE = 35,
+	NP_HOST_PRESENTATION_FEEDBACK = 36,
+	NP_HOST_SCENE_CLOCK_SAMPLE = 37,
+	NP_HOST_PRESENTATION_PAUSE = 38,
+	NP_HOST_PRESENTATION_DRAIN = 39,
+	NP_HOST_PRESENTATION_RESUME = 40,
 };
 
 enum np_window_pixel_format {
@@ -143,6 +158,9 @@ struct np_window_frame {
 	bool has_gpu_source;
 	const struct np_window_rect *damage;
 	uint32_t damage_count;
+	bool has_presentation_context;
+	bool requests_presentation_feedback;
+	uint64_t presentation_session, presentation_epoch, presentation_sent;
 };
 
 void np_window_message_init(struct np_window_message *message,

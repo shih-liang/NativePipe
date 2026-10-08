@@ -2,6 +2,7 @@
 
 #include "compositor_internal.h"
 #include "scene.h"
+#include "scale.h"
 #include "window_events.h"
 
 #include <stdio.h>
@@ -188,6 +189,9 @@ static void subcompositor_get_subsurface(struct wl_client *client, struct wl_res
 	surface->above_parent = true;
 	/* A new subsurface is initially top-most among its siblings and parent. */
 	wl_list_insert(parent->children.prev, &surface->sibling_link);
+	/* The parent may already be on another host screen. No window-screen
+	 * notification follows merely adding a child to its current surface tree. */
+	np_scale_subsurface_attached(surface);
 	if (np_trace_enabled())
 		fprintf(stderr, "[wayland] subsurface created surface=%u parent=%u\n",
 		        surface->id, parent->id);

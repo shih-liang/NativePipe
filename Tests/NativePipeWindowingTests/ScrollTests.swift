@@ -45,7 +45,7 @@ final class ScrollTests: XCTestCase {
             view = try XCTUnwrap(native.window?.contentView)
             bridge.output = { [weak self] command in
                 self?.commands.append(command)
-                if case .pointerScroll(_, let x, let y, let precise) = command {
+                if case .pointerScroll(_, let x, let y, let precise, _) = command {
                     self?.scrolls.append(Scroll(x: x, y: y, precise: precise))
                 }
             }
@@ -167,7 +167,7 @@ final class ScrollTests: XCTestCase {
         let view = try XCTUnwrap(native.window?.contentView)
         var deltas: [(Double, Double)] = []
         bridge.output = {
-            if case .pointerScroll(_, let x, let y, let precise) = $0 {
+            if case .pointerScroll(_, let x, let y, let precise, _) = $0 {
                 XCTAssertTrue(precise)
                 deltas.append((x, y))
             }
@@ -186,4 +186,19 @@ final class ScrollTests: XCTestCase {
         }
         XCTAssertEqual(deltas.count, 6)
     }
+    func testAxisDirectionTracksMacOSAndPerMachineOverride() {
+        let bridge = WindowBridge(frameSource: nil)
+        let event = ScrollEvent()
+        event.inverted = true
+        XCTAssertTrue(bridge.scrollDirectionInverted(for: event))
+        var preferences = WindowIntegrationPreferences()
+        preferences.naturalScrolling = false
+        bridge.setIntegrationPreferences(preferences)
+        XCTAssertFalse(bridge.scrollDirectionInverted(for: event))
+        preferences.naturalScrolling = true
+        bridge.setIntegrationPreferences(preferences)
+        event.inverted = false
+        XCTAssertTrue(bridge.scrollDirectionInverted(for: event))
+    }
+
 }

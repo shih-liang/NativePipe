@@ -82,6 +82,7 @@ public final class DockWindowSwitcherController: NSObject, NSPopoverDelegate,
     public var title: String { didSet { refresh() } }
     private let bridgeProvider: () -> WindowBridge?
     private let utilitiesProvider: () -> [Utility]
+    private let showWhenEmpty: Bool
     private weak var presentedBridge: WindowBridge?
     private var presentedSession: UUID?
     private var entries: [Entry] = []
@@ -102,9 +103,13 @@ public final class DockWindowSwitcherController: NSObject, NSPopoverDelegate,
         NSWindow.didEnterFullScreenNotification, NSWindow.didExitFullScreenNotification,
     ]
 
+    /// Hosts with a running machine may keep the chooser available before any
+    /// windows open. An empty chooser never starts a utility automatically.
     public init(title: String, bridge: @escaping () -> WindowBridge?,
+                showWhenEmpty: Bool = false,
                 utilities: @escaping () -> [Utility] = { [] }) {
         self.title = title; bridgeProvider = bridge; utilitiesProvider = utilities
+        self.showWhenEmpty = showWhenEmpty
         anchorPanel = NSPanel(contentRect: anchorView.frame,
                               styleMask: [.borderless, .nonactivatingPanel],
                               backing: .buffered, defer: false)
@@ -143,7 +148,7 @@ public final class DockWindowSwitcherController: NSObject, NSPopoverDelegate,
         let windows = bridge?.dockWindows ?? []
         let utilities = utilitiesProvider().filter(\.visible)
         let count = windows.count + utilities.count
-        guard count > 0 else { closeSwitcher(); return }
+        guard count > 0 || showWhenEmpty else { closeSwitcher(); return }
         if count == 1 {
             closeSwitcher()
             if let window = windows.first { _ = bridge?.activateDockWindow(window.id) }
@@ -177,7 +182,7 @@ public final class DockWindowSwitcherController: NSObject, NSPopoverDelegate,
         }
         let selected = selectedEntry?.id
         reloadEntries()
-        guard !entries.isEmpty else { closeSwitcher(); return }
+        guard !entries.isEmpty || showWhenEmpty else { closeSwitcher(); return }
         applyFilter(preferredID: selected)
     }
 
@@ -212,6 +217,9 @@ public final class DockWindowSwitcherController: NSObject, NSPopoverDelegate,
         let index = filtered.firstIndex { $0.id == preferredID } ?? (filtered.isEmpty ? nil : 0)
         if let index { tableView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false) }
         else { tableView.deselectAll(nil) }
+        emptyLabel.stringValue = entries.isEmpty
+            ? NPText("No open windows")
+            : NPText("No matching windows. Try another title or app name.")
         emptyLabel.isHidden = !filtered.isEmpty
         updateTools()
     }
@@ -520,7 +528,7 @@ public final class DockWindowSwitcherController: NSObject, NSPopoverDelegate,
         guard let screen = NSScreen.screens.first(where: { $0.frame.contains(pointer) }) ?? NSScreen.main else { return .maxY }
         let frame = screen.frame, visible = screen.visibleFrame
         content.preferredContentSize = NSSize(width: min(480, visible.width - 24),
-                                              height: min(560, 154 + CGFloat(entries.count) * 78, visible.height - 24))
+                                              height: min(560, 154 + CGFloat(max(entries.count, 1)) * 78, visible.height - 24))
         let distances: [(NSRectEdge, CGFloat)] = [(.maxY, abs(pointer.y - frame.minY)),
             (.maxX, abs(pointer.x - frame.minX)), (.minX, abs(frame.maxX - pointer.x))]
         let edge = distances.min { $0.1 < $1.1 }?.0 ?? .maxY

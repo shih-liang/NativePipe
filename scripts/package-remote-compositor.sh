@@ -123,4 +123,10 @@ codec_prefix=${CODEC_PREFIX:-.build/codecs/$arch-$libc}
 test -s "$codec_prefix/LICENSES/aom/LICENSE"
 test -s "$codec_prefix/LICENSES/aom/PATENTS"
 cp -R "$codec_prefix/LICENSES/." "$out/LICENSES/"
+
+# The Wayland server/client ABI comes from the pinned private static SDK.
+wayland_prefix=${WAYLAND_PREFIX:-.build/wayland/$arch-$libc}
+test -s "$wayland_prefix/LICENSES/wayland/COPYING"
+test -s "$wayland_prefix/LICENSES/wayland-protocols/COPYING"
+cp -R "$wayland_prefix/LICENSES/." "$out/LICENSES/"
 sed -n '1,25p' guest/encoder/vendor/nvEncodeAPI.h > "$out/LICENSES/NVIDIA-NVENC-header.txt"

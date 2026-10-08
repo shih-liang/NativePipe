@@ -10,6 +10,7 @@
 #include "syncobj.h"
 #include "window_events.h"
 #include "xdg_shell.h"
+#include "presentation_time.h"
 #include "viewporter-server-protocol.h"
 #include "xdg-shell-server-protocol.h"
 
@@ -160,6 +161,8 @@ static void update_buffer_destroyed(struct wl_listener *listener, void *data) {
 
 void np_surface_update_destroy(struct np_surface_update *update, bool release_buffer) {
 	if (!update) return;
+	if (release_buffer)
+		np_presentation_time_discard_commit(update->surface, update->presentation_id);
 	clear_update_wait(update);
 	if (!wl_list_empty(&update->link)) wl_list_remove(&update->link);
 	struct np_surface_update *dependency, *dependency_tmp;
@@ -321,6 +324,7 @@ static struct np_surface_update *snapshot_surface_update(struct np_surface *surf
 		}
 	}
 	bool needs_refresh = surface->pending_buffer_set || damaged || callbacks ||
+	                     np_presentation_time_has_pending(surface) ||
 	                     surface->pending_fifo_set_barrier ||
 	                     surface->pending_fifo_wait_barrier ||
 	                     surface->pending_viewport_changed ||
@@ -409,6 +413,7 @@ static struct np_surface_update *snapshot_surface_update(struct np_surface *surf
 		        (long long)surface->pending_buffer_damage.height);
 	update->set_fifo_barrier = surface->pending_fifo_set_barrier;
 	update->wait_fifo_barrier = surface->pending_fifo_wait_barrier;
+	update->display_feedback = np_presentation_time_has_pending(surface);
 	if (!np_syncobj_take_commit(
 			surface, update->buffer_commit != NP_BUFFER_UNCHANGED, update->buffer,
 			&update->acquire_point, &update->release_point)) {
@@ -449,6 +454,7 @@ static struct np_surface_update *snapshot_surface_update(struct np_surface *surf
 	if (needs_refresh) {
 		update->presentation_id = np_presentation_next_id(surface->server);
 		np_presentation_bind_callbacks(surface, update->presentation_id);
+		np_presentation_time_commit(surface, update->presentation_id);
 	}
 
 	return update;
@@ -559,6 +565,9 @@ static void apply_surface_update_now(struct np_surface_update *update) {
 		apply_surface_update_now(dependency);
 	}
 	struct np_surface *surface = update->surface;
+	bool was_flat = !np_scene_root(surface);
+	bool had_published = surface->has_published;
+	np_presentation_time_apply(surface, update->presentation_id);
 	np_sync_point_destroy(update->acquire_point);
 	update->acquire_point = NULL;
 	if (update->host_configure_serial)
@@ -691,11 +700,38 @@ static void apply_surface_update_now(struct np_surface_update *update) {
 	} else if (update->presentation_id) {
 		if (!((update->viewport_changed || update->geometry_set || scale_changed ||
 		       update->offset_changed ||
-		       update->subsurface_state_changed) &&
+		       update->subsurface_state_changed || update->display_feedback) &&
 		      np_presentation_queue_last(surface, update->presentation_id)))
 			np_presentation_request_refresh(surface, update->presentation_id);
 	}
 	np_shm_texture_note_damage(surface, &update->damage);
+	if (was_flat && update->buffer_commit == NP_BUFFER_DETACH) {
+		/* This envelope has never been admitted. Detaching replaces its
+		 * contents, but submitted feedback remains in the session ledger. */
+		if (surface->pending_frame) {
+			uint32_t old = surface->pending_presentation_id;
+			np_presentation_time_discard_commit(surface, old);
+			np_presentation_rebind_callbacks(surface, old, update->presentation_id);
+			np_scene_presented(surface, old);
+			free(surface->pending_frame);
+			surface->pending_frame = NULL;
+			surface->pending_frame_size = 0;
+			surface->pending_presentation_id = 0;
+		}
+		if (had_published && (surface->role == NP_SURFACE_ROLE_CURSOR ||
+		                      surface->role == NP_SURFACE_ROLE_DRAG_ICON)) {
+			uint32_t fields[] = { surface->id };
+			np_window_event_send(surface->server, NP_GUEST_SURFACE_UNMAPPED, fields, 1);
+		}
+	}
+	/* No new attachment is legal: retained current contents can be presented.
+	 * A surface awaiting a role keeps its bound query until activation. */
+	bool no_content = !surface->has_published && !surface->current_gpu &&
+	                  !surface->current_shm && !surface->current_buffer;
+	if (update->buffer_commit == NP_BUFFER_DETACH || no_content)
+		np_presentation_time_discard_commit(surface, update->presentation_id);
+	else if (!np_scene_root(surface))
+		np_presentation_time_scene(surface, update->presentation_id, update->presentation_id);
 
 	if (update->set_fifo_barrier) {
 		surface->fifo_barrier_active = true;

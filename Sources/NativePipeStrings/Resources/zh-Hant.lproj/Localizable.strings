@@ -112,6 +112,7 @@
 "NativePipe isn’t connected to the Linux computer." = "NativePipe 未連線到 Linux 電腦。";
 "NativePipe upload timed out." = "NativePipe 上傳超時。";
 "No matching windows. Try another title or app name." = "沒有匹配的視窗。請嘗試其他視窗標題或應用名稱。";
+"No open windows" = "沒有開啟的視窗";
 "No space left on device" = "設備空間不足";
 "No such file or directory" = "檔案或目錄不存在";
 "Not a directory" = "目標不是目錄";
@@ -291,3 +292,7 @@
 "The virtual file sharing backend is not available." = "虛擬檔案分享後端無法使用。";
 
 "This build lacks FSKit mount authorization. Virtual file sharing requires an application signed with an authorized provisioning profile." = "此建置未獲 FSKit 掛載授權。虛擬檔案共享需要使用具有相應授權描述檔簽署的應用程式。";
+
+"The display did not finish preparing for the virtual machine state change." = "顯示未能完成虛擬機器狀態變更前的準備。";
+"The display connection changed during the virtual machine state change." = "虛擬機器狀態變更期間，顯示連線發生了變化。";
+"Another display state change is already in progress." = "另一項顯示狀態變更正在進行。";

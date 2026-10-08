@@ -37,6 +37,9 @@ void np_host_finish(struct np_host *host);
 void np_host_disconnect(struct np_host *host);
 void np_host_accept(struct np_host *host);
 bool np_host_send_binary(struct np_host *host, const void *payload, size_t length);
+/* Structural scene enqueue succeeded; subsequent write failure is uncertain
+ * delivery and must not make the caller release its protected pixel reads. */
+bool np_host_admit_scene(struct np_host *host, const void *payload, size_t length);
 void np_host_pump(struct np_host *host,
                   np_host_binary_handler binary_handler, void *user_data);
 

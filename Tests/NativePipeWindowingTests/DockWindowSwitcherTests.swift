@@ -69,6 +69,106 @@ final class DockWindowSwitcherTests: XCTestCase {
         XCTAssertFalse(switcher.isShowingSwitcher)
     }
 
+    func testEmptyChooserOpensBeforeBridgeExistsAndKeepsSessionIsolation() throws {
+        _ = NSApplication.shared
+        var bridge: WindowBridge?
+        let switcher = DockWindowSwitcherController(
+            title: "Starting VM", bridge: { bridge }, showWhenEmpty: true)
+
+        switcher.showWindows()
+
+        XCTAssertTrue(switcher.isShowingSwitcher)
+        XCTAssertTrue(switcher.displayedWindowIDs.isEmpty)
+        XCTAssertNil(switcher.selectedWindowID)
+        let content = try XCTUnwrap(switcher.searchField.window?.contentView)
+        XCTAssertTrue(visibleLabels(in: content).contains("No open windows"))
+        XCTAssertGreaterThanOrEqual(switcher.searchField.window?.contentView?.bounds.height ?? 0, 232,
+                                    "The empty chooser needs room for its message and tools")
+        switcher.refresh()
+        XCTAssertTrue(switcher.isShowingSwitcher, "A still absent bridge is the same presentation")
+
+        bridge = WindowBridge(frameSource: nil)
+        switcher.refresh()
+        XCTAssertFalse(switcher.isShowingSwitcher, "A new bridge must invalidate the earlier context")
+    }
+
+    func testEmptyChooserDoesNotAutomaticallyOpenUtility() throws {
+        _ = NSApplication.shared
+        let bridge = WindowBridge(frameSource: nil)
+        var consoleActivations = 0
+        let switcher = DockWindowSwitcherController(
+            title: "VM", bridge: { bridge }, showWhenEmpty: true, utilities: {
+                [.init(title: "Console", symbol: "terminal", visible: false, enabled: true,
+                       action: { consoleActivations += 1 })]
+            })
+        defer { switcher.cancelOperation(nil) }
+
+        switcher.showWindows()
+        switcher.refresh()
+
+        XCTAssertTrue(switcher.isShowingSwitcher)
+        XCTAssertTrue(switcher.displayedWindowIDs.isEmpty)
+        XCTAssertNil(switcher.selectedWindowID)
+        let content = try XCTUnwrap(switcher.searchField.window?.contentView)
+        XCTAssertTrue(visibleLabels(in: content).contains("No open windows"))
+        XCTAssertEqual(consoleActivations, 0)
+
+        func toolButton(in view: NSView) -> NSPopUpButton? {
+            if let button = view as? NSPopUpButton { return button }
+            return view.subviews.lazy.compactMap { toolButton(in: $0) }.first
+        }
+        let menu = try XCTUnwrap(toolButton(in: content)?.menu)
+        let index = try XCTUnwrap(menu.items.firstIndex { $0.title == "Open Console" })
+        menu.performActionForItem(at: index)
+        XCTAssertEqual(consoleActivations, 1, "The user can explicitly open a tool from the empty chooser")
+        XCTAssertFalse(switcher.isShowingSwitcher)
+    }
+
+    func testEmptyChooserRemainsAfterClosingLastWindow() throws {
+        _ = NSApplication.shared
+        let bridge = WindowBridge(frameSource: nil)
+        let switcher = DockWindowSwitcherController(
+            title: "VM", bridge: { bridge }, showWhenEmpty: true)
+        defer { switcher.cancelOperation(nil); bridge.closeAll() }
+        _ = try mappedWindow(3, bridge: bridge)
+        _ = try mappedWindow(4, bridge: bridge)
+        switcher.showWindows()
+        XCTAssertTrue(switcher.isShowingSwitcher)
+
+        bridge.apply(.surfaceUnmapped(surface: 13))
+        bridge.apply(.surfaceUnmapped(surface: 14))
+        switcher.refresh()
+
+        XCTAssertTrue(switcher.isShowingSwitcher)
+        XCTAssertTrue(switcher.displayedWindowIDs.isEmpty)
+        XCTAssertNil(switcher.selectedWindowID)
+        let content = try XCTUnwrap(switcher.searchField.window?.contentView)
+        XCTAssertTrue(visibleLabels(in: content).contains("No open windows"))
+    }
+
+    func testEmptyChooserAutomaticallyInvalidatesWhenBridgeSessionCloses() async throws {
+        _ = NSApplication.shared
+        let bridge = WindowBridge(frameSource: nil)
+        var consoleActivations = 0
+        let switcher = DockWindowSwitcherController(
+            title: "VM", bridge: { bridge }, showWhenEmpty: true, utilities: {
+                [.init(title: "Console", symbol: "terminal", visible: false, enabled: true,
+                       action: { consoleActivations += 1 })]
+            })
+        defer { switcher.cancelOperation(nil); bridge.closeAll() }
+        switcher.showWindows()
+        XCTAssertTrue(switcher.isShowingSwitcher)
+
+        bridge.closeAll()
+        try await Task.sleep(for: .milliseconds(30))
+
+        XCTAssertFalse(switcher.isShowingSwitcher,
+                       "Closing an empty bridge must notify the chooser without a host refresh")
+        XCTAssertEqual(consoleActivations, 0)
+        switcher.showWindows()
+        XCTAssertTrue(switcher.isShowingSwitcher, "The next Dock click uses the new session")
+    }
+
     func testOpenPanelUpdatesAfterCloseMetadataAndSearch() async throws {
         _ = NSApplication.shared
         let bridge = WindowBridge(frameSource: nil)
@@ -88,6 +188,9 @@ final class DockWindowSwitcherTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(30))
         XCTAssertTrue(switcher.displayedWindowIDs.isEmpty)
         XCTAssertNil(switcher.selectedWindowID)
+        let content = try XCTUnwrap(switcher.searchField.window?.contentView)
+        XCTAssertTrue(visibleLabels(in: content).contains("No matching windows. Try another title or app name."))
+        XCTAssertFalse(visibleLabels(in: content).contains("No open windows"))
         switcher.cancelOperation(nil)
         XCTAssertEqual(switcher.displayedWindowIDs.count, 2, "Escape clears a search first")
         bridge.apply(.surfaceUnmapped(surface: 13))
@@ -222,6 +325,24 @@ final class DockWindowSwitcherTests: XCTestCase {
         XCTAssertEqual(bridge.dockWindows.map(\.id), [3])
     }
 
+    func testSingleWindowRestoresDirectlyWhenEmptyChooserIsEnabled() throws {
+        _ = NSApplication.shared
+        let bridge = WindowBridge(frameSource: nil)
+        let switcher = DockWindowSwitcherController(
+            title: "VM", bridge: { bridge }, showWhenEmpty: true)
+        defer { bridge.closeAll() }
+        let window = try mappedWindow(3, bridge: bridge)
+        window.miniaturize(nil)
+        window.orderOut(nil)
+
+        switcher.showWindows()
+
+        XCTAssertFalse(switcher.isShowingSwitcher)
+        XCTAssertTrue(window.isVisible)
+        XCTAssertFalse(window.isMiniaturized)
+        XCTAssertTrue(window.firstResponder === window.contentView)
+    }
+
     func testMultipleWindowsChooseButOneRemainingWindowClosesStaleSwitcher() throws {
         _ = NSApplication.shared
         let bridge = WindowBridge(frameSource: nil)
@@ -265,6 +386,12 @@ final class DockWindowSwitcherTests: XCTestCase {
         switcher.showWindows()
         XCTAssertFalse(switcher.isShowingSwitcher)
         XCTAssertEqual(screenActivations, 1, "Screen alone activates directly")
+    }
+
+    private func visibleLabels(in view: NSView) -> [String] {
+        guard !view.isHidden else { return [] }
+        if let field = view as? NSTextField { return [field.stringValue] }
+        return view.subviews.flatMap { visibleLabels(in: $0) }
     }
 
     private func mappedWindow(_ id: UInt32, bridge: WindowBridge) throws -> NSWindow {

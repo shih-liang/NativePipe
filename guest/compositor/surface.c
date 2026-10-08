@@ -9,6 +9,7 @@
 #include "syncobj.h"
 #include "window_events.h"
 #include "xdg_shell.h"
+#include "presentation_time.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,6 +54,25 @@ bool np_surface_assign_role(struct np_surface *surface,
 // ---------------------------------------------------------------------------
 // wl_surface
 // ---------------------------------------------------------------------------
+
+void np_surface_send_buffer_preferences(struct np_surface *surface, int scale) {
+	if (!surface || !surface->resource || scale <= 0 ||
+	    wl_resource_get_version(surface->resource) <
+	        WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION)
+		return;
+	if (surface->reported_buffer_scale != scale) {
+		wl_surface_send_preferred_buffer_scale(surface->resource, scale);
+		surface->reported_buffer_scale = scale;
+	}
+	/* AppKit already maps each screen into upright logical coordinates. Buffer
+	 * transforms requested by clients describe their submitted pixels; they
+	 * never change the compositor's preference for an upright source. */
+	if (!surface->reported_buffer_transform) {
+		wl_surface_send_preferred_buffer_transform(
+			surface->resource, WL_OUTPUT_TRANSFORM_NORMAL);
+		surface->reported_buffer_transform = true;
+	}
+}
 
 static void surface_destroy_handler(struct wl_client *client, struct wl_resource *resource) {
 	wl_resource_destroy(resource);
@@ -188,6 +208,7 @@ static const struct wl_surface_interface surface_implementation = {
 static void surface_resource_destroy(struct wl_resource *resource) {
 	struct np_surface *surface = wl_resource_get_user_data(resource);
 	if (!surface) return;
+	np_presentation_time_discard_surface(surface);
 
 	/* A client disconnect destroys all of its protocol resources, but libwayland
 	 * does not promise that role objects are destroyed before wl_surface.  Every
@@ -314,6 +335,7 @@ static void compositor_create_surface(struct wl_client *client, struct wl_resour
 	wl_list_init(&surface->sibling_link);
 	wl_list_init(&surface->pending_stack_ops);
 	wl_list_init(&surface->pending_frame_callbacks);
+	wl_list_init(&surface->presentation_feedbacks);
 	wl_list_init(&surface->blocked_updates);
 	wl_list_init(&surface->scene_presentations);
 	wl_list_init(&surface->synchronized_updates);
@@ -334,6 +356,7 @@ static void compositor_create_surface(struct wl_client *client, struct wl_resour
 	// Advertising wl_output.scale without enter leaves GTK/Qt with no applicable
 	// output and therefore no well-defined surface scale.
 	np_scale_surface_enter_outputs(surface, client);
+	np_surface_send_buffer_preferences(surface, surface->preferred_scale);
 	uint32_t fields[] = {surface->id};
 	np_window_event_send(server, NP_GUEST_SURFACE_CREATED, fields, 1);
 }

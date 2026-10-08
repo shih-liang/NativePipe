@@ -5,6 +5,7 @@
 #include "compositor_internal.h"
 #include "window_events.h"
 #include "windowwire.h"
+#include "presentation_time.h"
 #include "user_text.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -133,6 +134,7 @@ void np_backend_session_attach(struct np_server *server, struct wl_event_loop *l
     if (!np_window_event_send(server, NP_GUEST_SESSION_STARTED, ready, 2)) {
         server->terminate = true; return;
     }
+    np_presentation_time_clock_request(server);
 
     if (!b->command) return;
     posix_spawn_file_actions_t actions;
@@ -190,10 +192,19 @@ bool np_backend_connected(const struct np_server *server)
     struct np_remote_backend *b = np_remote_backend(server);
     return b && np_host_connected(&b->host) && np_media_connected(&b->media);
 }
+bool np_backend_display_boundary_ready(struct np_server *server)
+{
+    struct np_remote_backend *b = np_remote_backend(server);
+    return !b->jobs[0] && !b->jobs[1];
+}
+bool np_backend_admit_scene(struct np_server *server, const void *payload, size_t length)
+{
+    return np_remote_submit_scene(server, payload, length);
+}
 bool np_backend_send_binary(struct np_server *server, const void *payload, size_t length)
 {
     const unsigned char *p = payload;
-    if ((length >= 76 && !memcmp(p, "NPSN", 4)) ||
+    if ((length >= 100 && !memcmp(p, "NPSN", 4)) ||
         (length >= 40 && !memcmp(p, "NPW2", 4) && p[5] == NP_GUEST_COMMITTED))
         return np_remote_submit_scene(server, payload, length);
     if (length >= 8 && !memcmp(p, "NPW2", 4)) {
@@ -206,6 +217,10 @@ bool np_backend_send_binary(struct np_server *server, const void *payload, size_
         case NP_GUEST_HOST_SELECTION_REQUEST:
         case NP_GUEST_HOST_OPEN_REQUESTED:
         case NP_GUEST_HOST_OPEN_CANCELLED:
+        case NP_GUEST_PRESENTATION_CLOCK_REQUESTED:
+        case NP_GUEST_PRESENTATION_RESULT_ACK:
+        case NP_GUEST_PRESENTATION_DRAINED:
+        case NP_GUEST_PRESENTATION_RESUMED:
             break; /* Independent input/clipboard transactions stay responsive. */
         case NP_GUEST_NOTIFICATION_POSTED:
         case NP_GUEST_NOTIFICATION_CLOSED:

@@ -7,6 +7,21 @@ import IOSurface
 @preconcurrency import Metal
 import NativePipeProtocol
 import UniformTypeIdentifiers
+import QuartzCore
+
+public enum WindowPresentationPauseError: LocalizedError {
+    case timedOut
+    case connectionChanged
+    case busy
+
+    public var errorDescription: String? {
+        switch self {
+        case .timedOut: return NPText("The display did not finish preparing for the virtual machine state change.")
+        case .connectionChanged: return NPText("The display connection changed during the virtual machine state change.")
+        case .busy: return NPText("Another display state change is already in progress.")
+        }
+    }
+}
 
 public enum FrameTextureStatus: Sendable {
     case ready
@@ -276,108 +291,32 @@ public final class WindowBridge: NSObject {
             tx: 0, ty: source.minY + source.maxY))
     }
 
-    /// A Wayland drag icon is neither a window nor part of the target surface.
-    /// A non-activating, click-through panel gives it the same global, transient
-    /// lifetime while AppKit continues to own window movement and hit testing.
-    @MainActor
-    private final class DragIconOverlay {
-        private let panel: NSPanel
-        private let view = NSView()
-        private let metalLayer = CAMetalLayer()
-        private var presenter: AsyncMetalScenePresenter?
-		private var presenterRenderer: HostSceneRenderer?
-        private var displayedTexture: MTLTexture?
-
-        init() {
-            panel = NSPanel(
-                contentRect: .zero,
-                styleMask: [.borderless, .nonactivatingPanel],
-                backing: .buffered,
-                defer: false)
-            view.wantsLayer = true
-            view.layer = metalLayer
-            metalLayer.pixelFormat = .bgra8Unorm
-            metalLayer.isOpaque = false
-            metalLayer.framebufferOnly = true
-            panel.contentView = view
-            panel.isExcludedFromWindowsMenu = true
-            panel.backgroundColor = .clear
-            panel.isOpaque = false
-            panel.hasShadow = false
-            panel.ignoresMouseEvents = true
-            panel.level = .popUpMenu
-            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+    private var dragIconPresenter: AuxiliarySurfacePresenter?
+    private var cursorPresenter: AuxiliarySurfacePresenter?
+    private var dragIcon: AuxiliarySurfacePresenter {
+        if let dragIconPresenter { return dragIconPresenter }
+        let presenter = AuxiliarySurfacePresenter(kind: .drag, displayClock: displayClock)
+        presenter.onNeedsNewPublication = { [weak self] surface, _ in
+            self?.requestAuxiliaryPublication(surface: surface)
         }
-
-        func display(
-            _ texture: MTLTexture, owner: AnyObject?, frame: Windowing.Frame,
-			renderer: HostSceneRenderer,
-            readComplete: @escaping @MainActor @Sendable (Bool) -> Void,
-            presented: @escaping @MainActor @Sendable () -> Void
-        ) -> Bool {
-            let scale = CGFloat(max(frame.scale, 1))
-            let size = NSSize(
-                width: CGFloat(frame.width) / scale,
-                height: CGFloat(frame.height) / scale)
-            panel.setContentSize(size)
-            metalLayer.frame = view.bounds
-			if presenterRenderer !== renderer {
-				presenter = AsyncMetalScenePresenter(
-					layer: metalLayer, device: texture.device, renderer: renderer)
-				presenterRenderer = renderer
-            }
-            guard let presenter else { return false }
-            displayedTexture = texture
-            moveToPointer()
-            panel.orderFrontRegardless()
-
-            let source = frame.fullViewportBufferPixelRect
-            let layer = Windowing.SceneLayer(
-                surface: 1, resourceID: frame.resourceID,
-                width: frame.width, height: frame.height,
-                bytesPerRow: frame.bytesPerRow, format: frame.format,
-                destination: .init(
-                    x: 0, y: 0, width: Double(frame.width), height: Double(frame.height)),
-                sourcePixels: .init(
-                    x: Double(source.origin.x), y: Double(source.origin.y),
-                    width: Double(source.width), height: Double(source.height)),
-                clip: .init(
-                    x: 0, y: 0, width: Double(frame.width), height: Double(frame.height)),
-                alpha: 1, opaque: frame.format == .bgrx8888, transform: .normal)
-            let scene = Windowing.SceneSnapshot(
-                surface: 1, presentationID: frame.presentationID,
-                width: frame.width, height: frame.height, scale: max(frame.scale, 1),
-                windowGeometry: .init(
-                    x: 0, y: 0, width: Int(size.width), height: Int(size.height)),
-                layers: [layer])
-            presenter.enqueue(
-                scene: scene,
-                layers: [ResolvedSceneLayer(state: layer, texture: texture, owner: owner)],
-                drawableSize: CGSize(width: frame.width, height: frame.height),
-                readComplete: readComplete,
-                latched: {},
-                presented: { _ in presented() })
-            return true
-        }
-
-        func moveToPointer() {
-            guard panel.isVisible else { return }
-            let pointer = NSEvent.mouseLocation
-            // Keep the image next to rather than underneath the pointer. The
-            // panel ignores events either way, but the offset leaves the drop
-            // target and cursor visually legible.
-            panel.setFrameOrigin(NSPoint(
-                x: pointer.x + 8,
-                y: pointer.y - panel.frame.height - 8))
-        }
-
-        func hide() {
-            panel.orderOut(nil)
-            displayedTexture = nil
-        }
+        dragIconPresenter = presenter
+        return presenter
     }
-
-    private let dragIcon = DragIconOverlay()
+    private var customCursor: AuxiliarySurfacePresenter {
+        if let cursorPresenter { return cursorPresenter }
+        let presenter = AuxiliarySurfacePresenter(kind: .cursor, displayClock: displayClock)
+        presenter.onNeedsNewPublication = { [weak self] surface, _ in
+            self?.requestAuxiliaryPublication(surface: surface)
+        }
+        cursorPresenter = presenter
+        return presenter
+    }
+    private var dragExportSuppressed = false
+    private var pointerPresentationWindow: UInt32?
+    private var pointerPresentationPosition = CGPoint.zero
+    private var auxiliaryWasVisible = false
+    private var auxiliaryRecords: [PresentationJournal.Key: PresentationRecord] = [:]
+    private var deferredPresentationRefresh: Set<UInt32> = []
     private var dragIconSurface: UInt32?
     /// A client normally commits the icon immediately before start_drag gives
     /// the surface its role, so retain unroled commits until that event arrives.
@@ -391,9 +330,11 @@ public final class WindowBridge: NSObject {
     private struct SceneWork {
         var scene: Windowing.SceneSnapshot
         var latchIDs: [UInt32]
+        let record: PresentationRecord?
 
-        init(scene: Windowing.SceneSnapshot) {
+        init(scene: Windowing.SceneSnapshot, record: PresentationRecord?) {
             self.scene = scene
+            self.record = record
             latchIDs = scene.presentationID == 0 ? [] : [scene.presentationID]
         }
 
@@ -420,9 +361,34 @@ public final class WindowBridge: NSObject {
     /// presentation handler; superseded/cancelled scenes report false.
     /// This is separate from Wayland frame/FIFO latch completion.
     public var onScenePresentation: ((UInt32, UInt32, Bool, UInt32) -> Void)?
+    /// Actual Wayland feedback is independent of NPRP transport display credit.
+    public var reportsPresentationTime = true
     private var deferredSceneFeedback = DeferredSceneFeedback()
+    private lazy var presentationJournal = PresentationJournal { [weak self] in
+        guard let bridge = self else { return }
+        MainRunLoop.perform { [weak bridge] in bridge?.flushPresentationResults() }
+    }
+    private var presentationSessionID: UInt64?
+    private var sentPresentationResults: Set<PresentationJournal.Key> = []
+    private var presentationDrawingGated = false
+    private var presentationBarrierInFlight = false
+    private struct CompletedPauseRollback: Sendable {
+        let generation: UInt64
+        let sessionID: UInt64?
+    }
+    private var completedPauseRollback: CompletedPauseRollback?
+    private var nextPresentationBarrierToken: UInt32 = 0
+    private enum PresentationBarrierPhase { case pause, drain, resume }
+    private struct PresentationBarrier {
+        let sessionID: UInt64
+        let token: UInt32
+        let phase: PresentationBarrierPhase
+        var reached = false
+    }
+    private var presentationBarrier: PresentationBarrier?
 
-    func scenePresented(surface: UInt32, presentationID: UInt32, displayed: Bool) {
+    func scenePresented(surface: UInt32, presentationID: UInt32, displayed: Bool,
+                        presentedTime: Double? = nil) {
         guard onScenePresentation != nil else { return }
         let native = surfaceToWindow[surface].flatMap { windows[$0] }
         let occluded = native?.window != nil && native?.canPresent == false
@@ -442,11 +408,75 @@ public final class WindowBridge: NSObject {
     private func displayInterval(for surface: UInt32) -> UInt32 {
         surfaceToWindow[surface].flatMap { windows[$0]?.displayIntervalNanoseconds } ?? 0
     }
+
+    private func acceptPresentationSession(_ sessionID: UInt64) {
+        guard sessionID != 0 else { return }
+        if presentationSessionID != sessionID {
+            presentationJournal.retainSession(sessionID)
+            sentPresentationResults.removeAll()
+            presentationSessionID = sessionID
+        }
+        flushPresentationResults()
+    }
+
+    private func flushPresentationResults(replay: Bool = false) {
+        guard reportsPresentationTime, output != nil,
+              let sessionID = presentationSessionID else { return }
+        for result in presentationJournal.results(sessionID: sessionID) {
+            guard replay || !sentPresentationResults.contains(result.key) else { continue }
+            send(.presentationFeedback(
+                sessionID: result.key.sessionID, clockEpoch: result.key.clockEpoch,
+                surface: result.key.surface, presentationID: result.key.presentationID,
+                hostTimeNanoseconds: result.hostTimeNanoseconds,
+                refreshNanoseconds: result.refreshNanoseconds, outputID: result.outputID))
+            sentPresentationResults.insert(result.key)
+        }
+    }
+
+    private func hasDiscardAwaitingAcknowledgement(surface: UInt32) -> Bool {
+        guard let sessionID = presentationSessionID else { return false }
+        return presentationJournal.results(sessionID: sessionID).contains {
+            $0.key.surface == surface && $0.hostTimeNanoseconds == 0
+        }
+    }
+
+    func flushDeferredPresentationRefresh(surface: UInt32) {
+        guard deferredPresentationRefresh.contains(surface),
+              !hasDiscardAwaitingAcknowledgement(surface: surface) else { return }
+        guard !presentationDrawingGated, !presentationSuspended else { return }
+        if surface == cursorSurface {
+            guard cursorUsesSoftwarePresentation || cursorPublicationIsQueried else {
+                deferredPresentationRefresh.remove(surface)
+                return
+            }
+            guard auxiliaryPointerVisible else { return }
+        } else if surface == dragIconSurface {
+            guard !dragExportSuppressed else {
+                deferredPresentationRefresh.remove(surface)
+                return
+            }
+            guard auxiliaryPointerVisible else { return }
+        } else {
+            guard let native = surfaceToWindow[surface].flatMap({ windows[$0] }) else {
+                deferredPresentationRefresh.remove(surface)
+                return
+            }
+            guard native.canPresent || native.hasPendingFrameCapture else { return }
+        }
+        send(.captureFrame(surface: surface))
+    }
     private var pointerCursor = NSCursor.arrow
     private var cursorSurface: UInt32?
     private var cursorHotSpot = CGPoint.zero
-    private var cursorPixelScale = 1
+    private var cursorPresentationHotSpot = CGPoint.zero
+    private var cursorGeometryFrame: Windowing.Frame?
+    private var cursorUsesSoftwarePresentation = false
+    private var cursorPublicationIsQueried = false
     private var cursorContext: CIContext?
+    private var cursorPixelScale = 1
+    private lazy var transparentPointerCursor = NSCursor(
+        image: NSImage(size: NSSize(width: 1, height: 1), flipped: false) { _ in true },
+        hotSpot: .zero)
 
     private var windows: [UInt32: NativeWindow] = [:]
     private var forceQuitCapabilities: [UInt32: Bool] = [:]
@@ -539,7 +569,11 @@ public final class WindowBridge: NSObject {
     func containsGuestWindow(at point: NSPoint) -> Bool {
         windows.values.contains { $0.window.map { $0.isVisible && $0.frame.contains(point) } ?? false }
     }
-    func hideDragIcon() { dragIcon.hide() }
+    func hideDragIcon() {
+        dragExportSuppressed = true
+        dragIconPresenter?.setVisible(false)
+        if let surface = dragIconSurface { retireAuxiliaryFrames(surface: surface) }
+    }
     func reportFileTransferError(_ error: Error) { NSApp.presentError(error) }
 
     public init(frameSource: FrameSource?) {
@@ -575,9 +609,12 @@ public final class WindowBridge: NSObject {
         return native.handleKeyUp(event)
     }
 
-    var acceptsKeyboardInput: Bool { !presentationSuspended }
+    var acceptsKeyboardInput: Bool { !presentationSuspended && !presentationDrawingGated }
 
     @objc private func applicationDidResignActive(_ notification: Notification) {
+        pointerPresentationWindow = nil
+        updateAuxiliaryVisibility()
+        refreshPointerCursor()
         for native in windows.values {
             native.endScrollGesture()
             native.releasePressedKeys()
@@ -614,6 +651,10 @@ public final class WindowBridge: NSObject {
             -Double(event.scrollingDeltaY) * multiplier)
     }
 
+    func scrollDirectionInverted(for event: NSEvent) -> Bool {
+        integrationPreferences.naturalScrolling ?? event.isDirectionInvertedFromDevice
+    }
+
     var shortcutPreferences: KeyboardShortcutPreferences {
         integrationPreferences.shortcuts
     }
@@ -629,6 +670,7 @@ public final class WindowBridge: NSObject {
     /// `orderOut` is deliberately not `close`: the guest remains authoritative
     /// and sees the same xdg_toplevels after VZ resumes.
     public func setSuspended(_ suspended: Bool, hideWindows: Bool = false) {
+        if suspended { completedPauseRollback = nil }
         guard presentationSuspended != suspended else { return }
         if suspended {
             for native in windows.values {
@@ -637,6 +679,7 @@ public final class WindowBridge: NSObject {
             }
         }
         presentationSuspended = suspended
+        updateAuxiliaryVisibility()
         if suspended {
             for native in windows.values { unregisterDisplayClock(native) }
             guard hideWindows else { return }
@@ -659,6 +702,181 @@ public final class WindowBridge: NSObject {
         suspendedVisibleWindows.removeAll(keepingCapacity: true)
         suspendedKeyWindow = nil
         retryPendingFrames()
+        refreshAuxiliaryFrames()
+    }
+
+    /// Close submission first, fence the display stream and actual drawable
+    /// callbacks, then ask the guest to consume all terminal feedback. A
+    /// timeout leaves submitted records intact and attempts a calibrated resume.
+    public func prepareForVirtualMachinePause() async throws {
+        guard !presentationBarrierInFlight else { throw WindowPresentationPauseError.busy }
+        presentationBarrierInFlight = true
+        defer { presentationBarrierInFlight = false }
+        completedPauseRollback = nil
+        let generation = connectionGeneration
+        let deadline = ProcessInfo.processInfo.systemUptime + 5
+        setPresentationDrawingGated(true)
+        for surface in Set(pendingScenes.keys).union(resolvingScenes.keys) {
+            cancelSceneWork(for: surface)
+        }
+        for surface in Set(pendingSurfaceFrames.keys).union(pendingFrames.keys) {
+            retireAuxiliaryFrames(surface: surface)
+        }
+        do {
+            if let sessionID = presentationSessionID {
+                let token = newPresentationBarrierToken()
+                try await requestPresentationBarrier(.pause, sessionID: sessionID,
+                    token: token, generation: generation, deadline: deadline,
+                    command: .presentationPause(sessionID: sessionID, token: token))
+                try await fencePresentationSubmission(generation: generation, deadline: deadline)
+                try await waitForPresentationCondition(generation: generation, deadline: deadline) {
+                    !self.presentationJournal.hasSubmitted(sessionID: sessionID)
+                }
+                for native in windows.values { native.flushPresentationLatchesForPause() }
+                // Latches/configures use the control lane, while actual
+                // feedback and drain use a different writer. A second control
+                // receipt proves those late latches crossed the guest before
+                // the feedback fence can authorize VZ to stop executing it.
+                let controlFenceToken = newPresentationBarrierToken()
+                try await requestPresentationBarrier(.pause, sessionID: sessionID,
+                    token: controlFenceToken, generation: generation, deadline: deadline,
+                    command: .presentationPause(sessionID: sessionID, token: controlFenceToken))
+                flushPresentationResults(replay: true)
+                try await requestPresentationBarrier(.drain, sessionID: sessionID,
+                    token: controlFenceToken, generation: generation, deadline: deadline,
+                    command: .presentationDrain(sessionID: sessionID, token: controlFenceToken))
+            } else {
+                // No live compositor requires no protocol handshake, but a
+                // detached old drawable can still own an unrecorded result.
+                try await fencePresentationSubmission(generation: generation, deadline: deadline)
+                try await waitForPresentationCondition(generation: generation, deadline: deadline) {
+                    !self.presentationJournal.hasSubmitted()
+                }
+            }
+        } catch {
+            // The VM is still running. Resume must establish the guest clock
+            // before drawing is allowed again, even after a failed pause fence.
+            // Cleanup gets its own task: the failed operation may already be
+            // cancelled, but that must not cancel the rollback calibration.
+            let rollback = Task { @MainActor [self] in
+                try await resumePresentation(deadline: ProcessInfo.processInfo.systemUptime + 5)
+                return CompletedPauseRollback(generation: connectionGeneration,
+                                              sessionID: presentationSessionID)
+            }
+            completedPauseRollback = try? await rollback.value
+            throw error
+        }
+    }
+
+    /// Called only after VZ has resumed (or to roll back a failed pause).
+    /// The guest acknowledges this after recalibrating its presentation clock.
+    public func resumePresentationAfterVirtualMachinePause() async throws {
+        guard !presentationBarrierInFlight else { throw WindowPresentationPauseError.busy }
+        if let rollback = completedPauseRollback,
+           rollback.generation == connectionGeneration,
+           rollback.sessionID == presentationSessionID,
+           !presentationDrawingGated, !presentationSuspended {
+            // VMController also invokes its rollback hook after prepare fails.
+            // Consume only this already completed rollback; a real pause,
+            // restore or new session always requires a new clock epoch.
+            completedPauseRollback = nil
+            return
+        }
+        completedPauseRollback = nil
+        presentationBarrierInFlight = true
+        defer { presentationBarrierInFlight = false }
+        try await resumePresentation(deadline: ProcessInfo.processInfo.systemUptime + 5)
+    }
+
+    private func resumePresentation(deadline: Double) async throws {
+        if let sessionID = presentationSessionID {
+            let token = newPresentationBarrierToken()
+            try await requestPresentationBarrier(.resume, sessionID: sessionID,
+                token: token, generation: connectionGeneration, deadline: deadline,
+                command: .presentationResume(sessionID: sessionID, token: token))
+        } else {
+            try await waitForPresentationCondition(generation: connectionGeneration, deadline: deadline) {
+                !self.presentationJournal.hasSubmitted()
+            }
+        }
+        setSuspended(false)
+        setPresentationDrawingGated(false)
+        retryPendingFrames()
+        refreshAuxiliaryFrames()
+    }
+
+    private func setPresentationDrawingGated(_ gated: Bool) {
+        presentationDrawingGated = gated
+        for native in windows.values { native.setPresentationSubmissionAllowed(!gated) }
+        cursorPresenter?.setSubmissionAllowed(!gated)
+        dragIconPresenter?.setSubmissionAllowed(!gated)
+        updateAuxiliaryVisibility()
+        if !gated {
+            for surface in Array(deferredPresentationRefresh)
+                where surface != cursorSurface && surface != dragIconSurface {
+                flushDeferredPresentationRefresh(surface: surface)
+            }
+        }
+    }
+
+    private func newPresentationBarrierToken() -> UInt32 {
+        nextPresentationBarrierToken &+= 1
+        if nextPresentationBarrierToken == 0 { nextPresentationBarrierToken = 1 }
+        return nextPresentationBarrierToken
+    }
+
+    private func reachPresentationBarrier(_ phase: PresentationBarrierPhase, sessionID: UInt64, token: UInt32) {
+        guard presentationSessionID == sessionID,
+              presentationBarrier?.sessionID == sessionID,
+              presentationBarrier?.token == token,
+              presentationBarrier?.phase == phase else { return }
+        presentationBarrier?.reached = true
+    }
+
+    private func requestPresentationBarrier(
+        _ phase: PresentationBarrierPhase, sessionID: UInt64, token: UInt32,
+        generation: UInt64, deadline: Double, command: Windowing.HostCommand
+    ) async throws {
+        guard presentationSessionID == sessionID else { throw WindowPresentationPauseError.connectionChanged }
+        presentationBarrier = PresentationBarrier(sessionID: sessionID, token: token, phase: phase)
+        defer { presentationBarrier = nil }
+        send(command)
+        try await waitForPresentationCondition(generation: generation, deadline: deadline) {
+            self.presentationBarrier?.reached == true
+        }
+        guard presentationSessionID == sessionID else { throw WindowPresentationPauseError.connectionChanged }
+    }
+
+    @MainActor private final class SubmissionFence {
+        var remaining: Int
+        init(_ count: Int) { remaining = count }
+    }
+
+    private func fencePresentationSubmission(generation: UInt64, deadline: Double) async throws {
+        let fence = SubmissionFence(windows.count + 2)
+        for native in windows.values {
+            native.fencePresentationSubmission { fence.remaining -= 1 }
+        }
+        if let cursorPresenter { cursorPresenter.fenceSubmission { fence.remaining -= 1 } }
+        else { fence.remaining -= 1 }
+        if let dragIconPresenter { dragIconPresenter.fenceSubmission { fence.remaining -= 1 } }
+        else { fence.remaining -= 1 }
+        try await waitForPresentationCondition(generation: generation, deadline: deadline) {
+            fence.remaining == 0
+        }
+        for native in windows.values { native.flushPresentationLatchesForPause() }
+    }
+
+    private func waitForPresentationCondition(
+        generation: UInt64, deadline: Double, condition: () -> Bool
+    ) async throws {
+        while true {
+            try Task.checkCancellation()
+            guard connectionGeneration == generation else { throw WindowPresentationPauseError.connectionChanged }
+            if condition() { return }
+            guard ProcessInfo.processInfo.systemUptime < deadline else { throw WindowPresentationPauseError.timedOut }
+            try await Task.sleep(for: .milliseconds(10))
+        }
     }
 
     /// Authoritative mapped xdg_toplevels for the VM host's window switcher.
@@ -791,7 +1009,7 @@ public final class WindowBridge: NSObject {
 
     @discardableResult
     public func computerPointerMove(window id: UInt32, x: Double, y: Double) -> Bool {
-        guard !presentationSuspended, x.isFinite, y.isFinite,
+        guard acceptsKeyboardInput, x.isFinite, y.isFinite,
               let native = dockWindow(id), let view = native.window?.contentView,
               view.bounds.contains(CGPoint(x: x, y: y)) else { return false }
         let point = CGPoint(x: x, y: y)
@@ -808,7 +1026,7 @@ public final class WindowBridge: NSObject {
     public func computerPointerButton(
         window id: UInt32, button: Windowing.PointerButton, pressed: Bool
     ) -> Bool {
-        guard !presentationSuspended, computerPointerWindow == id,
+        guard acceptsKeyboardInput, computerPointerWindow == id,
               let native = dockWindow(id) else { return false }
         native.pointerButton(button, pressed: pressed)
         return true
@@ -818,7 +1036,7 @@ public final class WindowBridge: NSObject {
     public func computerScroll(
         window id: UInt32, dx: Double, dy: Double, precise: Bool
     ) -> Bool {
-        guard !presentationSuspended, computerPointerWindow == id,
+        guard acceptsKeyboardInput, computerPointerWindow == id,
               dx.isFinite, dy.isFinite, let native = dockWindow(id) else { return false }
         native.pointerScroll(dx: dx, dy: dy, precise: precise)
         return true
@@ -829,7 +1047,7 @@ public final class WindowBridge: NSObject {
         window id: UInt32, macKeyCode: UInt16, pressed: Bool,
         modifierFlags: UInt64
     ) -> Bool {
-        guard !presentationSuspended, KeyTranslation.evdevCode(for: macKeyCode) != nil, let native = dockWindow(id) else { return false }
+        guard acceptsKeyboardInput, KeyTranslation.evdevCode(for: macKeyCode) != nil, let native = dockWindow(id) else { return false }
         native.activateFromDock()
         guard native.window?.isKeyWindow == true, NSApp.isActive else { return false }
         native.key(
@@ -840,7 +1058,7 @@ public final class WindowBridge: NSObject {
 
     @discardableResult
     public func computerCommitText(window id: UInt32, text: String) -> Bool {
-        guard !presentationSuspended, !text.isEmpty, text.utf8.count <= 65_535,
+        guard acceptsKeyboardInput, !text.isEmpty, text.utf8.count <= 65_535,
               !text.contains("\0"), let native = dockWindow(id) else { return false }
         native.activateFromDock()
         guard native.window?.isKeyWindow == true, NSApp.isActive, native.acceptsCommittedText else { return false }
@@ -850,7 +1068,7 @@ public final class WindowBridge: NSObject {
 
     @discardableResult
     public func setDockWindowFrame(_ id: UInt32, frame: CGRect) -> Bool {
-        guard !presentationSuspended, let native = dockWindow(id) else { return false }
+        guard acceptsKeyboardInput, let native = dockWindow(id) else { return false }
         return native.setFrameFromControl(frame)
     }
 
@@ -905,10 +1123,138 @@ public final class WindowBridge: NSObject {
 
     func window(_ id: UInt32) -> NativeWindow? { windows[id] }
 
-    func currentPointerCursor() -> NSCursor { pointerCursor }
+    // MARK: Guest activation
+
+    private let activationAuthority = WindowActivationAuthority()
+
+    private func activationOrigin(for id: UInt32) -> NativeWindow? {
+        guard let native = windows[id] else { return nil }
+        if !native.isPopup { return native }
+        var parent = native.window?.parent
+        for _ in 0..<64 {
+            guard let current = parent else { return nil }
+            if let origin = windows.values.first(where: { !$0.isPopup && $0.window === current }) {
+                return origin
+            }
+            parent = current.parent
+        }
+        return nil
+    }
+
+    private func recordActivationInput(_ command: Windowing.HostCommand) {
+        let id: UInt32
+        switch command {
+        case .key(let window, _, true, _), .pointerButton(let window, _, true): id = window
+        case .keyboardFocus(nil): activationAuthority.clear(); return
+        default: return
+        }
+        guard NSApp.isActive, let origin = activationOrigin(for: id),
+              let window = origin.window, window.isKeyWindow else { return }
+        activationAuthority.record(window: window, id: origin.windowID)
+    }
+
+    private func activateGuestWindow(_ id: UInt32, originID: UInt32, inputAge: UInt32) {
+        guard let origin = windows[originID]?.window,
+              let target = windows[id], !target.isPopup, target.window != nil,
+              activationAuthority.consume(
+                window: origin, id: originID, guestInputAgeMilliseconds: inputAge,
+                appIsActive: NSApp.isActive, originIsKey: origin.isKeyWindow)
+        else { return }
+        target.activateFromDock()
+    }
+
+    func currentPointerCursor() -> NSCursor {
+        cursorUsesSoftwarePresentation && cursorSurface != nil && auxiliaryPointerVisible
+            ? transparentPointerCursor : pointerCursor
+    }
+
+    private var auxiliaryPointerVisible: Bool {
+        guard !presentationDrawingGated, !presentationSuspended, NSApp.isActive,
+              let id = pointerPresentationWindow, let native = windows[id],
+              native.canPresent else { return false }
+        return true
+    }
+
+    func pointerPresentationEntered(window: UInt32, position: CGPoint) {
+        pointerPresentationWindow = window
+        pointerPresentationPosition = position
+        updateAuxiliaryVisibility()
+        refreshPointerCursor()
+        refreshAuxiliaryFrames()
+    }
+
+    func pointerPresentationMoved(window: UInt32, position: CGPoint) {
+        let entered = pointerPresentationWindow != window
+        pointerPresentationWindow = window
+        pointerPresentationPosition = position
+        updateAuxiliaryVisibility()
+        if entered { refreshPointerCursor(); refreshAuxiliaryFrames() }
+    }
+
+    func pointerPresentationLeft(window: UInt32) {
+        guard pointerPresentationWindow == window else { return }
+        pointerPresentationWindow = nil
+        updateAuxiliaryVisibility()
+        refreshPointerCursor()
+    }
+
+    func pointerPresentationVisibilityChanged(window: UInt32) {
+        guard pointerPresentationWindow == window else { return }
+        let wasVisible = auxiliaryWasVisible
+        updateAuxiliaryVisibility()
+        if wasVisible != auxiliaryWasVisible {
+            refreshPointerCursor()
+            if auxiliaryWasVisible { refreshAuxiliaryFrames() }
+        }
+    }
+
+    private func updateAuxiliaryVisibility() {
+        let visible = auxiliaryPointerVisible
+        let wasVisible = auxiliaryWasVisible
+        auxiliaryWasVisible = visible
+        let cursorVisible = visible && cursorSurface != nil && cursorUsesSoftwarePresentation
+        if cursorVisible { cursorPresenter?.move(to: pointerPresentationPosition, hotSpot: cursorPresentationHotSpot) }
+        if visible, dragIconSurface != nil, !dragExportSuppressed { dragIconPresenter?.move(to: pointerPresentationPosition) }
+        cursorPresenter?.setVisible(cursorVisible)
+        dragIconPresenter?.setVisible(visible && dragIconSurface != nil && !dragExportSuppressed)
+        if wasVisible, !visible {
+            if cursorPublicationIsQueried, let surface = cursorSurface { retireAuxiliaryFrames(surface: surface) }
+            if let surface = dragIconSurface { retireAuxiliaryFrames(surface: surface) }
+        }
+    }
+
+    private func refreshAuxiliaryFrames() {
+        guard auxiliaryPointerVisible else { return }
+        for surface in [cursorSurface, dragExportSuppressed ? nil : dragIconSurface].compactMap({ $0 }) {
+            if deferredPresentationRefresh.contains(surface) {
+                flushDeferredPresentationRefresh(surface: surface)
+                continue
+            }
+            if let frame = pendingSurfaceFrames.removeValue(forKey: surface) {
+                apply(.committed(surface: surface, frame: frame))
+            } else if pendingFrames[surface] == nil,
+                      surface != cursorSurface || cursorUsesSoftwarePresentation || cursorPublicationIsQueried {
+                // Only a new protected publication may redraw a cursor whose
+                // previous source read has already been released to Linux.
+                send(.captureFrame(surface: surface))
+            }
+        }
+    }
+
+    private func requestAuxiliaryPublication(surface: UInt32) {
+        guard auxiliaryPointerVisible, pendingFrames[surface] == nil,
+              pendingSurfaceFrames[surface] == nil else { return }
+        if surface == cursorSurface {
+            guard cursorUsesSoftwarePresentation else { return }
+        } else {
+            guard surface == dragIconSurface, !dragExportSuppressed else { return }
+        }
+        send(.captureFrame(surface: surface))
+    }
 
     private func refreshPointerCursor() {
         for window in windows.values { window.refreshPointerCursor() }
+        if pointerPresentationWindow != nil, NSApp.isActive { currentPointerCursor().set() }
     }
 
     func applicationIcon(for applicationID: String) -> NSImage? {
@@ -946,6 +1292,7 @@ public final class WindowBridge: NSObject {
 	}
 
 	func windowClosed(_ windowID: UInt32) {
+        pointerPresentationLeft(window: windowID)
 		guard windowDisplayStates.removeValue(forKey: windowID)?.outputID != nil else {
 			return
 		}
@@ -957,6 +1304,7 @@ public final class WindowBridge: NSObject {
 		for (windowID, native) in windows {
 			registerDisplayClock(native, screen: native.window?.screen)
 			windowScreenChanged(windowID, screen: native.window?.screen)
+			native.reportWindowState()
 		}
 	}
 
@@ -996,19 +1344,28 @@ public final class WindowBridge: NSObject {
 	}
 
     public func send(_ command: Windowing.HostCommand) {
+        if case .captureFrame(let surface) = command {
+            if hasDiscardAwaitingAcknowledgement(surface: surface) {
+                // Feedback and control use independent writers. A republished
+                // current commit must wait until Linux has rebound its query and
+                // acknowledged the failed display attempt.
+                deferredPresentationRefresh.insert(surface)
+                return
+            }
+            deferredPresentationRefresh.remove(surface)
+        }
+        recordActivationInput(command)
         if case .pointerButton(_, _, false) = command { fileDrag.pointerReleased() }
         // Outgoing commands were the one direction with no trace, which made
         // "input does not work" impossible to localise from the logs alone.
         switch command {
         case .pointerMoved:
-            dragIcon.moveToPointer()
             break  // every frame of mouse movement would drown everything else
         case .pointerScroll:
             break  // trackpads can report hundreds per second
         case .configure(_, _, let states, _) where states.contains(.resizing):
             if Self.frameTrace { Self.note("-> \(command)") }
         case .pointerEntered:
-            dragIcon.moveToPointer()
             Self.note("-> \(command)")
         default:
             Self.note("-> \(command)")
@@ -1019,7 +1376,15 @@ public final class WindowBridge: NSObject {
     // MARK: - Event application
 
     public func apply(_ event: Windowing.GuestEvent) {
-        if case .fileDrag(let message) = event { fileDrag.receive(message); return }
+        if case .fileDrag(let message) = event {
+            if message.action == .offered { dragExportSuppressed = false; updateAuxiliaryVisibility() }
+            fileDrag.receive(message)
+            return
+        }
+        if case .committed(let surface, let frame) = event {
+            trackAuxiliaryFrame(frame, surface: surface)
+            removePendingAuxiliaryFrames(surface: surface, except: frame)
+        }
         if case .sceneCommitted(let scene) = event {
             Self.note(
                 "scene surface=\(scene.surface) present=\(scene.presentationID) " +
@@ -1049,10 +1414,34 @@ public final class WindowBridge: NSObject {
                 output?(.notificationClosed(id: id, revision: revision, reason: .undefined))
             }
         case .notificationBacklogReset: onGuestNotificationBacklogReset?()
+        case .presentationClockRequested(let token, let sessionID, let clockEpoch):
+            if reportsPresentationTime {
+                acceptPresentationSession(sessionID)
+                let nanoseconds = UInt64((CACurrentMediaTime() * 1_000_000_000).rounded())
+                send(.presentationClockSample(token: token, sessionID: sessionID,
+                     clockEpoch: clockEpoch, hostTimeNanoseconds: nanoseconds))
+            }
+        case .presentationFeedbackAcknowledged(let sessionID, let clockEpoch, let surface, let presentationID):
+            let key = PresentationJournal.Key(sessionID: sessionID, clockEpoch: clockEpoch,
+                                              surface: surface, presentationID: presentationID)
+            presentationJournal.acknowledge(key)
+            sentPresentationResults.remove(key)
+            flushDeferredPresentationRefresh(surface: surface)
+        case .presentationPauseReached(let sessionID, let token):
+            reachPresentationBarrier(.pause, sessionID: sessionID, token: token)
+        case .presentationDrained(let sessionID, let token):
+            reachPresentationBarrier(.drain, sessionID: sessionID, token: token)
+        case .presentationResumed(let sessionID, _, let token):
+            reachPresentationBarrier(.resume, sessionID: sessionID, token: token)
         case .channelReady:
+            activationAuthority.clear()
             onChannelReady?()
             onGuestFileSharingRevoked?()
             connectionGeneration &+= 1
+            presentationSessionID = nil
+            completedPauseRollback = nil
+            sentPresentationResults.removeAll()
+            deferredPresentationRefresh.removeAll()
             // Consumed by WindowChannel as the transport generation boundary.
 			lastDisplays.removeAll(keepingCapacity: true)
 			publishDisplayTopology(force: true)
@@ -1065,21 +1454,25 @@ public final class WindowBridge: NSObject {
 
         case .surfaceDestroyed(let surface):
             knownSurfaces.remove(surface)
+            deferredPresentationRefresh.remove(surface)
             if let frame = pendingSurfaceFrames.removeValue(forKey: surface) {
-                completeCopiedPresentation(
-                    surface: surface, presentationID: frame.presentationID)
+                completeAuxiliaryFrame(frame, surface: surface)
             }
             if let frame = pendingFrames.removeValue(forKey: surface) {
-                completeCopiedPresentation(
-                    surface: surface, presentationID: frame.presentationID)
+                completeAuxiliaryFrame(frame, surface: surface)
             }
             cancelSceneWork(for: surface)
             if dragIconSurface == surface {
                 dragIconSurface = nil
-                dragIcon.hide()
+                dragExportSuppressed = false
+                dragIconPresenter?.resetContent()
             }
             if cursorSurface == surface {
                 cursorSurface = nil
+                cursorGeometryFrame = nil
+                cursorUsesSoftwarePresentation = false
+                cursorPublicationIsQueried = false
+                cursorPresenter?.resetContent()
                 pointerCursor = .arrow
                 refreshPointerCursor()
             }
@@ -1090,15 +1483,23 @@ public final class WindowBridge: NSObject {
             }
 
         case .surfaceUnmapped(let surface):
+            deferredPresentationRefresh.remove(surface)
             if let frame = pendingSurfaceFrames.removeValue(forKey: surface) {
-                completeCopiedPresentation(
-                    surface: surface, presentationID: frame.presentationID)
+                completeAuxiliaryFrame(frame, surface: surface)
             }
             if let frame = pendingFrames.removeValue(forKey: surface) {
-                completeCopiedPresentation(
-                    surface: surface, presentationID: frame.presentationID)
+                completeAuxiliaryFrame(frame, surface: surface)
             }
             cancelSceneWork(for: surface)
+            if cursorSurface == surface {
+                cursorGeometryFrame = nil
+                cursorUsesSoftwarePresentation = false
+                cursorPublicationIsQueried = false
+                pointerCursor = .arrow
+                cursorPresenter?.resetContent()
+                refreshPointerCursor()
+            }
+            if dragIconSurface == surface { dragIconPresenter?.resetContent() }
             guard let windowID = surfaceToWindow[surface],
                   let native = windows[windowID] else { break }
             mappedApplicationWindows.remove(windowID)
@@ -1163,9 +1564,13 @@ public final class WindowBridge: NSObject {
             }
 
         case .dragIconChanged(let surface):
+            if let old = dragIconSurface, old != surface { retireAuxiliaryFrames(surface: old) }
+            if dragIconSurface != surface { dragIconPresenter?.resetContent() }
             dragIconSurface = surface
+            if surface == nil { dragExportSuppressed = false }
+            updateAuxiliaryVisibility()
             guard let surface else {
-                dragIcon.hide()
+                dragIconPresenter?.setVisible(false)
                 return
             }
             if let frame = pendingSurfaceFrames.removeValue(forKey: surface) {
@@ -1177,9 +1582,28 @@ public final class WindowBridge: NSObject {
             }
 
         case .cursorChanged(let surface, let hotspotX, let hotspotY, let pixelScale):
+            if let old = cursorSurface, old != surface { retireAuxiliaryFrames(surface: old) }
+            if cursorSurface != surface {
+                cursorGeometryFrame = nil
+                cursorUsesSoftwarePresentation = false
+                cursorPublicationIsQueried = false
+                pointerCursor = .arrow
+                cursorPresenter?.resetContent()
+            }
             cursorSurface = surface
             cursorHotSpot = CGPoint(x: hotspotX, y: hotspotY)
             cursorPixelScale = pixelScale
+            if let frame = cursorGeometryFrame {
+                let geometry = Self.customCursorGeometry(
+                    frame: frame, hotSpot: cursorHotSpot, pixelScale: pixelScale)
+                cursorPresentationHotSpot = geometry.hotSpot
+                if !cursorUsesSoftwarePresentation, let image = pointerCursor.image.copy() as? NSImage {
+                    image.size = geometry.imageSize
+                    pointerCursor = NSCursor(image: image, hotSpot: geometry.hotSpot)
+                }
+            }
+            updateAuxiliaryVisibility()
+            refreshPointerCursor()
             guard let surface else {
                 pointerCursor = .arrow
                 refreshPointerCursor()
@@ -1187,10 +1611,17 @@ public final class WindowBridge: NSObject {
             }
             if let frame = pendingSurfaceFrames.removeValue(forKey: surface) {
                 installCustomCursor(frame, surface: surface)
+            } else if auxiliaryPointerVisible, pendingFrames[surface] == nil {
+                send(.captureFrame(surface: surface))
             }
 
         case .cursorShapeChanged(let shape):
+            if let old = cursorSurface { retireAuxiliaryFrames(surface: old) }
             cursorSurface = nil
+            cursorGeometryFrame = nil
+            cursorUsesSoftwarePresentation = false
+            cursorPublicationIsQueried = false
+            cursorPresenter?.resetContent()
             pointerCursor = NativeCursorResolver.cursor(for: shape)
             refreshPointerCursor()
 
@@ -1213,11 +1644,16 @@ public final class WindowBridge: NSObject {
             windows[window]?.setConstraints(minimum: minimum, maximum: maximum)
 
         case .committed(let surface, let frame):
+            if presentationDrawingGated {
+                completeAuxiliaryFrame(frame, surface: surface)
+                return
+            }
             if surface == cursorSurface {
                 installCustomCursor(frame, surface: surface)
                 return
             }
             if surface == dragIconSurface {
+                if dragExportSuppressed { completeAuxiliaryFrame(frame, surface: surface); return }
                 guard let texture = texture(for: frame) else {
                     retainDeferred(frame, for: surface)
                     Self.note("drag icon commit deferred: no Metal texture for \(frame.resourceID)")
@@ -1262,16 +1698,21 @@ public final class WindowBridge: NSObject {
         case .maximizeRequested(let window, let enabled):
             windows[window]?.setMaximized(enabled)
 
-        case .textInputEnabled(let window, let enabled):
-            windows[window]?.setTextInput(enabled: enabled)
+        case .activationRequested(let window, let origin, let age):
+            activateGuestWindow(window, originID: origin, inputAge: age)
+
+        case .textInputEnabled(let window, let epoch, let enabled):
+            windows[window]?.setTextInput(enabled: enabled, epoch: epoch)
 
         case .textInputCursorRect(let window, let x, let y, let width, let height):
             windows[window]?.setTextCursorRect(
                 CGRect(x: x, y: y, width: max(width, 1), height: max(height, 1)))
 
-        case .textInputSurroundingText:
-            // Only useful for reconversion, which the host declines for now.
-            break
+        case .textInputSurroundingText(let window, let text, let cursor, let anchor):
+            windows[window]?.setTextSurrounding(text, cursor: cursor, anchor: anchor)
+
+        case .textInputContentType(let window, let hints, let purpose, let cause):
+            windows[window]?.setTextContentType(hints: hints, purpose: purpose, changeCause: cause)
 
         case .selectionOffered(let mimeTypes):
             clipboard.guestOffered(mimeTypes: mimeTypes)
@@ -1289,7 +1730,7 @@ public final class WindowBridge: NSObject {
 
     /// Called when a virtio-gpu resource becomes presentable after CREATE_BLOB.
     public func retryPendingFrames() {
-        guard !presentationSuspended else { return }
+        guard !presentationSuspended, !presentationDrawingGated else { return }
         for surface in Array(pendingScenes.keys) { startPendingScene(for: surface) }
         if let surface = cursorSurface,
            let frame = pendingSurfaceFrames.removeValue(forKey: surface) {
@@ -1307,17 +1748,35 @@ public final class WindowBridge: NSObject {
     }
 
     private func enqueue(_ scene: Windowing.SceneSnapshot) {
-        var work = SceneWork(scene: scene)
+        let record: PresentationRecord?
+        if reportsPresentationTime, scene.presentationID != 0,
+           let context = scene.presentationContext {
+            acceptPresentationSession(context.sessionID)
+            record = presentationJournal.register(.init(
+                sessionID: context.sessionID, clockEpoch: context.clockEpoch,
+                surface: scene.surface, presentationID: scene.presentationID))
+            send(.sceneClockSample(sessionID: context.sessionID, clockEpoch: context.clockEpoch,
+                 surface: scene.surface, presentationID: scene.presentationID,
+                 guestSendTimeNanoseconds: context.guestSendTimeNanoseconds,
+                 hostReceiveTimeNanoseconds: scene.receivedHostTimeNanoseconds ??
+                    UInt64((CACurrentMediaTime() * 1_000_000_000).rounded())))
+        } else { record = nil }
+        var work = SceneWork(scene: scene, record: record)
+        if presentationDrawingGated {
+            complete(work)
+            return
+        }
         if let older = pendingScenes[scene.surface] {
             work = work.superseding(older)
             releaseScene(older.scene)
+            older.record?.discardIfUnsubmitted()
             scenePresented(surface: older.scene.surface, presentationID: older.scene.presentationID, displayed: false)
         }
         pendingScenes[scene.surface] = work
     }
 
     private func startPendingScene(for surface: UInt32) {
-        guard !presentationSuspended,
+        guard !presentationSuspended, !presentationDrawingGated,
               resolvingScenes[surface] == nil,
               let work = pendingScenes[surface],
               let windowID = surfaceToWindow[surface],
@@ -1350,12 +1809,17 @@ public final class WindowBridge: NSObject {
             pendingScenes.removeValue(forKey: surface)
             newer = newer.superseding(work)
             releaseScene(work.scene)
+            work.record?.discardIfUnsubmitted()
             scenePresented(surface: work.scene.surface, presentationID: work.scene.presentationID, displayed: false)
             pendingScenes[surface] = newer
             startPendingScene(for: surface)
             return
         }
 
+        if presentationDrawingGated {
+            complete(work)
+            return
+        }
         if presentationSuspended {
             pendingScenes[surface] = work
             return
@@ -1404,6 +1868,7 @@ public final class WindowBridge: NSObject {
               let native = windows[windowID],
               native.present(
                 scene: work.scene, layers: layers, latchIDs: work.latchIDs,
+                record: work.record,
                 readComplete: { [weak self] _ in
                     guard self?.connectionGeneration == generation else { return }
                     self?.releaseScene(work.scene)
@@ -1428,6 +1893,7 @@ public final class WindowBridge: NSObject {
 
     private func complete(_ work: SceneWork) {
         releaseScene(work.scene)
+        work.record?.discardIfUnsubmitted()
         scenePresented(surface: work.scene.surface, presentationID: work.scene.presentationID, displayed: false)
         for presentationID in work.latchIDs where presentationID != 0 {
             send(.framePresented(
@@ -1448,6 +1914,7 @@ public final class WindowBridge: NSObject {
     private func discardScene(_ work: SceneWork, reason: String) {
         nativeWindowOwningSurface(work.scene.surface)?.invalidateSceneHistory()
         releaseScene(work.scene)
+        work.record?.discardIfUnsubmitted()
         scenePresented(surface: work.scene.surface, presentationID: work.scene.presentationID, displayed: false)
         for presentationID in work.latchIDs where presentationID != 0 {
             if let native = nativeWindowOwningSurface(work.scene.surface) {
@@ -1476,11 +1943,80 @@ public final class WindowBridge: NSObject {
         return (texture, resolved.owner)
     }
 
+    private func auxiliaryKey(_ frame: Windowing.Frame, surface: UInt32) -> PresentationJournal.Key? {
+        guard reportsPresentationTime, frame.requestsPresentationFeedback, frame.presentationID != 0,
+              let context = frame.presentationContext else { return nil }
+        return .init(sessionID: context.sessionID, clockEpoch: context.clockEpoch,
+                     surface: surface, presentationID: frame.presentationID)
+    }
+
+    private func trackAuxiliaryFrame(_ frame: Windowing.Frame, surface: UInt32) {
+        guard let key = auxiliaryKey(frame, surface: surface),
+              auxiliaryRecords[key] == nil, let context = frame.presentationContext else { return }
+        acceptPresentationSession(context.sessionID)
+        auxiliaryRecords[key] = presentationJournal.register(key)
+        send(.sceneClockSample(sessionID: context.sessionID, clockEpoch: context.clockEpoch,
+             surface: surface, presentationID: frame.presentationID,
+             guestSendTimeNanoseconds: context.guestSendTimeNanoseconds,
+             hostReceiveTimeNanoseconds: frame.receivedHostTimeNanoseconds ??
+                UInt64((CACurrentMediaTime() * 1_000_000_000).rounded())))
+    }
+
+    private func takeAuxiliaryRecord(_ frame: Windowing.Frame, surface: UInt32) -> PresentationRecord? {
+        guard let key = auxiliaryKey(frame, surface: surface) else { return nil }
+        return auxiliaryRecords.removeValue(forKey: key)
+    }
+
+    private func completeAuxiliaryFrame(_ frame: Windowing.Frame, surface: UInt32) {
+        takeAuxiliaryRecord(frame, surface: surface)?.discardIfUnsubmitted()
+        completeCopiedPresentation(surface: surface, presentationID: frame.presentationID)
+    }
+
+    private func retireAuxiliaryFrames(surface: UInt32) {
+        if let frame = pendingSurfaceFrames.removeValue(forKey: surface) {
+            completeAuxiliaryFrame(frame, surface: surface)
+        }
+        if let frame = pendingFrames.removeValue(forKey: surface) {
+            completeAuxiliaryFrame(frame, surface: surface)
+        }
+    }
+
+    /// A surface has one protected publication waiting for either a role or a
+    /// resource. Moving between those reasons must not create two latest slots.
+    private func removePendingAuxiliaryFrames(surface: UInt32, except frame: Windowing.Frame) {
+        for previous in [pendingSurfaceFrames.removeValue(forKey: surface),
+                         pendingFrames.removeValue(forKey: surface)].compactMap({ $0 }) {
+            if previous.presentationID != frame.presentationID ||
+                previous.presentationContext != frame.presentationContext {
+                completeAuxiliaryFrame(previous, surface: surface)
+            }
+        }
+    }
+
     private func installCustomCursor(_ frame: Windowing.Frame, surface: UInt32) {
-        guard let resolved = texture(for: frame) else {
-            retainUnroled(frame, for: surface)
+        cursorPublicationIsQueried = frame.requestsPresentationFeedback
+        if !frame.requestsPresentationFeedback {
+            installNativeCustomCursor(frame, surface: surface)
             return
         }
+        guard auxiliaryPointerVisible else { retainUnroled(frame, for: surface); return }
+        guard let resolved = texture(for: frame) else { retainDeferred(frame, for: surface); return }
+        let geometry = Self.customCursorGeometry(frame: frame, hotSpot: cursorHotSpot,
+                                                  pixelScale: cursorPixelScale)
+        cursorGeometryFrame = frame
+        cursorUsesSoftwarePresentation = true
+        cursorPresentationHotSpot = geometry.hotSpot
+        customCursor.move(to: pointerPresentationPosition, hotSpot: geometry.hotSpot)
+        customCursor.setVisible(true)
+        presentAuxiliary(resolved, frame: frame, surface: surface,
+                         logicalSize: geometry.imageSize, presenter: customCursor)
+        refreshPointerCursor()
+    }
+
+    /// Ordinary custom cursors retain AppKit's low-latency pointer path. Only
+    /// commits with an actual presentation query need a measurable drawable.
+    private func installNativeCustomCursor(_ frame: Windowing.Frame, surface: UInt32) {
+        guard let resolved = texture(for: frame) else { retainDeferred(frame, for: surface); return }
         let texture = resolved.texture
         defer { withExtendedLifetime(resolved.owner) {} }
         let geometry = Self.customCursorGeometry(
@@ -1490,63 +2026,64 @@ public final class WindowBridge: NSObject {
         guard !source.isEmpty,
               let image = CIImage(mtlTexture: texture, options: [
                 .colorSpace: CGColorSpaceCreateDeviceRGB()
-              ])
-        else {
-            completeCopiedPresentation(
-                surface: surface, presentationID: frame.presentationID)
-            return
-        }
+              ]) else { completeAuxiliaryFrame(frame, surface: surface); return }
         if cursorContext == nil { cursorContext = CIContext(mtlDevice: texture.device) }
-        // Core Image's Metal texture origin is bottom-left; Wayland viewport
-        // coordinates are top-left.
-        let ciSource = CGRect(
-            x: source.minX,
-            y: CGFloat(texture.height) - source.maxY,
-            width: source.width,
-            height: source.height)
+        let ciSource = CGRect(x: source.minX, y: CGFloat(texture.height) - source.maxY,
+            width: source.width, height: source.height)
         let cursorImage = Self.topDownCursorImage(image, source: ciSource)
-        guard let cgImage = cursorContext?.createCGImage(cursorImage, from: ciSource) else {
-            completeCopiedPresentation(
-                surface: surface, presentationID: frame.presentationID)
+        guard let cgImage = cursorContext?.createCGImage(cursorImage, from: ciSource,
+            format: .RGBA8, colorSpace: CGColorSpace(name: CGColorSpace.sRGB), deferred: false) else {
+            completeAuxiliaryFrame(frame, surface: surface)
             return
         }
-        let nsImage = NSImage(cgImage: cgImage, size: geometry.imageSize)
-        pointerCursor = NSCursor(image: nsImage, hotSpot: geometry.hotSpot)
+        cursorGeometryFrame = frame
+        pointerCursor = NSCursor(image: NSImage(cgImage: cgImage, size: geometry.imageSize),
+            hotSpot: geometry.hotSpot)
+        cursorUsesSoftwarePresentation = false
+        cursorPresenter?.resetContent()
+        updateAuxiliaryVisibility()
         refreshPointerCursor()
-        pendingSurfaceFrames.removeValue(forKey: surface)
-        completeCopiedPresentation(
-            surface: surface, presentationID: frame.presentationID)
+        completeAuxiliaryFrame(frame, surface: surface)
     }
 
     private func presentDragIcon(
         _ resolved: (texture: MTLTexture, owner: AnyObject?), frame: Windowing.Frame, surface: UInt32
     ) {
-        let texture = resolved.texture
+        if dragExportSuppressed { completeAuxiliaryFrame(frame, surface: surface); return }
+        guard auxiliaryPointerVisible else { retainUnroled(frame, for: surface); return }
+        dragIcon.move(to: pointerPresentationPosition)
+        dragIcon.setVisible(true)
+        let scale = CGFloat(max(frame.scale, 1))
+        presentAuxiliary(resolved, frame: frame, surface: surface,
+            logicalSize: CGSize(width: CGFloat(frame.width) / scale, height: CGFloat(frame.height) / scale),
+            presenter: dragIcon)
+    }
+
+    private func presentAuxiliary(
+        _ resolved: (texture: MTLTexture, owner: AnyObject?), frame: Windowing.Frame,
+        surface: UInt32, logicalSize: CGSize, presenter: AuxiliarySurfacePresenter
+    ) {
+        let record = takeAuxiliaryRecord(frame, surface: surface)
+        guard let renderer = sceneRenderer(for: resolved.texture.device) else {
+            record?.discardIfUnsubmitted()
+            completeCopiedPresentation(surface: surface, presentationID: frame.presentationID)
+            return
+        }
+        pendingSurfaceFrames.removeValue(forKey: surface)
+        pendingFrames.removeValue(forKey: surface)
         let generation = connectionGeneration
-		guard let renderer = sceneRenderer(for: texture.device) else {
-			completeCopiedPresentation(
-				surface: surface, presentationID: frame.presentationID)
-			return
-		}
-        let queued = dragIcon.display(
-			texture, owner: resolved.owner, frame: frame, renderer: renderer,
-            readComplete: { [weak self] success in
+        let queued = presenter.present(texture: resolved.texture, owner: resolved.owner,
+            frame: frame, surface: surface, logicalSize: logicalSize, renderer: renderer, record: record,
+            readComplete: { [weak self] _ in
                 guard let self, self.connectionGeneration == generation else { return }
-                self.send(.frameReleased(
-                    surface: surface, presentationID: frame.presentationID))
-                if !success {
-                    self.send(.framePresented(
-                        surface: surface, presentationID: frame.presentationID))
-                }
-            },
-            presented: { [weak self] in
+                self.send(.frameReleased(surface: surface, presentationID: frame.presentationID))
+            }, latched: { [weak self] in
                 guard self?.connectionGeneration == generation else { return }
-                self?.send(.framePresented(
-                    surface: surface, presentationID: frame.presentationID))
+                self?.send(.framePresented(surface: surface, presentationID: frame.presentationID))
             })
         if !queued {
-            completeCopiedPresentation(
-                surface: surface, presentationID: frame.presentationID)
+            record?.discardIfUnsubmitted()
+            completeCopiedPresentation(surface: surface, presentationID: frame.presentationID)
         }
     }
 
@@ -1554,20 +2091,14 @@ public final class WindowBridge: NSObject {
     /// superseded presentation id. Once a commit crosses the guest/host
     /// boundary, that id retains its source texture until frameReleased.
     private func retainDeferred(_ frame: Windowing.Frame, for surface: UInt32) {
-        if let previous = pendingFrames.updateValue(frame, forKey: surface),
-           previous.presentationID != frame.presentationID {
-            completeCopiedPresentation(
-                surface: surface, presentationID: previous.presentationID)
-        }
+        removePendingAuxiliaryFrames(surface: surface, except: frame)
+        pendingFrames[surface] = frame
     }
 
     /// The same rule applies to a commit that arrives before its xdg role.
     private func retainUnroled(_ frame: Windowing.Frame, for surface: UInt32) {
-        if let previous = pendingSurfaceFrames.updateValue(frame, forKey: surface),
-           previous.presentationID != frame.presentationID {
-            completeCopiedPresentation(
-                surface: surface, presentationID: previous.presentationID)
-        }
+        removePendingAuxiliaryFrames(surface: surface, except: frame)
+        pendingSurfaceFrames[surface] = frame
     }
 
     private func presentCommitted(surface: UInt32, windowID: UInt32, frame: Windowing.Frame) {
@@ -1575,13 +2106,21 @@ public final class WindowBridge: NSObject {
             Self.note("commit dropped: no window \(windowID)")
             return
         }
+        if frame.presentationContext != nil {
+            // Flat publications precede cursor/drag role assignment. Once a
+            // window owns this surface it needs a fresh composed scene, whose
+            // drawable provides the real timestamp; CALayer installation has
+            // no equivalent public display callback.
+            completeAuxiliaryFrame(frame, surface: surface)
+            send(.captureFrame(surface: surface))
+            return
+        }
         guard frame.source == .encoded else {
-            completeCopiedPresentation(
-                surface: surface, presentationID: frame.presentationID)
+            completeAuxiliaryFrame(frame, surface: surface)
             Self.note("ignored obsolete local committed frame for surface \(surface)")
             return
         }
-        guard !presentationSuspended else {
+        guard !presentationSuspended, !presentationDrawingGated else {
             retainDeferred(frame, for: surface)
             return
         }
@@ -1837,19 +2376,22 @@ public final class WindowBridge: NSObject {
     }
 
     public func closeAll() {
+        activationAuthority.clear()
         computerSessionID = UUID()
         connectionGeneration &+= 1
+        presentationSessionID = nil
+        completedPauseRollback = nil
+        sentPresentationResults.removeAll()
+        presentationBarrier = nil
         fileDrag.disconnect()
         clipboard.disconnect()
         onGuestFileSharingRevoked?()
         for (surface, frame) in pendingSurfaceFrames {
-            completeCopiedPresentation(
-                surface: surface, presentationID: frame.presentationID)
+            completeAuxiliaryFrame(frame, surface: surface)
         }
         pendingSurfaceFrames.removeAll()
         for (surface, frame) in pendingFrames {
-            completeCopiedPresentation(
-                surface: surface, presentationID: frame.presentationID)
+            completeAuxiliaryFrame(frame, surface: surface)
         }
         pendingFrames.removeAll()
         for work in pendingScenes.values { complete(work) }
@@ -1857,10 +2399,24 @@ public final class WindowBridge: NSObject {
         for resolving in resolvingScenes.values { complete(resolving.work) }
         resolvingScenes.removeAll()
         cursorSurface = nil
+        cursorGeometryFrame = nil
+        cursorUsesSoftwarePresentation = false
+        cursorPublicationIsQueried = false
         cursorContext = nil
+        cursorPresentationHotSpot = .zero
+        pointerPresentationWindow = nil
+        auxiliaryWasVisible = false
+        dragIconSurface = nil
+        dragExportSuppressed = false
+        cursorPresenter?.close()
+        dragIconPresenter?.close()
+        auxiliaryRecords.values.forEach { $0.discardIfUnsubmitted() }
+        auxiliaryRecords.removeAll()
+        deferredPresentationRefresh.removeAll()
         pointerCursor = .arrow
         for (_, window) in windows { window.close() }
         windows.removeAll()
+        presentationJournal.discardUnsubmitted()
         deferredSceneFeedback.reset()
 		forceQuitCapabilities.removeAll(keepingCapacity: true)
 		windowDisplayStates.removeAll(keepingCapacity: true)
@@ -1869,8 +2425,10 @@ public final class WindowBridge: NSObject {
         surfaceToWindow.removeAll()
         knownSurfaces.removeAll()
         presentationSuspended = false
+        presentationDrawingGated = false
         suspendedVisibleWindows.removeAll(keepingCapacity: true)
         suspendedKeyWindow = nil
         computerPointerWindow = nil
+        notifyDockWindowsChanged()
     }
 }

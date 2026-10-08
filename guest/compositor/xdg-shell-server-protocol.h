@@ -262,7 +262,7 @@ extern const struct wl_interface xdg_surface_interface;
  * id, and well as trigger user interactive operations such as interactive
  * resize and move.
  *
- * A xdg_toplevel by default is responsible for providing the full intended
+ * An xdg_toplevel by default is responsible for providing the full intended
  * visual representation of the toplevel, which depending on the window
  * state, may mean things like a title bar, window controls and drop shadow.
  *
@@ -289,7 +289,7 @@ extern const struct wl_interface xdg_surface_interface;
  * id, and well as trigger user interactive operations such as interactive
  * resize and move.
  *
- * A xdg_toplevel by default is responsible for providing the full intended
+ * An xdg_toplevel by default is responsible for providing the full intended
  * visual representation of the toplevel, which depending on the window
  * state, may mean things like a title bar, window controls and drop shadow.
  *
@@ -466,17 +466,16 @@ struct xdg_wm_base_interface {
 	/**
 	 * create a shell surface from a surface
 	 *
-	 * This creates an xdg_surface for the given surface. While
-	 * xdg_surface itself is not a role, the corresponding surface may
-	 * only be assigned a role extending xdg_surface, such as
-	 * xdg_toplevel or xdg_popup. It is illegal to create an
-	 * xdg_surface for a wl_surface which already has an assigned role
-	 * and this will result in a role error.
-	 *
 	 * This creates an xdg_surface for the given surface. An
 	 * xdg_surface is used as basis to define a role to a given
 	 * surface, such as xdg_toplevel or xdg_popup. It also manages
 	 * functionality shared between xdg_surface based surface roles.
+	 *
+	 * While xdg_surface itself is not a role, the corresponding
+	 * surface may only be assigned a role extending xdg_surface, such
+	 * as xdg_toplevel or xdg_popup. It is illegal to create an
+	 * xdg_surface for a wl_surface which already has anassigned role
+	 * and this will result in a role error.
 	 *
 	 * See the documentation of xdg_surface for more details about what
 	 * an xdg_surface is and how it is used.
@@ -862,13 +861,13 @@ struct xdg_positioner_interface {
 	 * set anchor rectangle anchor
 	 *
 	 * Defines the anchor point for the anchor rectangle. The
-	 * specified anchor is used derive an anchor point that the child
-	 * surface will be positioned relative to. If a corner anchor is
-	 * set (e.g. 'top_left' or 'bottom_right'), the anchor point will
-	 * be at the specified corner; otherwise, the derived anchor point
-	 * will be centered on the specified edge, or in the center of the
-	 * anchor rectangle if no edge is specified.
-	 * @param anchor anchor
+	 * specified anchor is used to derive an anchor point that the
+	 * child surface will be positioned relative to. If a corner anchor
+	 * is set (e.g. 'top_left' or 'bottom_right'), the anchor point
+	 * will be at the specified corner; otherwise, the derived anchor
+	 * point will be centered on the specified edge, or in the center
+	 * of the anchor rectangle if no edge is specified.
+	 * @param anchor anchor point
 	 */
 	void (*set_anchor)(struct wl_client *client,
 			   struct wl_resource *resource,
@@ -950,7 +949,7 @@ struct xdg_positioner_interface {
 	void (*set_reactive)(struct wl_client *client,
 			     struct wl_resource *resource);
 	/**
-	 * 
+	 * set parent size
 	 *
 	 * Set the parent window geometry the compositor should use when
 	 * positioning the popup. The compositor may use this information
@@ -1123,6 +1122,8 @@ struct xdg_surface_interface {
 	 *
 	 * See the documentation of xdg_popup for more details about what
 	 * an xdg_popup is and how it is used.
+	 * @param parent parent surface for this popup
+	 * @param positioner positioner for this popup
 	 */
 	void (*get_popup)(struct wl_client *client,
 			  struct wl_resource *resource,
@@ -1175,6 +1176,10 @@ struct xdg_surface_interface {
 	 * The width and height of the effective window geometry must be
 	 * greater than zero. Setting an invalid size will raise an
 	 * invalid_size error.
+	 * @param x x coordinate of the top-left corner of the window inside this surface
+	 * @param y y coordinate of the top-left corner of the window inside this surface
+	 * @param width width of the window
+	 * @param height height of the window
 	 */
 	void (*set_window_geometry)(struct wl_client *client,
 				    struct wl_resource *resource,
@@ -1685,6 +1690,7 @@ struct xdg_toplevel_interface {
 	 * The parent toplevel must not be one of the child toplevel's
 	 * descendants, and the parent must be different from the child
 	 * toplevel, otherwise the invalid_parent protocol error is raised.
+	 * @param parent parent surface for this surface
 	 */
 	void (*set_parent)(struct wl_client *client,
 			   struct wl_resource *resource,
@@ -1699,6 +1705,7 @@ struct xdg_toplevel_interface {
 	 * compositor.
 	 *
 	 * The string must be encoded in UTF-8.
+	 * @param title title of the surface
 	 */
 	void (*set_title)(struct wl_client *client,
 			  struct wl_resource *resource,
@@ -1730,6 +1737,7 @@ struct xdg_toplevel_interface {
 	 * names and .desktop files.
 	 *
 	 * [0] https://standards.freedesktop.org/desktop-entry-spec/
+	 * @param app_id application identifier surface belongs to
 	 */
 	void (*set_app_id)(struct wl_client *client,
 			   struct wl_resource *resource,
@@ -1868,7 +1876,9 @@ struct xdg_toplevel_interface {
 	 *
 	 * The width and height must be greater than or equal to zero.
 	 * Using strictly negative values for width or height will result
-	 * in a invalid_size error.
+	 * in an invalid_size error.
+	 * @param width maximum width of the window
+	 * @param height maximum height of the window
 	 */
 	void (*set_max_size)(struct wl_client *client,
 			     struct wl_resource *resource,
@@ -1910,7 +1920,9 @@ struct xdg_toplevel_interface {
 	 *
 	 * The width and height must be greater than or equal to zero.
 	 * Using strictly negative values for width and height will result
-	 * in a invalid_size error.
+	 * in an invalid_size error.
+	 * @param width minimum width of the window
+	 * @param height minimum height of the window
 	 */
 	void (*set_min_size)(struct wl_client *client,
 			     struct wl_resource *resource,
@@ -1988,15 +2000,16 @@ struct xdg_toplevel_interface {
 	 *
 	 * If the surface doesn't cover the whole output, the compositor
 	 * will position the surface in the center of the output and
-	 * compensate with with border fill covering the rest of the
-	 * output. The content of the border fill is undefined, but should
-	 * be assumed to be in some way that attempts to blend into the
-	 * surrounding area (e.g. solid black).
+	 * compensate with border fill covering the rest of the output. The
+	 * content of the border fill is undefined, but should be assumed
+	 * to be in some way that attempts to blend into the surrounding
+	 * area (e.g. solid black).
 	 *
 	 * If the fullscreened surface is not opaque, the compositor must
 	 * make sure that other screen content not part of the same surface
 	 * tree (made up of subsurfaces, popups or similarly coupled
 	 * surfaces) are not visible below the fullscreened surface.
+	 * @param output preferred output to place surface on
 	 */
 	void (*set_fullscreen)(struct wl_client *client,
 			       struct wl_resource *resource,
@@ -2124,6 +2137,9 @@ struct xdg_toplevel_interface {
  * @ingroup iface_xdg_toplevel
  * Sends an configure event to the client owning the resource.
  * @param resource_ The client's resource
+ * @param width suggested width of window
+ * @param height suggested height of window
+ * @param states suggested states of the window
  */
 static inline void
 xdg_toplevel_send_configure(struct wl_resource *resource_, int32_t width, int32_t height, struct wl_array *states)
@@ -2146,6 +2162,8 @@ xdg_toplevel_send_close(struct wl_resource *resource_)
  * @ingroup iface_xdg_toplevel
  * Sends an configure_bounds event to the client owning the resource.
  * @param resource_ The client's resource
+ * @param width suggested maximum width of surface
+ * @param height suggested maximum height of surface
  */
 static inline void
 xdg_toplevel_send_configure_bounds(struct wl_resource *resource_, int32_t width, int32_t height)

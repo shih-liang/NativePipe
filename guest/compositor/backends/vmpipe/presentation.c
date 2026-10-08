@@ -1,10 +1,12 @@
 /* VMPipe buffer publication: preserve original virtio-gpu and wl_shm
  * lifetimes while the frontend owns Wayland commit/scene scheduling. */
 
+#include "activation.h"
 #include "compositor_internal.h"
 #include "dmabuf.h"
 #include "scale.h"
 #include "scene.h"
+#include "presentation_time.h"
 #include "shm_texture.h"
 #include "shm_texture_internal.h"
 #include "syncobj.h"
@@ -116,6 +118,7 @@ static bool queue_unroled_frame(
 	}
 	if (surface->pending_frame) {
 		uint32_t old = surface->pending_presentation_id;
+		np_presentation_time_discard_scene(surface->server, old);
 		np_presentation_rebind_callbacks(surface, old, presentation_id);
 		np_scene_presented(surface, old);
 		free(surface->pending_frame);
@@ -132,6 +135,7 @@ static bool queue_unroled_frame(
 	surface->pending_frame = body;
 	surface->pending_frame_size = body_size;
 	surface->pending_presentation_id = presentation_id;
+	np_presentation_time_scene(surface, presentation_id, presentation_id);
 	return true;
 }
 
@@ -175,7 +179,8 @@ void np_backend_publish_buffer(
 		if (buffer_commit == NP_BUFFER_DETACH) {
 			if (surface == root && surface->mapped) {
 				uint32_t fields[] = {surface->id};
-				np_window_event_send(surface->server,
+				np_activation_revoke_surface(surface);
+			np_window_event_send(surface->server,
 				                     NP_GUEST_SURFACE_UNMAPPED, fields, 1);
 				surface->mapped = false;
 			}

@@ -47,6 +47,9 @@ final class PresenterLatestTests: XCTestCase {
         layer.drawableSize = CGSize(width: 128, height: 96)
         let renderer = try HostSceneRenderer(device: device)
         let presenter = AsyncMetalScenePresenter(layer: layer, device: device, renderer: renderer)
+        defer { layer.resume.signal(); presenter.cancelPending() }
+        let journal = PresentationJournal()
+        var records: [Int: PresentationRecord] = [:]
         var submitted: [Int] = []
         var readSuccess: [Int] = []
         var discarded: [Int] = []
@@ -71,11 +74,14 @@ final class PresenterLatestTests: XCTestCase {
                 width: 128, height: 96, scale: 1,
                 windowGeometry: .init(x: 0, y: 0, width: 128, height: 96),
                 layers: [state], damage: [.init(x: 0, y: 0, width: 128, height: 96)])
+            let record = journal.register(.init(
+                sessionID: 1, clockEpoch: 1, surface: 1, presentationID: UInt32(index)))
+            records[index] = record
             presenter.enqueue(scene: scene, layers: [.init(state: state, texture: texture)],
                 drawableSize: CGSize(width: 128, height: 96),
                 readComplete: { success in
                     if success { readSuccess.append(index) } else { discarded.append(index) }
-                }, latched: { submitted.append(index) })
+                }, latched: { submitted.append(index) }, record: record)
         }
         enqueue(1)
         for _ in 0..<300 {
@@ -88,13 +94,19 @@ final class PresenterLatestTests: XCTestCase {
         for index in 2...8 { enqueue(index) }
         layer.resume.signal()
         for _ in 0..<600 {
-            if readSuccess.count + discarded.count == 8 { break }
+            if readSuccess.count + discarded.count == 8, submitted.count == 8 { break }
             try await Task.sleep(for: .milliseconds(5))
         }
         XCTAssertEqual(readSuccess, [8])
         XCTAssertEqual(discarded.sorted(), Array(1...7))
         XCTAssertEqual(submitted.sorted(), Array(1...8), "Superseding keeps all latch obligations")
         XCTAssertEqual(layer.drawableCount, 1)
-        presenter.cancelPending()
+        let superseded = journal.results(sessionID: 1).filter { $0.key.presentationID < 8 }
+        XCTAssertEqual(superseded.map(\.key.presentationID).sorted(), Array(1...7).map(UInt32.init))
+        XCTAssertTrue(superseded.allSatisfy { $0.hostTimeNanoseconds == 0 })
+        for index in 1...8 { XCTAssertFalse(records[index]?.claimSubmission() ?? true) }
+        XCTAssertTrue(journal.hasSubmitted(sessionID: 1) ||
+            journal.results(sessionID: 1).contains { $0.key.presentationID == 8 },
+            "The latest scene keeps its own submitted or actual drawable result")
     }
 }

@@ -45,6 +45,7 @@ bool np_trace_enabled(void) { return false; }
 void np_surface_commit(struct wl_client *client, struct wl_resource *resource) {}
 void np_surface_frame(struct wl_client *client, struct wl_resource *resource, uint32_t callback) {}
 void np_presentation_clear_scene_wait(struct np_surface *surface) {}
+void np_presentation_time_discard_surface(struct np_surface *surface) {}
 void np_xdg_clear_configures(struct np_surface *surface) {}
 void np_surface_update_destroy(struct np_surface_update *update, bool release_buffer) {}
 void np_presentation_set_current_buffer(struct np_surface *surface, struct wl_resource *buffer,
@@ -52,6 +53,7 @@ void np_presentation_set_current_buffer(struct np_surface *surface, struct wl_re
 void np_syncobj_surface_destroyed(struct np_surface *surface) {}
 void np_backend_surface_destroy(struct np_surface *surface) {}
 void np_scale_surface_enter_outputs(struct np_surface *surface, struct wl_client *client) {}
+void np_scale_subsurface_attached(struct np_surface *surface) {}
 bool np_window_event_send(struct np_server *server, uint8_t opcode,
                           const uint32_t *values, size_t count) { return true; }
 

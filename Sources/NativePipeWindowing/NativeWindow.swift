@@ -5,45 +5,49 @@ import AppKit
 import NativePipeProtocol
 import QuartzCore
 
-/// One refresh source per physical NSScreen, shared by every NativeWindow on
-/// that display. A window moving screens is re-registered atomically; links are
-/// invalidated when their final window leaves.
+@MainActor
+protocol DisplayClockTarget: AnyObject {
+    func displayClockFired(_ link: CADisplayLink)
+}
+
+/// One refresh source per physical NSScreen, shared by all presentation targets
+/// on that display. Links are invalidated when their final target leaves.
 @MainActor
 final class DisplayClock: NSObject {
-	private final class WeakWindow {
-		weak var value: NativeWindow?
-		init(_ value: NativeWindow) { self.value = value }
+	private final class WeakTarget {
+		weak var value: (any DisplayClockTarget)?
+		init(_ value: any DisplayClockTarget) { self.value = value }
 	}
 	private struct Entry {
 		let link: CADisplayLink
-		var windows: [ObjectIdentifier: WeakWindow]
+		var targets: [ObjectIdentifier: WeakTarget]
 	}
 	private var entries: [ObjectIdentifier: Entry] = [:]
-	private var screenByWindow: [ObjectIdentifier: ObjectIdentifier] = [:]
+	private var screenByTarget: [ObjectIdentifier: ObjectIdentifier] = [:]
 
-	func register(_ window: NativeWindow, screen: NSScreen?) {
+	func register(_ target: any DisplayClockTarget, screen: NSScreen?) {
 		guard let screen = screen ?? NSScreen.main else { return }
-		let windowKey = ObjectIdentifier(window)
+		let targetKey = ObjectIdentifier(target)
 		let screenKey = ObjectIdentifier(screen)
-		if screenByWindow[windowKey] == screenKey { return }
-		unregister(window)
+		if screenByTarget[targetKey] == screenKey { return }
+		unregister(target)
 		if entries[screenKey] == nil {
 			let link = screen.displayLink(
 				target: self, selector: #selector(tick(_:)))
 			link.add(to: .main, forMode: .common)
 			link.isPaused = false
-			entries[screenKey] = Entry(link: link, windows: [:])
+			entries[screenKey] = Entry(link: link, targets: [:])
 		}
-		entries[screenKey]?.windows[windowKey] = WeakWindow(window)
-		screenByWindow[windowKey] = screenKey
+		entries[screenKey]?.targets[targetKey] = WeakTarget(target)
+		screenByTarget[targetKey] = screenKey
 	}
 
-	func unregister(_ window: NativeWindow) {
-		let windowKey = ObjectIdentifier(window)
-		guard let screenKey = screenByWindow.removeValue(forKey: windowKey),
+	func unregister(_ target: any DisplayClockTarget) {
+		let targetKey = ObjectIdentifier(target)
+		guard let screenKey = screenByTarget.removeValue(forKey: targetKey),
 			var entry = entries[screenKey] else { return }
-		entry.windows.removeValue(forKey: windowKey)
-		if entry.windows.isEmpty {
+		entry.targets.removeValue(forKey: targetKey)
+		if entry.targets.isEmpty {
 			entry.link.invalidate()
 			entries.removeValue(forKey: screenKey)
 		} else {
@@ -54,21 +58,18 @@ final class DisplayClock: NSObject {
 	@objc private func tick(_ link: CADisplayLink) {
 		guard let screenKey = entries.first(where: { $0.value.link === link })?.key,
 			var entry = entries[screenKey] else { return }
-		let windows = entry.windows
-		for (key, weakWindow) in windows {
-			if let window = weakWindow.value {
-				window.displayClockFired(link)
-			} else {
-				entry.windows.removeValue(forKey: key)
-				screenByWindow.removeValue(forKey: key)
-			}
+		for (key, target) in entry.targets where target.value == nil {
+			entry.targets.removeValue(forKey: key)
+			screenByTarget.removeValue(forKey: key)
 		}
-		if entry.windows.isEmpty {
+		if entry.targets.isEmpty {
 			entry.link.invalidate()
 			entries.removeValue(forKey: screenKey)
 		} else {
 			entries[screenKey] = entry
 		}
+        // Publish pruning before callbacks, which may re-register themselves.
+        for target in entry.targets.values { target.value?.displayClockFired(link) }
 	}
 }
 
@@ -114,7 +115,7 @@ struct SceneCaptureRecovery {
 ///   * client buffers + guest-resolved layer state
 ///   * host Metal blit/render → CAMetalDrawable → WindowServer
 @MainActor
-final class NativeWindow: NSObject {
+final class NativeWindow: NSObject, DisplayClockTarget {
     private static let frameTrace = ProcessInfo.processInfo.environment["NATIVEPIPE_FRAME_TRACE"] != nil
     private static let trace = frameTrace
         || ProcessInfo.processInfo.environment["NATIVEPIPE_WINDOW_TRACE"] != nil
@@ -158,6 +159,12 @@ final class NativeWindow: NSObject {
     private var minimumConstraint: Windowing.Size?
     private var maximumConstraint: Windowing.Size?
     private var requestedMaximized: Bool?
+    private struct HostWindowState: Equatable {
+        let visible: Bool
+        let boundsWidth: Int
+        let boundsHeight: Int
+    }
+    private var lastReportedWindowState: HostWindowState?
     private var requestedFullscreen: Bool?
     private var lastConfiguredSize: Windowing.Size?
     private var lastConfiguredStates: [Windowing.ToplevelState] = []
@@ -186,8 +193,11 @@ final class NativeWindow: NSObject {
     }
     private var pendingConfigure: PendingConfigure?
 	private var presenterNeedsDisplayRetry = false
+    private var needsFreshPresentation = false
+    private var currentPresentationKey: PresentationJournal.Key?
     private var captureRecovery = SceneCaptureRecovery()
     private let scenePresentationCredits = ScenePresentationCredits()
+    private let presentationOutput = PresentationOutputState()
 	/// Commits accepted since the previous display tick. This is the Wayland
 	/// output-latch clock; Metal source release remains tied to command completion.
     private struct Presentation: Hashable {
@@ -200,7 +210,9 @@ final class NativeWindow: NSObject {
         guard let metalDevice else { return nil }
 		return bridge?.sceneRenderer(for: metalDevice)
     }()
+    private var scenePresenterInitialized = false
     private lazy var asyncScenePresenter: AsyncMetalScenePresenter? = {
+        scenePresenterInitialized = true
         guard let metalDevice, let renderer = sceneRenderer else { return nil }
         let markRetry: @MainActor @Sendable () -> Void = { [weak self] in
             self?.presenterNeedsDisplayRetry = true
@@ -243,6 +255,7 @@ final class NativeWindow: NSObject {
         if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(contentView)
+        reportWindowState()
     }
 
     func minimizeFromDock() {
@@ -382,6 +395,7 @@ final class NativeWindow: NSObject {
     func present(
         scene: Windowing.SceneSnapshot, layers: [ResolvedSceneLayer],
         latchIDs: [UInt32],
+        record: PresentationRecord? = nil,
         readComplete: @escaping @MainActor @Sendable (Bool) -> Void
     ) -> Bool {
         prepareWindow(for: scene)
@@ -391,20 +405,36 @@ final class NativeWindow: NSObject {
             Self.note("could not configure Metal scene window=\(windowID)")
             return false
         }
+        currentPresentationKey = record?.key
+        needsFreshPresentation = false
         let completion: ScenePresentationCompletion?
         let generation = bridge?.connectionGeneration
         if bridge?.onScenePresentation != nil {
-            // A drawable can finish after its NSWindow has been destroyed.
-            // Return its remote credit for as long as the session is alive.
-            completion = scenePresentationCredits.register(scene.presentationID) { [weak bridge = bridge] displayed in
+            // NPRP transport credit may be retired by visibility or capture.
+            // The independent record retains the actual drawable result.
+            completion = scenePresentationCredits.registerTimed(scene.presentationID) { [weak bridge = bridge] displayed, time in
                 guard bridge?.connectionGeneration == generation else { return }
                 bridge?.scenePresented(surface: scene.surface,
-                    presentationID: scene.presentationID, displayed: displayed)
+                    presentationID: scene.presentationID, displayed: displayed, presentedTime: time)
             }
         } else { completion = nil }
-        let onPresented: (@MainActor @Sendable (Bool) -> Void)?
-        if let completion { onPresented = { displayed in completion.finish(displayed) } }
+        let onPresented: (@MainActor @Sendable (Double?) -> Void)?
+        if completion != nil || record != nil {
+            onPresented = { [weak self] time in
+                completion?.finish(time != nil, presentedTime: time)
+                guard let self, self.bridge?.connectionGeneration == generation,
+                      let record, self.currentPresentationKey == record.key,
+                      time == nil, record.hasDiscardResult else { return }
+                // Core Animation can legitimately skip the first drawable of
+                // a new visible window. The same static Wayland commit still
+                // needs a protected fresh publication after its zero ACK.
+                self.needsFreshPresentation = true
+            }
+        }
         else { onPresented = nil }
+        updatePresentationOutput()
+        record?.useOutput(presentationOutput)
+        presenter.setDrawableAllowed(canPresent)
         presenter.enqueue(
             scene: scene, layers: layers, drawableSize: drawableSize,
             readComplete: { [weak self] success in
@@ -418,8 +448,26 @@ final class NativeWindow: NSObject {
                         surface: scene.surface, presentationID: presentationID)
                 }
             },
-            presented: onPresented)
+            presentationTime: onPresented, record: record)
         return true
+    }
+
+    func setPresentationSubmissionAllowed(_ allowed: Bool) {
+        asyncScenePresenter?.setSubmissionAllowed(allowed)
+    }
+
+    func fencePresentationSubmission(_ completion: @escaping @MainActor @Sendable () -> Void) {
+        if let presenter = asyncScenePresenter { presenter.fenceSubmission(completion) }
+        else { completion() }
+    }
+
+    func flushPresentationLatchesForPause() { flushPresentations() }
+
+    private func updatePresentationOutput() {
+        let screen = window?.screen
+        let outputID = (screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
+        presentationOutput.update(outputID: outputID,
+            refreshNanoseconds: screen == nil ? 0 : displayIntervalNanoseconds)
     }
 
     func awaitPresentation(surface: UInt32, presentationID: UInt32) {
@@ -462,6 +510,10 @@ final class NativeWindow: NSObject {
                 waiter.finish(.failure(ComputerUseWindowError.captureFailed))
             }
         }
+    }
+
+    var hasPendingFrameCapture: Bool {
+        scenePresenterInitialized && asyncScenePresenter?.hasPendingCapture == true
     }
 
     private func awaitPresentation(_ presentation: Presentation) {
@@ -665,6 +717,7 @@ final class NativeWindow: NSObject {
         }
 		bridge?.registerDisplayClock(self, screen: window.screen)
 		bridge?.windowScreenChanged(windowID, screen: window.screen)
+        reportWindowState()
     }
 
     private func styleMaskForToplevel() -> NSWindow.StyleMask {
@@ -739,6 +792,8 @@ final class NativeWindow: NSObject {
     }
 
 	func close() {
+        needsFreshPresentation = false
+        currentPresentationKey = nil
         pointerButton(.left, pressed: false)
         endScrollGesture()
         releasePressedKeys()
@@ -774,6 +829,7 @@ final class NativeWindow: NSObject {
             window.close()
         }
         window = nil
+        lastReportedWindowState = nil
         bridge?.updateWindowPresence()
     }
 
@@ -837,15 +893,21 @@ final class NativeWindow: NSObject {
         if period.isFinite && period >= 0.001 && period <= 1 {
             displayIntervalNanoseconds = UInt32((period * 1_000_000_000).rounded())
         }
+        updatePresentationOutput()
         if canPresent { bridge?.flushSceneFeedback(surface: surfaceID) }
         // Deliver the newest resize before waking a frame-throttled client, so
         // the draw started by this tick targets the newest logical size.
         flushConfigure()
         refreshSceneAfterCaptureIfVisible()
+        bridge?.flushDeferredPresentationRefresh(surface: surfaceID)
 
         // Frame callbacks and FIFO latching are paced by the display clock.
         // Source buffers were already released by their Metal completion.
         flushPresentations()
+        if needsFreshPresentation, canPresent, bridge?.acceptsKeyboardInput == true {
+            needsFreshPresentation = false
+            bridge?.send(.captureFrame(surface: surfaceID))
+        }
 
 		if presenterNeedsDisplayRetry {
 			presenterNeedsDisplayRetry = false
@@ -893,6 +955,10 @@ final class NativeWindow: NSObject {
     /// space `xdg_toplevel.configure` speaks — not buffer pixels. The content
     /// view is flipped, so its coordinates already run top-down like Wayland's.
     func pointerEntered(at point: CGPoint) {
+        if let window {
+            bridge?.pointerPresentationEntered(window: windowID,
+                position: window.convertPoint(toScreen: contentView.convert(point, to: nil)))
+        }
         let point = windowPoint(from: point)
         bridge?.send(.pointerEntered(window: windowID, x: point.x, y: point.y))
     }
@@ -900,6 +966,10 @@ final class NativeWindow: NSObject {
     func pointerMoved(to point: CGPoint) {
         if nativeMoveInProgress { finishWindowMoveIfReleased(pressedMouseButtons: NSEvent.pressedMouseButtons) }
         guard !nativeMoveInProgress else { return }
+        if let window {
+            bridge?.pointerPresentationMoved(window: windowID,
+                position: window.convertPoint(toScreen: contentView.convert(point, to: nil)))
+        }
         let point = windowPoint(from: point)
         bridge?.send(.pointerMoved(window: windowID, x: point.x, y: point.y))
     }
@@ -918,6 +988,7 @@ final class NativeWindow: NSObject {
     }
 
     func pointerLeft() {
+        bridge?.pointerPresentationLeft(window: windowID)
         endScrollGesture()
         bridge?.send(.pointerLeft(window: windowID))
     }
@@ -944,6 +1015,7 @@ final class NativeWindow: NSObject {
     func beginInteractiveMove() {
         guard let event = takeWindowMoveEvent(pressedMouseButtons: NSEvent.pressedMouseButtons),
               let window else { return }
+        bridge?.pointerPresentationLeft(window: windowID)
         Self.note("move window=\(windowID) input_age_ms=\((ProcessInfo.processInfo.systemUptime - event.timestamp) * 1000)")
         if Self.inputTrace {
             let now = ProcessInfo.processInfo.systemUptime
@@ -977,9 +1049,9 @@ final class NativeWindow: NSObject {
         }
     }
 
-    func pointerScroll(dx: Double, dy: Double, precise: Bool) {
+    func pointerScroll(dx: Double, dy: Double, precise: Bool, inverted: Bool = false) {
         scrollGestureActive = precise && (dx != 0 || dy != 0)
-        bridge?.send(.pointerScroll(window: windowID, dx: dx, dy: dy, isPrecise: precise))
+        bridge?.send(.pointerScroll(window: windowID, dx: dx, dy: dy, isPrecise: precise, isDirectionInverted: inverted))
     }
 
     func endScrollGesture() {
@@ -1008,7 +1080,8 @@ final class NativeWindow: NSObject {
         let delta = bridge.scrollDeltas(for: event)
         if delta.dx != 0 || delta.dy != 0 {
             pointerMoved(to: point)
-            pointerScroll(dx: delta.dx, dy: delta.dy, precise: event.hasPreciseScrollingDeltas)
+            pointerScroll(dx: delta.dx, dy: delta.dy, precise: event.hasPreciseScrollingDeltas,
+                          inverted: bridge.scrollDirectionInverted(for: event))
         }
         // Zero-delta began/changed/stationary events are not gesture boundaries.
         // Preserve a final nonzero displacement before sending a separate stop.
@@ -1045,6 +1118,7 @@ extension NativeWindow: NSWindowDelegate {
     /// the display rate, but an old client frame is never stretched to it.
     func windowDidResize(_ notification: Notification) {
         guard !isPopup else { return }
+        reportWindowState()
 		if !applyingCommittedGeometry {
 			sendConfigure(states: activeStates())
 		}
@@ -1057,7 +1131,29 @@ extension NativeWindow: NSWindowDelegate {
         return CGDisplayIsActive(id.uint32Value) != 0
     }
 
+    /// Visibility and available screen bounds are independent of keyboard
+    /// focus. Send state changes after the real native window exists.
+    func reportWindowState() {
+        updatePresentationOutput()
+        asyncScenePresenter?.setDrawableAllowed(canPresent)
+        bridge?.pointerPresentationVisibilityChanged(window: windowID)
+        bridge?.flushDeferredPresentationRefresh(surface: surfaceID)
+        guard !isPopup, let window else { return }
+        let bounds = window.screen?.visibleFrame.size ?? .zero
+        let state = HostWindowState(visible: canPresent && !window.isMiniaturized,
+            boundsWidth: max(0, Int(bounds.width.rounded(.down))),
+            boundsHeight: max(0, Int(bounds.height.rounded(.down))))
+        guard lastReportedWindowState != state else { return }
+        lastReportedWindowState = state
+        bridge?.send(.windowState(window: windowID, visible: state.visible,
+            boundsWidth: state.boundsWidth, boundsHeight: state.boundsHeight))
+    }
+
+    func windowDidMiniaturize(_ notification: Notification) { reportWindowState() }
+    func windowDidDeminiaturize(_ notification: Notification) { reportWindowState() }
+
     func windowDidChangeOcclusionState(_ notification: Notification) {
+        reportWindowState()
         scenePresentationCredits.discardUnpresented()
         if canPresent {
             bridge?.flushSceneFeedback(surface: surfaceID)
@@ -1085,6 +1181,7 @@ extension NativeWindow: NSWindowDelegate {
 		guard let window else { return }
 		bridge?.registerDisplayClock(self, screen: window.screen)
 		bridge?.windowScreenChanged(windowID, screen: window.screen)
+        reportWindowState()
 	}
 
     /// The drag is over; the client should land on the exact size immediately.
@@ -1106,6 +1203,7 @@ extension NativeWindow: NSWindowDelegate {
     func windowDidChangeBackingProperties(_ notification: Notification) {
         guard let window else { return }
 		bridge?.windowScreenChanged(windowID, screen: window.screen)
+        reportWindowState()
         sendConfigure(states: activeStates())
         bridge?.parentGeometryChanged(windowID)
     }
@@ -1164,11 +1262,14 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         let readComplete: @MainActor @Sendable (Bool) -> Void
         let latches: [@MainActor @Sendable () -> Void]
         let presented: (@MainActor @Sendable (Bool) -> Void)?
+        let presentationTime: (@MainActor @Sendable (Double?) -> Void)?
+        let record: PresentationRecord?
 
         func superseding(_ older: Work) -> Work {
             Work(epoch: epoch, scene: scene.includingUnrenderedDamage(from: older.scene),
                  layers: layers, drawableSize: drawableSize, readComplete: readComplete,
-                 latches: older.latches + latches, presented: presented)
+                 latches: older.latches + latches, presented: presented,
+                 presentationTime: presentationTime, record: record)
         }
     }
 
@@ -1185,7 +1286,9 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         label: "com.nativepipe.metal-present", qos: .userInteractive)
 	private let lock = NSLock()
     private var pending: Work?
-	private var epoch: UInt64 = 0
+		private var epoch: UInt64 = 0
+			private var submissionAllowed = true
+    private var drawableAllowed = true
 	private var drainScheduled = false
 	private var appliedDrawableSize = CGSize.zero
 	private var drawableAges: DrawableAgeTracker
@@ -1235,7 +1338,13 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         lock.lock()
         nextCaptureID &+= 1
         let id = nextCaptureID
-        captureRequests.append(CaptureRequest(id: id, completion: completion))
+        let request = CaptureRequest(id: id, completion: completion)
+        guard submissionAllowed else {
+            lock.unlock()
+            completeCaptures([request], result: .failure(ComputerUseWindowError.captureFailed))
+            return id
+        }
+        captureRequests.append(request)
         // A protected scene may already be waiting for a display-link retry.
         // Explicit capture must wake it even if the occluded app has no tick.
         let shouldSchedule = pending != nil && !drainScheduled
@@ -1251,12 +1360,20 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         lock.unlock()
     }
 
+    var hasPendingCapture: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !captureRequests.isEmpty
+    }
+
     func enqueue(
         scene: Windowing.SceneSnapshot, layers: [ResolvedSceneLayer],
         drawableSize: CGSize,
         readComplete: @escaping @MainActor @Sendable (Bool) -> Void,
         latched: @escaping @MainActor @Sendable () -> Void,
-        presented: (@MainActor @Sendable (Bool) -> Void)? = nil
+        presented: (@MainActor @Sendable (Bool) -> Void)? = nil,
+        presentationTime: (@MainActor @Sendable (Double?) -> Void)? = nil,
+        record: PresentationRecord? = nil
     ) {
         lock.lock()
         let superseded = pending
@@ -1266,11 +1383,13 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
 				scene: scene.includingUnrenderedDamage(from: $0.scene),
 				layers: layers, drawableSize: drawableSize,
 				readComplete: readComplete,
-				latches: $0.latches + [latched], presented: presented)
+                latches: $0.latches + [latched], presented: presented,
+                presentationTime: presentationTime, record: record)
 		} ?? Work(
 			epoch: epoch, scene: scene, layers: layers,
 			drawableSize: drawableSize, readComplete: readComplete,
-			latches: [latched], presented: presented)
+            latches: [latched], presented: presented, presentationTime: presentationTime,
+            record: record)
         pending = work
         let shouldSchedule = !drainScheduled
         if shouldSchedule { drainScheduled = true }
@@ -1287,17 +1406,48 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
 
     func cancelPending() {
         lock.lock()
+        let cancelled = cancelPendingLocked()
+        lock.unlock()
+        finishCancelled(cancelled)
+    }
+
+    func setSubmissionAllowed(_ allowed: Bool) {
+        lock.lock()
+        guard submissionAllowed != allowed else { lock.unlock(); return }
+        submissionAllowed = allowed
+        let cancelled = allowed ? nil : cancelPendingLocked()
+        lock.unlock()
+        if let cancelled { finishCancelled(cancelled) }
+    }
+
+    func setDrawableAllowed(_ allowed: Bool) {
+        lock.lock()
+        guard drawableAllowed != allowed else { lock.unlock(); return }
+        drawableAllowed = allowed
+        let cancelled = allowed ? nil : cancelPendingLocked(includingCaptures: false)
+        lock.unlock()
+        if let cancelled { finishCancelled(cancelled) }
+    }
+
+    func fenceSubmission(_ completion: @escaping @MainActor @Sendable () -> Void) {
+        queue.async { MainRunLoop.perform(completion) }
+    }
+
+    private func cancelPendingLocked(includingCaptures: Bool = true) -> (work: Work?, captures: [CaptureRequest]) {
         epoch &+= 1
         let cancelled = pending
         pending = nil
-        let captures = captureRequests
-        captureRequests.removeAll(keepingCapacity: true)
-        lock.unlock()
-        if let work = cancelled {
+        let captures = includingCaptures ? captureRequests : []
+        if includingCaptures { captureRequests.removeAll(keepingCapacity: true) }
+        return (cancelled, captures)
+    }
+
+    private func finishCancelled(_ cancelled: (work: Work?, captures: [CaptureRequest])) {
+        if let work = cancelled.work {
             finish(work, success: false)
             latch(work)
         }
-        completeCaptures(captures, result: .failure(
+        completeCaptures(cancelled.captures, result: .failure(
             ComputerUseWindowError.captureFailed))
     }
 
@@ -1355,7 +1505,10 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
             }
         }
         let drawableStart = ProcessInfo.processInfo.systemUptime
-        let drawable = layer.nextDrawable()
+        lock.lock()
+        let requestDrawable = drawableAllowed
+        lock.unlock()
+        let drawable = requestDrawable ? layer.nextDrawable() : nil
         if drawable == nil {
             if Self.frameTrace {
                 let elapsed =
@@ -1375,7 +1528,7 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
             }
         }
         lock.lock()
-        guard work.epoch == epoch else {
+        guard work.epoch == epoch, submissionAllowed else {
             lock.unlock()
             finish(work, success: false)
             latch(work)
@@ -1384,7 +1537,13 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         // Ordinary scenes keep the drawable retry path. Only an explicit
         // capture may compose this protected scene into a temporary target.
         guard drawable != nil || !captureRequests.isEmpty else {
+            let hidden = !drawableAllowed
             lock.unlock()
+            if hidden {
+                finish(work, success: false)
+                latch(work)
+                return .handled
+            }
             return .retryAfterDisplay
         }
         var superseded: Work?
@@ -1406,10 +1565,18 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
         let selected = work
         let scene = selected.scene
         let offscreen = drawable == nil
-        if let drawable, let presented = work.presented {
+        if let drawable, work.presented != nil || work.presentationTime != nil || work.record != nil {
+            let record = selected.record
+            let presented = selected.presented
+            let presentationTime = selected.presentationTime
             drawable.addPresentedHandler { drawable in
-                let displayed = drawable.presentedTime > 0
-                MainRunLoop.perform { presented(displayed) }
+                let time = drawable.presentedTime
+                record?.recordDrawableResult(presentedTime: time)
+                let validTime = time.isFinite && time > 0 ? time : nil
+                MainRunLoop.perform {
+                    presented?(validTime != nil)
+                    presentationTime?(validTime)
+                }
             }
         }
         do {
@@ -1432,6 +1599,7 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
                     // display presentation. Preserve remote discard credits.
                     MainRunLoop.perform { presented(false) }
                 }
+                if offscreen { MainRunLoop.perform { selected.presentationTime?(nil) } }
                 self.finish(selected, success: command.status == .completed)
                 if offscreen, command.status == .completed {
                     MainRunLoop.perform {
@@ -1447,10 +1615,15 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
                     drawableHeight: drawable.texture.height)
                 try renderer.encode(scene: scene, layers: work.layers,
                     damage: plan.damage, redrawAll: plan.redrawAll,
-                    drawable: drawable, capture: !captures.isEmpty, completion: completion)
+                    drawable: drawable, capture: !captures.isEmpty,
+                    willCommitDrawable: { self.claimSubmission(selected, drawable: true) },
+                    completion: completion)
                 drawableAges.commit(plan)
             } else {
-                try renderer.encodeCapture(scene: scene, layers: work.layers, completion: completion)
+                selected.record?.discardIfUnsubmitted()
+                try renderer.encodeCapture(scene: scene, layers: work.layers,
+                    willCommitDrawable: { self.claimSubmission(selected, drawable: false) },
+                    completion: completion)
                 // This scene's damage never reached the screen drawable pool.
                 // On visibility restoration, redraw its current state in full.
                 drawableAges.invalidate()
@@ -1473,7 +1646,14 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
     private func isCurrent(_ work: Work) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        return work.epoch == epoch
+        return work.epoch == epoch && submissionAllowed
+    }
+
+    private func claimSubmission(_ work: Work, drawable: Bool) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard work.epoch == epoch, submissionAllowed else { return false }
+        return !drawable || (drawableAllowed && (work.record?.claimSubmission() ?? true))
     }
 
     private func completeCaptures(
@@ -1500,7 +1680,8 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
                 layers: newer.layers, drawableSize: newer.drawableSize,
                 readComplete: newer.readComplete,
                 latches: work.latches + newer.latches,
-                presented: newer.presented)
+                presented: newer.presented, presentationTime: newer.presentationTime,
+                record: newer.record)
             disposition = .superseded
         } else {
             pending = work
@@ -1520,8 +1701,12 @@ final class AsyncMetalScenePresenter: @unchecked Sendable {
     }
 
     private func finish(_ work: Work, success: Bool) {
+        if !success { work.record?.discardIfUnsubmitted() }
         let readComplete = work.readComplete
-        MainRunLoop.perform { readComplete(success) }
+        MainRunLoop.perform {
+            readComplete(success)
+            if !success { work.presentationTime?(nil) }
+        }
     }
 
     private func latch(_ work: Work) {
@@ -1548,10 +1733,11 @@ private final class SurfaceView: NSView {
     /// the key event offered to the macOS input context first — otherwise every
     /// keystroke would be routed through an IME that no client asked for.
     var textInputEnabled = false
+    var textInputEpoch: UInt32 = 0
     /// The caret, in surface-local logical points, for placing the candidate
     /// window. Zero means the client has not said, and the view's origin is used.
     var textCursorRect: CGRect = .zero
-    private var markedText = ""
+    var textState = GuestTextInputState()
     /// Set for the duration of one keyDown and cleared by whichever
     /// NSTextInputClient callback consumes it. If it survives, nothing did, and
     /// the key goes to the guest as an ordinary key press.
@@ -1935,38 +2121,55 @@ private final class SurfaceView: NSView {
 // MARK: - Text input
 
 extension NativeWindow {
-    /// A guest client turned zwp_text_input_v3 on or off for this window.
-    func setTextInput(enabled: Bool) {
-        guard contentView.textInputEnabled != enabled else { return }
+    /// enable also starts a new field within the same window, so it resets
+    /// composition/context even when the previous field was already enabled.
+    func setTextInput(enabled: Bool, epoch: UInt32) {
+        contentView.abandonComposition(notifyGuest: false)
+        contentView.textState = GuestTextInputState()
+        contentView.textCursorRect = .zero
         contentView.textInputEnabled = enabled
-        if !enabled { contentView.abandonComposition() }
-        // The input context caches whether the responder wants text. Without
-        // this it keeps the previous answer until focus moves, so the first
-        // field a user clicks into gets no IME.
-        NSTextInputContext.current?.invalidateCharacterCoordinates()
-        window?.makeFirstResponder(contentView)
+        contentView.textInputEpoch = enabled ? epoch : 0
+        contentView.inputContext?.allowedInputSourceLocales = nil
+        contentView.inputContext?.invalidateCharacterCoordinates()
+        if window?.isKeyWindow == true { window?.makeFirstResponder(contentView) }
     }
 
-    func setTextCursorRect(_ rect: CGRect) {
-        contentView.textCursorRect = rect
+    func setTextCursorRect(_ rect: CGRect) { contentView.textCursorRect = rect }
+
+    func setTextSurrounding(_ text: String, cursor: Int, anchor: Int) {
+        guard contentView.textInputEnabled else { return }
+        _ = contentView.textState.updateSurrounding(text, cursor: cursor, anchor: anchor)
+    }
+
+    func setTextContentType(hints: UInt32, purpose: UInt32, changeCause: UInt32) {
+        guard contentView.textInputEnabled else { return }
+        if changeCause == 1 { contentView.abandonComposition() }
+        contentView.textState.setContentType(hints: hints, purpose: purpose)
+        // AppKit exposes source locale restrictions, not Wayland's spelling,
+        // casing, completion or multiline policies. Leave those to the client.
+        contentView.inputContext?.allowedInputSourceLocales = contentView.textState.requiresRomanInput
+            ? [NSAllRomanInputSourcesLocaleIdentifier] : nil
     }
 
     var acceptsCommittedText: Bool { contentView.textInputEnabled }
 
     func commitText(_ text: String) {
-        bridge?.send(.textCommit(window: windowID, text: text))
+        guard acceptsCommittedText, acceptsKeyboardInput else { return }
+        bridge?.send(.textCommit(window: windowID, epoch: contentView.textInputEpoch, text: text))
     }
 
     func setPreedit(_ text: String, cursorBegin: Int, cursorEnd: Int) {
-        bridge?.send(.textPreedit(
-            window: windowID, text: text,
-            cursorBegin: cursorBegin, cursorEnd: cursorEnd))
+        guard acceptsCommittedText, acceptsKeyboardInput else { return }
+        bridge?.send(.textPreedit(window: windowID, epoch: contentView.textInputEpoch, text: text, cursorBegin: cursorBegin, cursorEnd: cursorEnd))
     }
 
-    func deleteSurrounding(before: UInt32, after: UInt32) {
-        bridge?.send(.textDeleteSurrounding(
-            window: windowID, beforeLength: before, afterLength: after))
+    func replaceText(_ edit: GuestTextInputState.Edit, preedit: Bool) {
+        guard acceptsCommittedText, acceptsKeyboardInput else { return }
+        bridge?.send(.textEdit(window: windowID, epoch: contentView.textInputEpoch, commit: preedit ? nil : edit.text,
+            preedit: preedit ? edit.text : "", cursorBegin: preedit ? edit.cursorBegin : 0,
+            cursorEnd: preedit ? edit.cursorEnd : 0, beforeLength: edit.before, afterLength: edit.after))
     }
+
 }
 
 /// The macOS side of the IME seam.
@@ -1983,75 +2186,54 @@ extension NativeWindow {
 @MainActor
 extension SurfaceView: @preconcurrency NSTextInputClient {
     func insertText(_ string: Any, replacementRange: NSRange) {
+        guard textInputEnabled, input?.acceptsKeyboardInput == true else { return }
         unconsumedKeyEvent = nil
         let text = (string as? NSAttributedString)?.string ?? (string as? String) ?? ""
-        guard !text.isEmpty else { return }
-        markedText = ""
-        input?.commitText(text)
+        guard let edit = textState.commit(text, replacing: replacementRange) else { return }
+        if replacementRange.location == NSNotFound { input?.commitText(edit.text) }
+        else { input?.replaceText(edit, preedit: false) }
     }
 
     override func doCommand(by selector: Selector) {
-        // Deliberately does nothing and leaves `unconsumedKeyEvent` set. This is
-        // how Return, Tab, Escape and the arrows get back onto the raw key path:
-        // they are commands for the client's editor, not text the IME produced.
+        // Editing commands continue on the raw key path.
     }
 
     func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        guard textInputEnabled, input?.acceptsKeyboardInput == true else { return }
         unconsumedKeyEvent = nil
         let text = (string as? NSAttributedString)?.string ?? (string as? String) ?? ""
-        markedText = text
-        // text-input-v3 measures the cursor in bytes of the UTF-8 preedit, while
-        // AppKit's range is in UTF-16 units. Converting through the string is
-        // what keeps a CJK preedit's caret in the right place.
-        let begin = utf8Offset(in: text, utf16Offset: selectedRange.location)
-        let end = utf8Offset(in: text, utf16Offset: selectedRange.location + selectedRange.length)
-        input?.setPreedit(text, cursorBegin: begin, cursorEnd: end)
+        guard let edit = textState.preedit(text, selection: selectedRange, replacing: replacementRange) else { return }
+        if replacementRange.location == NSNotFound {
+            input?.setPreedit(edit.text, cursorBegin: edit.cursorBegin, cursorEnd: edit.cursorEnd)
+        } else { input?.replaceText(edit, preedit: true) }
     }
 
-    private func utf8Offset(in text: String, utf16Offset: Int) -> Int {
-        guard utf16Offset > 0 else { return 0 }
-        guard let index = String.Index(
-            String.UTF16View.Index(utf16Offset: utf16Offset, in: text), within: text)
-        else { return text.utf8.count }
-        return text.utf8.distance(from: text.utf8.startIndex, to: index.samePosition(in: text.utf8)!)
-    }
-
-    /// Drops any composition in progress without committing it.
-    func abandonComposition() {
-        guard !markedText.isEmpty else { return }
-        markedText = ""
+    func abandonComposition(notifyGuest: Bool = true) {
+        guard !textState.markedText.isEmpty else { return }
+        textState.clearMarkedText()
         inputContext?.discardMarkedText()
-        input?.setPreedit("", cursorBegin: 0, cursorEnd: 0)
+        if notifyGuest { input?.setPreedit("", cursorBegin: 0, cursorEnd: 0) }
     }
 
     func unmarkText() {
-        guard !markedText.isEmpty else { return }
-        markedText = ""
-        input?.setPreedit("", cursorBegin: 0, cursorEnd: 0)
+        guard !textState.markedText.isEmpty else { return }
+        // NSTextInputClient's unmark accepts the current composition. Focus
+        // loss and external edits use abandonComposition for cancellation.
+        let text = textState.markedText
+        insertText(text, replacementRange: NSRange(location: NSNotFound, length: 0))
     }
 
-    func selectedRange() -> NSRange {
-        // The client owns the document; the host has no index into it. Reporting
-        // an empty selection at the caret is accurate for the only thing AppKit
-        // uses it for here, which is deciding a composition is a fresh one.
-        NSRange(location: 0, length: 0)
-    }
+    func selectedRange() -> NSRange { textState.selectedRange }
+    func markedRange() -> NSRange { textState.markedRange }
+    func hasMarkedText() -> Bool { !textState.markedText.isEmpty }
 
-    func markedRange() -> NSRange {
-        markedText.isEmpty
-            ? NSRange(location: NSNotFound, length: 0)
-            : NSRange(location: 0, length: markedText.utf16.count)
-    }
-
-    func hasMarkedText() -> Bool { !markedText.isEmpty }
-
-    func attributedSubstring(
-        forProposedRange range: NSRange, actualRange: NSRangePointer?
-    ) -> NSAttributedString? {
-        // Reconversion would need the client's text, which arrives as
-        // textInputSurroundingText. v1 declines rather than answering wrongly:
-        // a wrong substring makes an IME replace text the user did not select.
-        nil
+    func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? {
+        guard let text = textState.substring(in: range) else {
+            actualRange?.pointee = NSRange(location: NSNotFound, length: 0)
+            return nil
+        }
+        actualRange?.pointee = range
+        return NSAttributedString(string: text)
     }
 
     func validAttributesForMarkedText() -> [NSAttributedString.Key] { [] }

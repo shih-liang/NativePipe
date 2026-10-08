@@ -327,8 +327,71 @@ static void manager_bind(struct wl_client *client, void *data,
 	wl_resource_set_implementation(resource, &manager_implementation, data, NULL);
 }
 
+static bool syncobj_supported(int drm_fd)
+{
+	if (drm_fd < 0) return false;
+	struct drm_get_cap cap = { .capability = DRM_CAP_SYNCOBJ };
+	if (ioctl(drm_fd, DRM_IOCTL_GET_CAP, &cap) < 0 || !cap.value)
+		return false;
+	cap = (struct drm_get_cap) { .capability = DRM_CAP_SYNCOBJ_TIMELINE };
+	if (ioctl(drm_fd, DRM_IOCTL_GET_CAP, &cap) < 0 || !cap.value)
+		return false;
+
+	/* A render node alone does not promise working timeline/eventfd ioctls.
+	 * Exercise the same wait and notification modes used for client points. */
+	struct drm_syncobj_create create = {0};
+	if (ioctl(drm_fd, DRM_IOCTL_SYNCOBJ_CREATE, &create) < 0 || !create.handle)
+		return false;
+	bool supported = false;
+	int fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+	if (fd < 0) goto done;
+	uint32_t handle = create.handle;
+	uint64_t value = 1;
+	struct drm_syncobj_timeline_array signal = {
+		.handles = (uintptr_t)&handle,
+		.points = (uintptr_t)&value,
+		.count_handles = 1,
+	};
+	if (ioctl(drm_fd, DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, &signal) < 0)
+		goto done;
+	struct drm_syncobj_timeline_wait wait = {
+		.handles = (uintptr_t)&handle,
+		.points = (uintptr_t)&value,
+		.timeout_nsec = 0,
+		.count_handles = 1,
+		.flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL |
+		         DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
+	};
+	if (ioctl(drm_fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &wait) < 0)
+		goto done;
+	struct np_drm_syncobj_eventfd event = {
+		.handle = handle,
+		.point = value,
+		.fd = fd,
+	};
+	if (ioctl(drm_fd, DRM_IOCTL_SYNCOBJ_EVENTFD, &event) < 0)
+		goto done;
+	uint64_t notification = 0;
+	ssize_t size;
+	do size = read(fd, &notification, sizeof(notification));
+	while (size < 0 && errno == EINTR);
+	supported = size == (ssize_t)sizeof(notification) && notification != 0;
+done:
+	if (fd >= 0) close(fd);
+	struct drm_syncobj_destroy destroy = { .handle = create.handle };
+	if (ioctl(drm_fd, DRM_IOCTL_SYNCOBJ_DESTROY, &destroy) < 0)
+		supported = false;
+	return supported;
+}
+
 void np_syncobj_advertise(struct wl_display *display, struct np_server *server)
 {
+	struct np_vmpipe_backend *backend = np_vmpipe_backend(server);
+	if (!display || !backend || !syncobj_supported(backend->drm_fd)) {
+		fprintf(stderr,
+		        "[wayland] linux-drm-syncobj unavailable; using implicit synchronization\n");
+		return;
+	}
 	wl_global_create(display, &wp_linux_drm_syncobj_manager_v1_interface, 1,
 	                 server, manager_bind);
 }

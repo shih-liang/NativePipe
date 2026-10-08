@@ -12,6 +12,7 @@
 #include "syncobj.h"
 #include "window_events.h"
 #include "xdg_shell.h"
+#include "presentation_time.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -166,7 +167,7 @@ void np_presentation_finish_feedback(struct np_server *server)
 void np_presentation_flush(struct np_server *server) {
 	/* A scene owns client buffers until feedback returns. Never publish into a
 	 * partial multi-port session that cannot return both latch and release. */
-	if (!server->host_session_ready) return;
+	if (!server->host_session_ready || !np_presentation_time_emission_allowed(server)) return;
 	struct np_surface *surface;
 	wl_list_for_each(surface, &server->surfaces, link) {
 		if (!surface->scene_dirty || np_scene_root(surface) != surface)
@@ -179,6 +180,7 @@ void np_presentation_flush(struct np_server *server) {
 		 * every future window's frame. */
 		if (!surface->has_published) {
 			uint32_t presentation_id = surface->scene_presentation_id;
+			np_presentation_time_discard_scene(server, presentation_id);
 			surface->scene_dirty = false;
 			surface->scene_presentation_id = 0;
 			np_presentation_request_refresh(surface, presentation_id);
@@ -196,6 +198,7 @@ void np_presentation_flush(struct np_server *server) {
 		}
 		np_presentation_clear_scene_wait(surface);
 		if (result != NP_SCENE_READY) {
+			np_presentation_time_discard_scene(server, surface->scene_presentation_id);
 			surface->scene_dirty = false;
 			surface->scene_presentation_id = 0;
 			struct wl_client *client = wl_resource_get_client(surface->resource);
@@ -206,11 +209,19 @@ void np_presentation_flush(struct np_server *server) {
 					client, "could not construct a valid NativePipe scene");
 			continue;
 		}
-		if (!np_backend_send_binary(server, packet.data, packet.size)) {
+		if (!np_presentation_time_prepare_scene(server, surface->id,
+		        surface->scene_presentation_id, packet.data, packet.size)) {
 			np_scene_presented(surface, surface->scene_presentation_id);
 			free(packet.data);
 			continue;
 		}
+		if (!np_backend_admit_scene(server, packet.data, packet.size)) {
+			np_presentation_time_reject_scene(server, packet.data, packet.size);
+			np_scene_presented(surface, surface->scene_presentation_id);
+			free(packet.data);
+			continue;
+		}
+		np_presentation_time_submitted(server, packet.data, packet.size);
 		free(packet.data);
 		np_scene_damage_sent(surface);
 		np_perf_count(NP_PERF_COMMIT_SENT);
@@ -223,15 +234,28 @@ void np_presentation_flush(struct np_server *server) {
 	wl_list_for_each(surface, &server->surfaces, link) {
 		if (!surface->pending_frame) continue;
 		if (np_scene_root(surface)) continue;
+		/* A legal commit may precede set_cursor/start_drag. It is not a
+		 * submitted display outcome while its role has no active presenter. */
+		bool active_cursor = surface->role == NP_SURFACE_ROLE_CURSOR &&
+		                     server->cursor_surface == surface->resource;
+		bool active_drag = surface->role == NP_SURFACE_ROLE_DRAG_ICON &&
+		                   server->drag_icon == surface->resource;
+		if (!active_cursor && !active_drag) continue;
+		if (!np_backend_connected(server)) continue;
 		if (!np_backend_scene_ready(surface)) continue;
 		unsigned char *body = surface->pending_frame;
 		size_t body_size = surface->pending_frame_size;
 		uint32_t presentation_id = surface->pending_presentation_id;
+		if (!np_presentation_time_prepare_scene(server, surface->id, presentation_id, body, body_size))
+			continue;
+		if (!np_backend_admit_scene(server, body, body_size)) {
+			np_presentation_time_reject_scene(server, body, body_size);
+			continue; /* Keep this unsent frame and its one source hold for retry. */
+		}
+		np_presentation_time_submitted(server, body, body_size);
 		surface->pending_frame = NULL;
 		surface->pending_frame_size = 0;
 		surface->pending_presentation_id = 0;
-		if (!np_backend_send_binary(server, body, body_size))
-			np_scene_presented(surface, presentation_id);
 		free(body);
 	}
 	// Subsurface positions are guest scene state. Consume their dirty marker;
@@ -320,6 +344,7 @@ void np_presentation_queue_scene(struct np_surface *surface,
 		root->scene_presentation_id = np_presentation_next_id(surface->server);
 	}
 	uint32_t scene_id = root->scene_presentation_id;
+	np_presentation_time_scene(surface, presentation_id, scene_id);
 	np_presentation_rebind_callbacks(surface, presentation_id, scene_id);
 	if (surface->fifo_barrier_presentation_id == presentation_id)
 		surface->fifo_barrier_presentation_id = scene_id;
@@ -417,6 +442,7 @@ bool np_presentation_queue_last(struct np_surface *surface,
 		return false;
 	}
 	if (surface->pending_frame) {
+		np_presentation_time_discard_scene(surface->server, surface->pending_presentation_id);
 		np_presentation_rebind_callbacks(
 			surface, surface->pending_presentation_id, presentation_id);
 		np_scene_presented(surface, surface->pending_presentation_id);
@@ -425,5 +451,6 @@ bool np_presentation_queue_last(struct np_surface *surface,
 	surface->pending_frame = body;
 	surface->pending_frame_size = body_size;
 	surface->pending_presentation_id = presentation_id;
+	np_presentation_time_scene(surface, presentation_id, presentation_id);
 	return true;
 }

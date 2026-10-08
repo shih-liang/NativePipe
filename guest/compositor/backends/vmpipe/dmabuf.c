@@ -554,12 +554,12 @@ static const uint64_t k_modifiers[] = {
     /* NativePipe's private Apple-family token maps to optimal tiling in VGL. */
     DRM_FORMAT_MOD_APPLE_GPU_TILED,
     DRM_FORMAT_MOD_LINEAR,
+    DRM_FORMAT_MOD_INVALID,
 };
 
 /* Classic VirGL does not implement pipe_screen::resource_create_with_modifiers.
- * Mesa therefore requires INVALID in dmabuf feedback before it will allocate
- * an implicit-modifier window buffer.  Keep INVALID out of the legacy
- * `modifier` events: the legacy `format` event already advertises that path. */
+ * Mesa therefore requires INVALID among the advertised modifiers before it
+ * will allocate an implicit-modifier window buffer, including v3 clients. */
 static const uint64_t k_feedback_modifiers[] = {
     DRM_FORMAT_MOD_APPLE_GPU_TILED,
     DRM_FORMAT_MOD_LINEAR,

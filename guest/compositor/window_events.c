@@ -72,7 +72,11 @@ bool np_window_event_send_frame(struct np_server *server, uint32_t surface,
 	np_window_message_init(&message, NP_WINDOW_GUEST_TO_HOST,
 	                       NP_GUEST_COMMITTED);
 	np_window_put_u32(&message, surface);
-	np_window_put_frame(&message, frame);
+	/* Reserve the clock context; fill it only at admission, after role/resource
+	 * and backpressure waits have finished. */
+	struct np_window_frame outbound = *frame;
+	outbound.has_presentation_context = true;
+	np_window_put_frame(&message, &outbound);
 	if (!message.ok) {
 		np_window_message_clear(&message);
 		return false;

@@ -46,6 +46,11 @@ void np_backend_session_finish(struct np_server *server);
 bool np_backend_connected(const struct np_server *server);
 bool np_backend_send_binary(
 	struct np_server *server, const void *payload, size_t length);
+/* Scene admission, not connection liveness: true means the backend owns this
+ * immutable scene even if flushing subsequently discovers a broken transport. */
+bool np_backend_admit_scene(struct np_server *server, const void *payload, size_t length);
+/* All scenes accepted before a pause have reached the ordered display stream. */
+bool np_backend_display_boundary_ready(struct np_server *server);
 
 /* Backend source description used by the shared scene serializer. */
 struct np_backend_scene_source {

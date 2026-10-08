@@ -163,7 +163,7 @@ final class KeyboardTests: XCTestCase {
         guard down.window === native.window else {
             throw XCTSkip("AppKit text input requires a WindowServer-backed window")
         }
-        native.setTextInput(enabled: true)
+        native.setTextInput(enabled: true, epoch: 1)
         for (code, characters): (UInt16, String) in [(0x08, "c"), (0x12, "1"), (0x1D, "0")] {
             for index in 0..<6 {
                 output.commands.removeAll()
@@ -172,7 +172,7 @@ final class KeyboardTests: XCTestCase {
                     characters: characters, window: native.window))
                 XCTAssertTrue(output.commands.contains {
                     switch $0 {
-                    case .textCommit(_, let text), .textPreedit(_, let text, _, _):
+                    case .textCommit(_, _, let text), .textPreedit(_, _, let text, _, _):
                         return !text.isEmpty
                     default: return false
                     }
@@ -182,6 +182,83 @@ final class KeyboardTests: XCTestCase {
             view.keyUp(with: event(.keyUp, code: code, characters: characters, window: native.window))
             XCTAssertTrue(output.keys.isEmpty, "a text-only press has no raw release")
         }
+    }
+
+    func testAppKitReconversionSendsOneAtomicEditWithByteCounts() throws {
+        let (bridge, native, view, output) = try fixture()
+        defer { bridge.closeAll() }
+        let client = try XCTUnwrap(view as? NSTextInputClient)
+        native.setTextInput(enabled: true, epoch: 1)
+        native.setTextSurrounding("ab中😀z", cursor: 5, anchor: 5)
+        XCTAssertEqual(client.selectedRange(), NSRange(location: 3, length: 0))
+        XCTAssertEqual(client.attributedSubstring(forProposedRange: NSRange(location: 2, length: 3),
+            actualRange: nil)?.string, "中😀")
+        output.commands.removeAll()
+        client.insertText("文", replacementRange: NSRange(location: 2, length: 3))
+        let edits = output.commands.filter { if case .textEdit = $0 { return true }; return false }
+        XCTAssertEqual(edits.count, 1)
+        guard case .textEdit(let window, let epoch, let commit, let preedit, let begin, let end, let before, let after) =
+            try XCTUnwrap(edits.first) else { return XCTFail("missing atomic edit") }
+        XCTAssertEqual(window, 1); XCTAssertEqual(epoch, 1); XCTAssertEqual(commit, "文"); XCTAssertEqual(preedit, "")
+        XCTAssertEqual(begin, 0); XCTAssertEqual(end, 0)
+        XCTAssertEqual(before, 3); XCTAssertEqual(after, 4)
+        XCTAssertEqual(client.selectedRange(), NSRange(location: 3, length: 0))
+    }
+
+    func testEnablingAnotherFieldClearsContextAndComposition() throws {
+        let (bridge, native, view, _) = try fixture()
+        defer { bridge.closeAll() }
+        let client = try XCTUnwrap(view as? NSTextInputClient)
+        native.setTextInput(enabled: true, epoch: 1)
+        native.setTextSurrounding("a中", cursor: 1, anchor: 1)
+        client.setMarkedText("文字", selectedRange: NSRange(location: 2, length: 0),
+            replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertTrue(client.hasMarkedText())
+        native.setTextInput(enabled: true, epoch: 1)
+        XCTAssertFalse(client.hasMarkedText())
+        XCTAssertNil(client.attributedSubstring(forProposedRange: NSRange(location: 0, length: 1), actualRange: nil))
+        native.setTextContentType(hints: 0, purpose: 8, changeCause: 0)
+        XCTAssertEqual(view.inputContext?.allowedInputSourceLocales, [NSAllRomanInputSourcesLocaleIdentifier])
+        native.setTextContentType(hints: 0, purpose: 0, changeCause: 0)
+        XCTAssertNil(view.inputContext?.allowedInputSourceLocales)
+    }
+
+    func testUnmarkAcceptsCompositionAndExternalChangeCancelsIt() throws {
+        let (bridge, native, view, output) = try fixture()
+        defer { bridge.closeAll() }
+        let client = try XCTUnwrap(view as? NSTextInputClient)
+        native.setTextInput(enabled: true, epoch: 1)
+        client.setMarkedText("文字", selectedRange: NSRange(location: 2, length: 0),
+            replacementRange: NSRange(location: NSNotFound, length: 0))
+        output.commands.removeAll()
+        client.unmarkText()
+        XCTAssertFalse(client.hasMarkedText())
+        XCTAssertEqual(output.commands.filter { if case .textCommit(_, _, "文字") = $0 { return true }; return false }.count, 1)
+        client.setMarkedText("未提交", selectedRange: NSRange(location: 3, length: 0),
+            replacementRange: NSRange(location: NSNotFound, length: 0))
+        output.commands.removeAll()
+        native.setTextContentType(hints: 0, purpose: 0, changeCause: 1)
+        XCTAssertFalse(client.hasMarkedText())
+        XCTAssertEqual(output.commands.filter { if case .textPreedit(_, _, "", 0, 0) = $0 { return true }; return false }.count, 1)
+        XCTAssertFalse(output.commands.contains { if case .textCommit = $0 { return true }; return false })
+    }
+
+    func testQueuedCommandsRetainTheFieldEpochTheyWereProducedFor() throws {
+        let (bridge, native, view, output) = try fixture()
+        defer { bridge.closeAll() }
+        let client = try XCTUnwrap(view as? NSTextInputClient)
+        bridge.apply(.textInputEnabled(window: 1, epoch: 41, enabled: true))
+        client.insertText("old", replacementRange: NSRange(location: NSNotFound, length: 0))
+        bridge.apply(.textInputEnabled(window: 1, epoch: 42, enabled: true))
+        client.insertText("new", replacementRange: NSRange(location: NSNotFound, length: 0))
+        let edits = output.commands.compactMap { command -> UInt32? in
+            guard case .textCommit(_, let epoch, _) = command else { return nil }
+            return epoch
+        }
+        XCTAssertEqual(edits, [41, 42])
+        bridge.apply(.textInputEnabled(window: 1, epoch: 43, enabled: false))
+        client.insertText("disabled", replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertEqual(output.commands.filter { if case .textCommit = $0 { return true }; return false }.count, 2)
     }
 
     func testFocusLossReleasesKeysBeforeSendingLeave() throws {

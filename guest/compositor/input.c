@@ -3,6 +3,8 @@
 #define _GNU_SOURCE
 
 #include "compositor_internal.h"
+#include "activation.h"
+#include "presentation_time.h"
 #include "data_device.h"
 #include "keymap.h"
 #include "host_open.h"
@@ -176,6 +178,14 @@ static void pointer_set_cursor(struct wl_client *client, struct wl_resource *res
 		surface_id, (uint32_t)hotspot_x, (uint32_t)hotspot_y, pixel_scale,
 	};
 	np_window_event_send(server, NP_GUEST_CURSOR_CHANGED, fields, 4);
+	if (surface) {
+		struct np_surface *cursor = wl_resource_get_user_data(surface);
+		if (!cursor->pending_frame && cursor->has_published && cursor->last_resource_id) {
+			uint32_t presentation_id = np_presentation_next_id(server);
+			np_presentation_time_replay_surface(cursor, cursor->id, presentation_id);
+			(void)np_presentation_queue_last(cursor, presentation_id);
+		}
+	}
 }
 
 static void pointer_release(struct wl_client *client, struct wl_resource *resource) {
@@ -248,7 +258,10 @@ static void seat_get_keyboard(struct wl_client *client, struct wl_resource *reso
 	}
 }
 
-static void seat_get_touch(struct wl_client *client, struct wl_resource *resource, uint32_t id) {}
+static void seat_get_touch(struct wl_client *client, struct wl_resource *resource, uint32_t id) {
+	wl_resource_post_error(resource, WL_SEAT_ERROR_MISSING_CAPABILITY,
+	                       "This seat has no touch capability");
+}
 static void seat_release(struct wl_client *client, struct wl_resource *resource) {
 	wl_resource_destroy(resource);
 }
@@ -270,8 +283,8 @@ void np_seat_bind(struct wl_client *client, void *data, uint32_t version, uint32
 		return;
 	}
 	wl_resource_set_implementation(resource, &seat_implementation, data, NULL);
-	wl_seat_send_capabilities(resource, WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
 	if (version >= WL_SEAT_NAME_SINCE_VERSION) wl_seat_send_name(resource, "NativePipe");
+	wl_seat_send_capabilities(resource, WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
 }
 
 static void pointer_frame(struct wl_resource *pointer) {
@@ -419,6 +432,22 @@ void np_set_keyboard_focus(struct np_server *server, uint32_t window_id) {
 	np_text_input_focus_changed(server, previous, next);
 }
 
+void np_input_host_disconnected(struct np_server *server)
+{
+    np_set_keyboard_focus(server, 0);
+    clear_pointer_focus(server);
+    server->pointer_buttons = 0;
+    server->pointer_grab_client = NULL;
+    server->pointer_grab_serial = 0;
+    server->last_input_client = NULL;
+    server->last_input_serial = 0;
+    struct np_input *pointer;
+    wl_list_for_each(pointer, &server->pointers, link) pointer->active_scroll_axes = 0;
+    struct np_surface *surface;
+    wl_list_for_each(surface, &server->surfaces, link) np_activation_revoke_surface(surface);
+    wl_display_flush_clients(server->display);
+}
+
 /// Wayland has no "modifiers changed" input event separate from the key that
 /// changed them, so the current set is pushed alongside every key.
 static void send_modifiers(struct np_server *server, struct np_surface *surface,
@@ -559,11 +588,21 @@ enum {
 static int32_t wheel_steps(double value)
 {
 	if (value == 0) return 0;
+	if (value >= INT32_MAX) return INT32_MAX;
+	if (value <= INT32_MIN) return INT32_MIN;
 	int64_t rounded = llround(value);
 	if (!rounded) rounded = value < 0 ? -1 : 1;
 	if (rounded < INT32_MIN) return INT32_MIN;
 	if (rounded > INT32_MAX) return INT32_MAX;
 	return (int32_t)rounded;
+}
+
+static int32_t wheel_value120(double value)
+{
+	if (value >= (double)INT32_MAX / 120) return INT32_MAX;
+	if (value <= (double)INT32_MIN / 120) return INT32_MIN;
+	int32_t rounded = (int32_t)round(value * 120);
+	return rounded ? rounded : (value < 0 ? -1 : 1);
 }
 
 static void pointer_send_wheel_axis(
@@ -572,9 +611,7 @@ static void pointer_send_wheel_axis(
 	int32_t steps = wheel_steps(value);
 #ifdef WL_POINTER_AXIS_VALUE120_SINCE_VERSION
 	if (wl_resource_get_version(resource) >= WL_POINTER_AXIS_VALUE120_SINCE_VERSION) {
-		if (steps > INT32_MAX / 120) steps = INT32_MAX / 120;
-		if (steps < INT32_MIN / 120) steps = INT32_MIN / 120;
-		wl_pointer_send_axis_value120(resource, axis, steps * 120);
+		wl_pointer_send_axis_value120(resource, axis, wheel_value120(value));
 	} else
 #endif
 	if (wl_resource_get_version(resource) >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION)
@@ -583,7 +620,8 @@ static void pointer_send_wheel_axis(
 }
 
 static void handle_pointer_scroll(struct np_server *server, uint32_t window_id,
-                                  double dx, double dy, bool precise) {
+                                  double dx, double dy, bool precise, bool inverted) {
+	if (!isfinite(dx) || !isfinite(dy)) return;
 	struct np_surface *surface = np_surface_by_id(server, server->pointer_surface);
 	if (!surface || server->pointer_window != window_id) {
 		if (np_trace_enabled())
@@ -619,6 +657,11 @@ static void handle_pointer_scroll(struct np_server *server, uint32_t window_id,
 			entry->active_scroll_axes = 0;
 		} else {
 			if (dy != 0) {
+				if (version >= WL_POINTER_AXIS_RELATIVE_DIRECTION_SINCE_VERSION)
+					wl_pointer_send_axis_relative_direction(entry->resource,
+						WL_POINTER_AXIS_VERTICAL_SCROLL, inverted
+						? WL_POINTER_AXIS_RELATIVE_DIRECTION_INVERTED
+						: WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
 				if (precise) {
 					wl_pointer_send_axis(
 						entry->resource, time, WL_POINTER_AXIS_VERTICAL_SCROLL,
@@ -628,6 +671,11 @@ static void handle_pointer_scroll(struct np_server *server, uint32_t window_id,
 					entry->resource, time, WL_POINTER_AXIS_VERTICAL_SCROLL, dy);
 			}
 			if (dx != 0) {
+				if (version >= WL_POINTER_AXIS_RELATIVE_DIRECTION_SINCE_VERSION)
+					wl_pointer_send_axis_relative_direction(entry->resource,
+						WL_POINTER_AXIS_HORIZONTAL_SCROLL, inverted
+						? WL_POINTER_AXIS_RELATIVE_DIRECTION_INVERTED
+						: WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
 				if (precise) {
 					wl_pointer_send_axis(
 						entry->resource, time, WL_POINTER_AXIS_HORIZONTAL_SCROLL,
@@ -679,11 +727,31 @@ static void handle_keyboard_focus(struct np_server *server, uint32_t window) {
 	wl_display_flush_clients(server->display);
 }
 
-static void handle_key(struct np_server *server, uint32_t keycode,
+static bool keyboard_source_matches_focus(struct np_server *server,
+                                          struct np_surface *focused,
+                                          uint32_t window_id) {
+	if (!focused || !window_id) return false;
+	if (focused->window_id == window_id) return true;
+	/* A grabbing popup is a non-key AppKit panel. Its toplevel (or an outer
+	 * grabbing popup) still sends the keys, but an unrelated old window cannot
+	 * acquire that exception merely because some popup currently has focus. */
+	if (!focused->has_grab || grabbing_popup(server) != focused) return false;
+	struct np_surface *current = focused;
+	for (unsigned depth = 0; depth < 64 && current->has_grab; depth++) {
+		struct np_surface *parent = np_surface_by_window(server, current->popup_parent_window);
+		if (!parent || parent == current || !same_client(parent->resource, focused->resource))
+			return false;
+		if (parent->window_id == window_id) return true;
+		current = parent;
+	}
+	return false;
+}
+
+static void handle_key(struct np_server *server, uint32_t window_id, uint32_t keycode,
 	                   bool pressed, uint32_t modifiers) {
 	struct np_surface *surface = np_surface_by_window(
 		server, server->focused_window);
-	if (!surface) return;
+	if (!keyboard_source_matches_focus(server, surface, window_id)) return;
 	send_modifiers(server, surface, modifiers);
 	struct np_input *entry;
 	uint32_t serial = wl_display_next_serial(server->display);
@@ -701,10 +769,23 @@ static void handle_key(struct np_server *server, uint32_t keycode,
 		                             : WL_KEYBOARD_KEY_STATE_RELEASED);
 		delivered++;
 	}
+	if (pressed && delivered) np_activation_record_input(server, surface, serial);
 	if (np_trace_enabled())
 		fprintf(stderr, "[wayland] key %u -> %d of %d keyboards (surface %u)\n",
 		        keycode, delivered, total, surface->id);
 	wl_display_flush_clients(server->display);
+}
+
+static bool handle_host_key(struct np_server *server, struct np_window_reader *reader) {
+	uint32_t window = np_window_read_u32(reader);
+	uint32_t keycode = np_window_read_u32(reader);
+	bool pressed = np_window_read_bool(reader);
+	uint32_t modifiers = np_window_read_u32(reader);
+	/* Validate the entire record before modifiers, serials or key events can
+	 * affect a client. Truncation must not look like a valid key release. */
+	if (!np_window_reader_finished(reader)) return false;
+	handle_key(server, window, keycode, pressed, modifiers);
+	return true;
 }
 
 static void handle_pointer_left(struct np_server *server, uint32_t window_id) {
@@ -733,7 +814,7 @@ static void handle_pointer_button(struct np_server *server, uint32_t window_id,
 		return;
 	}
 	struct np_surface *surface = np_surface_by_id(server, server->pointer_surface);
-	if (pressed && !surface) return;
+	if (pressed && (!surface || server->pointer_window != window_id)) return;
 	if (pressed) server->pointer_buttons |= button;
 	else server->pointer_buttons &= ~button;
 	if (!pressed && server->pointer_buttons == 0)
@@ -764,6 +845,7 @@ static void handle_pointer_button(struct np_server *server, uint32_t window_id,
 		pointer_frame(entry->resource);
 		delivered++;
 	}
+	if (pressed && delivered) np_activation_record_input(server, surface, serial);
 	if (np_trace_enabled())
 		fprintf(stderr,
 		        "[wayland] pointer button window=%u surface=%u code=%u pressed=%d -> %d of %d pointers\n",
@@ -799,6 +881,42 @@ static void handle_scale(struct np_server *server, uint32_t window_id,
 	wl_display_flush_clients(server->display);
 }
 
+static void capture_current_presentation(struct np_server *server,
+                                         struct np_surface *surface)
+{
+	if (!surface) return;
+	struct np_surface *root = np_scene_root(surface);
+	if (root) {
+		if (!root->has_published) return;
+		/* A replay protects the same current commits. Outstanding queries must
+		 * join it before admission, including those deferred by a hidden attempt. */
+		root->scene_full_damage = true;
+		if (!root->scene_dirty) {
+			root->scene_dirty = true;
+			root->scene_presentation_id = np_presentation_next_id(server);
+		}
+		struct np_surface *member;
+		wl_list_for_each(member, &server->surfaces, link) {
+			if (np_scene_root(member) == root)
+				np_presentation_time_replay_surface(
+					member, root->id, root->scene_presentation_id);
+		}
+	} else {
+		bool active_cursor = surface->role == NP_SURFACE_ROLE_CURSOR &&
+		                     server->cursor_surface == surface->resource;
+		bool active_drag = surface->role == NP_SURFACE_ROLE_DRAG_ICON &&
+		                   server->drag_icon == surface->resource;
+		if ((!active_cursor && !active_drag) || !surface->has_published ||
+		    !surface->last_resource_id) return;
+		/* Reuse an unsent protected frame rather than holding its pixels twice. */
+		uint32_t id = surface->pending_frame ? surface->pending_presentation_id :
+		              np_presentation_next_id(server);
+		np_presentation_time_replay_surface(surface, surface->id, id);
+		if (!surface->pending_frame && !np_presentation_queue_last(surface, id)) return;
+	}
+	np_presentation_flush(server);
+}
+
 /// Binary host-control path. NPIP supplies message boundaries; fixed high-rate
 /// records and the complete NPW2 control protocol are the only accepted bodies.
 bool np_input_handle_host_binary(const unsigned char *payload, size_t length,
@@ -812,13 +930,15 @@ bool np_input_handle_host_binary(const unsigned char *payload, size_t length,
 		return true;
 	}
 	if (length == 28 && memcmp(payload, "NPSC", 4) == 0) {
+		if (payload[24] > 1 || payload[25] > 1 || payload[26] || payload[27]) return false;
 		uint64_t dx_bits = read_le64(payload + 8);
 		uint64_t dy_bits = read_le64(payload + 16);
 		double dx, dy;
 		memcpy(&dx, &dx_bits, sizeof(dx));
 		memcpy(&dy, &dy_bits, sizeof(dy));
+		if (!isfinite(dx) || !isfinite(dy)) return false;
 		handle_pointer_scroll(
-			server, read_le32(payload + 4), dx, dy, payload[24] != 0);
+			server, read_le32(payload + 4), dx, dy, payload[24] != 0, payload[25] != 0);
 		return true;
 	}
 	if (length == 24 && memcmp(payload, "NPCF", 4) == 0) {
@@ -883,6 +1003,14 @@ bool np_input_handle_host_binary(const unsigned char *payload, size_t length,
 	if (!np_window_reader_init(
 		    &reader, payload, length, NP_WINDOW_HOST_TO_GUEST)) return false;
 	switch (reader.opcode) {
+	case NP_HOST_WINDOW_STATE: {
+		uint32_t window = np_window_read_u32(&reader);
+		bool visible = np_window_read_bool(&reader);
+		int32_t width = np_window_read_i32(&reader), height = np_window_read_i32(&reader);
+		if (!np_window_reader_finished(&reader) || width < 0 || height < 0 || (width == 0) != (height == 0)) return false;
+		np_xdg_host_window_state(np_surface_by_window(server, window), visible, width, height);
+		return true;
+	}
 	case NP_HOST_CONFIGURE: {
 		uint32_t window = np_window_read_u32(&reader);
 		int32_t width = np_window_read_i32(&reader);
@@ -934,14 +1062,7 @@ bool np_input_handle_host_binary(const unsigned char *payload, size_t length,
 		handle_keyboard_focus(server, np_window_read_u32(&reader));
 		break;
 	case NP_HOST_KEY:
-		(void)np_window_read_u32(&reader);
-		{
-			uint32_t keycode = np_window_read_u32(&reader);
-			bool pressed = np_window_read_bool(&reader);
-			uint32_t modifiers = np_window_read_u32(&reader);
-			handle_key(server, keycode, pressed, modifiers);
-		}
-		break;
+		return handle_host_key(server, &reader);
 	case NP_HOST_POINTER_ENTERED:
 	case NP_HOST_POINTER_MOVED: {
 		uint32_t window = np_window_read_u32(&reader);
@@ -965,7 +1086,9 @@ bool np_input_handle_host_binary(const unsigned char *payload, size_t length,
 		double dx = np_window_read_f64(&reader);
 		double dy = np_window_read_f64(&reader);
 		bool precise = np_window_read_bool(&reader);
-		handle_pointer_scroll(server, window, dx, dy, precise);
+		bool inverted = np_window_read_bool(&reader);
+		if (!np_window_reader_finished(&reader) || !isfinite(dx) || !isfinite(dy)) return false;
+		handle_pointer_scroll(server, window, dx, dy, precise, inverted);
 		break;
 	}
 	case NP_HOST_FRAME_PRESENTED:
@@ -1036,31 +1159,49 @@ bool np_input_handle_host_binary(const unsigned char *payload, size_t length,
 		wl_display_flush_clients(server->display);
 		break;
 	}
+	case NP_HOST_TEXT_EDIT: {
+		uint32_t window = np_window_read_u32(&reader);
+		uint32_t epoch = np_window_read_u32(&reader);
+		uint32_t before = np_window_read_u32(&reader), after = np_window_read_u32(&reader);
+		bool has_commit = np_window_read_bool(&reader);
+		char *commit = has_commit ? np_window_read_string(&reader) : NULL;
+		bool has_preedit = np_window_read_bool(&reader);
+		char *preedit = has_preedit ? np_window_read_string(&reader) : NULL;
+		int32_t begin = np_window_read_i32(&reader), end = np_window_read_i32(&reader);
+		bool valid = (!has_commit || commit) && (!has_preedit || preedit) &&
+			np_window_reader_finished(&reader) && (has_preedit || (begin == 0 && end == 0));
+		if (valid) np_text_input_deliver(server, window, epoch, commit, preedit, begin, end, before, after);
+		free(commit); free(preedit);
+		return valid;
+	}
 	case NP_HOST_TEXT_COMMIT: {
-		(void)np_window_read_u32(&reader);
+		uint32_t window = np_window_read_u32(&reader);
+		uint32_t epoch = np_window_read_u32(&reader);
 		char *text = np_window_read_string(&reader);
-		if (!text) return false;
-		np_text_input_deliver(server, text, "", 0, 0, 0, 0);
+		if (!text || !np_window_reader_finished(&reader)) { free(text); return false; }
+		np_text_input_deliver(server, window, epoch, text, "", 0, 0, 0, 0);
 		free(text);
 		break;
 	}
 	case NP_HOST_TEXT_PREEDIT: {
-		(void)np_window_read_u32(&reader);
+		uint32_t window = np_window_read_u32(&reader);
+		uint32_t epoch = np_window_read_u32(&reader);
 		char *text = np_window_read_string(&reader);
 		int32_t begin = np_window_read_i32(&reader);
 		int32_t end = np_window_read_i32(&reader);
-		if (!text) return false;
-		np_text_input_deliver(server, NULL, text, begin, end, 0, 0);
+		if (!text || !np_window_reader_finished(&reader)) { free(text); return false; }
+		np_text_input_deliver(server, window, epoch, NULL, text, begin, end, 0, 0);
 		free(text);
 		break;
 	}
-	case NP_HOST_TEXT_DELETE_SURROUNDING:
-		(void)np_window_read_u32(&reader);
-		np_text_input_deliver(
-			server, NULL, NULL, 0, 0,
-			(int32_t)np_window_read_u32(&reader),
-			(int32_t)np_window_read_u32(&reader));
-		break;
+	case NP_HOST_TEXT_DELETE_SURROUNDING: {
+		uint32_t window = np_window_read_u32(&reader);
+		uint32_t epoch = np_window_read_u32(&reader);
+		uint32_t before = np_window_read_u32(&reader), after = np_window_read_u32(&reader);
+		if (!np_window_reader_finished(&reader)) return false;
+		np_text_input_deliver(server, window, epoch, NULL, NULL, 0, 0, before, after);
+		return true;
+	}
 	case NP_HOST_OUTPUTS_CHANGED: {
 		uint32_t count = np_window_read_u32(&reader);
 		if (count > 32) return false;
@@ -1105,22 +1246,21 @@ bool np_input_handle_host_binary(const unsigned char *payload, size_t length,
 		free(layout);
 		return valid;
 	}
+	case NP_HOST_PRESENTATION_CLOCK_SAMPLE:
+	case NP_HOST_PRESENTATION_FEEDBACK:
+	case NP_HOST_SCENE_CLOCK_SAMPLE:
+	case NP_HOST_PRESENTATION_PAUSE:
+	case NP_HOST_PRESENTATION_DRAIN:
+	case NP_HOST_PRESENTATION_RESUME: {
+		bool valid = np_presentation_time_handle_command(server, &reader);
+		if (valid) np_presentation_finish_feedback(server);
+		return valid;
+	}
 	case NP_HOST_CAPTURE_FRAME: {
 		struct np_surface *surface = np_surface_by_id(
 			server, np_window_read_u32(&reader));
-		struct np_surface *root = np_scene_root(surface);
 		if (!np_window_reader_finished(&reader)) return false;
-		if (!root || !root->has_published) return true;
-		/* This presentation exists only to protect the current Wayland buffers
-		 * while the host copies its own composed drawable. It has no client frame
-		 * callback, but uses the ordinary scene/release lifetime so a client can
-		 * never rewrite a source texture during the capture. */
-		root->scene_full_damage = true;
-		if (!root->scene_dirty) {
-			root->scene_dirty = true;
-			root->scene_presentation_id = np_presentation_next_id(server);
-		}
-		np_presentation_flush(server);
+		capture_current_presentation(server, surface);
 		return true;
 	}
 	case NP_HOST_NOTIFICATION_CLOSED:

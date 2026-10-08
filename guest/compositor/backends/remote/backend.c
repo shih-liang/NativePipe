@@ -3,6 +3,7 @@
 #include "backend_internal.h"
 #include "compositor.h"
 #include "dmabuf.h"
+#include "presentation_time.h"
 #include "user_text.h"
 #include <glib.h>
 #include <fcntl.h>
@@ -94,6 +95,9 @@ bool np_backend_prepare(struct np_server *server)
 }
 void np_backend_advertise_globals(struct np_server *server)
 {
+    /* Queried window, cursor and drag commits have real host drawable outcomes.
+     * The frontend publishes the global after initial host clock calibration. */
+    np_presentation_time_enable(server, true);
     np_dmabuf_advertise(server->display, -1);
 }
 void np_backend_finish(struct np_server *server)

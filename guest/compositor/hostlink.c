@@ -3,6 +3,7 @@
 #include "hostlink.h"
 #include "host_transport.h"
 #include "user_text.h"
+#include "windowwire.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -132,15 +133,10 @@ static bool reserve_outbound(struct np_host *host, size_t count) {
 	return true;
 }
 
-bool np_host_send_binary(struct np_host *host, const void *payload, size_t length) {
+static bool enqueue_structural(struct np_host *host, const void *payload, size_t length) {
 	if (!host || !payload || !length || length > NP_MAX_PAYLOAD ||
 	    host->conn_fd < 0 || !host->output_enabled)
 		return false;
-	if (np_notification_payload(payload, length)) {
-		bool accepted = np_notification_outbox_send(&host->notifications, payload, length);
-		flush_outbound(host);
-		return accepted && host->conn_fd >= 0;
-	}
 	size_t frame_size = NP_HEADER + length;
 	if (!reserve_outbound(host, frame_size)) {
 		/* Structural and presentation messages are ordered state.  Dropping one
@@ -160,8 +156,31 @@ bool np_host_send_binary(struct np_host *host, const void *payload, size_t lengt
 	memcpy(host->out + host->out_len, header, sizeof(header));
 	memcpy(host->out + host->out_len + sizeof(header), payload, length);
 	host->out_len += frame_size;
+	return true;
+}
+
+bool np_host_send_binary(struct np_host *host, const void *payload, size_t length) {
+	if (!host || !payload || !length || length > NP_MAX_PAYLOAD ||
+	    host->conn_fd < 0 || !host->output_enabled) return false;
+	if (np_notification_payload(payload, length)) {
+		bool accepted = np_notification_outbox_send(&host->notifications, payload, length);
+		flush_outbound(host);
+		return accepted && host->conn_fd >= 0;
+	}
+	if (!enqueue_structural(host, payload, length)) return false;
 	flush_outbound(host);
 	return host->conn_fd >= 0;
+}
+
+bool np_host_admit_scene(struct np_host *host, const void *payload, size_t length) {
+	const unsigned char *bytes = payload;
+	bool scene = bytes && length >= 100 && !memcmp(bytes, "NPSN", 4);
+	bool frame = bytes && length >= 40 && !memcmp(bytes, "NPW2", 4) &&
+	             bytes[5] == NP_GUEST_COMMITTED;
+	if (!scene && !frame) return false;
+	if (!enqueue_structural(host, payload, length)) return false;
+	flush_outbound(host);
+	return true; /* Admission survives an unrelated optional write failure. */
 }
 
 void np_host_flush(struct np_host *host) {

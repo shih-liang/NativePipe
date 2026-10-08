@@ -5,6 +5,7 @@
 #include "compositor_internal.h"
 #include "scale.h"
 #include "scene.h"
+#include "presentation_time.h"
 #include "window_events.h"
 #include "windowwire.h"
 #include "user_text.h"
@@ -745,16 +746,25 @@ bool np_data_handle_file_drag(struct np_server *s, struct np_window_reader *r) {
 void np_data_host_disconnected(struct np_server *server) {
     host_drag_leave(server);
     server->host_file_drag = 0;
-    if (server->drag_source && server->drag_exported) {
+    /* An unfinished guest drag depends on this host's physical pointer. Do
+     * not let it capture the new connection's motion or turn its first release
+     * into a drop. A completed guest-only drop retains its source/offer until
+     * the destination finishes reading; that pipe does not depend on the host. */
+    if (server->drag_source && (server->drag_exported || !server->drag_dropped)) {
+        if (!server->drag_dropped && (server->drag_focus_window || server->drag_focus_surface))
+            np_data_drag_leave(server, server->drag_focus_window);
         wl_data_source_send_cancelled(server->drag_source);
         detach_offers_for_source(server, server->drag_source, false);
+        if (server->drag_icon) send_drag_icon(server, NULL);
         server->drag_source = NULL; server->drag_origin = NULL; server->drag_icon = NULL;
+        server->drag_focus_window = 0; server->drag_focus_surface = 0;
         server->drag_dropped = false; server->drag_exported = false;
         server->pointer_buttons = 0;
     }
     struct np_data_offer *offer;
-    wl_list_for_each(offer, &server->data_offers, link)
+    wl_list_for_each(offer, &server->data_offers, link) {
         if (offer->from_host) offer->finished = true;
+    }
 	struct np_clip_read *read_state, *read_tmp;
 	wl_list_for_each_safe(read_state, read_tmp, &server->clip_reads, link)
 		clip_read_cancel(read_state);
@@ -1020,6 +1030,12 @@ static void data_device_start_drag(struct wl_client *client, struct wl_resource 
 		np_scale_changed(icon_surface, root->preferred_scale);
 	np_input_clear_pointer_focus_for_drag(server);
 	send_drag_icon(server, icon);
+	if (icon_surface && !icon_surface->pending_frame &&
+	    icon_surface->has_published && icon_surface->last_resource_id) {
+		uint32_t presentation_id = np_presentation_next_id(server);
+		np_presentation_time_replay_surface(icon_surface, icon_surface->id, presentation_id);
+		(void)np_presentation_queue_last(icon_surface, presentation_id);
+	}
 	np_data_drag_enter(server, surface, fixed_from(server->pointer_x), fixed_from(server->pointer_y));
 	struct np_data_source *offered = wl_resource_get_user_data(source);
 	if (offered && (offered->actions & WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY)) {
@@ -1127,6 +1143,9 @@ static void data_manager_get_device(struct wl_client *client, struct wl_resource
 static const struct wl_data_device_manager_interface data_manager_implementation = {
 	.create_data_source = data_manager_create_source,
 	.get_data_device = data_manager_get_device,
+	/* v4 releases only this factory. Its sources, offers and devices retain
+	 * independent protocol lifetimes. */
+	.release = data_device_release,
 };
 
 void np_data_device_manager_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id) {

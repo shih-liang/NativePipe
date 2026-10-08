@@ -1,3 +1,4 @@
+#include "presentation_time.h"
 #include "backend.h"
 #include "backend_internal.h"
 #include "compositor.h"
@@ -50,6 +51,9 @@ bool np_backend_prepare(struct np_server *server)
 
 void np_backend_advertise_globals(struct np_server *server)
 {
+	/* Queried window, cursor and drag commits have real host drawable outcomes.
+	 * The frontend publishes the global after initial host clock calibration. */
+	np_presentation_time_enable(server, true);
 	struct np_vmpipe_backend *backend = np_vmpipe_backend(server);
 	if (!backend) return;
 	np_dmabuf_advertise(server->display, backend->drm_fd);

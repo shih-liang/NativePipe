@@ -2,6 +2,26 @@ import XCTest
 @testable import NativePipeWindowing
 
 final class ScenePresentationCreditTests: XCTestCase {
+    @MainActor func testActualTimestampSurvivesOneShotCompletionWithoutTransferToNewScene() {
+        let credits = ScenePresentationCredits()
+        var old: [(Bool, Double?)] = []
+        var current: [(Bool, Double?)] = []
+        let first = credits.registerTimed(1) { old.append(($0, $1)) }
+        // Superseding a pending scene retires its own actual-display feedback;
+        // the replacement does not inherit the old scene's presentation time.
+        first.finish(false)
+        let next = credits.registerTimed(2) { current.append(($0, $1)) }
+        first.finish(true, presentedTime: 100)
+        next.finish(true, presentedTime: 102.125)
+        next.finish(false)
+        credits.discardUnpresented()
+        XCTAssertEqual(old.count, 1)
+        XCTAssertFalse(old[0].0)
+        XCTAssertNil(old[0].1)
+        XCTAssertEqual(current.count, 1)
+        XCTAssertTrue(current[0].0)
+        XCTAssertEqual(current[0].1, 102.125)
+    }
     @MainActor func testOccludedUnreportedDrawableCreditsRemainDeferredUntilCaptureFlush() {
         let credits = ScenePresentationCredits()
         var feedback = DeferredSceneFeedback()

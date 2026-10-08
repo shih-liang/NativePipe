@@ -112,6 +112,7 @@
 "NativePipe isn’t connected to the Linux computer." = "NativePipe не подключён к компьютеру Linux.";
 "NativePipe upload timed out." = "Истекло время отправки NativePipe.";
 "No matching windows. Try another title or app name." = "Подходящих окон нет. Попробуйте другое название окна или приложения.";
+"No open windows" = "Нет открытых окон";
 "No space left on device" = "На устройстве нет свободного места";
 "No such file or directory" = "Нет такого файла или папки";
 "Not a directory" = "Это не папка";
@@ -291,3 +292,7 @@
 "The virtual file sharing backend is not available." = "Служба виртуального обмена файлами недоступна.";
 
 "This build lacks FSKit mount authorization. Virtual file sharing requires an application signed with an authorized provisioning profile." = "У этой сборки нет разрешения FSKit на подключение томов. Для виртуального обмена файлами требуется приложение, подписанное с использованием авторизованного профиля подготовки.";
+
+"The display did not finish preparing for the virtual machine state change." = "Подготовка отображения к изменению состояния виртуальной машины не завершилась.";
+"The display connection changed during the virtual machine state change." = "Подключение отображения изменилось во время изменения состояния виртуальной машины.";
+"Another display state change is already in progress." = "Другое изменение состояния отображения уже выполняется.";

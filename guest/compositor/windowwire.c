@@ -151,6 +151,8 @@ void np_window_put_frame(struct np_window_message *message,
 	if (frame->has_window_geometry) flags |= 1u << 2;
 	if (frame->codec) flags |= 1u << 3;
 	if (frame->has_gpu_source) flags |= 1u << 4;
+	if (frame->has_presentation_context) flags |= 1u << 5;
+	if (frame->requests_presentation_feedback) flags |= 1u << 6;
 	np_window_put_u32(message, flags);
 	np_window_put_u32(message, frame->damage_count);
 	if (frame->has_viewport_source) {
@@ -168,6 +170,11 @@ void np_window_put_frame(struct np_window_message *message,
 	if (frame->has_gpu_source) np_window_put_u32(message, frame->gpu_source_id);
 	for (uint32_t i = 0; i < frame->damage_count; i++) {
 		put_rect(message, &frame->damage[i]);
+	}
+	if (frame->has_presentation_context) {
+		np_window_put_u64(message, frame->presentation_session);
+		np_window_put_u64(message, frame->presentation_epoch);
+		np_window_put_u64(message, frame->presentation_sent);
 	}
 }
 

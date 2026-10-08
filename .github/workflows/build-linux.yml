@@ -119,6 +119,13 @@ jobs:
         with:
           path: .build/codecs
           key: codecs-${{ matrix.architecture }}-${{ matrix.libc }}-${{ hashFiles('scripts/build-codecs.py') }}
+      - name: Restore private Wayland build cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            .build/wayland/src
+            .build/wayland/${{ matrix.architecture }}-${{ matrix.libc }}
+          key: wayland-${{ matrix.image }}-${{ matrix.architecture }}-${{ matrix.libc }}-${{ hashFiles('scripts/build-wayland.py') }}
       - name: Build and test
         shell: bash
         env:
@@ -135,22 +142,26 @@ jobs:
                 export DEBIAN_FRONTEND=noninteractive
                 apt-get update
                 apt-get install -y --no-install-recommends \
-                  build-essential pkg-config patchelf cmake ninja-build nasm git python3 perl ca-certificates \
+                  build-essential pkg-config patchelf cmake meson ninja-build nasm git python3 perl ca-certificates \
+                  libexpat1-dev libffi-dev \
                   libwayland-dev wayland-protocols libxkbcommon-dev \
                   libvulkan-dev libdrm-dev libegl1-mesa-dev libgles2-mesa-dev \
                   libgbm-dev libva-dev libdav1d-dev libglib2.0-dev \
                   libgdk-pixbuf-2.0-dev librsvg2-dev dbus xkb-data dconf-gsettings-backend
               else
                 apk add --no-cache \
-                  build-base pkgconf linux-headers patchelf cmake ninja nasm git python3 perl ca-certificates \
+                  build-base pkgconf linux-headers patchelf cmake meson ninja nasm git python3 perl ca-certificates \
+                  expat-dev libffi-dev \
                   wayland-dev wayland-protocols libxkbcommon-dev \
                   vulkan-loader-dev vulkan-headers libdrm-dev mesa-dev libva-dev dav1d-dev glib-dev \
                   gdk-pixbuf-dev librsvg-dev dbus xkeyboard-config dconf
               fi
               python3 scripts/build-codecs.py "$ARCH-$LIBC"
+              python3 scripts/build-wayland.py "$ARCH-$LIBC"
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-remote-transport test-remote-encoder test-remote-scheduler
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-applications
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-file-drag test-scene-damage
+              make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-core-protocols test-input-protocol test-activation test-xdg-output test-presentation-time test-scene-admission test-flat-feedback test-vmpipe-syncobj test-vmpipe-dmabuf test-text-input
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-host-open test-notify-dbus test-xwayland-session
               make -C common/file_rpc test-linux
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" dist-vmpipe

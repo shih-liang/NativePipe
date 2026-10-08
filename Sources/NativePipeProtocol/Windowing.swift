@@ -113,6 +113,16 @@ extension Windowing {
         /// on every new transport connection. A connected vsock alone is not
         /// evidence that the guest event loop owns and can write the channel.
         case channelReady(sessionID: UInt32, protocolVersion: UInt32)
+        /// VM clock calibration. The response samples the same host clock as
+        /// Metal's actual drawable presentation timestamp.
+        case presentationClockRequested(token: UInt32, sessionID: UInt64, clockEpoch: UInt64)
+        case presentationFeedbackAcknowledged(sessionID: UInt64, clockEpoch: UInt64,
+                                              surface: UInt32, presentationID: UInt32)
+        /// Ordered after all prior scenes on the display stream.
+        case presentationPauseReached(sessionID: UInt64, token: UInt32)
+        /// Ordered after the guest has consumed the feedback fence.
+        case presentationDrained(sessionID: UInt64, token: UInt32)
+        case presentationResumed(sessionID: UInt64, clockEpoch: UInt64, token: UInt32)
 
         case surfaceCreated(surface: UInt32)
         case surfaceDestroyed(surface: UInt32)
@@ -186,6 +196,11 @@ extension Windowing {
         case maximizeRequested(window: UInt32, enabled: Bool)
         case minimizeRequested(window: UInt32)
 
+        /// A one-use xdg activation token derived from recent user input was
+        /// consumed. The host rechecks its own input and focus before ordering
+        /// the target window front.
+        case activationRequested(window: UInt32, originWindow: UInt32, inputAgeMilliseconds: UInt32)
+
         // MARK: Clipboard
         //
         // The selection is announced as a type list and fetched separately,
@@ -216,13 +231,15 @@ extension Windowing {
 
         /// A client enabled or disabled text input on this window. Enabling is
         /// what makes the macOS input context active for it.
-        case textInputEnabled(window: UInt32, enabled: Bool)
+        case textInputEnabled(window: UInt32, epoch: UInt32, enabled: Bool)
         /// Where the caret is, in surface-local coordinates. The IME candidate
         /// window is positioned against this.
         case textInputCursorRect(window: UInt32, x: Int, y: Int, width: Int, height: Int)
         /// Text around the caret, which is what lets an IME do reconversion and
         /// context-sensitive conversion rather than composing blind.
         case textInputSurroundingText(window: UInt32, text: String, cursor: Int, anchor: Int)
+        /// Wayland content hints/purpose and why the surrounding text changed.
+        case textInputContentType(window: UInt32, hints: UInt32, purpose: UInt32, changeCause: UInt32)
     }
 
     public struct FloatRect: Codable, Sendable, Equatable {
@@ -326,6 +343,19 @@ extension Windowing {
     }
 
     /// Immutable scene state associated with one presentation id.
+    /// Immutable identity and clock boundary of one transmitted scene. The
+    /// nonce belongs to the compositor process, rather than its socket or PID.
+    public struct ScenePresentationContext: Codable, Sendable, Equatable {
+        public var sessionID: UInt64
+        public var clockEpoch: UInt64
+        public var guestSendTimeNanoseconds: UInt64
+        public init(sessionID: UInt64, clockEpoch: UInt64, guestSendTimeNanoseconds: UInt64) {
+            self.sessionID = sessionID
+            self.clockEpoch = clockEpoch
+            self.guestSendTimeNanoseconds = guestSendTimeNanoseconds
+        }
+    }
+
     public struct SceneSnapshot: Codable, Sendable, Equatable {
         public var surface: UInt32
         public var presentationID: UInt32
@@ -338,6 +368,10 @@ extension Windowing {
 		/// geometry to the configure generation without changing xdg-shell serials.
 		public var configureSerial: UInt32
         public var layers: [SceneLayer]
+        public var presentationContext: ScenePresentationContext?
+        /// Host-only receipt metadata. It is sampled by the connection decoder,
+        /// before UI delivery, and is never read from the guest wire.
+        public var receivedHostTimeNanoseconds: UInt64?
         /// Output-pixel regions whose composited result changed. The host keeps
         /// a short damage history for each drawable slot; an empty list means a
         /// latch-only scene.
@@ -347,7 +381,9 @@ extension Windowing {
             surface: UInt32, presentationID: UInt32,
             width: Int, height: Int, scale: Int,
 			windowGeometry: Rect, configureSerial: UInt32 = 0,
-			layers: [SceneLayer], damage: [Rect] = []
+			layers: [SceneLayer], damage: [Rect] = [],
+            presentationContext: ScenePresentationContext? = nil,
+            receivedHostTimeNanoseconds: UInt64? = nil
         ) {
             self.surface = surface
             self.presentationID = presentationID
@@ -358,6 +394,8 @@ extension Windowing {
 			self.configureSerial = configureSerial
             self.layers = layers
             self.damage = damage
+            self.presentationContext = presentationContext
+            self.receivedHostTimeNanoseconds = receivedHostTimeNanoseconds
         }
     }
 
@@ -410,6 +448,11 @@ extension Windowing {
         /// can still carry it because they are not part of a window scene.
         public var viewportSource: FloatRect?
         public var viewportDestination: Size?
+        public var presentationContext: ScenePresentationContext?
+        /// Sampled by the host decoder before UI delivery; never supplied by Linux.
+        public var receivedHostTimeNanoseconds: UInt64?
+        /// Only a queried cursor commit needs a drawable instead of NSCursor.
+        public var requestsPresentationFeedback: Bool
 
         public init(
             resourceID: UInt32, width: Int, height: Int, bytesPerRow: Int,
@@ -418,7 +461,10 @@ extension Windowing {
             codec: String? = nil, bitstreamEpoch: UInt16 = 0,
             presentationID: UInt32 = 0,
             viewportSource: FloatRect? = nil,
-            viewportDestination: Size? = nil
+            viewportDestination: Size? = nil,
+            presentationContext: ScenePresentationContext? = nil,
+            receivedHostTimeNanoseconds: UInt64? = nil,
+            requestsPresentationFeedback: Bool = false
         ) {
             self.resourceID = resourceID
             self.width = width
@@ -434,6 +480,9 @@ extension Windowing {
             self.presentationID = presentationID
             self.viewportSource = viewportSource
             self.viewportDestination = viewportDestination
+            self.presentationContext = presentationContext
+            self.receivedHostTimeNanoseconds = receivedHostTimeNanoseconds
+            self.requestsPresentationFeedback = requestsPresentationFeedback
         }
 
     }
@@ -548,6 +597,8 @@ extension Windowing {
         /// repeat. Existing wl_keyboard resources receive the new keymap.
         case inputPreferences(layout: String, repeatRate: Int, repeatDelay: Int)
 
+        case windowState(window: UInt32, visible: Bool, boundsWidth: Int, boundsHeight: Int)
+
         case keyboardFocus(window: UInt32?)
         case key(window: UInt32, keycode: UInt32, pressed: Bool, modifiers: Modifiers)
         case pointerEntered(window: UInt32, x: Double, y: Double)
@@ -556,7 +607,7 @@ extension Windowing {
         case pointerButton(window: UInt32, button: PointerButton, pressed: Bool)
         /// Precise displacement is in logical points. A precise (0, 0) record
         /// explicitly ends the gesture; it is not an idle motion sample.
-        case pointerScroll(window: UInt32, dx: Double, dy: Double, isPrecise: Bool)
+        case pointerScroll(window: UInt32, dx: Double, dy: Double, isPrecise: Bool, isDirectionInverted: Bool = false)
 
         /// The frame reached the host display clock. This completes Wayland
         /// frame callbacks and FIFO barriers, but does not make the currently
@@ -565,6 +616,21 @@ extension Windowing {
         /// A later CALayer contents transaction no longer references this
         /// frame, so its guest output-ring slot can be reused safely.
         case frameReleased(surface: UInt32, presentationID: UInt32)
+        case presentationClockSample(token: UInt32, sessionID: UInt64, clockEpoch: UInt64,
+                                     hostTimeNanoseconds: UInt64)
+        /// A causal clock anchor sampled before this scene reaches any renderer.
+        case sceneClockSample(sessionID: UInt64, clockEpoch: UInt64, surface: UInt32,
+                              presentationID: UInt32, guestSendTimeNanoseconds: UInt64,
+                              hostReceiveTimeNanoseconds: UInt64)
+        case presentationPause(sessionID: UInt64, token: UInt32)
+        case presentationDrain(sessionID: UInt64, token: UInt32)
+        case presentationResume(sessionID: UInt64, token: UInt32)
+        /// Actual drawable presentation, separate from FIFO latch and reads.
+        /// Zero host time means this scene was discarded without display.
+        case presentationFeedback(sessionID: UInt64, clockEpoch: UInt64,
+                                  surface: UInt32, presentationID: UInt32,
+                                  hostTimeNanoseconds: UInt64,
+                                  refreshNanoseconds: UInt32, outputID: UInt32)
 
         /// Ask the guest compositor to republish its current immutable scene.
         /// The resulting presentation owns every source buffer until the host
@@ -585,22 +651,25 @@ extension Windowing {
         // MARK: Text input
 
         /// Finished text from the macOS IME. The client inserts it as if typed.
-        case textCommit(window: UInt32, text: String)
+        case textCommit(window: UInt32, epoch: UInt32, text: String)
         /// Text still being composed, with the selection inside it. An empty
         /// string ends the preedit.
-        case textPreedit(window: UInt32, text: String, cursorBegin: Int, cursorEnd: Int)
+        case textPreedit(window: UInt32, epoch: UInt32, text: String, cursorBegin: Int, cursorEnd: Int)
         /// Bytes the IME wants removed around the caret before its commit —
         /// what replacing a reconverted word requires.
-        case textDeleteSurrounding(window: UInt32, beforeLength: UInt32, afterLength: UInt32)
+        case textDeleteSurrounding(window: UInt32, epoch: UInt32, beforeLength: UInt32, afterLength: UInt32)
+        /// A reconversion/replacement is one atomic text-input-v3 done batch.
+        case textEdit(window: UInt32, epoch: UInt32, commit: String?, preedit: String?,
+                      cursorBegin: Int, cursorEnd: Int, beforeLength: UInt32, afterLength: UInt32)
 
         /// Coalesce only adjacent motion, never a stop or a direction reversal.
         /// Shared by the VM and remote transports so neither can lose a gesture
         /// boundary or manufacture a stop by cancelling opposite displacements.
         public func coalescingScroll(with next: Self) -> Self? {
-            guard case .pointerScroll(let window, let dx, let dy, let precise) = self,
+            guard case .pointerScroll(let window, let dx, let dy, let precise, let inverted) = self,
                   case .pointerScroll(let nextWindow, let nextDX, let nextDY,
-                                      let nextPrecise) = next,
-                  window == nextWindow, precise == nextPrecise,
+                                      let nextPrecise, let nextInverted) = next,
+                  window == nextWindow, precise == nextPrecise, inverted == nextInverted,
                   dx.isFinite, dy.isFinite, nextDX.isFinite, nextDY.isFinite,
                   (dx != 0 || dy != 0), (nextDX != 0 || nextDY != 0)
             else { return nil }
@@ -610,7 +679,7 @@ extension Windowing {
             let x = dx + nextDX, y = dy + nextDY
             guard sameDirection(dx, nextDX), sameDirection(dy, nextDY),
                   x.isFinite, y.isFinite else { return nil }
-            return .pointerScroll(window: window, dx: x, dy: y, isPrecise: precise)
+            return .pointerScroll(window: window, dx: x, dy: y, isPrecise: precise, isDirectionInverted: inverted)
         }
     }
 

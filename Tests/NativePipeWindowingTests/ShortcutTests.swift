@@ -141,7 +141,7 @@ final class ShortcutTests: XCTestCase {
     func testMappedKeyNeverStartsIMEOrDuplicatesHostRepeat() throws {
         let (bridge, native, view, output) = try fixture()
         defer { bridge.closeAll() }
-        native.setTextInput(enabled: true)
+        native.setTextInput(enabled: true, epoch: 1)
         let rule = KeyboardShortcutRule(id: 1, source: .init(.c), target: .init(.v, .control))
         bridge.setIntegrationPreferences(.init(shortcuts: .init(rules: [rule])))
         view.keyDown(with: event(.keyDown, flags: []))
@@ -156,7 +156,7 @@ final class ShortcutTests: XCTestCase {
     func testInstallingRuleDoesNotTakeOverAnIMEOwnedRepeat() throws {
         let (bridge, native, view, output) = try fixture()
         defer { bridge.closeAll() }
-        native.setTextInput(enabled: true)
+        native.setTextInput(enabled: true, epoch: 1)
         let down = event(.keyDown, flags: [], window: native.window)
         guard down.window === native.window else { throw XCTSkip("Needs WindowServer") }
         view.keyDown(with: down)

@@ -2,9 +2,13 @@
 #include "compositor_internal.h"
 #include "fractional-scale-v1-server-protocol.h"
 #include "scene.h"
+#include "xdg_shell.h"
 #include "viewporter-server-protocol.h"
+#include "xdg-output-unstable-v1-server-protocol.h"
+#include "presentation-time-server-protocol.h"
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <wayland-server-protocol.h>
 
@@ -393,12 +397,20 @@ struct np_output_state {
 	struct wl_list link;
 	struct np_server *server;
 	struct wl_global *global;
+	struct wl_list xdg_outputs;
 	uint32_t id;
 	char *name;
 	int32_t x, y, width, height;
 	int32_t pixel_width, pixel_height;
 	int32_t physical_width_mm, physical_height_mm;
 	int32_t scale, refresh_millihz;
+};
+
+struct np_xdg_output {
+	struct wl_list link;
+	struct wl_resource *resource, *output_resource;
+	struct wl_listener output_destroy;
+	struct np_output_state *state;
 };
 
 static struct np_output_state *output_state_by_id(
@@ -422,6 +434,7 @@ static struct np_output_state *first_output_state(struct np_server *server)
 
 static bool output_state_has_resources(const struct np_output_state *state)
 {
+	if (!wl_list_empty(&state->xdg_outputs)) return true;
 	struct np_output *output;
 	wl_list_for_each(output, &state->server->outputs, link) {
 		if (output->state == state) return true;
@@ -434,6 +447,15 @@ int32_t np_scale_surface_refresh_millihz(const struct np_surface *surface)
     struct np_output_state *state = output_state_by_id(surface->server, surface->output_id);
     if (!state) state = first_output_state(surface->server);
     return state && state->refresh_millihz > 0 ? state->refresh_millihz : 60000;
+}
+
+void np_scale_surface_bounds(const struct np_surface *surface, int32_t *width, int32_t *height)
+{
+	struct np_output_state *state = surface
+		? output_state_by_id(surface->server, surface->output_id) : NULL;
+	if (!state && surface) state = first_output_state(surface->server);
+	if (width) *width = state ? state->width : 0;
+	if (height) *height = state ? state->height : 0;
 }
 
 static void output_state_maybe_destroy(struct np_output_state *state)
@@ -464,8 +486,100 @@ static const struct wl_output_interface output_implementation = {
 	.release = output_release,
 };
 
+static void output_protocol_name(const struct np_output_state *state, char name[32])
+{
+	/* localizedName is a description, not a stable ASCII connector name. */
+	snprintf(name, 32, "NativePipe-%u", state->id);
+}
+
+static void xdg_output_send_state(struct np_xdg_output *output, bool initial, bool finish)
+{
+	uint32_t version = (uint32_t)wl_resource_get_version(output->resource);
+	/* Version 3 completes changes through its associated wl_output. Once that
+	 * object has been released, the xdg object remains safely destroyable. */
+	if (version >= 3 && !output->output_resource) return;
+	const struct np_output_state *state = output->state;
+	zxdg_output_v1_send_logical_position(output->resource, state->x, state->y);
+	zxdg_output_v1_send_logical_size(output->resource, state->width, state->height);
+	if (initial && version >= ZXDG_OUTPUT_V1_NAME_SINCE_VERSION) {
+		char name[32]; output_protocol_name(state, name);
+		zxdg_output_v1_send_name(output->resource, name);
+	}
+	if (version >= ZXDG_OUTPUT_V1_DESCRIPTION_SINCE_VERSION && (initial || version >= 3))
+		zxdg_output_v1_send_description(output->resource, state->name);
+	if (version < 3)
+		zxdg_output_v1_send_done(output->resource);
+	/* wl_output v1 has no done event. Do not invent a v3 xdg completion or
+	 * send an event that its associated output never negotiated. */
+	else if (finish && wl_resource_get_version(output->output_resource) >= WL_OUTPUT_DONE_SINCE_VERSION)
+		wl_output_send_done(output->output_resource);
+}
+
+static void xdg_output_resource_destroy(struct wl_resource *resource)
+{
+	struct np_xdg_output *output = wl_resource_get_user_data(resource);
+	struct np_output_state *state = output->state;
+	if (output->output_resource) wl_list_remove(&output->output_destroy.link);
+	wl_list_remove(&output->link);
+	free(output);
+	output_state_maybe_destroy(state);
+}
+
+static void xdg_output_parent_destroyed(struct wl_listener *listener, void *data)
+{
+	struct np_xdg_output *output = wl_container_of(listener, output, output_destroy);
+	wl_list_remove(&output->output_destroy.link);
+	output->output_resource = NULL;
+}
+
+static void xdg_output_destroy_request(struct wl_client *client, struct wl_resource *resource)
+{
+	wl_resource_destroy(resource);
+}
+
+static const struct zxdg_output_v1_interface xdg_output_implementation = {
+	.destroy = xdg_output_destroy_request,
+};
+
+static void get_xdg_output(struct wl_client *client, struct wl_resource *resource,
+	                       uint32_t id, struct wl_resource *output_resource)
+{
+	struct np_server *server = wl_resource_get_user_data(resource);
+	struct np_output *parent = wl_resource_get_user_data(output_resource);
+	if (!parent || parent->resource != output_resource || parent->state->server != server ||
+	    wl_resource_get_client(output_resource) != client) {
+		wl_resource_post_error(resource, 0, "output does not belong to this compositor and client");
+		return;
+	}
+	struct np_xdg_output *output = calloc(1, sizeof(*output));
+	if (!output) { wl_client_post_no_memory(client); return; }
+	output->resource = wl_resource_create(client, &zxdg_output_v1_interface,
+	                                     wl_resource_get_version(resource), id);
+	if (!output->resource) { free(output); wl_client_post_no_memory(client); return; }
+	output->state = parent->state;
+	output->output_resource = output_resource;
+	output->output_destroy.notify = xdg_output_parent_destroyed;
+	wl_resource_add_destroy_listener(output_resource, &output->output_destroy);
+	wl_list_insert(output->state->xdg_outputs.prev, &output->link);
+	wl_resource_set_implementation(output->resource, &xdg_output_implementation, output, xdg_output_resource_destroy);
+	xdg_output_send_state(output, true, true);
+}
+
+static const struct zxdg_output_manager_v1_interface xdg_output_manager_implementation = {
+	.destroy = xdg_output_destroy_request,
+	.get_xdg_output = get_xdg_output,
+};
+
+static void xdg_output_manager_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+	struct wl_resource *resource = wl_resource_create(client, &zxdg_output_manager_v1_interface,
+	                                               version > 3 ? 3 : (int)version, id);
+	if (!resource) { wl_client_post_no_memory(client); return; }
+	wl_resource_set_implementation(resource, &xdg_output_manager_implementation, data, NULL);
+}
+
 static void output_send_state(
-	const struct np_output_state *state, struct wl_resource *resource)
+	const struct np_output_state *state, struct wl_resource *resource, bool initial)
 {
 	uint32_t version = (uint32_t)wl_resource_get_version(resource);
 	wl_output_send_geometry(
@@ -478,10 +592,16 @@ static void output_send_state(
 		state->pixel_width, state->pixel_height, state->refresh_millihz);
 	if (version >= WL_OUTPUT_SCALE_SINCE_VERSION)
 		wl_output_send_scale(resource, state->scale);
-	if (version >= WL_OUTPUT_NAME_SINCE_VERSION)
-		wl_output_send_name(resource, state->name);
+	if (initial && version >= WL_OUTPUT_NAME_SINCE_VERSION)
+	{
+		char name[32]; output_protocol_name(state, name);
+		wl_output_send_name(resource, name);
+	}
 	if (version >= WL_OUTPUT_DESCRIPTION_SINCE_VERSION)
 		wl_output_send_description(resource, state->name);
+	struct np_xdg_output *output;
+	wl_list_for_each(output, &state->xdg_outputs, link)
+		if (output->output_resource == resource) xdg_output_send_state(output, false, false);
 	if (version >= WL_OUTPUT_DONE_SINCE_VERSION)
 		wl_output_send_done(resource);
 }
@@ -508,7 +628,7 @@ static void output_bind(struct wl_client *client, void *data,
 	wl_list_insert(&server->outputs, &output->link);
 	wl_resource_set_implementation(
 		resource, &output_implementation, output, output_resource_destroy);
-	output_send_state(state, resource);
+	output_send_state(state, resource, true);
 
 	struct np_surface *surface;
 	wl_list_for_each(surface, &server->surfaces, link) {
@@ -529,6 +649,7 @@ static struct np_output_state *output_state_create(
 		return NULL;
 	}
 	state->server = server;
+	wl_list_init(&state->xdg_outputs);
 	state->id = value->id;
 	state->x = value->x;
 	state->y = value->y;
@@ -599,7 +720,16 @@ static void output_state_update(
 	state->refresh_millihz = value->refresh_millihz;
 	struct np_output *output;
 	wl_list_for_each(output, &state->server->outputs, link) {
-		if (output->state == state) output_send_state(state, output->resource);
+		if (output->state == state) output_send_state(state, output->resource, false);
+	}
+	struct np_xdg_output *xdg;
+	wl_list_for_each(xdg, &state->xdg_outputs, link)
+		if (!xdg->output_resource) xdg_output_send_state(xdg, false, false);
+	struct np_surface *surface;
+	wl_list_for_each(surface, &state->server->surfaces, link) {
+		if (surface->output_id != state->id) continue;
+		np_scale_changed(surface, state->scale);
+		np_xdg_output_bounds_changed(surface);
 	}
 }
 
@@ -623,7 +753,30 @@ void np_scale_changed(struct np_surface *surface, int scale)
 {
 	if (!surface || scale <= 0) return;
 	surface->preferred_scale = scale;
+	np_surface_send_buffer_preferences(surface, scale);
 	send_preferred_scale(surface, scale);
+}
+
+void np_scale_subsurface_attached(struct np_surface *surface)
+{
+	if (!surface || !surface->parent) return;
+	struct np_server *server = surface->server;
+	struct np_output_state *next = output_state_by_id(server, surface->parent->output_id);
+	int scale = surface->parent->preferred_scale;
+	struct np_surface *child;
+	wl_list_for_each(child, &server->surfaces, link) {
+		/* Children can acquire their own subsurface roles before this branch
+		 * is attached to a window. Inherit for the whole newly attached branch. */
+		struct np_surface *ancestor = child;
+		while (ancestor && ancestor != surface) ancestor = ancestor->parent;
+		if (!ancestor) continue;
+		struct np_output_state *previous = output_state_by_id(server, child->output_id);
+		if (previous != next) output_send_enter_or_leave(child, previous, false);
+		child->output_id = next ? next->id : 0;
+		if (previous != next) output_send_enter_or_leave(child, next, true);
+		np_scale_changed(child, scale);
+	}
+	wl_display_flush_clients(server->display);
 }
 
 bool np_scale_update_outputs(struct np_server *server,
@@ -667,6 +820,7 @@ bool np_scale_update_outputs(struct np_server *server,
 			surface->output_id = state->id;
 			output_send_enter_or_leave(surface, state, true);
 			np_scale_changed(surface, state->scale);
+			np_xdg_output_bounds_changed(surface);
 		}
 	}
 	wl_display_flush_clients(server->display);
@@ -688,13 +842,17 @@ void np_scale_window_output_changed(struct np_server *server,
 		output_send_enter_or_leave(surface, previous, false);
 		surface->output_id = next ? next->id : 0;
 		output_send_enter_or_leave(surface, next, true);
-		if (next) np_scale_changed(surface, next->scale);
+		if (next) {
+			np_scale_changed(surface, next->scale);
+			np_xdg_output_bounds_changed(surface);
+		}
 	}
 	wl_display_flush_clients(server->display);
 }
 
 void np_scale_advertise(struct wl_display *display, struct np_server *server)
 {
+	wl_global_create(display, &zxdg_output_manager_v1_interface, 3, server, xdg_output_manager_bind);
 	wl_global_create(display, &wp_viewporter_interface, 1, server, viewporter_bind);
 	wl_global_create(display, &wp_fractional_scale_manager_v1_interface, 1,
 	                 server, fractional_manager_bind);
@@ -712,4 +870,23 @@ void np_scale_advertise(struct wl_display *display, struct np_server *server)
 		.refresh_millihz = 60000,
 	};
 	(void)output_state_create(server, &fallback);
+}
+
+void np_scale_presentation_output(struct np_surface *surface,
+                                  struct wl_resource *feedback, uint32_t output_id)
+{
+    np_scale_presentation_output_for_server(surface->server, feedback, output_id);
+}
+
+void np_scale_presentation_output_for_server(struct np_server *server,
+                                  struct wl_resource *feedback, uint32_t output_id)
+{
+    if (!output_id) return;
+    struct wl_client *client = wl_resource_get_client(feedback);
+    struct np_output *output;
+    wl_list_for_each(output, &server->outputs, link) {
+        if (output->state->id == output_id &&
+            wl_resource_get_client(output->resource) == client)
+            wp_presentation_feedback_send_sync_output(feedback, output->resource);
+    }
 }

@@ -12,6 +12,8 @@ struct np_surface;
 struct np_viewport_state;
 struct wl_client;
 struct wl_display;
+struct wl_resource;
+struct wl_resource;
 
 struct np_surface_mapping {
 	double source_x_pixels;
@@ -60,11 +62,18 @@ void np_scale_advertise(struct wl_display *display, struct np_server *server);
 void np_scale_surface_enter_outputs(struct np_surface *surface,
 	                                struct wl_client *client);
 void np_scale_changed(struct np_surface *surface, int scale);
+void np_scale_subsurface_attached(struct np_surface *surface);
 bool np_scale_update_outputs(struct np_server *server,
 	                         const struct np_host_output *outputs,
 	                         size_t count);
 void np_scale_window_output_changed(struct np_server *server,
 	                                uint32_t window_id, uint32_t output_id);
 int32_t np_scale_surface_refresh_millihz(const struct np_surface *surface);
+void np_scale_presentation_output(struct np_surface *surface,
+                                  struct wl_resource *feedback, uint32_t output_id);
+void np_scale_presentation_output_for_server(struct np_server *server,
+                                  struct wl_resource *feedback, uint32_t output_id);
+void np_scale_surface_bounds(const struct np_surface *surface,
+                              int32_t *width, int32_t *height);
 
 #endif

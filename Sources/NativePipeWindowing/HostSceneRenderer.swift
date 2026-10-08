@@ -195,6 +195,7 @@ final class HostSceneRenderer: @unchecked Sendable {
         case commandBuffer
         case encoder
         case incompatibleTexture
+        case cancelled
     }
 
     private struct VertexUniforms {
@@ -335,10 +336,12 @@ final class HostSceneRenderer: @unchecked Sendable {
         damage: [Windowing.Rect], redrawAll: Bool,
         drawable: CAMetalDrawable,
         capture: Bool = false,
+        willCommitDrawable: @escaping @Sendable () -> Bool = { true },
         completion: @escaping @Sendable (MTLCommandBuffer, RenderedFrameCapture?) -> Void
     ) throws {
         try encode(scene: scene, layers: layers, damage: damage, redrawAll: redrawAll,
                    target: drawable.texture, drawable: drawable, capture: capture,
+                   willCommitDrawable: willCommitDrawable,
                    completion: completion)
     }
 
@@ -347,6 +350,7 @@ final class HostSceneRenderer: @unchecked Sendable {
     /// only until that command buffer completes; it is never a frame history.
     func encodeCapture(
         scene: Windowing.SceneSnapshot, layers: [ResolvedSceneLayer],
+        willCommitDrawable: @escaping @Sendable () -> Bool = { true },
         completion: @escaping @Sendable (MTLCommandBuffer, RenderedFrameCapture?) -> Void
     ) throws {
         let (pixels, pixelOverflow) = scene.width.multipliedReportingOverflow(by: scene.height)
@@ -364,13 +368,15 @@ final class HostSceneRenderer: @unchecked Sendable {
             throw RendererError.incompatibleTexture
         }
         try encode(scene: scene, layers: layers, damage: [], redrawAll: true,
-                   target: target, drawable: nil, capture: true, completion: completion)
+                   target: target, drawable: nil, capture: true,
+                   willCommitDrawable: willCommitDrawable, completion: completion)
     }
 
     private func encode(
         scene: Windowing.SceneSnapshot, layers: [ResolvedSceneLayer],
         damage: [Windowing.Rect], redrawAll: Bool,
         target: MTLTexture, drawable: CAMetalDrawable?, capture: Bool,
+        willCommitDrawable: @Sendable () -> Bool,
         completion: @escaping @Sendable (MTLCommandBuffer, RenderedFrameCapture?) -> Void
     ) throws {
         guard layers.count == scene.layers.count,
@@ -452,6 +458,9 @@ final class HostSceneRenderer: @unchecked Sendable {
             readback = nil
         }
 
+        // A released, uncommitted Metal command may still invoke its completion
+        // handlers. Reject it before installing the GPU-read completion path.
+        guard willCommitDrawable() else { throw RendererError.cancelled }
         command.addCompletedHandler { command in
             // Retain every source wrapper until Metal has completed its reads.
             withExtendedLifetime(layers) {}

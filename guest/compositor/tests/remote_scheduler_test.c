@@ -4,7 +4,7 @@
 #include <assert.h>
 
 struct np_encoder { np_encoder_done_fn done; void *user; uint8_t *pixels; uint32_t id; };
-static unsigned sent[8], sent_count;
+static unsigned sent[8], sent_count, stamp_count, cancelled_results;
 struct np_encoder *np_encoder_create(int w, int h, bool allow_h264, np_encoder_output_fn out, np_encoder_done_fn done, void *user)
 { (void)w; (void)h; (void)allow_h264; (void)out; struct np_encoder *e = calloc(1, sizeof(*e)); e->done = done; e->user = user; return e; }
 bool np_encoder_take_bgra(struct np_encoder *e, uint8_t *pixels, int w, int h, int stride, uint64_t pts, uint32_t id, uint8_t flags)
@@ -16,7 +16,7 @@ static void finish(struct np_surface *s)
 void np_media_wake(struct np_media *m) { (void)m; }
 bool np_media_can_encode(struct np_media *m) { (void)m; return true; }
 bool np_media_send_display(struct np_media *m, const void *p, size_t n)
-{ (void)m; assert(n == 164); sent[sent_count++] = get32((const unsigned char *)p + 12); return true; }
+{ (void)m; assert(n == 188); assert(((const unsigned char *)p)[92] == 200); sent[sent_count++] = get32((const unsigned char *)p + 12); return true; }
 bool np_media_send(struct np_media *m, uint8_t codec, uint8_t flags, uint32_t sid, uint32_t rid, uint16_t w, uint16_t h, uint64_t pts, uint16_t epoch, const uint8_t *p, uint32_t n)
 { (void)m; (void)codec; (void)flags; (void)sid; (void)rid; (void)w; (void)h; (void)pts; (void)epoch; (void)p; (void)n; return true; }
 struct np_surface *np_surface_by_id(struct np_server *server, uint32_t id)
@@ -25,12 +25,27 @@ int32_t np_scale_surface_refresh_millihz(const struct np_surface *s) { (void)s; 
 void np_xdg_flush_pending_toplevel_configure(struct np_surface *s) { (void)s; }
 void np_presentation_process_presented(struct np_server *s, uint32_t owner, uint32_t id) { (void)s; (void)owner; (void)id; }
 void np_presentation_flush(struct np_server *s) { (void)s; }
+uint64_t np_presentation_time_session(struct np_server *s) { (void)s; return 99; }
+bool np_presentation_time_packet_identity(const void *packet, size_t size, struct np_presentation_identity *identity)
+{
+    const unsigned char *p = packet;
+    if (size != 188 || memcmp(p, "NPSN", 4) || get32(p + 8) != size || p[76] != 99 || p[84] != 1) return false;
+    *identity = (struct np_presentation_identity){ .session = 99, .epoch = 1, .sent = p[92],
+        .owner = get32(p + 12), .presentation = get32(p + 16) };
+    return true;
+}
+void np_presentation_time_stamp_scene(struct np_server *s, uint32_t owner, uint32_t id, void *p, size_t size)
+{ (void)s; assert(owner && id && size == 188); ((unsigned char *)p)[92] = 200; stamp_count++; }
+void np_presentation_time_result(struct np_server *s, uint64_t session, uint64_t epoch,
+    uint32_t owner, uint32_t id, uint64_t host, uint32_t refresh, uint32_t output)
+{ (void)s; assert(session == 99 && epoch == 1 && owner && id && !host && !refresh && !output); cancelled_results++; }
 static void put(unsigned char *p, uint32_t v) { memcpy(p, &v, 4); }
 static bool submit(struct np_server *server, struct np_surface *owner, struct np_surface *source)
 {
-    unsigned char p[164] = {0}; memcpy(p, "NPSN", 4);
+    unsigned char p[188] = {0}; memcpy(p, "NPSN", 4); p[4] = 4; p[6] = 100;
+    p[76] = 99; p[84] = 1; p[92] = 100; put(p + 8, sizeof(p));
     put(p + 12, owner->id); put(p + 16, source->last_resource_id); put(p + 48, 1);
-    put(p + 76, source->id); put(p + 80, source->last_resource_id);
+    put(p + 100, source->id); put(p + 104, source->last_resource_id);
     return np_remote_submit_scene(server, p, sizeof(p));
 }
 int main(void)
@@ -80,6 +95,7 @@ int main(void)
     np_remote_cancel_scenes(&server, a.id); // Cancelling active work waits for done.
     assert(as->job); finish(&a); np_remote_flush_encoded(&server);
     assert(!as->job && sent_count == 2);
+    assert(stamp_count == 2 && cancelled_results == 2);
     np_backend_surface_destroy(&a); np_backend_surface_destroy(&b); np_backend_surface_destroy(&c);
     np_remote_finish_scenes(&server); wl_display_destroy(server.display);
     puts("Independent windows, bounded jobs, immutable owned pixels, source ordering, pacing and cancellation: PASS");

@@ -28,7 +28,7 @@ hash_file()
 	{ find . ../encoder ../../common/file_rpc -type f \( -name '*.c' -o -name '*.h' -o -name '*.xml' \
 		-o -name Makefile -o -name source-hash.sh \) \
 		! -path './.build/*' ! -path './dist/*'
-	  printf '%s\n' ../../scripts/build-codecs.py
+	  printf '%s\n' ../../scripts/build-codecs.py ../../scripts/build-wayland.py
 	  printf '%s\n' ../session/np-open-wire.h
 	} | LC_ALL=C sort |
 	while IFS= read -r file; do

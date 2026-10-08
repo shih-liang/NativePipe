@@ -112,6 +112,7 @@
 "NativePipe isn’t connected to the Linux computer." = "NativePipe n’est pas connecté à l’ordinateur Linux.";
 "NativePipe upload timed out." = "Délai d’envoi NativePipe dépassé.";
 "No matching windows. Try another title or app name." = "Aucune fenêtre correspondante. Essayez un autre titre ou nom d’application.";
+"No open windows" = "Aucune fenêtre ouverte";
 "No space left on device" = "Plus d’espace sur le périphérique";
 "No such file or directory" = "Fichier ou dossier inexistant";
 "Not a directory" = "Ce n’est pas un dossier";
@@ -291,3 +292,7 @@
 "The virtual file sharing backend is not available." = "Le service de partage de fichiers virtuels n’est pas disponible.";
 
 "This build lacks FSKit mount authorization. Virtual file sharing requires an application signed with an authorized provisioning profile." = "Cette version ne dispose pas de l’autorisation de montage FSKit. Le partage de fichiers virtuels nécessite une application signée avec un profil de provisionnement autorisé.";
+
+"The display did not finish preparing for the virtual machine state change." = "La préparation de l’affichage pour le changement d’état de la machine virtuelle n’a pas abouti.";
+"The display connection changed during the virtual machine state change." = "La connexion de l’affichage a changé pendant le changement d’état de la machine virtuelle.";
+"Another display state change is already in progress." = "Un autre changement d’état de l’affichage est déjà en cours.";

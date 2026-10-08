@@ -6,6 +6,8 @@
 #define _GNU_SOURCE
 
 #include "applications.h"
+#include "activation.h"
+#include "presentation_time.h"
 #include "compositor.h"
 #include "compositor_internal.h"
 #include "cursor_shape.h"
@@ -30,9 +32,9 @@
 #include <unistd.h>
 #include <wayland-server-protocol.h>
 
-#define COMPOSITOR_VERSION 4
-#define XDG_WM_BASE_VERSION 3
-#define SEAT_VERSION 5
+#define COMPOSITOR_VERSION 6
+#define XDG_WM_BASE_VERSION 6
+#define SEAT_VERSION 9
 
 #ifndef NP_COMPOSITOR_SOURCE_HASH
 #error "NP_COMPOSITOR_SOURCE_HASH must be supplied by the compositor Makefile"
@@ -102,11 +104,12 @@ int np_frontend_run(int argc, char **argv, void *backend_state)
 	wl_global_create(server.display, &wl_subcompositor_interface,
 	                 1, &server, np_subcompositor_bind);
 	wl_global_create(server.display, &wl_data_device_manager_interface,
-	                 3, &server, np_data_device_manager_bind);
+	                 4, &server, np_data_device_manager_bind);
 	wl_global_create(server.display, &xdg_wm_base_interface,
 	                 XDG_WM_BASE_VERSION, &server, np_xdg_shell_bind);
 	wl_global_create(server.display, &wl_seat_interface,
 	                 SEAT_VERSION, &server, np_seat_bind);
+	if (!np_activation_advertise(&server)) return 1;
 	np_scale_advertise(server.display, &server);
 	np_cursor_shape_advertise(server.display, &server);
 	wl_global_create(server.display, &wp_fifo_manager_v1_interface,
@@ -184,6 +187,7 @@ int np_frontend_run(int argc, char **argv, void *backend_state)
 	wl_display_destroy_clients(server.display);
 	np_backend_session_finish(&server);
 	np_xwayland_finish(&server);
+	np_presentation_time_destroy(&server);
 	wl_display_destroy(server.display);
 	np_backend_finish(&server);
 	return applications_started ? 0 : 1;

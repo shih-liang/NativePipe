@@ -24,7 +24,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
-            build-essential pkg-config cmake ninja-build nasm git python3 perl ca-certificates \
+            build-essential pkg-config cmake meson ninja-build nasm git python3 perl ca-certificates \
+            libexpat1-dev libffi-dev \
             libva-dev libdav1d-dev libdrm-dev libegl1-mesa-dev \
             libgbm-dev libgles2-mesa-dev libvulkan-dev \
             libwayland-dev libxkbcommon-dev wayland-protocols libglib2.0-dev \
@@ -36,6 +37,15 @@ jobs:
           key: codecs-ci-ubuntu24-x86_64-gnu-${{ hashFiles('scripts/build-codecs.py') }}
       - name: Build static codec dependencies
         run: python3 scripts/build-codecs.py x86_64-gnu
+      - name: Restore private Wayland build cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            .build/wayland/src
+            .build/wayland/x86_64-gnu
+          key: wayland-ci-ubuntu24-x86_64-gnu-${{ hashFiles('scripts/build-wayland.py') }}
+      - name: Build pinned static Wayland dependencies
+        run: python3 scripts/build-wayland.py x86_64-gnu
       - name: Build the complete remote compositor
         run: make -C guest/compositor remote
       - name: Test remote transport
@@ -44,6 +54,11 @@ jobs:
         run: make -C guest/compositor test-applications
       - name: Test file drag lifecycle and scene damage
         run: make -C guest/compositor test-file-drag test-scene-damage
+      - name: Test Wayland protocol versions and lifecycle
+        run: >-
+          make -C guest/compositor test-core-protocols test-input-protocol
+          test-activation test-xdg-output test-presentation-time test-scene-admission test-flat-feedback
+          test-vmpipe-syncobj test-vmpipe-dmabuf test-text-input
       - name: Test bounded file service and syscall fallback
         run: make -C common/file_rpc test-linux
       - name: Test guest GPU compatibility hooks

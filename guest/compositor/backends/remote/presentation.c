@@ -3,6 +3,7 @@
 
 #define _GNU_SOURCE
 
+#include "activation.h"
 #include "backend.h"
 #include "backend_internal.h"
 #include "compositor_internal.h"
@@ -10,6 +11,7 @@
 #include "media.h"
 #include "scene.h"
 #include "scale.h"
+#include "presentation_time.h"
 #include "surface_internal.h"
 #include "syncobj.h"
 #include "window_events.h"
@@ -242,20 +244,22 @@ bool np_remote_submit_scene(struct np_server *server, const void *data, size_t s
 {
     struct np_remote_backend *b = np_remote_backend(server);
     const unsigned char *p = data;
-    if (size < 40 || !np_media_can_encode(&b->media)) return false;
+    struct np_presentation_identity identity;
+    if (!np_presentation_time_packet_identity(data, size, &identity) ||
+        identity.session != np_presentation_time_session(server) || !np_media_can_encode(&b->media)) return false;
     bool scene = !memcmp(p, "NPSN", 4);
-    if (scene && size < 76) return false;
+    if (scene && (size < 100 || p[4] != 4 || p[5] != 0 || p[6] != 100 || p[7] != 0)) return false;
     struct np_surface *owner = np_surface_by_id(server, get32(p + (scene ? 12 : 8)));
     if (!owner || !remote_surface(owner, true) || !np_remote_scene_available(owner)) return false;
     size_t count = scene ? get32(p + 48) : 1;
-    if (!count || count > 128 || (scene && size != 76 + count * 88)) return false;
+    if (!count || count > 128 || (scene && size != 100 + count * 88)) return false;
     struct np_remote_scene_job *job = calloc(1, sizeof(*job));
     if (!job) return false;
     job->inputs = calloc(count, sizeof(*job->inputs));
     job->packet = malloc(size);
     if (!job->inputs || !job->packet) goto reject;
     for (size_t i = 0; i < count; i++) {
-        const unsigned char *source = scene ? p + 76 + i * 88 : p + 8;
+        const unsigned char *source = scene ? p + 100 + i * 88 : p + 8;
         struct np_surface *s = np_surface_by_id(server, get32(source));
         struct np_remote_surface *state = remote_surface(s, false);
         if (!state || state->job || s->last_resource_id != get32(source + 4)) goto reject;
@@ -354,6 +358,8 @@ void np_remote_flush_encoded(struct np_server *server)
         struct np_surface *owner = np_surface_by_id(server, job->owner);
         struct np_remote_surface *state = remote_surface(owner, false);
         bool sent = state && !job->cancelled && !atomic_load(&job->failed);
+        if (sent)
+            np_presentation_time_stamp_scene(server, job->owner, job->presentation, job->packet, job->size);
         if (atomic_load(&job->failed) || (sent && !np_media_send_display(&b->media, job->packet, job->size))) {
             server->terminate = true; b->exit_status = 1; sent = false;
         }
@@ -363,6 +369,13 @@ void np_remote_flush_encoded(struct np_server *server)
             unsigned i = state->flight_count++;
             state->flight[i].id = presentation_id;
             state->flight[i].scene = !memcmp(job->packet, "NPSN", 4);
+        }
+        else {
+            struct np_presentation_identity identity;
+            bool valid = np_presentation_time_packet_identity(job->packet, job->size, &identity);
+            /* This metadata was never put on the host display stream. */
+            if (valid) np_presentation_time_result(server, identity.session, identity.epoch,
+                identity.owner, identity.presentation, 0, 0, 0);
         }
         free_scene(server, job); b->jobs[slot] = NULL;
         /* Virtual-output latch permits new client work. NPRP independently
@@ -385,6 +398,7 @@ void np_backend_publish_buffer(
 	if (buffer_commit == NP_BUFFER_DETACH) {
 		if (surface == root && surface->mapped) {
 			uint32_t fields[] = {surface->id};
+			np_activation_revoke_surface(surface);
 			np_window_event_send(surface->server, NP_GUEST_SURFACE_UNMAPPED,
 			                     fields, 1);
 			surface->mapped = false;

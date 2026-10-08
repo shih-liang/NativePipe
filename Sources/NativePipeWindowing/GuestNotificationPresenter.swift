@@ -137,9 +137,11 @@ public final class GuestNotificationPresenter {
         let identifier: String
         let revision: UInt64
         let actions: Set<String>
+        var record: GuestNotificationHistoryRecord
         var task: Task<Void, Never>?
-        init(identifier: String, revision: UInt64, actions: Set<String>) {
+        init(identifier: String, revision: UInt64, actions: Set<String>, record: GuestNotificationHistoryRecord) {
             self.identifier = identifier; self.revision = revision; self.actions = actions
+            self.record = record
         }
     }
     private let machine: String
@@ -148,6 +150,7 @@ public final class GuestNotificationPresenter {
     private let isEnabled: () -> Bool
     private let now: () -> TimeInterval
     private let send: (Windowing.HostCommand) -> Void
+    private let archive: ((GuestNotificationHistoryRecord) -> Void)?
     private let initialLimiter: GuestNotificationRateLimiter
     private var limiter: GuestNotificationRateLimiter
     private var active: [UInt32: Entry] = [:]
@@ -160,20 +163,23 @@ public final class GuestNotificationPresenter {
     public convenience init(machine: String, identity: String,
                             responseDirectory: URL = FileManager.default.temporaryDirectory,
                             isEnabled: @escaping () -> Bool = { true },
+                            archive: ((GuestNotificationHistoryRecord) -> Void)? = nil,
                             send: @escaping (Windowing.HostCommand) -> Void) {
         let center: GuestNotificationCenter = Bundle.main.bundleURL.pathExtension == "app"
             && Bundle.main.bundleIdentifier != nil
             ? SystemGuestNotificationCenter(responseDirectory: responseDirectory) : UnavailableGuestNotificationCenter()
-        self.init(machine: machine, identity: identity, center: center, isEnabled: isEnabled, send: send)
+        self.init(machine: machine, identity: identity, center: center, isEnabled: isEnabled, archive: archive, send: send)
     }
 
     init(machine: String, identity: String = "test-machine", center: GuestNotificationCenter,
          isEnabled: @escaping () -> Bool = { true }, limiter: GuestNotificationRateLimiter = .init(),
          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         archive: ((GuestNotificationHistoryRecord) -> Void)? = nil,
          send: @escaping (Windowing.HostCommand) -> Void) {
         self.machine = machine
         machineIdentity = SHA256.hash(data: Data(identity.utf8)).map { String(format: "%02x", $0) }.joined()
         self.center = center; self.isEnabled = isEnabled; self.now = now; self.send = send
+        self.archive = archive
         initialLimiter = limiter; self.limiter = limiter
         bindResponses()
     }
@@ -200,20 +206,33 @@ public final class GuestNotificationPresenter {
         }
         remove(id: id)
         let identifier = "nativepipe.guest.\(machineIdentity).\(session.uuidString).\(id).\(notification.revision).\(UUID().uuidString)"
+        let machineLabel = GuestNotificationPolicy.plainText(machine, limit: GuestNotificationPolicy.maximumTitleLength)
+        let record = GuestNotificationHistoryRecord(id: identifier, machine: machineLabel.isEmpty ? "Guest" : machineLabel,
+            application: GuestNotificationPolicy.plainText(notification.appName, limit: GuestNotificationPolicy.maximumAppNameLength),
+            title: content.title, body: content.body, receivedAt: Date(), delivery: .pending)
         let entry = Entry(identifier: identifier, revision: notification.revision,
-            actions: Set(content.actions.map(\.key) + [GuestNotificationPolicy.defaultActionKey]))
+            actions: Set(content.actions.map(\.key) + [GuestNotificationPolicy.defaultActionKey]), record: record)
         active[id] = entry
+        archive?(record)
+        guard owns(entry, id: id) else { return }
         entry.task = Task { @MainActor [weak self, entry, center] in
             defer { entry.task = nil }
             let allowed = await center.authorize() // Fresh settings; denied is not cached forever.
             guard self?.owns(entry, id: id) == true else { return }
             guard !Task.isCancelled, self?.isEnabled() == true else { self?.reject(entry, id: id); return }
-            guard allowed else { self?.reject(entry, id: id); return }
+            guard allowed else {
+                self?.updateDelivery(.notAuthorized, for: entry, id: id)
+                self?.reject(entry, id: id)
+                return
+            }
             do { try await center.present(identifier: identifier, content: content) }
             catch {
                 // This task may belong to an earlier replacement. Its failure
                 // must never remove the current notification's record.
-                if self?.owns(entry, id: id) == true { self?.reject(entry, id: id) }
+                if self?.owns(entry, id: id) == true {
+                    self?.updateDelivery(.failed, for: entry, id: id)
+                    self?.reject(entry, id: id)
+                }
                 else { center.withdraw(identifier: identifier) }
                 return
             }
@@ -222,6 +241,7 @@ public final class GuestNotificationPresenter {
                 if self?.owns(entry, id: id) == true { self?.reject(entry, id: id) }
                 return
             }
+            self?.updateDelivery(.delivered, for: entry, id: id)
             if let expiry = content.expiry {
                 do { try await Task.sleep(for: .seconds(expiry)) }
                 catch { return }
@@ -233,6 +253,11 @@ public final class GuestNotificationPresenter {
     }
 
     private func owns(_ entry: Entry, id: UInt32) -> Bool { !stopped && active[id] === entry }
+    private func updateDelivery(_ delivery: GuestNotificationDelivery, for entry: Entry, id: UInt32) {
+        guard owns(entry, id: id) else { return }
+        entry.record.delivery = delivery
+        archive?(entry.record)
+    }
     private func reject(_ entry: Entry, id: UInt32) {
         guard owns(entry, id: id) else { return }
         remove(id: id)
@@ -248,6 +273,10 @@ public final class GuestNotificationPresenter {
     private func remove(id: UInt32) {
         guard let entry = active.removeValue(forKey: id) else { return }
         let task = entry.task; entry.task = nil; task?.cancel()
+        if entry.record.delivery == .pending {
+            entry.record.delivery = .cancelled
+            archive?(entry.record)
+        }
         center.withdraw(identifier: entry.identifier)
     }
 
@@ -293,8 +322,16 @@ public final class GuestNotificationPresenter {
 
     deinit {
         let center = center, identifiers = active.values.map(\.identifier)
+        let archive = archive
+        let cancelled = active.values.compactMap { entry -> GuestNotificationHistoryRecord? in
+            guard entry.record.delivery == .pending else { return nil }
+            var record = entry.record
+            record.delivery = .cancelled
+            return record
+        }
         active.values.forEach { $0.task?.cancel() }
         Task { @MainActor in
+            cancelled.forEach { archive?($0) }
             center.onResponse = nil
             identifiers.forEach { center.withdraw(identifier: $0) }
         }

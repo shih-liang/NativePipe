@@ -1,12 +1,13 @@
 import NativePipeStrings
 import Foundation
+import QuartzCore
 
 /// Binary payloads for every window-channel message.
 ///
 /// NPIP supplies only bounded length framing. Integer fields are explicitly
 /// little endian; this is a wire format, never a Swift struct memory dump.
 public enum WindowWire {
-    public static let windowProtocolVersion: UInt32 = 12
+    public static let windowProtocolVersion: UInt32 = 15
     public static let motionMagic: [UInt8] = Array("NPMO".utf8)
     public static let motionPayloadSize = 16
     public static let scrollMagic: [UInt8] = Array("NPSC".utf8)
@@ -15,8 +16,8 @@ public enum WindowWire {
     public static let popupConfigureMagic: [UInt8] = Array("NPPF".utf8)
     public static let sceneMagic: [UInt8] = Array("NPSN".utf8)
     public static let lifecycleMagic: [UInt8] = Array("NPW2".utf8)
-    public static let sceneVersion: UInt16 = 3
-    public static let sceneHeaderSize = 76
+    public static let sceneVersion: UInt16 = 4
+    public static let sceneHeaderSize = 100
     public static let sceneLayerSize = 88
     public static let maximumSceneLayers = 128
     public static let maximumFieldSize = 8 * 1024 * 1024
@@ -68,6 +69,9 @@ public enum WindowWire {
               Array(payload.prefix(4)) == sceneMagic else {
             throw DecodeError.notBinaryScene
         }
+        // CACurrentMediaTime and MTLDrawable.presentedTime share this host
+        // clock. Record receipt on the decoder's thread, before UI queueing.
+        let receivedHostTime = UInt64(CACurrentMediaTime() * 1_000_000_000)
         var reader = Reader(payload)
         try reader.skip(4)
         let version: UInt16 = try reader.integer()
@@ -95,8 +99,12 @@ public enum WindowWire {
 			width: Int(try reader.integer() as Int32),
 			height: Int(try reader.integer() as Int32))
 		let configureSerial: UInt32 = try reader.integer()
+        let sessionID: UInt64 = try reader.integer()
+        let clockEpoch: UInt64 = try reader.integer()
+        let guestSendTime: UInt64 = try reader.integer()
 
-        guard surface != 0, presentationID != 0,
+        guard sessionID != 0, clockEpoch != 0, guestSendTime != 0,
+              surface != 0, presentationID != 0,
               width > 0, height > 0, scale >= 1, scale <= 4,
               geometry.width > 0, geometry.height > 0,
 			  flags & ~1 == 0,
@@ -159,10 +167,14 @@ public enum WindowWire {
             surface: surface, presentationID: presentationID,
             width: width, height: height, scale: scale,
 			windowGeometry: geometry, configureSerial: configureSerial, layers: layers,
-			damage: damage.width > 0 ? [damage] : []))
+			damage: damage.width > 0 ? [damage] : [],
+            presentationContext: .init(sessionID: sessionID, clockEpoch: clockEpoch,
+                                       guestSendTimeNanoseconds: guestSendTime),
+            receivedHostTimeNanoseconds: receivedHostTime))
     }
 
     private static func lifecycleEvent(from payload: Data) throws -> Windowing.GuestEvent {
+        let receivedHostTime = UInt64(CACurrentMediaTime() * 1_000_000_000)
         var reader = Reader(payload)
         try reader.skip(4)
         let direction: UInt8 = try reader.integer()
@@ -267,8 +279,9 @@ public enum WindowWire {
                 window: window, minimum: minimum, maximum: maximum))
         case 21:
             let surface: UInt32 = try reader.integer()
+            guard surface != 0 else { throw DecodeError.malformed }
             return try finished(.committed(
-                surface: surface, frame: reader.frame()))
+                surface: surface, frame: reader.frame(receivedHostTime: receivedHostTime)))
         case 22:
             let surface: UInt32 = try reader.integer()
             let presentationID: UInt32 = try reader.integer()
@@ -306,8 +319,10 @@ public enum WindowWire {
             return try finished(.hostSelectionRequest(
                 token: reader.integer(), mimeType: reader.string()))
         case 31:
-            return try finished(.textInputEnabled(
-                window: reader.integer(), enabled: reader.boolean()))
+            let window: UInt32 = try reader.integer()
+            let epoch: UInt32 = try reader.integer()
+            guard window != 0, epoch != 0 else { throw DecodeError.malformed }
+            return try finished(.textInputEnabled(window: window, epoch: epoch, enabled: reader.boolean()))
         case 32:
             return try finished(.textInputCursorRect(
                 window: reader.integer(),
@@ -316,10 +331,20 @@ public enum WindowWire {
                 width: Int(try reader.integer() as Int32),
                 height: Int(try reader.integer() as Int32)))
         case 33:
-            return try finished(.textInputSurroundingText(
-                window: reader.integer(), text: reader.string(),
-                cursor: Int(try reader.integer() as Int32),
-                anchor: Int(try reader.integer() as Int32)))
+            let window: UInt32 = try reader.integer()
+            let text = try reader.string()
+            let cursor = Int(try reader.integer() as Int32)
+            let anchor = Int(try reader.integer() as Int32)
+            guard text.utf8.count <= 4000, textByteIndex(cursor, in: text),
+                  textByteIndex(anchor, in: text) else { throw DecodeError.malformed }
+            return try finished(.textInputSurroundingText(window: window, text: text, cursor: cursor, anchor: anchor))
+        case 46:
+            let window: UInt32 = try reader.integer()
+            let hints: UInt32 = try reader.integer()
+            let purpose: UInt32 = try reader.integer()
+            let cause: UInt32 = try reader.integer()
+            guard window != 0, hints & ~0x3ff == 0, purpose <= 13, cause <= 1 else { throw DecodeError.malformed }
+            return try finished(.textInputContentType(window: window, hints: hints, purpose: purpose, changeCause: cause))
         case 35:
             let placement = Windowing.PopupPlacement(
                 window: try reader.integer(), parent: try reader.integer(),
@@ -386,6 +411,39 @@ public enum WindowWire {
         case 42:
             do { return try finished(.notificationBacklogReset) }
             catch { return .notificationRejected(id: nil, revision: nil) }
+        case 43:
+            let window: UInt32 = try reader.integer()
+            let origin: UInt32 = try reader.integer()
+            let age: UInt32 = try reader.integer()
+            guard window != 0, origin != 0, age <= 5_000 else { throw DecodeError.malformed }
+            return try finished(.activationRequested(
+                window: window, originWindow: origin, inputAgeMilliseconds: age))
+        case 44:
+            let token: UInt32 = try reader.integer()
+            let session: UInt64 = try reader.integer()
+            let epoch: UInt64 = try reader.integer()
+            guard token != 0, session != 0, epoch != 0 else { throw DecodeError.malformed }
+            return try finished(.presentationClockRequested(token: token, sessionID: session, clockEpoch: epoch))
+        case 47:
+            let session: UInt64 = try reader.integer()
+            let epoch: UInt64 = try reader.integer()
+            let surface: UInt32 = try reader.integer()
+            let scene: UInt32 = try reader.integer()
+            guard session != 0, epoch != 0, surface != 0, scene != 0 else { throw DecodeError.malformed }
+            return try finished(.presentationFeedbackAcknowledged(
+                sessionID: session, clockEpoch: epoch, surface: surface, presentationID: scene))
+        case 48, 49:
+            let session: UInt64 = try reader.integer()
+            let token: UInt32 = try reader.integer()
+            guard session != 0, token != 0 else { throw DecodeError.malformed }
+            return try finished(opcode == 48 ? .presentationPauseReached(sessionID: session, token: token)
+                                            : .presentationDrained(sessionID: session, token: token))
+        case 50:
+            let session: UInt64 = try reader.integer()
+            let epoch: UInt64 = try reader.integer()
+            let token: UInt32 = try reader.integer()
+            guard session != 0, epoch != 0, token != 0 else { throw DecodeError.malformed }
+            return try finished(.presentationResumed(sessionID: session, clockEpoch: epoch, token: token))
         case 40, 41:
             var token: UInt32?
             do {
@@ -417,6 +475,12 @@ public enum WindowWire {
         case .notificationClosed: opcode = 29
         case .notificationAction: opcode = 30
         case .hostOpenResponse: opcode = 31
+        case .presentationClockSample: opcode = 35
+        case .presentationFeedback: opcode = 36
+        case .sceneClockSample: opcode = 37
+        case .presentationPause: opcode = 38
+        case .presentationDrain: opcode = 39
+        case .presentationResume: opcode = 40
         case .configure: opcode = 1
         case .close: opcode = 2
         case .dismissPopup: opcode = 3
@@ -428,6 +492,7 @@ public enum WindowWire {
         case .pointerLeft: opcode = 9
         case .pointerButton: opcode = 10
         case .pointerScroll: opcode = 11
+        case .windowState: opcode = 32
         case .framePresented: opcode = 12
         case .selectionRequest: opcode = 14
         case .hostSelectionOffered: opcode = 15
@@ -435,6 +500,7 @@ public enum WindowWire {
         case .textCommit: opcode = 17
         case .textPreedit: opcode = 18
         case .textDeleteSurrounding: opcode = 19
+        case .textEdit: opcode = 33
         case .frameReleased: opcode = 20
         case .forceQuit: opcode = 21
         case .configurePopup: opcode = 22
@@ -450,6 +516,36 @@ public enum WindowWire {
         append(UInt16(0), to: &payload)
 
         switch command {
+        case .presentationClockSample(let token, let session, let epoch, let time):
+            guard token != 0, session != 0, epoch != 0, time != 0 else { throw EncodeError.invalidValue }
+            append(token, to: &payload)
+            append(session, to: &payload)
+            append(epoch, to: &payload)
+            append(time, to: &payload)
+        case .sceneClockSample(let session, let epoch, let surface, let id, let guest, let host):
+            guard session != 0, epoch != 0, surface != 0, id != 0, guest != 0, host != 0 else {
+                throw EncodeError.invalidValue
+            }
+            append(session, to: &payload)
+            append(epoch, to: &payload)
+            append(surface, to: &payload)
+            append(id, to: &payload)
+            append(guest, to: &payload)
+            append(host, to: &payload)
+        case .presentationPause(let session, let token), .presentationDrain(let session, let token),
+             .presentationResume(let session, let token):
+            guard session != 0, token != 0 else { throw EncodeError.invalidValue }
+            append(session, to: &payload)
+            append(token, to: &payload)
+        case .presentationFeedback(let session, let epoch, let surface, let id, let time, let refresh, let output):
+            guard session != 0, epoch != 0, surface != 0, id != 0 else { throw EncodeError.invalidValue }
+            append(session, to: &payload)
+            append(epoch, to: &payload)
+            append(surface, to: &payload)
+            append(id, to: &payload)
+            append(time, to: &payload)
+            append(refresh, to: &payload)
+            append(output, to: &payload)
         case .hostOpenResponse(let token, let response):
             guard token != 0 else { throw EncodeError.invalidValue }
             append(token, to: &payload)
@@ -479,6 +575,13 @@ public enum WindowWire {
         case .close(let window), .forceQuit(let window),
              .dismissPopup(let window), .pointerLeft(let window):
             append(window, to: &payload)
+        case .windowState(let window, let visible, let width, let height):
+            guard window != 0, let width = Int32(exactly: width), let height = Int32(exactly: height),
+                  width >= 0, height >= 0, (width == 0) == (height == 0) else { throw EncodeError.invalidValue }
+            append(window, to: &payload)
+            payload.append(visible ? 1 : 0)
+            append(width, to: &payload)
+            append(height, to: &payload)
         case .scaleChanged(let window, let scale):
             guard let scale = Int32(exactly: scale), scale > 0 else {
                 throw EncodeError.invalidValue
@@ -520,21 +623,39 @@ public enum WindowWire {
             append(token, to: &payload)
             try append(mimeType, to: &payload)
             try append(data, to: &payload)
-        case .textCommit(let window, let text):
+        case .textCommit(let window, let epoch, let text):
+            guard window != 0, epoch != 0 else { throw EncodeError.invalidValue }
             append(window, to: &payload)
+            append(epoch, to: &payload)
             try append(text, to: &payload)
-        case .textPreedit(let window, let text, let begin, let end):
-            guard let begin = Int32(exactly: begin), let end = Int32(exactly: end) else {
+        case .textPreedit(let window, let epoch, let text, let begin, let end):
+            guard window != 0, epoch != 0, validPreedit(text, begin: begin, end: end),
+                  let begin = Int32(exactly: begin), let end = Int32(exactly: end) else {
                 throw EncodeError.invalidValue
             }
             append(window, to: &payload)
+            append(epoch, to: &payload)
             try append(text, to: &payload)
             append(begin, to: &payload)
             append(end, to: &payload)
-        case .textDeleteSurrounding(let window, let before, let after):
+        case .textDeleteSurrounding(let window, let epoch, let before, let after):
+            guard window != 0, epoch != 0 else { throw EncodeError.invalidValue }
             append(window, to: &payload)
+            append(epoch, to: &payload)
             append(before, to: &payload)
             append(after, to: &payload)
+        case .textEdit(let window, let epoch, let commit, let preedit, let begin, let end, let before, let after):
+            guard window != 0, epoch != 0, commit != nil || preedit != nil || before != 0 || after != 0,
+                  preedit.map({ validPreedit($0, begin: begin, end: end) }) ?? (begin == 0 && end == 0),
+                  let begin = Int32(exactly: begin), let end = Int32(exactly: end) else { throw EncodeError.invalidValue }
+            append(window, to: &payload)
+            append(epoch, to: &payload)
+            append(before, to: &payload); append(after, to: &payload)
+            payload.append(commit == nil ? 0 : 1)
+            if let commit { try append(commit, to: &payload) }
+            payload.append(preedit == nil ? 0 : 1)
+            if let preedit { try append(preedit, to: &payload) }
+            append(begin, to: &payload); append(end, to: &payload)
         case .frameReleased(let surface, let presentationID):
             append(surface, to: &payload)
             append(presentationID, to: &payload)
@@ -591,14 +712,14 @@ public enum WindowWire {
             append(fixed24_8(x), to: &payload)
             append(fixed24_8(y), to: &payload)
             return payload
-        case .pointerScroll(let window, let dx, let dy, let precise):
+        case .pointerScroll(let window, let dx, let dy, let precise, let inverted):
             guard dx.isFinite, dy.isFinite else { return nil }
             var payload = Data(scrollMagic)
             append(window, to: &payload)
             append(dx.bitPattern, to: &payload)
             append(dy.bitPattern, to: &payload)
             payload.append(precise ? 1 : 0)
-            payload.append(contentsOf: [0, 0, 0])
+            payload.append(contentsOf: [inverted ? 1 : 0, 0, 0])
             return payload
         case .configure(let window, let size, let states, let serial):
             guard let width = Int32(exactly: size.width),
@@ -683,6 +804,15 @@ public enum WindowWire {
         if scaled <= Double(Int32.min) { return .min }
         if scaled >= Double(Int32.max) { return .max }
         return Int32(scaled)
+    }
+
+    private static func textByteIndex(_ index: Int, in text: String) -> Bool {
+        let bytes = Array(text.utf8)
+        return index >= 0 && index <= bytes.count && (index == bytes.count || bytes[index] & 0xc0 != 0x80)
+    }
+
+    private static func validPreedit(_ text: String, begin: Int, end: Int) -> Bool {
+        (begin == -1 && end == -1) || (textByteIndex(begin, in: text) && textByteIndex(end, in: text))
     }
 
     private static func append<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
@@ -784,7 +914,7 @@ public enum WindowWire {
             return values
         }
 
-        mutating func frame() throws -> Windowing.Frame {
+        mutating func frame(receivedHostTime: UInt64) throws -> Windowing.Frame {
             let resourceID: UInt32 = try integer()
             let width = Int(try integer() as Int32)
             let height = Int(try integer() as Int32)
@@ -796,7 +926,7 @@ public enum WindowWire {
             let presentationID: UInt32 = try integer()
             let flags: UInt32 = try integer()
             let damageCount = Int(try integer() as UInt32)
-            guard flags & ~0x1f == 0,
+            guard flags & ~0x7f == 0, flags & (1 << 5) != 0,
                   damageCount <= maximumCollectionCount else {
                 throw DecodeError.malformed
             }
@@ -833,6 +963,12 @@ public enum WindowWire {
                     width: Int(try integer() as Int32),
                     height: Int(try integer() as Int32)))
             }
+            let sessionID: UInt64 = try integer()
+            let clockEpoch: UInt64 = try integer()
+            let guestSendTime: UInt64 = try integer()
+            guard sessionID != 0, clockEpoch != 0, guestSendTime != 0 else {
+                throw DecodeError.malformed
+            }
             let format: Windowing.PixelFormat
             switch formatRaw {
             case 1: format = .bgra8888
@@ -863,7 +999,11 @@ public enum WindowWire {
                 codec: codec, bitstreamEpoch: bitstreamEpoch,
                 presentationID: presentationID,
                 viewportSource: viewportSource,
-                viewportDestination: viewportDestination)
+                viewportDestination: viewportDestination,
+                presentationContext: .init(sessionID: sessionID, clockEpoch: clockEpoch,
+                                           guestSendTimeNanoseconds: guestSendTime),
+                receivedHostTimeNanoseconds: receivedHostTime,
+                requestsPresentationFeedback: flags & (1 << 6) != 0)
         }
 
         mutating func floatRect() throws -> Windowing.FloatRect {

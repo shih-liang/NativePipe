@@ -66,17 +66,28 @@ final class CapturePresentationTests: XCTestCase {
         var discarded: [Int] = []
         var latched: [Int] = []
         var presented: [Bool] = []
+        var timedDiscards: [Int] = []
+        var timedPresentations: [Double] = []
+        let journal = PresentationJournal()
+        var records: [PresentationRecord] = []
         _ = presenter.captureNextFrame { captured = $0 }
 
         func enqueue(_ index: Int, width: Int = 64, height: Int = 48) throws {
             let (scene, layers) = try makeScene(
                 device: device, index: index, width: width, height: height)
+            let record = journal.register(.init(
+                sessionID: 1, clockEpoch: 1, surface: 1, presentationID: UInt32(index)))
+            records.append(record)
             presenter.enqueue(scene: scene, layers: layers,
                 drawableSize: CGSize(width: width, height: height),
                 readComplete: { success in
                     if success { readSuccess.append(index) } else { discarded.append(index) }
                 }, latched: { latched.append(index) },
-                presented: { presented.append($0) })
+                presented: { presented.append($0) },
+                presentationTime: { time in
+                    if let time { timedPresentations.append(time) }
+                    else { timedDiscards.append(index) }
+                }, record: record)
         }
 
         try enqueue(1)
@@ -111,6 +122,15 @@ final class CapturePresentationTests: XCTestCase {
         XCTAssertEqual(discarded.sorted(), Array(1...7))
         XCTAssertEqual(latched.sorted(), Array(1...8), "All superseded latch obligations survive")
         XCTAssertEqual(presented, [false], "An offscreen capture cannot claim screen presentation")
+        XCTAssertEqual(timedDiscards.sorted(), Array(1...8),
+                       "Every superseded scene keeps its own discarded outcome")
+        XCTAssertTrue(timedPresentations.isEmpty,
+                      "GPU read completion and an offscreen capture never invent an actual display time")
+        let actualResults = journal.results(sessionID: 1)
+        XCTAssertEqual(actualResults.map(\.key.presentationID).sorted(), Array(1...8).map(UInt32.init))
+        XCTAssertTrue(actualResults.allSatisfy { $0.hostTimeNanoseconds == 0 })
+        XCTAssertFalse(journal.hasSubmitted(sessionID: 1))
+        for record in records { XCTAssertFalse(record.claimSubmission()) }
         XCTAssertEqual(offscreenCompletions, 1, "A completed read enables one static-scene refresh")
         XCTAssertEqual(layer.attemptCount, 1)
     }
@@ -234,6 +254,147 @@ final class CapturePresentationTests: XCTestCase {
         XCTAssertEqual(latches, 0)
         XCTAssertEqual(captures, 0)
         XCTAssertEqual(offscreenCompletions, 0)
+    }
+
+    @MainActor func testDiscardedRecordRejectsFinalDrawableCommitAndCompletesReadsAndLatches() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal unavailable") }
+        let layer = GatedLayer()
+        layer.pixelFormat = .bgra8Unorm
+        let renderer = try HostSceneRenderer(device: device)
+        let presenter = AsyncMetalScenePresenter(layer: layer, device: device, renderer: renderer)
+        defer { layer.resume.signal(); presenter.cancelPending() }
+        let journal = PresentationJournal()
+        let record = journal.register(.init(sessionID: 1, clockEpoch: 1, surface: 1, presentationID: 1))
+        var reads: [Bool] = []
+        var latches = 0
+        var captured: Result<RenderedFrameCapture, Error>?
+        _ = presenter.captureNextFrame { captured = $0 }
+        let (scene, layers) = try makeScene(device: device, index: 1, width: 64, height: 48)
+        presenter.enqueue(scene: scene, layers: layers, drawableSize: CGSize(width: 64, height: 48),
+            readComplete: { reads.append($0) }, latched: { latches += 1 }, record: record)
+        for _ in 0..<300 {
+            if layer.isWaiting { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(layer.isWaiting)
+        XCTAssertTrue(record.discardIfUnsubmitted())
+        layer.resume.signal()
+        await withCheckedContinuation { continuation in
+            presenter.fenceSubmission { continuation.resume() }
+        }
+        XCTAssertEqual(layer.drawableCount, 1, "The rejection must run after acquiring a real drawable")
+        XCTAssertEqual(reads, [false], "A rejected commit releases sources without reporting a GPU read")
+        XCTAssertEqual(latches, 1)
+        guard case .failure? = captured else { return XCTFail("A rejected commit must fail its capture") }
+        XCTAssertEqual(journal.results(sessionID: 1).map(\.hostTimeNanoseconds), [0])
+        XCTAssertFalse(journal.hasSubmitted(sessionID: 1))
+        record.recordDrawableResult(presentedTime: 100)
+        XCTAssertEqual(journal.results(sessionID: 1).map(\.hostTimeNanoseconds), [0])
+    }
+
+    @MainActor func testClosedSubmissionGateFencesCanceledLatchesAndRejectsCapture() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal unavailable") }
+        let layer = UnavailableCaptureLayer()
+        layer.pixelFormat = .bgra8Unorm
+        let renderer = try HostSceneRenderer(device: device)
+        let presenter = AsyncMetalScenePresenter(layer: layer, device: device, renderer: renderer)
+        defer { layer.resume.signal(); presenter.cancelPending() }
+        let journal = PresentationJournal()
+        let record = journal.register(.init(sessionID: 1, clockEpoch: 1, surface: 1, presentationID: 1))
+        var reads: [Bool] = []
+        var latches = 0
+        var captured: Result<RenderedFrameCapture, Error>?
+        _ = presenter.captureNextFrame { captured = $0 }
+        let (scene, layers) = try makeScene(device: device, index: 1, width: 64, height: 48)
+        presenter.enqueue(scene: scene, layers: layers, drawableSize: CGSize(width: 64, height: 48),
+            readComplete: { reads.append($0) }, latched: { latches += 1 }, record: record)
+        for _ in 0..<300 {
+            if layer.isWaiting { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(layer.isWaiting)
+        presenter.setSubmissionAllowed(false)
+        layer.resume.signal()
+        await withCheckedContinuation { continuation in
+            presenter.fenceSubmission { continuation.resume() }
+        }
+        XCTAssertEqual(reads, [false])
+        XCTAssertEqual(latches, 1, "The fence follows the worker's queued latch")
+        guard case .failure? = captured else { return XCTFail("Closing the gate must fail its queued capture") }
+        XCTAssertEqual(journal.results(sessionID: 1).map(\.hostTimeNanoseconds), [0])
+        XCTAssertFalse(journal.hasSubmitted(sessionID: 1))
+
+        var rejectedCapture: Result<RenderedFrameCapture, Error>?
+        _ = presenter.captureNextFrame { rejectedCapture = $0 }
+        await withCheckedContinuation { continuation in
+            presenter.fenceSubmission { continuation.resume() }
+        }
+        guard case .failure? = rejectedCapture else { return XCTFail("A closed gate cannot enqueue a new capture") }
+        XCTAssertEqual(layer.attemptCount, 1)
+    }
+
+    @MainActor func testHiddenWindowCapturesOffscreenAndDiscardsOrdinarySceneWithoutDrawableRetry() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal unavailable") }
+        let layer = UnavailableCaptureLayer()
+        layer.pixelFormat = .bgra8Unorm
+        let renderer = try HostSceneRenderer(device: device)
+        let retries = CaptureRetryProbe()
+        let presenter = AsyncMetalScenePresenter(layer: layer, device: device, renderer: renderer,
+            requestDisplayRetry: { retries.mark() })
+        defer { presenter.cancelPending() }
+        let journal = PresentationJournal()
+        let record = journal.register(.init(sessionID: 1, clockEpoch: 1, surface: 1, presentationID: 1))
+        var captured: Result<RenderedFrameCapture, Error>?
+        var reads: [Bool] = []
+        var latches = 0
+        _ = presenter.captureNextFrame { captured = $0 }
+        presenter.setDrawableAllowed(false)
+        let (scene, layers) = try makeScene(device: device, index: 1, width: 64, height: 48)
+        presenter.enqueue(scene: scene, layers: layers, drawableSize: CGSize(width: 64, height: 48),
+            readComplete: { reads.append($0) }, latched: { latches += 1 }, record: record)
+        for _ in 0..<300 {
+            if captured != nil, reads.count == 1, latches == 1 { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let image = try XCTUnwrap(captured).get()
+        XCTAssertEqual(Array(image.pixels.prefix(4)), [20, 20, 20, 255])
+        XCTAssertEqual(reads, [true])
+        XCTAssertEqual(latches, 1)
+        XCTAssertEqual(layer.attemptCount, 0, "Hidden captures must not request a screen drawable")
+        XCTAssertEqual(journal.results(sessionID: 1).map(\.hostTimeNanoseconds), [0])
+        XCTAssertFalse(journal.hasSubmitted(sessionID: 1))
+
+        let ordinary = journal.register(.init(sessionID: 1, clockEpoch: 1, surface: 1, presentationID: 2))
+        let (secondScene, secondLayers) = try makeScene(device: device, index: 2, width: 64, height: 48)
+        presenter.enqueue(scene: secondScene, layers: secondLayers, drawableSize: CGSize(width: 64, height: 48),
+            readComplete: { reads.append($0) }, latched: { latches += 1 }, record: ordinary)
+        await withCheckedContinuation { continuation in
+            presenter.fenceSubmission { continuation.resume() }
+        }
+        XCTAssertEqual(reads, [true, false])
+        XCTAssertEqual(latches, 2)
+        XCTAssertEqual(layer.attemptCount, 0)
+        XCTAssertEqual(retries.count, 0)
+        XCTAssertEqual(journal.results(sessionID: 1).map(\.hostTimeNanoseconds), [0, 0])
+    }
+
+    @MainActor func testEncoderCommitHookRejectionDoesNotSubmitCapture() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal unavailable") }
+        let renderer = try HostSceneRenderer(device: device)
+        let hook = CaptureRetryProbe()
+        let completed = CaptureRetryProbe()
+        let (scene, layers) = try makeScene(device: device, index: 1, width: 64, height: 48)
+        XCTAssertThrowsError(try renderer.encodeCapture(scene: scene, layers: layers,
+            willCommitDrawable: { hook.mark(); return false },
+            completion: { _, _ in completed.mark() })) { error in
+                guard let rendererError = error as? HostSceneRenderer.RendererError,
+                      case .cancelled = rendererError else {
+                    return XCTFail("Expected commit rejection, received \(error)")
+                }
+            }
+        XCTAssertEqual(hook.count, 1)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(completed.count, 0, "An uncommitted command cannot complete a GPU read")
     }
 
     @MainActor func testRetiringDisplayCreditDoesNotReleaseProtectedSceneBeforeGPUCompletion() async throws {

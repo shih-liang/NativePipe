@@ -1,7 +1,10 @@
 #include "xdg_shell.h"
+#include "activation.h"
+#include "presentation_time.h"
 
 #include "compositor_internal.h"
 #include "decoration.h"
+#include "scale.h"
 #include "window_events.h"
 #include "windowwire.h"
 #include "xwayland.h"
@@ -76,6 +79,12 @@ void np_xdg_clear_configures(struct np_surface *surface) {
 	surface->host_configure_pending_serial = 0;
 	surface->host_resize_configure_awaiting_commit = 0;
 	surface->committed_host_configure_serial = 0;
+	surface->host_configure_width = surface->host_configure_height = 0;
+	surface->host_configure_state_bits = 0;
+	surface->host_window_visibility_known = false;
+	surface->host_window_bounds_known = false;
+	surface->reported_toplevel_bounds = false;
+	surface->reported_toplevel_capabilities = false;
 }
 
 static uint32_t send_xdg_surface_configure(struct np_surface *surface) {
@@ -296,6 +305,8 @@ static const struct xdg_toplevel_interface toplevel_implementation = {
 static void toplevel_resource_destroy(struct wl_resource *resource) {
 	struct np_surface *surface = wl_resource_get_user_data(resource);
 	if (!surface) return;
+	np_activation_revoke_surface(surface);
+	np_presentation_time_discard_surface(surface);
 	uint32_t fields[] = {surface->window_id};
 	np_window_event_send(surface->server, NP_GUEST_TOPLEVEL_DESTROYED, fields, 1);
 	surface->toplevel = NULL;
@@ -304,9 +315,45 @@ static void toplevel_resource_destroy(struct wl_resource *resource) {
 	surface->mapped = false;
 }
 
-static void append_toplevel_state(struct wl_array *states, uint32_t value) {
-	uint32_t *slot = wl_array_add(states, sizeof(*slot));
-	if (slot) *slot = value;
+static void toplevel_bounds(const struct np_surface *surface,
+                            int32_t *width, int32_t *height) {
+	if (surface->host_window_bounds_known) {
+		*width = surface->host_window_bounds_width;
+		*height = surface->host_window_bounds_height;
+	} else {
+		np_scale_surface_bounds(surface, width, height);
+	}
+}
+
+static void send_toplevel_metadata(struct np_surface *surface) {
+	int version = wl_resource_get_version(surface->toplevel);
+	if (version >= XDG_TOPLEVEL_WM_CAPABILITIES_SINCE_VERSION &&
+	    !surface->reported_toplevel_capabilities) {
+		/* show_window_menu is deliberately absent: there is no host menu for
+		 * that request. Only advertise operations with a real host handler. */
+		uint32_t values[] = {
+			XDG_TOPLEVEL_WM_CAPABILITIES_MAXIMIZE,
+			XDG_TOPLEVEL_WM_CAPABILITIES_FULLSCREEN,
+			XDG_TOPLEVEL_WM_CAPABILITIES_MINIMIZE,
+		};
+		struct wl_array capabilities = {
+			.size = sizeof(values), .alloc = sizeof(values), .data = values,
+		};
+		xdg_toplevel_send_wm_capabilities(surface->toplevel, &capabilities);
+		surface->reported_toplevel_capabilities = true;
+	}
+	if (version >= XDG_TOPLEVEL_CONFIGURE_BOUNDS_SINCE_VERSION) {
+		int32_t width, height;
+		toplevel_bounds(surface, &width, &height);
+		if (!surface->reported_toplevel_bounds ||
+		    surface->reported_toplevel_bounds_width != width ||
+		    surface->reported_toplevel_bounds_height != height) {
+			xdg_toplevel_send_configure_bounds(surface->toplevel, width, height);
+			surface->reported_toplevel_bounds = true;
+			surface->reported_toplevel_bounds_width = width;
+			surface->reported_toplevel_bounds_height = height;
+		}
+	}
 }
 
 static uint32_t send_host_toplevel_configure(struct np_surface *surface,
@@ -314,22 +361,32 @@ static uint32_t send_host_toplevel_configure(struct np_surface *surface,
 	                                          uint32_t state_bits,
 	                                          uint32_t host_serial) {
 	if (!surface || !surface->toplevel || !surface->xdg_surface) return 0;
-	struct wl_array states;
-	wl_array_init(&states);
+	uint32_t values[5];
+	size_t count = 0;
 	if (state_bits & NP_CONFIGURE_MAXIMIZED)
-		append_toplevel_state(&states, XDG_TOPLEVEL_STATE_MAXIMIZED);
+		values[count++] = XDG_TOPLEVEL_STATE_MAXIMIZED;
 	if (state_bits & NP_CONFIGURE_FULLSCREEN)
-		append_toplevel_state(&states, XDG_TOPLEVEL_STATE_FULLSCREEN);
+		values[count++] = XDG_TOPLEVEL_STATE_FULLSCREEN;
 	if (state_bits & NP_CONFIGURE_RESIZING)
-		append_toplevel_state(&states, XDG_TOPLEVEL_STATE_RESIZING);
+		values[count++] = XDG_TOPLEVEL_STATE_RESIZING;
 	if (state_bits & NP_CONFIGURE_ACTIVATED)
-		append_toplevel_state(&states, XDG_TOPLEVEL_STATE_ACTIVATED);
+		values[count++] = XDG_TOPLEVEL_STATE_ACTIVATED;
+	if (surface->host_window_visibility_known && !surface->host_window_visible &&
+	    wl_resource_get_version(surface->toplevel) >=
+	        XDG_TOPLEVEL_STATE_SUSPENDED_SINCE_VERSION)
+		values[count++] = XDG_TOPLEVEL_STATE_SUSPENDED;
+	struct wl_array states = {
+		.size = count * sizeof(*values), .alloc = sizeof(values), .data = values,
+	};
 
 	// Host sizes arrive in AppKit points. A Wayland configure is also expressed
 	// in logical window-geometry coordinates; buffer_scale only controls how many
 	// pixels the client attaches and must not be applied to this size.
+	send_toplevel_metadata(surface);
 	xdg_toplevel_send_configure(surface->toplevel, width, height, &states);
-	wl_array_release(&states);
+	surface->host_configure_width = width;
+	surface->host_configure_height = height;
+	surface->host_configure_state_bits = state_bits;
 	uint32_t serial = send_xdg_surface_configure(surface);
 	if (!serial) return 0;
 	struct np_xdg_configure *configure = wl_container_of(
@@ -438,6 +495,57 @@ void np_xdg_configure_toplevel_from_host(struct np_surface *surface,
 	}
 	if (!surface->host_resize_configure_awaiting_commit)
 		schedule_pending_host_toplevel_configure(surface);
+}
+
+/* Visibility and available screen space are independent of a resize. Preserve
+ * the newest queued host geometry instead of replacing it with an older size
+ * when an occlusion notification races a live-resize sample. */
+static void configure_toplevel_metadata_changed(struct np_surface *surface) {
+	if (surface->xdg_configure_phase == NP_XDG_AWAITING_INITIAL_COMMIT)
+		return;
+	if (!surface->host_configure_pending) {
+		surface->host_configure_pending = true;
+		surface->host_configure_pending_width = surface->host_configure_width;
+		surface->host_configure_pending_height = surface->host_configure_height;
+		surface->host_configure_pending_state_bits = surface->host_configure_state_bits;
+		surface->host_configure_pending_serial = 0;
+	}
+	np_xdg_flush_pending_toplevel_configure(surface);
+}
+
+void np_xdg_host_window_state(struct np_surface *surface, bool visible,
+                              int32_t bounds_width, int32_t bounds_height) {
+	if (!surface || !surface->toplevel || !surface->xdg_surface ||
+	    bounds_width < 0 || bounds_height < 0 ||
+	    ((bounds_width == 0) != (bounds_height == 0)))
+		return;
+	bool visibility_changed = !surface->host_window_visibility_known ||
+		surface->host_window_visible != visible;
+	bool bounds_changed = !surface->host_window_bounds_known ||
+		surface->host_window_bounds_width != bounds_width ||
+		surface->host_window_bounds_height != bounds_height;
+	surface->host_window_visibility_known = true;
+	surface->host_window_visible = visible;
+	surface->host_window_bounds_known = true;
+	surface->host_window_bounds_width = bounds_width;
+	surface->host_window_bounds_height = bounds_height;
+	int version = wl_resource_get_version(surface->toplevel);
+	if ((visibility_changed && version >= XDG_TOPLEVEL_STATE_SUSPENDED_SINCE_VERSION) ||
+	    (bounds_changed && version >= XDG_TOPLEVEL_CONFIGURE_BOUNDS_SINCE_VERSION))
+		configure_toplevel_metadata_changed(surface);
+}
+
+void np_xdg_output_bounds_changed(struct np_surface *surface) {
+	if (!surface || !surface->toplevel || !surface->xdg_surface ||
+	    wl_resource_get_version(surface->toplevel) <
+	        XDG_TOPLEVEL_CONFIGURE_BOUNDS_SINCE_VERSION)
+		return;
+	int32_t width, height;
+	toplevel_bounds(surface, &width, &height);
+	if (surface->reported_toplevel_bounds &&
+	    (surface->reported_toplevel_bounds_width != width ||
+	     surface->reported_toplevel_bounds_height != height))
+		configure_toplevel_metadata_changed(surface);
 }
 
 static void send_pending_host_toplevel_configure(struct np_surface *surface) {
@@ -813,6 +921,8 @@ static const struct xdg_popup_interface popup_implementation = {
 static void popup_resource_destroy(struct wl_resource *resource) {
 	struct np_surface *surface = wl_resource_get_user_data(resource);
 	if (!surface) return;
+	np_activation_revoke_surface(surface);
+	np_presentation_time_discard_surface(surface);
 	if (surface->has_grab) {
 		struct np_server *server = surface->server;
 		surface->has_grab = false;

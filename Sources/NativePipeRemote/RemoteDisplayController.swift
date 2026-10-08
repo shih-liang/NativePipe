@@ -21,6 +21,7 @@ public final class RemoteDisplayController {
     /// user approval for each item through the shared macOS coordinator.
     public var hostOpenEnabled: () -> Bool = { true }
     public var notificationsEnabled: () -> Bool = { true }
+    public var notificationArchive: ((GuestNotificationHistoryRecord) -> Void)?
     public var notificationResponseDirectory: URL = FileManager.default.temporaryDirectory
     public var onApplicationsChanged: (() -> Void)?
     public var onStateChange: ((RemoteSession.State) -> Void)?
@@ -33,6 +34,7 @@ public final class RemoteDisplayController {
                                 localCompositorDirectory: localCompositorDirectory)
         frames = RemoteFrameSource()
         bridge = WindowBridge(frameSource: frames)
+        bridge.reportsPresentationTime = true
         bridge.fileAccess = RemoteUserFileAccess(command: command, environment: environment)
         bridge.applicationIconProvider = { [weak self] id in
             self?.applications.first(where: { $0.matches(applicationID: id) })
@@ -132,6 +134,7 @@ public final class RemoteDisplayController {
                 guestNotifications = GuestNotificationPresenter(machine: bridge.machineName,
                     identity: notificationIdentity, responseDirectory: notificationResponseDirectory,
                     isEnabled: { [weak self] in self?.notificationsEnabled() ?? false },
+                    archive: { [weak self] in self?.notificationArchive?($0) },
                     send: { [weak self] in self?.session.send($0) })
             }
         case .hostOpenRequested(let token, let request):

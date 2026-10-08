@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import fnmatch
+import ast
 import hashlib
 import json
 from pathlib import Path
@@ -60,7 +61,7 @@ def main() -> None:
     if not isinstance(entries, list):
         fail("entries must be an array")
     by_id = {entry.get("id"): entry for entry in entries if isinstance(entry, dict)}
-    required = {"nativepipe-original", "wayland-generated-protocols", "nvidia-nvenc-header"}
+    required = {"nativepipe-original", "wayland-generated-protocols", "wayland-static-runtime", "nvidia-nvenc-header"}
     if set(by_id) != required:
         fail(f"expected exactly {sorted(required)}, found {sorted(str(key) for key in by_id)}")
 
@@ -80,6 +81,22 @@ def main() -> None:
     protocols = by_id["wayland-generated-protocols"]
     if protocols.get("licenseExpression") != "MIT":
         fail("Wayland protocol sources must retain their embedded MIT notices")
+    tree = ast.parse((ROOT / "scripts/build-wayland.py").read_text(encoding="utf-8"))
+    pins = next(ast.literal_eval(node.value) for node in tree.body
+                if isinstance(node, ast.Assign) and any(
+                    isinstance(target, ast.Name) and target.id == "DEPS" for target in node.targets))
+    for name, entry_id, notice in (
+        ("wayland", "wayland-static-runtime", "LICENSES/Wayland-COPYING"),
+        ("wayland-protocols", "wayland-generated-protocols", "LICENSES/Wayland-protocols-COPYING"),
+    ):
+        entry = by_id[entry_id]
+        if entry.get("licenseExpression") != "MIT" or entry.get("revision") != pins[name][1]:
+            fail(f"{name} licensing provenance differs from the private SDK pin")
+        path = ROOT / notice
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != entry.get("licenseSha256"):
+            fail(f"{name} complete upstream copyright notice is missing or changed")
+    if by_id["wayland-static-runtime"].get("licenseLocation") != "LICENSES/Wayland-COPYING":
+        fail("static Wayland runtime notice must be included in release bundles")
     for required_policy_path in (".github/workflows/build-linux.yml",):
         matches = [entry["id"] for entry in entries if matched(required_policy_path, entry)]
         if matches != ["nativepipe-original"]:
@@ -93,7 +110,8 @@ def main() -> None:
             fail(f"missing release license file: {relative!r}")
         if not (ROOT / relative).stat().st_size:
             fail(f"empty release license file: {relative}")
-    if not {"LICENSE", "LICENSES/NOTICE", "LICENSES/source-inventory.json"} <= set(license_files):
+    if not {"LICENSE", "LICENSES/NOTICE", "LICENSES/source-inventory.json",
+            "LICENSES/Wayland-COPYING", "LICENSES/Wayland-protocols-COPYING"} <= set(license_files):
         fail("release license files must include the license, licensing notice and source inventory")
     if hashlib.sha256((ROOT / "LICENSE").read_bytes()).hexdigest() != AGPL3_SHA256:
         fail("LICENSE must contain the complete, unmodified AGPLv3 text")

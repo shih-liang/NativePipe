@@ -12,6 +12,7 @@
 #include "window_events.h"
 #include "windowwire.h"
 #include "xwayland.h"
+#include "presentation_time.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -131,6 +132,7 @@ static void republish_state(struct np_server *server) {
 		struct np_surface *member;
 		wl_list_for_each(member, &server->surfaces, link) {
 			if (np_scene_root(member) != root) continue;
+			np_presentation_time_replay_surface(member, root->id, presentation_id);
 			struct np_frame_callback *callback;
 			wl_list_for_each(callback, &member->pending_frame_callbacks, link) {
 				if (callback->presentation_id)
@@ -152,6 +154,7 @@ static void republish_state(struct np_server *server) {
 		    (!surface->current_gpu && !surface->current_shm))
 			continue;
 		uint32_t presentation_id = np_presentation_next_id(server);
+		np_presentation_time_replay_surface(surface, surface->id, presentation_id);
 		struct np_frame_callback *callback;
 		wl_list_for_each(callback, &surface->pending_frame_callbacks, link) {
 			if (callback->presentation_id)
@@ -194,6 +197,8 @@ void np_backend_session_sync(struct np_server *server) {
 	bool connected = all_host_channels_connected(server);
 	if (server->host_session_ready && !connected) {
 		server->host_session_ready = false;
+		np_presentation_time_reset(server);
+		np_input_host_disconnected(server);
         ++server->application_generation;
         np_apps_set_generation(server->applications, server->application_generation);
 		unpublish_session_environment();
@@ -204,6 +209,9 @@ void np_backend_session_sync(struct np_server *server) {
 	}
 
 	if (!server->host_session_ready && connected) {
+			/* Preserve submitted outcome history. Current unsent feedback is rebound
+			 * by replay; cached/pending commits retain their ordinary lifetime. */
+		np_presentation_time_reset(server);
 		/* channelReady is the host launch gate. The environment must be visible
 		 * before the event because the host may launch immediately on receipt. */
 		if (!publish_session_environment(server))
@@ -213,6 +221,7 @@ void np_backend_session_sync(struct np_server *server) {
 			(uint32_t)getpid(), NP_WINDOW_PROTOCOL_VERSION,
 		};
 		np_window_event_send(server, NP_GUEST_SESSION_STARTED, ready, 2);
+		np_presentation_time_clock_request(server);
 		republish_state(server);
 	}
 
@@ -335,4 +344,16 @@ bool np_backend_send_binary(
 {
 	struct np_vmpipe_backend *backend = np_vmpipe_backend(server);
 	return backend && np_host_send_binary(&backend->host, payload, length);
+}
+
+bool np_backend_display_boundary_ready(struct np_server *server)
+{
+	(void)server;
+	return true; /* The same ordered np_host queue carries scenes and pause ACK. */
+}
+
+bool np_backend_admit_scene(struct np_server *server, const void *payload, size_t length)
+{
+	struct np_vmpipe_backend *backend = np_vmpipe_backend(server);
+	return backend && np_host_admit_scene(&backend->host, payload, length);
 }

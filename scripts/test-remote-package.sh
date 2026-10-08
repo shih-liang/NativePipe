@@ -36,6 +36,19 @@ step='bundled license inventory'
 cmp LICENSE "$root/LICENSE"
 cmp LICENSES/NOTICE "$root/LICENSES/NOTICE"
 cmp LICENSES/source-inventory.json "$root/LICENSES/source-inventory.json"
+cmp LICENSES/Wayland-COPYING "$root/LICENSES/Wayland-COPYING"
+cmp LICENSES/Wayland-protocols-COPYING "$root/LICENSES/Wayland-protocols-COPYING"
+cmp LICENSES/Wayland-COPYING "$root/LICENSES/wayland/COPYING"
+cmp LICENSES/Wayland-protocols-COPYING "$root/LICENSES/wayland-protocols/COPYING"
+python3 - "$root/LICENSES" <<'PYTHON'
+import ast, json, pathlib, sys
+tree = ast.parse(pathlib.Path('scripts/build-wayland.py').read_text())
+pins = next(ast.literal_eval(node.value) for node in tree.body
+            if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'DEPS' for t in node.targets))
+for name, (url, revision) in pins.items():
+    source = json.loads((pathlib.Path(sys.argv[1]) / name / 'SOURCE.json').read_text())
+    assert source == {'url': url, 'revision': revision}, f'Wayland source pin differs: {name}'
+PYTHON
 test ! -e "$root/LICENSES/distribution"
 test -z "$(find "$root/LICENSES" -type l -print)"
 while IFS="$(printf '\t')" read -r object package version; do
@@ -61,6 +74,9 @@ needed=$(patchelf --print-needed "$binary")
 resolved=$(ldd "$binary")
 if printf '%s\n' "$needed" | grep -Eq '^lib(avcodec|avutil|swscale|va|aom|yuv|cuda|nvidia)[.-]'; then
     echo 'Unexpected required system codec ABI' >&2; exit 1
+fi
+if printf '%s\n' "$needed" | grep -Eq '^libwayland-(server|client)[.]'; then
+    echo 'Unexpected required system Wayland ABI' >&2; exit 1
 fi
 for notice in aom/LICENSE aom/PATENTS libyuv/LICENSE libyuv/PATENTS NVIDIA-NVENC-header.txt; do
     step="codec notice: $notice"

@@ -4,12 +4,12 @@ import Foundation
 /// A late Core Animation callback must not return a retired credit twice.
 @MainActor
 final class ScenePresentationCompletion {
-    private var callback: ((Bool) -> Void)?
-    init(_ callback: @escaping (Bool) -> Void) { self.callback = callback }
-    func finish(_ displayed: Bool) {
+    private var callback: ((Bool, Double?) -> Void)?
+    init(_ callback: @escaping (Bool, Double?) -> Void) { self.callback = callback }
+    func finish(_ displayed: Bool, presentedTime: Double? = nil) {
         let callback = self.callback
         self.callback = nil
-        callback?(displayed)
+        callback?(displayed, presentedTime)
     }
 }
 
@@ -20,10 +20,16 @@ final class ScenePresentationCredits {
     func register(
         _ presentationID: UInt32, callback: @escaping (Bool) -> Void
     ) -> ScenePresentationCompletion {
+        registerTimed(presentationID) { displayed, _ in callback(displayed) }
+    }
+
+    func registerTimed(
+        _ presentationID: UInt32, callback: @escaping (Bool, Double?) -> Void
+    ) -> ScenePresentationCompletion {
         outstanding.removeValue(forKey: presentationID)?.finish(false)
-        let completion = ScenePresentationCompletion { [weak self] displayed in
+        let completion = ScenePresentationCompletion { [weak self] displayed, time in
             self?.outstanding.removeValue(forKey: presentationID)
-            callback(displayed)
+            callback(displayed, time)
         }
         outstanding[presentationID] = completion
         return completion

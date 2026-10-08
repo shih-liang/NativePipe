@@ -112,6 +112,7 @@
 "NativePipe isn’t connected to the Linux computer." = "NativePipe가 Linux 컴퓨터에 연결되어 있지 않습니다.";
 "NativePipe upload timed out." = "NativePipe 업로드 시간이 초과되었습니다.";
 "No matching windows. Try another title or app name." = "일치하는 창이 없습니다. 다른 제목이나 앱 이름을 시도하세요.";
+"No open windows" = "열린 창 없음";
 "No space left on device" = "장치에 남은 공간 없음";
 "No such file or directory" = "해당 파일 또는 디렉터리 없음";
 "Not a directory" = "디렉터리가 아님";
@@ -291,3 +292,7 @@
 "The virtual file sharing backend is not available." = "가상 파일 공유 백엔드를 사용할 수 없습니다.";
 
 "This build lacks FSKit mount authorization. Virtual file sharing requires an application signed with an authorized provisioning profile." = "이 빌드에는 FSKit 마운트 권한이 없습니다. 가상 파일 공유에는 권한이 있는 프로비저닝 프로파일로 서명된 앱이 필요합니다.";
+
+"The display did not finish preparing for the virtual machine state change." = "가상 머신 상태 변경을 위한 화면 준비가 완료되지 않았습니다.";
+"The display connection changed during the virtual machine state change." = "가상 머신 상태 변경 중 화면 연결이 변경되었습니다.";
+"Another display state change is already in progress." = "다른 화면 상태 변경이 진행 중입니다.";

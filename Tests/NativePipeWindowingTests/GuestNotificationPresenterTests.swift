@@ -38,17 +38,19 @@ private final class FakeCenter: GuestNotificationCenter {
 final class GuestNotificationPresenterTests: XCTestCase {
     private var center: FakeCenter!
     private var sent: [Windowing.HostCommand] = []
+    private var history: [GuestNotificationHistoryRecord] = []
     private var enabled = true
     private var clock: TimeInterval = 0
 
     override func setUp() {
-        center = FakeCenter(); sent = []; enabled = true; clock = 0
+        center = FakeCenter(); sent = []; history = []; enabled = true; clock = 0
     }
 
-    private func makePresenter(limiter: GuestNotificationRateLimiter = .init()) -> GuestNotificationPresenter {
+    private func makePresenter(machine: String = "Dev", limiter: GuestNotificationRateLimiter = .init()) -> GuestNotificationPresenter {
         GuestNotificationPresenter(
-            machine: "Dev", center: center, isEnabled: { [unowned self] in enabled },
+            machine: machine, center: center, isEnabled: { [unowned self] in enabled },
             limiter: limiter, now: { [unowned self] in clock },
+            archive: { [unowned self] in history.append($0) },
             send: { [unowned self] in sent.append($0) })
     }
 
@@ -152,6 +154,49 @@ final class GuestNotificationPresenterTests: XCTestCase {
         XCTAssertEqual(center.authorizations, 2)
         XCTAssertEqual(center.presented.map(\.identifier), [presenter.identifier(for: 1), presenter.identifier(for: 2)].compactMap { $0 })
         XCTAssertEqual(presenter.activeIdentifiers, [1, 2])
+        for identifier in center.presented.map(\.identifier) {
+            let records = history.filter { $0.id == identifier }
+            XCTAssertEqual(records.map(\.delivery), [.pending, .delivered])
+            XCTAssertEqual(records.first?.receivedAt, records.last?.receivedAt)
+        }
+    }
+
+    func testDeniedNotificationIsArchivedWithSanitizedContentBeforeAuthorization() async throws {
+        center.holdAuthorization = true
+        let presenter = makePresenter()
+        let before = Date()
+        presenter.post(note(summary: "<b>Ready</b> &amp; done\u{7}", body: "First\r\n<b>second</b>\u{202E}",
+                            app: "<i>Terminal</i>\u{7}"))
+        let pending = try XCTUnwrap(history.first)
+        XCTAssertEqual(history.count, 1)
+        XCTAssertEqual(pending.id, presenter.identifier(for: 1))
+        XCTAssertEqual(pending.machine, "Dev")
+        XCTAssertEqual(pending.application, "Terminal")
+        XCTAssertEqual(pending.title, "Ready & done")
+        XCTAssertEqual(pending.body, "First\nsecond")
+        XCTAssertEqual(pending.delivery, .pending)
+        XCTAssertGreaterThanOrEqual(pending.receivedAt, before)
+        XCTAssertLessThanOrEqual(pending.receivedAt, Date())
+        XCTAssertEqual(center.authorizations, 0, "The pending archive is written synchronously before authorization")
+        try await waitUntil { self.center.pendingAuthorizations.count == 1 }
+        center.pendingAuthorizations.removeFirst().resume(returning: false)
+        try await waitUntil { self.history.count == 2 }
+        var denied = pending
+        denied.delivery = .notAuthorized
+        XCTAssertEqual(history, [pending, denied])
+        XCTAssertTrue(center.presented.isEmpty)
+        XCTAssertTrue(presenter.activeIdentifiers.isEmpty)
+    }
+
+    func testArchivedMachineLabelIsBoundedAndNeverEmpty() {
+        let long = makePresenter(machine: String(repeating: "m", count: 500))
+        long.post(note())
+        XCTAssertEqual(history.last?.machine.count, GuestNotificationPolicy.maximumTitleLength)
+        long.stop()
+        let empty = makePresenter(machine: "<b></b>\u{7}")
+        empty.post(note())
+        XCTAssertEqual(history.last?.machine, "Guest")
+        empty.stop()
     }
 
     func testDisabledOrDeniedNotificationsAreNotShown() async {
@@ -161,12 +206,14 @@ final class GuestNotificationPresenterTests: XCTestCase {
         await settle()
         XCTAssertTrue(center.presented.isEmpty)
         XCTAssertEqual(center.authorizations, 0, "A disabled feature must not trigger the system prompt.")
+        XCTAssertTrue(history.isEmpty)
 
         enabled = true; center.allowed = false
         presenter.post(note(2)); presenter.post(note(3))
         await settle()
         XCTAssertTrue(center.presented.isEmpty)
         XCTAssertEqual(center.authorizations, 2, "The center checks current settings; it alone merges an initial system prompt.")
+        XCTAssertEqual(history.filter { $0.delivery == .notAuthorized }.count, 2)
     }
 
     func testFloodingIsRateLimited() async {
@@ -174,6 +221,7 @@ final class GuestNotificationPresenterTests: XCTestCase {
         for id in 1...10 { presenter.post(note(UInt32(id))) }
         await settle()
         XCTAssertEqual(center.presented.count, 2)
+        XCTAssertEqual(history.filter { $0.delivery == .pending }.count, 2, "Rate limited posts never enter history")
     }
 
     func testClickRunsTheDefaultActionAndClosesTheNotification() async throws {
@@ -218,6 +266,7 @@ final class GuestNotificationPresenterTests: XCTestCase {
         presenter.close(id: 6, revision: 1)
         XCTAssertEqual(center.withdrawn, [identifier])
         XCTAssertTrue(sent.isEmpty)
+        XCTAssertEqual(history.map(\.delivery), [.pending, .delivered], "Withdrawing a delivered notification keeps its final status")
         presenter.close(id: 6, revision: 1)
         XCTAssertEqual(center.withdrawn, [identifier], "Closing twice withdraws once.")
     }
@@ -238,6 +287,11 @@ final class GuestNotificationPresenterTests: XCTestCase {
         let presenter = makePresenter()
         presenter.post(note(9)); await settle()
         XCTAssertTrue(presenter.activeIdentifiers.isEmpty)
+        XCTAssertEqual(history.map(\.delivery), [.pending, .failed])
+        guard let pending = history.first, let final = history.last else { return XCTFail("Missing history") }
+        var failed = pending
+        failed.delivery = .failed
+        XCTAssertEqual(final, failed)
     }
 
     func testLatePresentationCannotResurrectGuestClosedNotification() async throws {
@@ -253,6 +307,7 @@ final class GuestNotificationPresenterTests: XCTestCase {
         XCTAssertTrue(center.visible.isEmpty)
         XCTAssertTrue(presenter.activeIdentifiers.isEmpty)
         XCTAssertTrue(sent.isEmpty, "Guest closure must not be echoed by a late add")
+        XCTAssertEqual(history.map(\.delivery), [.pending, .cancelled])
     }
 
     func testLateReplacementCannotOverwriteOrRemoveNewNotification() async throws {
@@ -274,6 +329,8 @@ final class GuestNotificationPresenterTests: XCTestCase {
         _ = center.onResponse?(oldIdentifier, "default")
         XCTAssertTrue(sent.isEmpty)
         XCTAssertEqual(presenter.activeIdentifiers, [1])
+        XCTAssertEqual(history.filter { $0.id == oldIdentifier }.map(\.delivery), [.pending, .cancelled])
+        XCTAssertEqual(history.filter { $0.id == newIdentifier }.map(\.delivery), [.pending, .delivered])
     }
 
     func testOldAddFailureCannotDiscardSuccessfulReplacement() async throws {
@@ -282,7 +339,7 @@ final class GuestNotificationPresenterTests: XCTestCase {
         let presenter = makePresenter()
         presenter.post(note(summary: "Old"))
         try await waitUntil { self.center.pendingPresentations.count == 1 }
-        let (_, pending) = center.pendingPresentations.removeFirst()
+        let (oldIdentifier, pending) = center.pendingPresentations.removeFirst()
         center.holdPresentation = false
         presenter.post(note(revision: 2, summary: "New"))
         try await waitUntil { self.center.presented.count == 1 }
@@ -292,6 +349,8 @@ final class GuestNotificationPresenterTests: XCTestCase {
         XCTAssertEqual(presenter.activeIdentifiers, [1])
         XCTAssertEqual(center.visible.values.first?.title, "New")
         XCTAssertTrue(sent.isEmpty)
+        XCTAssertEqual(history.filter { $0.id == oldIdentifier }.map(\.delivery), [.pending, .cancelled])
+        XCTAssertEqual(history.filter { $0.id == presenter.identifier(for: 1) }.map(\.delivery), [.pending, .delivered])
     }
 
     func testStopDuringAuthorizationPreventsPresentationAndResetStartsNewSession() async throws {
@@ -305,6 +364,7 @@ final class GuestNotificationPresenterTests: XCTestCase {
         await settle()
         XCTAssertTrue(center.presented.isEmpty)
         XCTAssertTrue(presenter.activeIdentifiers.isEmpty)
+        XCTAssertEqual(history.map(\.delivery), [.pending, .cancelled])
         presenter.post(note())
         XCTAssertTrue(presenter.activeIdentifiers.isEmpty)
         presenter.resetSession()
@@ -312,6 +372,63 @@ final class GuestNotificationPresenterTests: XCTestCase {
         presenter.post(note())
         try await waitUntil { self.center.presented.count == 1 }
         XCTAssertNotEqual(oldIdentifier, presenter.identifier(for: 1))
+        XCTAssertEqual(history.filter { $0.id == oldIdentifier }.map(\.delivery), [.pending, .cancelled])
+    }
+
+    func testLatePresentationAfterStopDoesNotUpdateHistory() async throws {
+        center.holdPresentation = true
+        let presenter = makePresenter()
+        presenter.post(note())
+        try await waitUntil { self.center.pendingPresentations.count == 1 }
+        let (_, pending) = center.pendingPresentations.removeFirst()
+        presenter.stop()
+        pending.resume()
+        try await waitUntil { self.center.presented.count == 1 }
+        await settle()
+        XCTAssertEqual(history.map(\.delivery), [.pending, .cancelled])
+        XCTAssertTrue(center.visible.isEmpty)
+    }
+
+    func testLateAuthorizationCannotChangeNewSessionHistory() async throws {
+        center.holdAuthorization = true
+        let presenter = makePresenter()
+        presenter.post(note(summary: "Old session"))
+        let oldIdentifier = try XCTUnwrap(presenter.identifier(for: 1))
+        try await waitUntil { self.center.pendingAuthorizations.count == 1 }
+        let pending = center.pendingAuthorizations.removeFirst()
+        presenter.resetSession()
+        center.holdAuthorization = false
+        presenter.post(note(summary: "New session"))
+        let newIdentifier = try XCTUnwrap(presenter.identifier(for: 1))
+        try await waitUntil { self.center.presented.count == 1 }
+        pending.resume(returning: false)
+        await settle()
+        XCTAssertNotEqual(oldIdentifier, newIdentifier)
+        XCTAssertEqual(history.filter { $0.id == oldIdentifier }.map(\.delivery), [.pending, .cancelled])
+        XCTAssertEqual(history.filter { $0.id == newIdentifier }.map(\.delivery), [.pending, .delivered])
+        XCTAssertEqual(presenter.identifier(for: 1), newIdentifier)
+        XCTAssertTrue(sent.isEmpty)
+    }
+
+    func testReplacementCancelsPendingHistoryBeforeLateAuthorization() async throws {
+        center.holdAuthorization = true
+        let presenter = makePresenter()
+        presenter.post(note(summary: "Old"))
+        let old = try XCTUnwrap(history.first)
+        try await waitUntil { self.center.pendingAuthorizations.count == 1 }
+        let authorization = center.pendingAuthorizations.removeFirst()
+        center.holdAuthorization = false
+        presenter.post(note(revision: 2, summary: "New"))
+        var cancelled = old
+        cancelled.delivery = .cancelled
+        XCTAssertEqual(history.filter { $0.id == old.id }, [old, cancelled])
+        try await waitUntil { self.center.presented.count == 1 }
+        authorization.resume(returning: true)
+        await settle()
+        XCTAssertEqual(history.filter { $0.id == old.id }, [old, cancelled])
+        XCTAssertEqual(history.filter { $0.id == presenter.identifier(for: 1) }.map(\.delivery), [.pending, .delivered])
+        XCTAssertEqual(center.presented.count, 1)
+        XCTAssertTrue(sent.isEmpty)
     }
 
     func testDeniedPermissionIsRecheckedAndLeavesNoPendingRecord() async throws {
@@ -330,12 +447,23 @@ final class GuestNotificationPresenterTests: XCTestCase {
         let presenter = makePresenter()
         presenter.post(note())
         try await waitUntil { self.center.presented.count == 1 }
+        let delivered = try XCTUnwrap(presenter.identifier(for: 1))
+        center.holdAuthorization = true
+        presenter.post(note(2))
+        let pending = try XCTUnwrap(presenter.identifier(for: 2))
+        try await waitUntil { self.center.pendingAuthorizations.count == 1 }
         enabled = false
         presenter.refreshPreferences()
         XCTAssertTrue(center.visible.isEmpty)
         XCTAssertTrue(presenter.activeIdentifiers.isEmpty)
-        enabled = true
-        presenter.post(note(2))
+        XCTAssertEqual(history.filter { $0.id == delivered }.map(\.delivery), [.pending, .delivered])
+        XCTAssertEqual(history.filter { $0.id == pending }.map(\.delivery), [.pending, .cancelled])
+        center.pendingAuthorizations.removeFirst().resume(returning: true)
+        await settle()
+        XCTAssertEqual(center.presented.count, 1)
+        XCTAssertEqual(history.filter { $0.id == pending }.map(\.delivery), [.pending, .cancelled])
+        enabled = true; center.holdAuthorization = false
+        presenter.post(note(3))
         try await waitUntil { self.center.presented.count == 2 }
     }
 
@@ -404,6 +532,8 @@ final class GuestNotificationPresenterTests: XCTestCase {
         }
         XCTAssertEqual(Set(closed), [1, 2, 3, 4, 5])
         XCTAssertTrue(presenter.activeIdentifiers.isEmpty)
+        XCTAssertEqual(history.map(\.delivery), [.pending, .notAuthorized, .pending, .failed],
+                       "Disabled, empty and rate limited posts must not be archived")
     }
 
     func testStopReleasesEveryGuestIDButNewSessionResetDoesNotEchoOldIDs() async throws {
@@ -439,6 +569,7 @@ final class GuestNotificationPresenterTests: XCTestCase {
         let presenter = makePresenter(limiter: .init(capacity: 100, refillInterval: 60))
         for id in 1...100 { presenter.post(note(UInt32(id))) }
         XCTAssertEqual(presenter.activeIdentifiers.count, GuestNotificationPresenter.maximumActive)
+        XCTAssertEqual(history.count, GuestNotificationPresenter.maximumActive, "The active limit also bounds history admission")
         presenter.stop()
     }
     func testStaleRevisionCannotWithdrawReplacementOrRunItsAction() async throws {
@@ -462,20 +593,24 @@ final class GuestNotificationPresenterTests: XCTestCase {
         var presenter: GuestNotificationPresenter? = makePresenter()
         weak var weakPresenter = presenter
         presenter?.post(note(timeout: 3_600_000))
+        let pendingIdentifier = try XCTUnwrap(presenter?.identifier(for: 1))
         try await waitUntil { self.center.pendingPresentations.count == 1 }
         presenter = nil
         XCTAssertNil(weakPresenter, "The presentation task must not retain its owner")
         center.pendingPresentations.removeFirst().1.resume()
         await settle()
         XCTAssertTrue(center.visible.isEmpty)
+        XCTAssertEqual(history.filter { $0.id == pendingIdentifier }.map(\.delivery), [.pending, .cancelled])
         center.holdPresentation = false
         presenter = makePresenter(); weakPresenter = presenter
         presenter?.post(note(timeout: 3_600_000))
+        let deliveredIdentifier = try XCTUnwrap(presenter?.identifier(for: 1))
         try await waitUntil { !self.center.visible.isEmpty }
         presenter = nil
         XCTAssertNil(weakPresenter, "The expiry task must not retain its owner")
         await settle()
         XCTAssertTrue(center.visible.isEmpty)
+        XCTAssertEqual(history.filter { $0.id == deliveredIdentifier }.map(\.delivery), [.pending, .delivered])
     }
 
     func testBodyOnlyTitleAndBacklogResetAreBounded() async throws {

@@ -46,4 +46,15 @@ final class ScrollCoalescingTests: XCTestCase {
         XCTAssertEqual(Array(payload[8..<24]), Array(repeating: 0, count: 16))
         XCTAssertEqual(Array(payload[24..<28]), [1, 0, 0, 0])
     }
+    func testNaturalDirectionIsCarriedAndCannotCoalesceAcrossPreferenceChange() throws {
+        let normal = scroll(0, 1)
+        let inverted = Windowing.HostCommand.pointerScroll(window: 1, dx: 0, dy: 1,
+            isPrecise: true, isDirectionInverted: true)
+        XCTAssertNil(normal.coalescingScroll(with: inverted))
+        XCTAssertNil(inverted.coalescingScroll(with: normal))
+        let payload = try WindowWire.commandPayload(for: inverted)
+        XCTAssertEqual(payload.count, 28)
+        XCTAssertEqual(Array(payload[24..<28]), [1, 1, 0, 0])
+    }
+
 }

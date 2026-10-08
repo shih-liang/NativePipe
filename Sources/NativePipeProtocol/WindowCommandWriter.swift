@@ -13,15 +13,16 @@ extension Windowing.HostCommand {
     public var transportLane: WindowTransportLane {
         switch self {
 		case .configure, .configurePopup, .close, .forceQuit, .dismissPopup, .scaleChanged,
-			 .outputsChanged, .windowOutputChanged, .inputPreferences,
-             .framePresented, .captureFrame,
+			 .outputsChanged, .windowOutputChanged, .windowState, .inputPreferences,
+             .framePresented, .captureFrame, .presentationPause, .presentationResume,
              .selectionRequest, .hostSelectionOffered, .hostSelectionData:
             return .control
         case .keyboardFocus, .key, .pointerEntered, .pointerMoved,
              .pointerLeft, .pointerButton, .pointerScroll,
-             .textCommit, .textPreedit, .textDeleteSurrounding:
+             .textCommit, .textPreedit, .textDeleteSurrounding, .textEdit:
             return .input
-        case .frameReleased:
+        case .frameReleased, .presentationClockSample, .sceneClockSample,
+             .presentationFeedback, .presentationDrain:
             return .feedback
         case .applicationRequest, .fileDrag, .notificationClosed, .notificationAction, .hostOpenResponse:
             return .control
@@ -306,8 +307,15 @@ public final class WindowCommandWriter: @unchecked Sendable {
         } else if !remoteFeedback.isEmpty {
             outbound = .payload(remoteFeedback.removeFirst())
         } else if let index {
-            if lane == .feedback {
-                let end = min(head + 256, pending.count)
+            if lane == .feedback, case .frameReleased = pending[head] {
+                // NPFT carries only latch/read timing. Calibration, actual
+                // outcomes and drain fences are lossless NPW2 records on this
+                // same lane; never fold them into a timing batch.
+                var end = head + 1
+                while end < min(head + 256, pending.count) {
+                    guard case .frameReleased = pending[end] else { break }
+                    end += 1
+                }
                 outbound = .feedback(Array(pending[head..<end]))
                 head = end
             } else if !remote {

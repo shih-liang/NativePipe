@@ -16,8 +16,10 @@ struct np_sync_point;
 struct np_xwayland;
 struct np_notifications;
 struct np_host_open;
+struct np_activation;
 struct np_window_frame;
 struct np_output_state;
+struct np_presentation_time;
 
 enum np_surface_role {
 	NP_SURFACE_ROLE_NONE = 0,
@@ -37,6 +39,7 @@ struct np_server {
 	 * protocol state. */
 	void *backend_state;
 	bool host_session_ready;
+	struct np_presentation_time *presentation_time;
     struct np_apps *applications;
     struct wl_event_source *application_source;
     uint64_t application_generation;
@@ -64,6 +67,9 @@ struct np_server {
 	struct wl_list clip_pending;
 	struct wl_list clip_writes;
 	struct wl_list text_inputs;
+	/* Distinct from text-input-v3 commit serials: only a field lifecycle reset
+	 * retires queued host IME edits. Zero never identifies an enabled field. */
+	uint32_t text_input_epoch;
 	struct wl_resource *drag_source;
 	struct wl_resource *drag_origin;
 	struct wl_resource *drag_icon;
@@ -96,6 +102,7 @@ struct np_server {
 	char xwayland_appdefaults[256];
 	struct np_notifications *notifications;
 	struct np_host_open *host_open;
+	struct np_activation *activation;
 };
 
 struct np_input {
@@ -169,6 +176,7 @@ struct np_surface_update {
 	struct np_box damage;
 	bool set_fifo_barrier;
 	bool wait_fifo_barrier;
+	bool display_feedback;
 	bool subsurface_state_changed;
 	struct np_sync_point *acquire_point;
 	struct np_sync_point *release_point;
@@ -234,6 +242,7 @@ struct np_surface {
 	struct wl_resource *resource;
 	uint32_t id;
 	struct wl_list pending_frame_callbacks;
+	struct wl_list presentation_feedbacks;
 	struct wl_list blocked_updates;
 	struct wl_resource *pending_buffer;
 	bool pending_buffer_set;
@@ -287,6 +296,8 @@ struct np_surface {
 	struct wl_resource *fractional_scale;
 	int preferred_scale;
 	int reported_scale;
+	int reported_buffer_scale;
+	bool reported_buffer_transform;
 	struct wl_resource *viewport;
 	struct np_viewport_state pending_viewport;
 	struct np_viewport_state viewport_state;
@@ -302,6 +313,13 @@ struct np_surface {
 	int32_t host_configure_pending_height;
 	uint32_t host_configure_pending_state_bits;
 	uint32_t host_configure_pending_serial;
+	int32_t host_configure_width, host_configure_height;
+	uint32_t host_configure_state_bits;
+	bool host_window_visibility_known, host_window_visible;
+	bool host_window_bounds_known;
+	int32_t host_window_bounds_width, host_window_bounds_height;
+	bool reported_toplevel_bounds, reported_toplevel_capabilities;
+	int32_t reported_toplevel_bounds_width, reported_toplevel_bounds_height;
 	uint32_t host_configure_acked_serial;
 	uint32_t host_configure_acked_host_serial;
 	bool host_configure_acked;
@@ -404,11 +422,13 @@ bool np_surface_is_popup(const struct np_surface *surface);
 /* Core protocol registration. */
 void np_compositor_bind(struct wl_client *client, void *data,
                         uint32_t version, uint32_t id);
+void np_surface_send_buffer_preferences(struct np_surface *surface, int scale);
 void np_subcompositor_bind(struct wl_client *client, void *data,
                            uint32_t version, uint32_t id);
 void np_seat_bind(struct wl_client *client, void *data,
                   uint32_t version, uint32_t id);
 bool np_input_create_keymap(struct np_server *server);
+void np_input_host_disconnected(struct np_server *server);
 
 /* Surface commit and subsurface state. */
 void np_surface_commit(struct wl_client *client, struct wl_resource *resource);
