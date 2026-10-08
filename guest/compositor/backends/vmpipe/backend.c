@@ -1,4 +1,5 @@
 #include "presentation_time.h"
+#include "presentation_clock.h"
 #include "backend.h"
 #include "backend_internal.h"
 #include "compositor.h"
@@ -14,6 +15,10 @@
 #include <unistd.h>
 
 bool np_backend_check_runtime(void) { return true; }
+uint64_t np_backend_presentation_clock_window(void)
+{
+    return NP_PRESENTATION_CLOCK_VM_MAX_RTT_NS;
+}
 
 int np_backend_run(int argc, char **argv)
 {

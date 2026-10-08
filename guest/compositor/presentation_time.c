@@ -8,6 +8,7 @@
 #include "scene.h"
 #include "window_events.h"
 #include "windowwire.h"
+#include "user_text.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -17,7 +18,8 @@
 #include <time.h>
 #include <unistd.h>
 
-#define CLOCK_RETRY_NS UINT64_C(250000000)
+#define CLOCK_RETRY_NS NP_PRESENTATION_CLOCK_REMOTE_MAX_RTT_NS
+#define CLOCK_RECOVERY_NS UINT64_C(2000000000)
 #define CLOCK_TIMEOUT_NS UINT64_C(3000000000)
 #define RESULT_TIMEOUT_NS UINT64_C(15000000000)
 #define MAX_SCENES 4096u
@@ -215,9 +217,13 @@ static void bind_presentation(struct wl_client *client, void *data, uint32_t ver
 void np_presentation_time_clock_request(struct np_server *server)
 {
     struct np_presentation_time *state = server->presentation_time;
-    if (!state || !server->host_session_ready || state->faulted ||
+    if (!state || !server->host_session_ready ||
         (state->paused && !state->resume_token)) return;
     uint64_t now = now_ns();
+    /* A timeout keeps public feedback unavailable, but a recovered transport
+     * can qualify it later. Avoid busy retry while preserving the same nonce
+     * and clock epoch; only a valid reply clears faulted below. */
+    if (state->faulted && now - state->sent < CLOCK_RECOVERY_NS) return;
     if (state->token && now - state->sent < CLOCK_RETRY_NS) return;
     if (state->clock.valid && now - state->sent < CLOCK_RETRY_NS) return;
     uint32_t token = ++state->next_token;
@@ -269,6 +275,7 @@ void np_presentation_time_init(struct np_server *server)
         free(state); return;
     }
     state->server = server;
+    state->clock.maximum_rtt_ns = np_backend_presentation_clock_window();
     state->epoch = 1;
     wl_list_init(&state->scenes);
     state->timer = wl_event_loop_add_timer(wl_display_get_event_loop(server->display), tick, state);
@@ -579,8 +586,12 @@ static void clock_fault(struct np_presentation_time *state)
         /* The last independently validated sample bounds known history. It
          * does not locate the discontinuity between it and the new sample. */
         uint64_t ceiling = state->clock.host > scene->clock.host ? state->clock.host : scene->clock.host;
+        if (state->clock.epoch_host > ceiling) ceiling = state->clock.epoch_host;
+        if (scene->clock.epoch_host > ceiling) ceiling = scene->clock.epoch_host;
         if (state->disconnected_clock.valid && state->disconnected_clock.host > ceiling)
             ceiling = state->disconnected_clock.host;
+        if (state->disconnected_clock.valid && state->disconnected_clock.epoch_host > ceiling)
+            ceiling = state->disconnected_clock.epoch_host;
         if (!scene->mapping_ceiling || ceiling < scene->mapping_ceiling) scene->mapping_ceiling = ceiling;
         if (scene->terminal) flush_result(scene);
     }
@@ -592,17 +603,37 @@ void np_presentation_time_clock_sample(struct np_server *server, uint32_t token,
     uint64_t session, uint64_t epoch, uint64_t host)
 {
     struct np_presentation_time *state = server->presentation_time;
-    if (!state || session != state->session || epoch != state->epoch || !token || token != state->token) return;
+    if (!state) return;
+    if (session != state->session || epoch != state->epoch || !token || token != state->token) {
+        np_debug_log("[wayland] presentation clock sample rejected: stale identity token=%u expected=%u session=%llu epoch=%llu\n",
+            token, state->token, (unsigned long long)session, (unsigned long long)epoch);
+        return;
+    }
     uint64_t received = now_ns();
     state->token = 0;
     if (state->history_unverified && np_presentation_clock_discontinuous(
         &state->disconnected_clock, state->sent, received, host)) clock_fault(state);
     if (np_presentation_clock_discontinuous(&state->clock, state->sent, received, host)) {
+        np_debug_log("[wayland] presentation clock sample rejected: offset discontinuity token=%u rtt_ns=%llu\n",
+            token, (unsigned long long)(received - state->sent));
         clock_fault(state); return;
     }
-    if (!np_presentation_clock_sample_at(&state->clock, state->sent, received, host)) return;
+    if (!np_presentation_clock_sample_at(&state->clock, state->sent, received, host)) {
+        const char *reason = !host ? "zero host time" : received < state->sent ? "reversed guest time" :
+            received - state->sent > np_presentation_clock_maximum_rtt(&state->clock) ? "response window exceeded" :
+            received < state->clock.sampled_at ? "older guest sample" : "older host sample";
+        np_debug_log("[wayland] presentation clock sample rejected: %s token=%u rtt_ns=%llu limit_ns=%llu\n",
+            reason, token, (unsigned long long)(received >= state->sent ? received - state->sent : 0),
+            (unsigned long long)np_presentation_clock_maximum_rtt(&state->clock));
+        return;
+    }
+    np_debug_log("[wayland] presentation clock calibrated token=%u measured_rtt_ns=%llu anchor_rtt_ns=%llu uncertainty_ns=%llu\n",
+        token, (unsigned long long)(received - state->sent), (unsigned long long)state->clock.rtt,
+        (unsigned long long)(state->clock.rtt / 2));
     state->clock.epoch = epoch;
-    state->clock.epoch_host = state->clock.host;
+    /* A slower validated sample may preserve the best mapping. Its instant
+     * still advances the trustworthy historical boundary for a later fault. */
+    state->clock.epoch_host = host;
     state->calibration_started = 0;
     state->faulted = false;
     state->history_unverified = false;
@@ -634,7 +665,10 @@ void np_presentation_time_scene_clock_sample(struct np_server *server, uint64_t 
     if (np_presentation_clock_discontinuous(&scene->clock, sent, received, host)) {
         clock_fault(state); return;
     }
-    if (np_presentation_clock_sample_at(&scene->clock, sent, received, host)) flush_result(scene);
+    if (np_presentation_clock_sample_at(&scene->clock, sent, received, host)) {
+        scene->clock.epoch_host = host;
+        flush_result(scene);
+    }
 }
 void np_presentation_time_result(struct np_server *server, uint64_t session, uint64_t epoch,
     uint32_t owner, uint32_t id, uint64_t host, uint32_t refresh, uint32_t output)
@@ -688,7 +722,8 @@ void np_presentation_time_resume(struct np_server *server, uint64_t session, uin
     if (!state->epoch) ++state->epoch;
     if (state->clock.valid) state->disconnected_clock = state->clock;
     if (!wl_list_empty(&state->scenes)) state->history_unverified = true;
-    state->clock = (struct np_presentation_clock){ .epoch = state->epoch };
+    state->clock = (struct np_presentation_clock){ .epoch = state->epoch,
+        .maximum_rtt_ns = state->clock.maximum_rtt_ns };
     state->faulted = false;
     state->paused = true;
     state->token = 0; state->drain_token = 0;

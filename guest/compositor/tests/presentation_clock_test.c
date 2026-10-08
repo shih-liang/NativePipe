@@ -31,7 +31,7 @@ static void expect_unchanged(const struct np_presentation_clock *clock,
     assert(clock->valid == before->valid && clock->host == before->host &&
            clock->guest == before->guest && clock->rtt == before->rtt &&
            clock->sampled_at == before->sampled_at && clock->epoch == before->epoch &&
-           clock->epoch_host == before->epoch_host);
+           clock->epoch_host == before->epoch_host && clock->maximum_rtt_ns == before->maximum_rtt_ns);
 }
 
 static void different_origins_preserve_display_time(void)
@@ -111,6 +111,71 @@ static void fresh_calibration_keeps_the_lowest_rtt(void)
     assert(np_presentation_clock_sample_at(&clock,
         103 * SECOND, 103 * SECOND + 12 * MS, 903 * SECOND + 6 * MS));
     assert(clock.rtt == 12 * MS && clock.sampled_at == 103 * SECOND + 12 * MS);
+}
+
+static void remote_baseline_uses_request_window_without_weakening_vm(void)
+{
+    struct np_presentation_clock vm = {0};
+    assert(!np_presentation_clock_sample_at(&vm,
+        100 * SECOND, 100 * SECOND + 80 * MS, 900 * SECOND + 40 * MS));
+    assert(!vm.valid);
+    struct np_presentation_clock remote = {
+        .epoch = 1, .maximum_rtt_ns = NP_PRESENTATION_CLOCK_REMOTE_MAX_RTT_NS,
+    };
+    assert(np_presentation_clock_sample_at(&remote,
+        100 * SECOND, 100 * SECOND + 90 * MS, 900 * SECOND + 45 * MS));
+    assert(remote.rtt == 90 * MS);
+    assert(np_presentation_clock_sample_at(&remote,
+        100 * SECOND + 300 * MS, 100 * SECOND + 380 * MS, 900 * SECOND + 340 * MS));
+    assert(remote.rtt == 80 * MS && remote.guest == 100 * SECOND + 340 * MS);
+    expect_conversion(&remote, 900 * SECOND + 350 * MS,
+        100 * SECOND + 380 * MS, 100 * SECOND + 350 * MS);
+    // A finite half-RTT bound is retained; accepting SSH is not accepting any
+    // future timestamp, an invalid origin or a delayed reply from another epoch.
+    expect_conversion(&remote, 900 * SECOND + 420 * MS,
+        100 * SECOND + 380 * MS, 100 * SECOND + 420 * MS);
+    expect_rejection(&remote, 900 * SECOND + 420 * MS + 1, 100 * SECOND + 380 * MS);
+    struct np_presentation_clock before = remote;
+    assert(!np_presentation_clock_sample_at(&remote,
+        101 * SECOND, 101 * SECOND + 250 * MS + 1, 901 * SECOND + 125 * MS));
+    expect_unchanged(&remote, &before);
+    assert(!np_presentation_clock_sample_at(&remote, SECOND, SECOND + 80 * MS, 0));
+    expect_unchanged(&remote, &before);
+    remote = (struct np_presentation_clock){ .maximum_rtt_ns = NP_PRESENTATION_CLOCK_REMOTE_MAX_RTT_NS };
+    assert(np_presentation_clock_sample_at(&remote,
+        100 * SECOND, 100 * SECOND + 250 * MS, 900 * SECOND + 125 * MS));
+    assert(remote.rtt == 250 * MS);
+}
+
+static void slower_remote_sample_cannot_jitter_an_aged_best_anchor(void)
+{
+    struct np_presentation_clock remote = { .maximum_rtt_ns = NP_PRESENTATION_CLOCK_REMOTE_MAX_RTT_NS };
+    assert(np_presentation_clock_sample_at(&remote,
+        100 * SECOND, 100 * SECOND + 80 * MS, 900 * SECOND + 40 * MS));
+    struct np_presentation_clock before = remote;
+    uint64_t previous;
+    assert(np_presentation_clock_convert(&remote, 903 * SECOND + 99 * MS,
+        103 * SECOND + 100 * MS, &previous));
+    /* After the old two-second refresh period a slower asymmetric sample can
+     * imply an offset 50ms earlier. Keeping the proven better anchor prevents
+     * the next one-millisecond display step from jumping back 49ms. */
+    assert(np_presentation_clock_sample_at(&remote,
+        103 * SECOND, 103 * SECOND + 90 * MS, 903 * SECOND + 95 * MS));
+    expect_unchanged(&remote, &before);
+    uint64_t next;
+    assert(np_presentation_clock_convert(&remote, 903 * SECOND + 100 * MS,
+        103 * SECOND + 200 * MS, &next));
+    assert(next == previous + MS);
+    remote.epoch_host = 903 * SECOND + 95 * MS; /* The slower sample was still independently validated. */
+    before = remote;
+    assert(!np_presentation_clock_sample_at(&remote,
+        103 * SECOND + 90 * MS, 103 * SECOND + 110 * MS, 903 * SECOND + 94 * MS));
+    expect_unchanged(&remote, &before);
+    assert(np_presentation_clock_discontinuous(&remote,
+        104 * SECOND, 104 * SECOND + 90 * MS, 904 * SECOND + 200 * MS));
+    assert(!np_presentation_clock_sample_at(&remote,
+        104 * SECOND, 104 * SECOND + 90 * MS, 904 * SECOND + 200 * MS));
+    expect_unchanged(&remote, &before);
 }
 
 static void vm_pause_requires_an_explicit_new_epoch(void)
@@ -261,6 +326,8 @@ int main(void)
     different_origins_preserve_display_time();
     invalid_and_slow_samples_cannot_replace_calibration();
     fresh_calibration_keeps_the_lowest_rtt();
+    remote_baseline_uses_request_window_without_weakening_vm();
+    slower_remote_sample_cannot_jitter_an_aged_best_anchor();
     vm_pause_requires_an_explicit_new_epoch();
     discontinuity_excludes_measured_transport_uncertainty();
     first_scene_keeps_its_actual_time_until_qualified();

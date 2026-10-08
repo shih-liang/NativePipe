@@ -23,7 +23,6 @@ bool np_window_event_send(struct np_server *server, uint8_t opcode,
     return true;
 }
 
-bool np_trace_enabled(void) { return false; }
 struct np_gpu_buffer *np_gpu_buffer_get(struct wl_resource *buffer)
 {
     return buffer ? wl_resource_get_user_data(buffer) : NULL;

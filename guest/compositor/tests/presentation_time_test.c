@@ -14,6 +14,7 @@
 #include <wayland-server-protocol.h>
 
 static int fixture_clock_gettime(clockid_t clock, struct timespec *time);
+bool np_trace_enabled(void) { return false; }
 static void capture_event(struct wl_resource *resource, uint32_t opcode, ...);
 static void capture_implementation_error(struct wl_client *client, const char *format, ...);
 #define clock_gettime fixture_clock_gettime
@@ -126,6 +127,10 @@ bool np_backend_display_boundary_ready(struct np_server *server)
 {
     assert(server == &active->server);
     return active->boundary_ready;
+}
+uint64_t np_backend_presentation_clock_window(void)
+{
+    return NP_PRESENTATION_CLOCK_VM_MAX_RTT_NS;
 }
 
 static uint64_t words_u64(const uint32_t *values)
@@ -701,7 +706,7 @@ static void reset_preserves_unsent_queries_and_replay_binds_only_current_commit(
     teardown(&fixture);
 }
 
-static void calibration_failure_stops_retry_without_fabricating_feedback(void)
+static void calibration_failure_retries_without_fabricating_feedback(void)
 {
     struct fixture fixture;
     setup(&fixture, true);
@@ -722,6 +727,7 @@ static void calibration_failure_stops_retry_without_fabricating_feedback(void)
     clock_reply(&fixture, 900 * SECOND + 330 * MS);
     fixture.now = 104 * SECOND;
     tick(fixture.server.presentation_time);
+    ++requests; /* Low-frequency recovery issued a new request, not feedback. */
     assert(!fixture.errors && !fixture.event_count);
     assert(wl_client_get_object(fixture.client, feedback));
     assert(fixture.server.presentation_time->faulted);
@@ -745,9 +751,102 @@ static void calibration_failure_stops_retry_without_fabricating_feedback(void)
      * A cached positive still unknown at 15 seconds fails truthfully. */
     fixture.now = 100 * SECOND + 4 * MS + RESULT_TIMEOUT_NS;
     tick(fixture.server.presentation_time);
+    ++requests;
     assert(fixture.errors == 1 && !fixture.event_count);
     assert(!wl_client_get_object(fixture.client, historical));
     assert(fixture.clock_requests == requests);
+    teardown(&fixture);
+}
+
+static void remote_initial_clock_and_timeout_recovery_advertise_only_after_a_valid_sample(void)
+{
+    struct fixture fixture;
+    setup(&fixture, false);
+    struct np_presentation_time *state = fixture.server.presentation_time;
+    state->clock.maximum_rtt_ns = NP_PRESENTATION_CLOCK_REMOTE_MAX_RTT_NS;
+    np_presentation_time_clock_request(&fixture.server);
+    fixture.now += 80 * MS;
+    clock_reply(&fixture, 900 * SECOND + 40 * MS);
+    assert(state->global && state->clock.valid && state->clock.rtt == 80 * MS);
+    bind_manager(&fixture);
+    uint32_t feedback = request_feedback(&fixture, &fixture.root);
+    attach_scene(&fixture.root, 1, 6191);
+    submit_scene(&fixture, fixture.root.id, 6191);
+    fixture.now = 100 * SECOND + 300 * MS;
+    result(&fixture, 1, fixture.root.id, 6191, 900 * SECOND + 150 * MS);
+    expect_event(&fixture, 0, feedback, true, 100 * SECOND + 150 * MS);
+    /* Explicit resume uses the same transport policy in its fresh epoch. */
+    uint64_t session = state->session;
+    fence_command(&fixture, NP_HOST_PRESENTATION_RESUME, session, 1);
+    assert(!state->clock.valid && state->clock.maximum_rtt_ns == NP_PRESENTATION_CLOCK_REMOTE_MAX_RTT_NS);
+    fixture.now += 90 * MS;
+    clock_reply(&fixture, 900 * SECOND + 345 * MS);
+    assert(state->clock.valid && state->clock.rtt == 90 * MS && !state->paused);
+    teardown(&fixture);
+
+    setup(&fixture, false);
+    state = fixture.server.presentation_time;
+    state->clock.maximum_rtt_ns = NP_PRESENTATION_CLOCK_REMOTE_MAX_RTT_NS;
+    np_presentation_time_clock_request(&fixture.server);
+    fixture.now += 250 * MS + 1;
+    clock_reply(&fixture, 900 * SECOND + 125 * MS);
+    assert(!state->clock.valid && !state->global);
+    fixture.now = 103 * SECOND;
+    tick(state);
+    assert(state->faulted && !state->clock.valid && !state->global);
+    unsigned requests = fixture.clock_requests;
+    fixture.now += 500 * MS;
+    tick(state);
+    assert(fixture.clock_requests == requests && state->faulted && !state->global);
+    fixture.now = 105 * SECOND;
+    tick(state);
+    assert(fixture.clock_requests == requests + 1 && state->faulted && !state->global);
+    fixture.now += 80 * MS;
+    clock_reply(&fixture, 905 * SECOND + 40 * MS);
+    assert(state->clock.valid && !state->faulted && state->global);
+    assert(!fixture.event_count && !fixture.errors);
+    teardown(&fixture);
+}
+
+static void slower_remote_validation_extends_history_without_rewriting_saved_mapping(void)
+{
+    struct fixture fixture;
+    setup(&fixture, false);
+    struct np_presentation_time *state = fixture.server.presentation_time;
+    state->clock.maximum_rtt_ns = NP_PRESENTATION_CLOCK_REMOTE_MAX_RTT_NS;
+    np_presentation_time_clock_request(&fixture.server);
+    fixture.now += 80 * MS;
+    clock_reply(&fixture, 900 * SECOND + 40 * MS);
+    bind_manager(&fixture);
+    fixture.child.parent = NULL; /* Two independently presented toplevels. */
+    uint32_t before_fault = request_feedback(&fixture, &fixture.root);
+    uint32_t uncertain = request_feedback(&fixture, &fixture.child);
+    fixture.now = 100 * SECOND + 100 * MS;
+    attach_scene(&fixture.root, 1, 6192);
+    attach_scene(&fixture.child, 1, 6193);
+    submit_scene(&fixture, fixture.root.id, 6192);
+    submit_scene(&fixture, fixture.child.id, 6193);
+    struct np_display_scene *saved = find_scene(state, 1, fixture.root.id, 6192);
+    uint64_t saved_host = saved->clock.host, saved_guest = saved->clock.guest;
+    fixture.now = 103 * SECOND;
+    np_presentation_time_clock_request(&fixture.server);
+    fixture.now += 90 * MS;
+    clock_reply(&fixture, 903 * SECOND + 45 * MS);
+    assert(state->clock.host == 900 * SECOND + 40 * MS && state->clock.rtt == 80 * MS);
+    assert(state->clock.epoch_host == 903 * SECOND + 45 * MS);
+    assert(saved->clock.host == saved_host && saved->clock.guest == saved_guest);
+    fixture.now = 103 * SECOND + 300 * MS;
+    np_presentation_time_clock_request(&fixture.server);
+    fixture.now += 90 * MS;
+    clock_reply(&fixture, 904 * SECOND + 345 * MS); /* An actual offset jump. */
+    assert(state->faulted && !state->clock.valid && saved->mapping_ceiling == 903 * SECOND + 45 * MS);
+    // The old mapping remains usable up to the later independent validation,
+    // even though the better RTT anchor itself was intentionally not replaced.
+    result(&fixture, 1, fixture.root.id, 6192, 902 * SECOND);
+    expect_event(&fixture, 0, before_fault, true, 102 * SECOND);
+    result(&fixture, 1, fixture.child.id, 6193, 903 * SECOND + 100 * MS);
+    assert(fixture.errors == 1 && fixture.event_count == 1);
+    assert(!wl_client_get_object(fixture.client, uncertain));
     teardown(&fixture);
 }
 
@@ -1435,7 +1534,9 @@ int main(void)
     client_resource_destruction_and_server_destroy_do_not_invent_events();
     scene_early_sample_preserves_history_and_rejects_stale_identity();
     reset_preserves_unsent_queries_and_replay_binds_only_current_commit();
-    calibration_failure_stops_retry_without_fabricating_feedback();
+    calibration_failure_retries_without_fabricating_feedback();
+    remote_initial_clock_and_timeout_recovery_advertise_only_after_a_valid_sample();
+    slower_remote_validation_extends_history_without_rewriting_saved_mapping();
     actual_queried_render_after_clock_timeout_errors_only_that_attempt();
     reconnect_changed_offset_preserves_only_verified_history();
     submitted_unknown_outcome_errors_without_discard();

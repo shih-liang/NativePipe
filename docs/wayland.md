@@ -91,6 +91,20 @@ result before rebinding its query; it never rereads a released source texture.
 No hardware-clock, hardware-completion, zero-copy or constant-refresh claim is
 made; v1 refresh prediction and presentation flags remain zero.
 
+Clock replies are sampled on the connection reader, before UI delivery. VM
+calibration retains its 50 ms round-trip limit. SSH software clock samples must
+arrive within the existing 250 ms pending-request window; their midpoint mapping
+has transport uncertainty of up to half the measured round trip, including any
+path asymmetry. An 80 ms sample therefore permits approximately 40 ms of clock
+mapping uncertainty; it does not promise the protocol's recommended 1 ms
+precision. The actual Metal display timestamp remains the source, rather than
+the later feedback receipt time. SSH keeps a better low-RTT anchor when slower
+samples arrive, and clock epochs retain each scene's historical mapping. An
+initial calibration timeout leaves public feedback unavailable and retries at
+most once every two seconds; only a valid sample restores it. With `NP_TRACE`
+enabled, diagnostics include the rejection reason, measured RTT and mapping
+uncertainty. Ordinary use does not print these debug records.
+
 Host reconnect resets input authority and IME state, cancels unfinished drags and
 replays retained scenes. Historical submitted display feedback is retained until
 acknowledged or explicitly failed. Completed guest-only drops can continue

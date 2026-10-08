@@ -4,6 +4,7 @@
 #include "compositor.h"
 #include "dmabuf.h"
 #include "presentation_time.h"
+#include "presentation_clock.h"
 #include "user_text.h"
 #include <glib.h>
 #include <fcntl.h>
@@ -23,6 +24,10 @@ bool np_backend_check_runtime(void)
     }
     g_free(command);
     return true;
+}
+uint64_t np_backend_presentation_clock_window(void)
+{
+    return NP_PRESENTATION_CLOCK_REMOTE_MAX_RTT_NS;
 }
 
 int np_backend_run(int argc, char **argv)

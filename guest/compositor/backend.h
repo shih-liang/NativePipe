@@ -51,6 +51,8 @@ bool np_backend_send_binary(
 bool np_backend_admit_scene(struct np_server *server, const void *payload, size_t length);
 /* All scenes accepted before a pause have reached the ordered display stream. */
 bool np_backend_display_boundary_ready(struct np_server *server);
+/* Software clock quality follows the concrete transport's response window. */
+uint64_t np_backend_presentation_clock_window(void);
 
 /* Backend source description used by the shared scene serializer. */
 struct np_backend_scene_source {

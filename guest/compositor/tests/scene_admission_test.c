@@ -31,7 +31,6 @@ static ssize_t admission_send(int fd, const void *bytes, size_t size, int flags)
     assert(written == (ssize_t)size);
     return written;
 }
-bool np_trace_enabled(void) { return false; }
 bool np_host_transport_connected(const struct np_host *host) { return host->conn_fd >= 0; }
 bool np_backend_connected(const struct np_server *server)
 { (void)server; return !use_vm || vm_host.conn_fd >= 0; }
