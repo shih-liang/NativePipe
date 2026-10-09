@@ -32,6 +32,8 @@ public enum GuestNotificationLimits {
     public static let actionLabel = 40
     public static let actionKey = 128
     public static let actions = 4
+    /// Seconds after which the host withdraws a notification at the latest.
+    public static let expiry: TimeInterval = 3600
     public static let subtitle = title + appName + 3
     public static let identifierBytes = 256
     /// The click on the banner itself, as opposed to one of the guest's actions.
@@ -47,6 +49,6 @@ public extension GuestNotificationContent {
             && actions.count <= GuestNotificationLimits.actions
             && actions.allSatisfy { !$0.key.isEmpty && $0.key.utf8.count <= GuestNotificationLimits.actionKey
                 && !$0.label.isEmpty && $0.label.count <= GuestNotificationLimits.actionLabel }
-            && (expiry.map { $0 >= 0 && $0 <= 3600 } ?? true)
+            && (expiry.map { $0 >= 0 && $0 <= GuestNotificationLimits.expiry } ?? true)
     }
 }

@@ -15,8 +15,8 @@ enum GuestNotificationPolicy {
     static let maximumActionLabelLength = GuestNotificationLimits.actionLabel
     static let maximumActionKeyLength = GuestNotificationLimits.actionKey
     /// macOS shows only a few buttons; the click on the banner is "default".
-    static let maximumActions = 4
-    static let maximumExpiry: TimeInterval = 3600
+    static let maximumActions = GuestNotificationLimits.actions
+    static let maximumExpiry = GuestNotificationLimits.expiry
     static let defaultActionKey = GuestNotificationLimits.defaultActionKey
 
     static func content(
