@@ -8,6 +8,19 @@ public enum GuestNotificationDelivery: String, Codable, Sendable {
     case cancelled
 }
 
+/// What macOS currently lets the notification owner do. `alertsOff` is
+/// authorized, but the alert style is "None" so nothing appears on screen.
+public enum GuestNotificationAuthorization: String, Codable, Sendable, Equatable, CaseIterable {
+    case notDetermined
+    case authorized
+    case denied
+    case alertsOff
+
+    /// Notifications may be handed to macOS: the center keeps them even when
+    /// the user turned banners off.
+    public var allowsDelivery: Bool { self == .authorized || self == .alertsOff }
+}
+
 /// The bounded, plain text content accepted by the host, identified by its
 /// system notification ID rather than a reusable guest ID.
 public struct GuestNotificationHistoryRecord: Codable, Identifiable, Sendable, Equatable {

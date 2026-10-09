@@ -6,6 +6,7 @@ let codecPrefix = URL(fileURLWithPath: #filePath).deletingLastPathComponent().ap
 
 let products: [Product] = [
     .library(name: "NativePipeProtocol", targets: ["NativePipeProtocol"]),
+    .library(name: "NativePipeNotifications", targets: ["NativePipeNotifications"]),
     .library(name: "NativePipeWindowing", targets: ["NativePipeWindowing"]),
     .library(name: "NativePipeRemote", targets: ["NativePipeRemote"]),
     .library(name: "NativePipeFileSharing", targets: ["NativePipeFileSharing"]),
@@ -46,10 +47,19 @@ let targets: [Target] = [
             dependencies: ["NativePipeStrings", "CNativePipeFileRPC"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
+        // macOS Notification Center for guest notifications. Kept apart from the
+        // windowing code so a headless resident process can own the permission.
+        .target(
+            name: "NativePipeNotifications",
+            dependencies: ["NativePipeProtocol"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .testTarget(name: "NativePipeNotificationsTests", dependencies: ["NativePipeNotifications", "NativePipeProtocol"],
+                swiftSettings: [.swiftLanguageMode(.v5)]),
         // Wayland guest events ↔ NSWindow / clipboard / key codes.
         .target(
             name: "NativePipeWindowing",
-            dependencies: ["NativePipeStrings", "NativePipeProtocol"],
+            dependencies: ["NativePipeStrings", "NativePipeProtocol", "NativePipeNotifications"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         // Remote Linux: SSH stdio NPIP + NPEN, VideoToolbox decode, WindowBridge.

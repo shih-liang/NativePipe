@@ -1,38 +1,23 @@
+@_exported import NativePipeNotifications
 import Foundation
 import CryptoKit
 import Darwin
 import NativePipeProtocol
 import UserNotifications
 
-/// What macOS is asked to show for one guest notification.
-struct GuestNotificationContent: Equatable {
-    struct Action: Codable, Hashable {
-        var key: String
-        var label: String
-    }
-    var title: String
-    var subtitle: String
-    var body: String
-    var actions: [Action]
-    /// Seconds after which the host withdraws it. Nil leaves it to macOS.
-    var expiry: TimeInterval?
-    /// Low urgency is delivered without interrupting; others as normal alerts.
-    var quiet: Bool
-}
-
 /// Everything a guest sends is untrusted text: any program in the machine can
 /// post notifications. These rules bound size and strip anything that is not
 /// plain text before macOS sees it.
 enum GuestNotificationPolicy {
-    static let maximumTitleLength = 120
-    static let maximumBodyLength = 600
-    static let maximumAppNameLength = 40
-    static let maximumActionLabelLength = 40
-    static let maximumActionKeyLength = 128
+    static let maximumTitleLength = GuestNotificationLimits.title
+    static let maximumBodyLength = GuestNotificationLimits.body
+    static let maximumAppNameLength = GuestNotificationLimits.appName
+    static let maximumActionLabelLength = GuestNotificationLimits.actionLabel
+    static let maximumActionKeyLength = GuestNotificationLimits.actionKey
     /// macOS shows only a few buttons; the click on the banner is "default".
     static let maximumActions = 4
     static let maximumExpiry: TimeInterval = 3600
-    static let defaultActionKey = "default"
+    static let defaultActionKey = GuestNotificationLimits.defaultActionKey
 
     static func content(
         for notification: Windowing.GuestNotification, machine: String
@@ -162,12 +147,14 @@ public final class GuestNotificationPresenter {
     /// still run its display without constructing an invalid system center.
     public convenience init(machine: String, identity: String,
                             responseDirectory: URL = FileManager.default.temporaryDirectory,
+                            backend: GuestNotificationBackend? = nil,
                             isEnabled: @escaping () -> Bool = { true },
                             archive: ((GuestNotificationHistoryRecord) -> Void)? = nil,
                             send: @escaping (Windowing.HostCommand) -> Void) {
         let center: GuestNotificationCenter = Bundle.main.bundleURL.pathExtension == "app"
             && Bundle.main.bundleIdentifier != nil
-            ? SystemGuestNotificationCenter(responseDirectory: responseDirectory) : UnavailableGuestNotificationCenter()
+            ? SystemGuestNotificationCenter(responseDirectory: responseDirectory, backend: backend)
+            : UnavailableGuestNotificationCenter()
         self.init(machine: machine, identity: identity, center: center, isEnabled: isEnabled, archive: archive, send: send)
     }
 
@@ -346,56 +333,11 @@ private final class UnavailableGuestNotificationCenter: GuestNotificationCenter 
     func withdraw(identifier: String) {}
 }
 
-/// One native delegate per process; creating another VM/remote owner must not
-/// replace the first owner's response handler.
-@MainActor
-private final class GuestNotificationSystem: NSObject, UNUserNotificationCenterDelegate {
-    static let shared = GuestNotificationSystem()
-    let center = UNUserNotificationCenter.current()
-    nonisolated static let responseSocketKey = "nativepipe.response-socket"
-    var responses: [UUID: (String, String?) -> Bool] = [:]
-    // A stopped local owner must still forward another live VM's response.
-    // These are configured host directories, never paths supplied by guests.
-    var responseDirectories: Set<URL> = []
-    private var authorization: Task<Bool, Never>?
-
-    override init() { super.init(); center.delegate = self }
-    func authorize() async -> Bool {
-        let settings = await center.notificationSettings()
-        switch settings.authorizationStatus {
-        case .authorized, .provisional, .ephemeral: return true
-        case .denied: return false
-        case .notDetermined:
-            if let authorization { return await authorization.value }
-            let task = Task { (try? await center.requestAuthorization(options: [.alert])) ?? false }
-            authorization = task
-            let result = await task.value
-            authorization = nil
-            return result
-        @unknown default: return false
-        }
-    }
-    nonisolated func userNotificationCenter(
-        _ center: UNUserNotificationCenter, willPresent notification: UNNotification
-    ) async -> UNNotificationPresentationOptions { [.banner, .list] }
-    nonisolated func userNotificationCenter(
-        _ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse
-    ) async {
-        let identifier = response.notification.request.identifier
-        let action: String?
-        switch response.actionIdentifier {
-        case UNNotificationDismissActionIdentifier: action = nil
-        case UNNotificationDefaultActionIdentifier: action = GuestNotificationPolicy.defaultActionKey
-        default: action = response.actionIdentifier
-        }
-        let path = response.notification.request.content.userInfo[Self.responseSocketKey] as? String
-        await deliver(identifier: identifier, action: action, path: path)
-    }
-    private func deliver(identifier: String, action: String?, path: String?) async {
-        if responses.values.contains(where: { $0(identifier, action) }) { return }
-        guard let path else { return }
-        _ = await GuestNotificationResponseRouter.forward(.init(identifier: identifier, action: action),
-            path: path, permittedDirectories: responseDirectories)
+/// A click on a notification presented by another process reaches the display
+/// that posted it only if that process is named here.
+public enum GuestNotificationForwarding {
+    @MainActor public static func trust(bundle identifier: String) {
+        GuestNotificationResponseRouter.trustForwarder(bundle: identifier)
     }
 }
 
@@ -403,80 +345,40 @@ private final class GuestNotificationSystem: NSObject, UNUserNotificationCenterD
 final class SystemGuestNotificationCenter: GuestNotificationCenter {
     private let owner = UUID()
     private let responseDirectory: URL
+    private let backend: GuestNotificationBackend
     private var router: GuestNotificationResponseRouter?
-    init(responseDirectory: URL) { self.responseDirectory = responseDirectory }
+    init(responseDirectory: URL, backend: GuestNotificationBackend? = nil) {
+        self.responseDirectory = responseDirectory
+        self.backend = backend ?? LocalGuestNotificationBackend()
+    }
     var onResponse: ((String, String?) -> Bool)? {
         didSet {
             router?.stop(); router = nil
-            GuestNotificationSystem.shared.responses[owner] = nil
+            backend.attach(owner: owner, directory: nil, responder: nil)
             guard let onResponse else { return }
             do {
                 let route = try GuestNotificationResponseRouter(directory: responseDirectory, receive: onResponse)
                 router = route
-                GuestNotificationSystem.shared.responseDirectories.insert(route.directory)
-                GuestNotificationSystem.shared.responses[owner] = onResponse
+                backend.attach(owner: owner, directory: route.directory, responder: onResponse)
             } catch { /* No reliable action route: decline posts rather than lose guest actions. */ }
         }
     }
     func authorize() async -> Bool {
         guard router != nil else { return false }
-        return await GuestNotificationSystem.shared.authorize()
+        return await backend.authorization(prompt: true).allowsDelivery
     }
-
-    static func categoryIdentifier(_ actions: [GuestNotificationContent.Action]) -> String {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        let data = (try? encoder.encode(actions)) ?? Data()
-        return "nativepipe.guest.actions." + SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-    }
-
-    static func mergeCategories(_ existing: Set<UNNotificationCategory>, used: Set<String>,
-                                actions: [GuestNotificationContent.Action]) -> Set<UNNotificationCategory> {
-        var result = Set(existing.filter {
-            !$0.identifier.hasPrefix("nativepipe.guest.actions.") || used.contains($0.identifier)
-        })
-        result.insert(UNNotificationCategory(identifier: categoryIdentifier(actions),
-            actions: actions.map { UNNotificationAction(identifier: $0.key, title: $0.label, options: []) },
-            intentIdentifiers: [], options: [.customDismissAction]))
-        return result
-    }
-
     func present(identifier: String, content: GuestNotificationContent) async throws {
         guard let router else { throw CancellationError() }
-        let center = GuestNotificationSystem.shared.center
-        // Categories are application-wide, including other VMHost processes.
-        // Hold a cooperative private lock across read/merge/add, using async
-        // backoff so a competing VM never blocks its main actor.
-        let path = FileManager.default.temporaryDirectory.appendingPathComponent("nativepipe-notification-categories.lock").path
-        let descriptor = Darwin.open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0o600)
-        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-        defer { flock(descriptor, LOCK_UN); Darwin.close(descriptor) }
-        while flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
-            guard errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR else {
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-            }
-            try Task.checkCancellation()
-            try await Task.sleep(for: .milliseconds(25))
-        }
-        try Task.checkCancellation()
-        let existing = await center.notificationCategories()
-        let delivered = await center.deliveredNotifications()
-        let pending = await center.pendingNotificationRequests()
-        try Task.checkCancellation()
-        let used = Set(delivered.map { $0.request.content.categoryIdentifier } + pending.map { $0.content.categoryIdentifier })
-        let category = Self.categoryIdentifier(content.actions)
-        center.setNotificationCategories(Self.mergeCategories(existing, used: used, actions: content.actions))
-        let value = UNMutableNotificationContent()
-        value.title = content.title; value.subtitle = content.subtitle; value.body = content.body
-        value.threadIdentifier = identifier.components(separatedBy: ".").prefix(4).joined(separator: ".")
-        if content.quiet { value.interruptionLevel = .passive }
-        value.categoryIdentifier = category
-        value.userInfo[GuestNotificationSystem.responseSocketKey] = router.url.path
-        try await center.add(UNNotificationRequest(identifier: identifier, content: value, trigger: nil))
+        try await backend.present(identifier: identifier, content: content, responsePath: router.url.path)
     }
-    func withdraw(identifier: String) {
-        let center = GuestNotificationSystem.shared.center
-        center.removeDeliveredNotifications(withIdentifiers: [identifier])
-        center.removePendingNotificationRequests(withIdentifiers: [identifier])
+    func withdraw(identifier: String) { backend.withdraw(identifier: identifier) }
+
+    static func categoryIdentifier(_ actions: [GuestNotificationContent.Action]) -> String {
+        GuestNotificationCategories.identifier(actions)
     }
+    static func mergeCategories(_ existing: Set<UNNotificationCategory>, used: Set<String>,
+                                actions: [GuestNotificationContent.Action]) -> Set<UNNotificationCategory> {
+        GuestNotificationCategories.merge(existing, used: used, actions: actions)
+    }
+
 }

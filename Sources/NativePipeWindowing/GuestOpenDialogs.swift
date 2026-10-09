@@ -9,10 +9,8 @@ public enum GuestOpenDialogs {
     public static func confirm(_ prompt: GuestOpenPrompt) async -> GuestOpenAction {
         guard !Task.isCancelled else { return .cancel }
         let alert = NSAlert()
-        let machine: String
         switch prompt {
         case .link(let name, let url):
-            machine = name
             alert.messageText = NPText("Open a link from %@?", name)
             alert.informativeText = GuestOpenPolicy.displayURL(url) + "\n\n" + NPText("The application for this link will open on your Mac. Mail links may include attachments; review the draft before sending.")
             if url.user != nil || url.password != nil {
@@ -21,14 +19,12 @@ public enum GuestOpenDialogs {
             alert.addButton(withTitle: NPText("Open"))
             alert.addButton(withTitle: NPText("Cancel"))
         case .receive(let name, let path):
-            machine = name
             alert.messageText = NPText("Receive an item from %@?", name)
             alert.informativeText = path + "\n\n" + NPText("Save a copy without opening it, or receive and open it on your Mac. Programs, scripts and installers need a separate confirmation before opening.")
             alert.addButton(withTitle: NPText("Save…"))
             alert.addButton(withTitle: NPText("Open"))
             alert.addButton(withTitle: NPText("Cancel"))
         case .execute(let name, let file):
-            machine = name
             alert.alertStyle = .warning
             alert.messageText = NPText("Open this program or installer?")
             alert.informativeText = NPText("%@ was received from %@. Opening it may run code or change your Mac. Allow this item to open?", file.lastPathComponent, name)
@@ -38,7 +34,7 @@ public enum GuestOpenDialogs {
         // Return is deliberately not a shortcut for running guest content.
         alert.buttons.first?.keyEquivalent = ""
         alert.buttons.last?.keyEquivalent = "\r"
-        let response = await present(alert, machine: machine)
+        let response = await present(alert)
         guard !Task.isCancelled else { return .cancel }
         if case .receive(_, let path) = prompt {
             if response == .alertFirstButtonReturn {
@@ -64,24 +60,63 @@ public enum GuestOpenDialogs {
         return response == .alertFirstButtonReturn ? .open : .cancel
     }
 
-    private static func present(_ alert: NSAlert, machine: String) async -> NSApplication.ModalResponse {
-        let existing = NSApp.keyWindow ?? NSApp.orderedWindows.first(where: { $0.isVisible && $0.canBecomeKey && $0.sheetParent == nil })
-        let owner = existing ?? NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 160),
-            styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        if existing == nil {
-            owner.isReleasedWhenClosed = false
-            owner.title = machine
-            owner.center()
-            owner.makeKeyAndOrderFront(nil)
-        }
+    /// A sheet on a window the person already has open. With none, the alert's
+    /// own window: attaching it to a blank placeholder window only adds a window.
+    /// Neither blocks the main actor, which keeps serving the guest's display.
+    private static func present(_ alert: NSAlert) async -> NSApplication.ModalResponse {
         NSApp.activate(ignoringOtherApps: true)
-        defer { if existing == nil { owner.close() } }
+        if let owner = NSApp.keyWindow ?? NSApp.orderedWindows.first(where: { $0.isVisible && $0.canBecomeKey && $0.sheetParent == nil }) {
+            return await withTaskCancellationHandler(operation: {
+                guard !Task.isCancelled else { return .cancel }
+                return await alert.beginSheetModal(for: owner)
+            }, onCancel: {
+                Task { @MainActor in owner.endSheet(alert.window, returnCode: .cancel) }
+            })
+        }
+        let standalone = StandaloneAlert(alert)
         return await withTaskCancellationHandler(operation: {
             guard !Task.isCancelled else { return .cancel }
-            return await alert.beginSheetModal(for: owner)
+            return await standalone.run()
         }, onCancel: {
-            Task { @MainActor in owner.endSheet(alert.window, returnCode: .cancel) }
+            Task { @MainActor in standalone.finish(.cancel) }
         })
+    }
+}
+
+/// Shows an NSAlert's window without a modal session or a parent. The alert's
+/// buttons normally end the session they were started with, so they are rewired
+/// to answer directly; key equivalents (Return, Escape) still press them.
+@MainActor
+private final class StandaloneAlert: NSObject {
+    private let alert: NSAlert
+    private var continuation: CheckedContinuation<NSApplication.ModalResponse, Never>?
+
+    init(_ alert: NSAlert) { self.alert = alert }
+
+    func run() async -> NSApplication.ModalResponse {
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+            for button in alert.buttons {
+                button.target = self
+                button.action = #selector(pressed(_:))
+            }
+            alert.layout()
+            alert.window.level = .floating
+            alert.window.center()
+            alert.window.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    @objc private func pressed(_ button: NSButton) {
+        let index = alert.buttons.firstIndex(of: button) ?? alert.buttons.count
+        finish(NSApplication.ModalResponse(rawValue: NSApplication.ModalResponse.alertFirstButtonReturn.rawValue + index))
+    }
+
+    func finish(_ response: NSApplication.ModalResponse) {
+        guard let continuation else { return }
+        self.continuation = nil
+        alert.window.orderOut(nil)
+        continuation.resume(returning: response)
     }
 }
 

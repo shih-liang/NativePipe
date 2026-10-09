@@ -1,28 +1,33 @@
 import AppKit
 import Darwin
 import Foundation
+import NativePipeNotifications
 import NativePipeProtocol
 
 /// Notification Center identifies an application, not a VM process. A click
 /// received by another instance is delivered to the live session that posted it.
 @MainActor
 final class GuestNotificationResponseRouter {
-    struct Response: Codable, Sendable {
-        let identifier: String
-        let action: String?
-        var isValid: Bool {
-            identifier.hasPrefix("nativepipe.guest.") && identifier.utf8.count <= 256
-                && (action.map { $0.utf8.count <= GuestNotificationPolicy.maximumActionKeyLength } ?? true)
-        }
-    }
-    nonisolated static let maximumPayload = 2048
+    typealias Response = GuestNotificationResponse
+    nonisolated static let maximumPayload = GuestNotificationResponseForwarder.maximumPayload
     private let server: LocalSocketServer
     let url: URL
     let directory: URL
 
+    /// Bundles other than this process's own that may forward a click here. The
+    /// resident service presents notifications for the display processes.
+    private static var trustedForwarders: Set<String> = []
+    static func allowsForwarder(bundle: String?) -> Bool {
+        bundle.map { trustedForwarders.contains($0) } ?? false
+    }
+    static func endpointDirectory(in directory: URL) -> URL {
+        GuestNotificationResponseForwarder.endpointDirectory(in: directory)
+    }
+    static func trustForwarder(bundle: String) { trustedForwarders.insert(bundle) }
+
     init(directory: URL, receive: @escaping @MainActor (String, String?) -> Bool) throws {
         // Keep the endpoint short enough for sockaddr_un even in an App Group.
-        self.directory = directory.standardizedFileURL.appendingPathComponent(".n", isDirectory: true)
+        self.directory = Self.endpointDirectory(in: directory)
         try FileManager.default.createDirectory(at: self.directory, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
         var info = stat()
@@ -35,8 +40,9 @@ final class GuestNotificationResponseRouter {
             do {
                 let peer = try await connection.processIdentifier()
                 let permitted = await MainActor.run {
-                    peer == getpid() || (expectedBundle != nil
-                        && NSRunningApplication(processIdentifier: peer)?.bundleIdentifier == expectedBundle)
+                    peer == getpid() || (NSRunningApplication(processIdentifier: peer)?.bundleIdentifier).map {
+                        $0 == expectedBundle || Self.allowsForwarder(bundle: $0)
+                    } == true
                 }
                 guard permitted else { return }
                 let deadline: DispatchTime = .now() + .seconds(2)
@@ -55,24 +61,7 @@ final class GuestNotificationResponseRouter {
         server.stop()
         _ = unlink(url.appendingPathExtension("lock").path)
     }
-
     static func forward(_ response: Response, path: String, permittedDirectories: Set<URL>) async -> Bool {
-        guard response.isValid else { return false }
-        let url = URL(fileURLWithPath: path).standardizedFileURL
-        let name = url.lastPathComponent
-        guard name.count == 17, name.first == "n", name.dropFirst().allSatisfy({ $0.isHexDigit }),
-              permittedDirectories.contains(url.deletingLastPathComponent()) else { return false }
-        var info = stat()
-        guard lstat(url.path, &info) == 0, info.st_mode & S_IFMT == S_IFSOCK,
-              info.st_uid == getuid(), info.st_mode & 0o077 == 0 else { return false }
-        do {
-            let payload = try JSONEncoder().encode(response)
-            guard payload.count <= maximumPayload else { return false }
-            let deadline: DispatchTime = .now() + .seconds(2)
-            let connection = try await SocketConnection.connect(to: url, deadline: deadline)
-            defer { connection.close() }
-            try await connection.write(WireFormat.frame(payload: payload), deadline: deadline)
-            return try await connection.readExactly(1, deadline: deadline) == Data([1])
-        } catch { return false }
+        await GuestNotificationResponseForwarder.forward(response, path: path, permittedDirectories: permittedDirectories)
     }
 }

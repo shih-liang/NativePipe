@@ -23,6 +23,8 @@ public final class RemoteDisplayController {
     public var notificationsEnabled: () -> Bool = { true }
     public var notificationArchive: ((GuestNotificationHistoryRecord) -> Void)?
     public var notificationResponseDirectory: URL = FileManager.default.temporaryDirectory
+    /// Where macOS notifications are presented; nil presents from this process.
+    public var notificationBackend: GuestNotificationBackend?
     public var onApplicationsChanged: (() -> Void)?
     public var onStateChange: ((RemoteSession.State) -> Void)?
     public var applications: [GuestApplication] { session.applicationClient.cached ?? [] }
@@ -139,6 +141,7 @@ public final class RemoteDisplayController {
             } else {
                 guestNotifications = GuestNotificationPresenter(machine: bridge.machineName,
                     identity: notificationIdentity, responseDirectory: notificationResponseDirectory,
+                    backend: notificationBackend,
                     isEnabled: { [weak self] in self?.notificationsEnabled() ?? false },
                     archive: { [weak self] in self?.notificationArchive?($0) },
                     send: { [weak self] in self?.session.send($0) })
