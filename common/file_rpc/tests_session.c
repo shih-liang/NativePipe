@@ -1,0 +1,370 @@
+#define _GNU_SOURCE
+#undef NDEBUG
+#include "np_file_session.h"
+#include "np_file_rpc.h"
+#include <assert.h>
+#include <errno.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+
+enum { ECHO = 1, SINK, INFO };
+
+struct side {
+    struct np_file2_session *session;
+    pthread_mutex_t lock;
+    pthread_cond_t changed;
+    int closed, closed_error;
+    int notifications;
+    uint16_t notified_opcode;
+    char notified[64];
+    int sink_started, sink_release, sink_done, sink_result, sink_errno;
+    struct np_file2_stream *held;
+};
+
+struct work { struct side *side; struct np_file2_stream *stream; uint16_t opcode; char body[64]; size_t length; };
+
+static void wait_until(struct side *side, int *flag) {
+    struct timespec deadline; clock_gettime(CLOCK_REALTIME, &deadline); deadline.tv_sec += 10;
+    pthread_mutex_lock(&side->lock);
+    while (!*flag) assert(pthread_cond_timedwait(&side->changed, &side->lock, &deadline) == 0);
+    pthread_mutex_unlock(&side->lock);
+}
+static void set_flag(struct side *side, int *flag) {
+    pthread_mutex_lock(&side->lock);
+    *flag = 1;
+    pthread_cond_broadcast(&side->changed);
+    pthread_mutex_unlock(&side->lock);
+}
+
+static void *serve(void *argument) {
+    struct work *work = argument;
+    struct np_file2_stream *stream = work->stream;
+    struct np_file2_message *message = malloc(sizeof(*message));
+    assert(message);
+    if (work->opcode == ECHO) {
+        /* A requester may abandon the stream at any point. */
+        int result = np_file2_respond(stream, 0, "echo", 4, 0) == 0 ? 1 : -1;
+        while (result == 1 && (result = np_file2_receive(stream, message)) == 1) {
+            assert(message->type == NP_FILE2_DATA);
+            if (np_file2_send(stream, message->data, message->length, 0) < 0) result = -1;
+        }
+        if (!result) result = np_file2_send(stream, NULL, 0, 1);
+        assert(!result || errno == ECANCELED || errno == ECONNRESET);
+    } else if (work->opcode == SINK) {
+        assert(np_file2_respond(stream, 0, NULL, 0, 0) == 0);
+        pthread_mutex_lock(&work->side->lock);
+        work->side->sink_started = 1;
+        pthread_cond_broadcast(&work->side->changed);
+        pthread_mutex_unlock(&work->side->lock);
+        /* Consumes nothing until released: the requester stalls on credit. */
+        wait_until(work->side, &work->side->sink_release);
+        int result = np_file2_receive(stream, message), error = errno;
+        pthread_mutex_lock(&work->side->lock);
+        work->side->sink_result = result;
+        work->side->sink_errno = error;
+        work->side->sink_done = 1;
+        pthread_cond_broadcast(&work->side->changed);
+        pthread_mutex_unlock(&work->side->lock);
+    } else if (work->opcode == INFO) {
+        char reversed[64];
+        for (size_t i = 0; i < work->length; i++) reversed[i] = work->body[work->length - 1 - i];
+        assert(np_file2_respond(stream, 42, reversed, work->length, 1) == 0);
+        assert(np_file2_receive(stream, message) == 0);
+    }
+    free(message);
+    np_file2_stream_release(stream);
+    free(work);
+    return NULL;
+}
+
+static void on_request(void *context, struct np_file2_stream *stream, uint16_t opcode,
+                       const void *body, size_t length) {
+    struct work *work = calloc(1, sizeof(*work));
+    assert(work && length <= sizeof(work->body));
+    work->side = context; work->stream = stream; work->opcode = opcode;
+    memcpy(work->body, body, length); work->length = length;
+    pthread_attr_t attributes; pthread_t thread;
+    assert(pthread_attr_init(&attributes) == 0);
+    /* musl's small default stack; message buffers live on the heap. */
+    assert(pthread_attr_setstacksize(&attributes, 128 * 1024) == 0);
+    assert(pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED) == 0);
+    assert(pthread_create(&thread, &attributes, serve, work) == 0);
+    pthread_attr_destroy(&attributes);
+}
+static void on_hold(void *context, struct np_file2_stream *stream, uint16_t opcode,
+                    const void *body, size_t length) {
+    (void)opcode; (void)body; (void)length;
+    struct side *side = context;
+    pthread_mutex_lock(&side->lock);
+    if (side->held) np_file2_stream_release(side->held);
+    side->held = stream;
+    pthread_mutex_unlock(&side->lock);
+}
+static void on_notify(void *context, uint16_t opcode, const void *body, size_t length) {
+    struct side *side = context;
+    pthread_mutex_lock(&side->lock);
+    side->notifications++;
+    side->notified_opcode = opcode;
+    memset(side->notified, 0, sizeof(side->notified));
+    memcpy(side->notified, body, length < sizeof(side->notified) - 1 ? length : sizeof(side->notified) - 1);
+    pthread_cond_broadcast(&side->changed);
+    pthread_mutex_unlock(&side->lock);
+}
+static void on_closed(void *context, int error) {
+    struct side *side = context;
+    pthread_mutex_lock(&side->lock);
+    side->closed++; side->closed_error = error;
+    pthread_cond_broadcast(&side->changed);
+    pthread_mutex_unlock(&side->lock);
+}
+
+static void init_side(struct side *side) {
+    memset(side, 0, sizeof(*side));
+    pthread_mutex_init(&side->lock, NULL);
+    pthread_cond_init(&side->changed, NULL);
+}
+enum serving { NONE, SERVE, HOLD };
+static struct np_file2_session *start_side(struct side *side, int socket, enum np_file2_role role,
+                                           enum serving serve) {
+    struct np_file2_handlers handlers = {side, serve == SERVE ? on_request : serve == HOLD ? on_hold : NULL,
+                                         on_notify, on_closed};
+    side->session = np_file2_session_start(socket, role, &handlers);
+    assert(side->session);
+    return side->session;
+}
+static void pair(struct side *host, struct side *guest, int host_serves, int guest_serves) {
+    int sockets[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    init_side(host); init_side(guest);
+    start_side(host, sockets[0], NP_FILE2_ROLE_HOST, host_serves ? SERVE : NONE);
+    start_side(guest, sockets[1], NP_FILE2_ROLE_GUEST, guest_serves ? SERVE : NONE);
+}
+static void close_pair(struct side *host, struct side *guest) {
+    np_file2_session_close(host->session);
+    np_file2_session_close(guest->session);
+    assert(host->closed == 1 && guest->closed == 1);
+}
+static unsigned char pattern(size_t index, unsigned seed) { return (unsigned char)(index * 131u + seed); }
+
+struct transfer { struct np_file2_stream *stream; size_t size; unsigned seed; int result, error; };
+static void *send_pattern(void *argument) {
+    struct transfer *transfer = argument;
+    unsigned char *buffer = malloc(100000);
+    assert(buffer);
+    size_t sent = 0;
+    transfer->result = 0;
+    while (sent < transfer->size) {
+        size_t n = transfer->size - sent < 100000 ? transfer->size - sent : 100000;
+        for (size_t i = 0; i < n; i++) buffer[i] = pattern(sent + i, transfer->seed);
+        if (np_file2_send(transfer->stream, buffer, n, sent + n == transfer->size) < 0) {
+            transfer->result = -1; transfer->error = errno; break;
+        }
+        sent += n;
+    }
+    if (!transfer->size && np_file2_send(transfer->stream, NULL, 0, 1) < 0) {
+        transfer->result = -1; transfer->error = errno;
+    }
+    free(buffer);
+    return NULL;
+}
+/* Sends `size` patterned bytes through an ECHO stream while reading them back. */
+static void echo(struct np_file2_session *session, size_t size, unsigned seed) {
+    struct np_file2_stream *stream = np_file2_request(session, ECHO, "x", 1, 0);
+    assert(stream);
+    struct np_file2_message *message = malloc(sizeof(*message));
+    assert(message);
+    assert(np_file2_receive(stream, message) == 1);
+    assert(message->type == NP_FILE2_RESPONSE && message->status == 0 &&
+           message->length == 4 && !memcmp(message->data, "echo", 4) && !message->end);
+    struct transfer transfer = {stream, size, seed, 0, 0};
+    pthread_t sender; assert(pthread_create(&sender, NULL, send_pattern, &transfer) == 0);
+    size_t received = 0;
+    int result;
+    while ((result = np_file2_receive(stream, message)) == 1) {
+        assert(message->type == NP_FILE2_DATA && message->length <= NP_FILE2_FRAME_MAX);
+        for (uint32_t i = 0; i < message->length; i++) assert(message->data[i] == pattern(received + i, seed));
+        received += message->length;
+    }
+    assert(result == 0 && received == size);
+    assert(pthread_join(sender, NULL) == 0 && transfer.result == 0);
+    np_file2_stream_release(stream);
+    free(message);
+}
+
+static void test_echo_exceeds_windows(void) {
+    struct side host, guest; pair(&host, &guest, 0, 1);
+    /* Larger than both the stream and connection windows. */
+    echo(host.session, 3 * NP_FILE2_CONNECTION_WINDOW / 2 + 12345, 7);
+    echo(host.session, 0, 1);
+    close_pair(&host, &guest);
+}
+
+struct concurrent { struct np_file2_session *session; unsigned seed; };
+static void *concurrent_echo(void *argument) {
+    struct concurrent *c = argument;
+    echo(c->session, 1024 * 1024 + c->seed * 977, c->seed);
+    return NULL;
+}
+static void test_multiplexed_streams_both_directions(void) {
+    struct side host, guest; pair(&host, &guest, 1, 1);
+    pthread_t threads[12]; struct concurrent work[12];
+    for (unsigned i = 0; i < 12; i++) {
+        /* Half the streams open from each side, sharing one connection. */
+        work[i].session = i % 2 ? guest.session : host.session; work[i].seed = i + 1;
+        assert(pthread_create(&threads[i], NULL, concurrent_echo, &work[i]) == 0);
+    }
+    for (unsigned i = 0; i < 12; i++) assert(pthread_join(threads[i], NULL) == 0);
+    close_pair(&host, &guest);
+}
+
+static void test_request_response_and_notifications(void) {
+    struct side host, guest; pair(&host, &guest, 1, 0);
+    struct np_file2_stream *stream = np_file2_request(guest.session, INFO, "abc", 3, 1);
+    assert(stream && np_file2_stream_id(stream) % 2 == 1);
+    struct np_file2_message message;
+    assert(np_file2_receive(stream, &message) == 1);
+    assert(message.type == NP_FILE2_RESPONSE && message.status == 42 && message.end &&
+           message.length == 3 && !memcmp(message.data, "cba", 3));
+    assert(np_file2_receive(stream, &message) == 0);
+    np_file2_stream_release(stream);
+
+    assert(np_file2_notify(host.session, 9, "invalidate", 10) == 0);
+    wait_until(&guest, &guest.notifications);
+    assert(guest.notified_opcode == 9 && !strcmp(guest.notified, "invalidate"));
+    assert(np_file2_notify(guest.session, 3, "", 0) == 0);
+    wait_until(&host, &host.notifications);
+    assert(host.notified_opcode == 3);
+    close_pair(&host, &guest);
+}
+
+static void test_unserved_request_is_cancelled(void) {
+    struct side host, guest; pair(&host, &guest, 0, 0);
+    struct np_file2_stream *stream = np_file2_request(host.session, INFO, NULL, 0, 1);
+    assert(stream);
+    struct np_file2_message message;
+    assert(np_file2_receive(stream, &message) == -1 && errno == ECANCELED);
+    np_file2_stream_release(stream);
+    close_pair(&host, &guest);
+}
+
+static void test_credit_stall_and_cancel(void) {
+    struct side host, guest; pair(&host, &guest, 0, 1);
+    struct np_file2_stream *stream = np_file2_request(host.session, SINK, NULL, 0, 0);
+    assert(stream);
+    struct np_file2_message message;
+    assert(np_file2_receive(stream, &message) == 1 && message.type == NP_FILE2_RESPONSE);
+    wait_until(&guest, &guest.sink_started);
+    /* The sink only reads once; the rest stalls on stream credit. */
+    struct transfer transfer = {stream, 4 * NP_FILE2_STREAM_WINDOW, 3, 0, 0};
+    pthread_t sender; assert(pthread_create(&sender, NULL, send_pattern, &transfer) == 0);
+    usleep(200000);
+    /* Another stream on the same connection still makes progress. */
+    echo(host.session, 100000, 5);
+    np_file2_cancel(stream);
+    assert(pthread_join(sender, NULL) == 0);
+    assert(transfer.result == -1 && transfer.error == ECANCELED);
+    np_file2_stream_release(stream);
+    /* The responder sees the cancellation, and buffered data is dropped. */
+    set_flag(&guest, &guest.sink_release);
+    wait_until(&guest, &guest.sink_done);
+    assert(guest.sink_result == -1 && guest.sink_errno == ECANCELED);
+    close_pair(&host, &guest);
+}
+
+static void test_release_cancels_and_close_wakes(void) {
+    struct side host, guest; pair(&host, &guest, 0, 1);
+    struct np_file2_stream *abandoned = np_file2_request(host.session, ECHO, NULL, 0, 0);
+    assert(abandoned);
+    np_file2_stream_release(abandoned);
+    /* The connection stays usable after the peer sees the cancellation. */
+    echo(host.session, 70000, 9);
+    struct np_file2_stream *pending = np_file2_request(host.session, ECHO, NULL, 0, 0);
+    struct np_file2_message message;
+    assert(np_file2_receive(pending, &message) == 1);
+    np_file2_session_close(guest.session);
+    wait_until(&host, &host.closed);
+    assert(np_file2_receive(pending, &message) == -1 && errno == ECONNRESET);
+    assert(np_file2_send(pending, "x", 1, 0) == -1 && errno == ECONNRESET);
+    assert(np_file2_request(host.session, ECHO, NULL, 0, 0) == NULL && errno == ECONNRESET);
+    np_file2_session_close(host.session);
+    /* A stream outliving its session's owner stays valid until released. */
+    assert(np_file2_receive(pending, &message) == -1 && errno == ECONNRESET);
+    np_file2_stream_release(pending);
+}
+
+static void raw_frame(int socket, uint8_t type, uint8_t flags, uint32_t id, const void *body, uint32_t length) {
+    unsigned char header[NP_FILE2_HEADER] = {'N','P','2','F', type, flags, 0, 0};
+    np_file_put32(header + 8, id); np_file_put32(header + 12, length);
+    assert(write(socket, header, sizeof(header)) == (ssize_t)sizeof(header));
+    if (length) assert(write(socket, body, length) == (ssize_t)length);
+}
+static void raw_hello(int socket, enum np_file2_role role) {
+    unsigned char hello[8] = {NP_FILE2_VERSION, (unsigned char)role};
+    raw_frame(socket, NP_FILE2_HELLO, 0, 0, hello, sizeof(hello));
+}
+static void expect_protocol_error(void (*inject)(int socket)) {
+    int sockets[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    struct side side; init_side(&side);
+    start_side(&side, sockets[0], NP_FILE2_ROLE_HOST, HOLD);
+    inject(sockets[1]);
+    wait_until(&side, &side.closed);
+    assert(side.closed_error == EPROTO);
+    np_file2_session_close(side.session);
+    if (side.held) np_file2_stream_release(side.held);
+    close(sockets[1]);
+}
+static void bad_magic(int socket) { assert(write(socket, "NPFR\1\1\0\0\0\0\0\0\0\0\0\0", 16) == 16); }
+static void same_role(int socket) { raw_hello(socket, NP_FILE2_ROLE_HOST); }
+static void wrong_parity(int socket) {
+    raw_hello(socket, NP_FILE2_ROLE_GUEST);
+    raw_frame(socket, NP_FILE2_REQUEST, 0, 2, "\1\0\0\0", 4);
+}
+static void decreasing_id(int socket) {
+    raw_hello(socket, NP_FILE2_ROLE_GUEST);
+    raw_frame(socket, NP_FILE2_REQUEST, 0, 5, "\1\0\0\0", 4);
+    raw_frame(socket, NP_FILE2_REQUEST, 0, 3, "\1\0\0\0", 4);
+}
+static void unsolicited_response(int socket) {
+    raw_hello(socket, NP_FILE2_ROLE_GUEST);
+    raw_frame(socket, NP_FILE2_RESPONSE, 0, 2, "\0\0\0\0", 4);
+}
+static void stream_window_exceeded(int socket) {
+    raw_hello(socket, NP_FILE2_ROLE_GUEST);
+    static unsigned char chunk[NP_FILE2_FRAME_MAX];
+    /* The held stream never consumes, so no credit is returned. */
+    raw_frame(socket, NP_FILE2_REQUEST, 0, 1, "\1\0\0\0", 4);
+    for (unsigned i = 0; i <= NP_FILE2_STREAM_WINDOW / NP_FILE2_FRAME_MAX; i++)
+        raw_frame(socket, NP_FILE2_DATA, 0, 1, chunk, sizeof(chunk));
+}
+static void data_after_end(int socket) {
+    raw_hello(socket, NP_FILE2_ROLE_GUEST);
+    raw_frame(socket, NP_FILE2_REQUEST, NP_FILE2_END_STREAM, 1, "\1\0\0\0", 4);
+    raw_frame(socket, NP_FILE2_DATA, 0, 1, "x", 1);
+}
+static void flag_on_credit(int socket) {
+    raw_hello(socket, NP_FILE2_ROLE_GUEST);
+    raw_frame(socket, NP_FILE2_CREDIT, NP_FILE2_END_STREAM, 0, "\1\0\0\0", 4);
+}
+
+int main(void) {
+    test_echo_exceeds_windows();
+    test_multiplexed_streams_both_directions();
+    test_request_response_and_notifications();
+    test_unserved_request_is_cancelled();
+    test_credit_stall_and_cancel();
+    test_release_cancels_and_close_wakes();
+    expect_protocol_error(bad_magic);
+    expect_protocol_error(same_role);
+    expect_protocol_error(wrong_parity);
+    expect_protocol_error(decreasing_id);
+    expect_protocol_error(unsolicited_response);
+    expect_protocol_error(stream_window_exceeded);
+    expect_protocol_error(data_after_end);
+    expect_protocol_error(flag_on_credit);
+    puts("file session tests passed");
+    return 0;
+}

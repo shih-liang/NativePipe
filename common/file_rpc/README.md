@@ -123,3 +123,48 @@ WRITE updates an explicitly requested destination directly. On interruption it
 reports failure; a partial destination may remain. It never deletes a path it
 did not create. Bootstrap installation retains its existing adjacent staging
 and rename so a failed update cannot replace the running executable.
+
+## NPFR v2 sessions
+
+`np_file_session.c` (C, guest) and `FileSession.swift` (host) implement one
+long-lived, full-duplex connection carrying many concurrent streams. It is a
+transport only; operations are defined by the users of its opcodes. v1 above is
+unchanged and keeps serving recovery, bootstrap and transfers.
+
+The guest keeps listening (vsock 1031, host CID only); the host connects. After
+that either side opens streams and sends notifications. Host-opened stream IDs
+are even, guest-opened IDs odd; 0 is the connection. IDs only increase.
+
+The 16-byte header is `NP2F`, type:u8, flags:u8, reserved:u16 (zero),
+stream_id:u32, length:u32 (at most 65536), all little-endian.
+
+| Type | Stream | Payload |
+| --- | --- | --- |
+| HELLO=1 | 0 | version:u8 = 2, role:u8 (host 0, guest 1), reserved:u16, capabilities:u32. First frame from each side; the roles must differ. |
+| REQUEST=2 | new | opcode:u16, reserved:u16, body. Opens the stream. |
+| RESPONSE=3 | existing | status:u32, body. Exactly once from the responder, before its DATA. |
+| DATA=4 | existing | bytes. Counts against credit. Empty DATA only carries END. |
+| NOTIFY=5 | 0 | opcode:u16, reserved:u16, body. |
+| CANCEL=6 | existing | empty. Abandons both directions; queued data is dropped. |
+| CREDIT=7 | 0 or existing | increment:u32 (nonzero). |
+
+Only REQUEST, RESPONSE and DATA may set END_STREAM (flag 1), which finishes
+the sender's half. A stream is complete when both halves ended or either side
+cancelled; dropping the last local reference to an unfinished stream cancels it.
+
+Flow control: each direction of a stream starts with 256 KiB of credit and the
+connection with 4 MiB; DATA consumes both. A receiver returns credit as the
+application consumes data, so memory per stream and per connection is bounded
+and a stalled reader of one stream never blocks others. Exceeding credit,
+out-of-order or wrong-parity IDs, a second RESPONSE, DATA after END or before
+RESPONSE, and unknown types or flags end the session with EPROTO. Frames for a
+stream that is already gone are dropped, with connection credit returned.
+
+Frames are written whole. Control frames (everything except DATA) overtake
+queued DATA. The C reader thread never writes, so two peers with full socket
+buffers cannot deadlock; frames it originates go through a writer thread.
+Request and notification callbacks run on the reader and must not block. A
+peer accepts at most 256 concurrent inbound streams and cancels the rest.
+
+`make test` runs `tests_session.c` over socketpairs; the Swift
+`FileSessionTests` also exercise Swift↔C in both roles.

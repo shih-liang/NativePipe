@@ -10,6 +10,8 @@ public enum NativePipePort {
     public static let agent: UInt32 = 1029
     /// Guest-initiated requests to open a URL or file on the Mac (np-open).
     public static let hostOpen: UInt32 = 1030
+    /// NPFR v2 file sessions (guest FUSE for drag-and-drop editing).
+    public static let fileSession: UInt32 = 1031
 
     public static let sessionFirst: UInt32 = 2048
     public static let sessionLast: UInt32 = 2303
