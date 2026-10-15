@@ -13,6 +13,9 @@
 #define NP_FILE2_STREAM_WINDOW (256u * 1024u)
 #define NP_FILE2_CONNECTION_WINDOW (4u * 1024u * 1024u)
 #define NP_FILE2_MAX_INBOUND_STREAMS 256u
+/* Frames the reader originates (credit, refusals) wait here while the peer is
+ * not reading; a peer that lets this many accumulate is dropped (ENOBUFS). */
+#define NP_FILE2_MAX_PENDING_CONTROL 65536u
 #define NP_FILE2_PORT 1031u
 
 enum np_file2_type {
@@ -26,10 +29,10 @@ enum np_file2_role { NP_FILE2_ROLE_HOST = 0, NP_FILE2_ROLE_GUEST = 1 };
 struct np_file2_session;
 struct np_file2_stream;
 
-/* Callbacks run on the session's reader thread and must not block: hand work
- * to another thread. `request` receives an owned stream reference that the
- * callee releases with np_file2_stream_release. Bodies are only valid during
- * the call. `closed` runs once, after which no callback is made. */
+/* Callbacks run on the session's reader thread and must not block or call
+ * np_file2_session_close: hand work to another thread. `request` receives an
+ * owned stream reference that the callee releases with np_file2_stream_release.
+ * Bodies are only valid during the call. `closed` runs once, after which no callback is made. */
 struct np_file2_handlers {
     void *context;
     void (*request)(void *context, struct np_file2_stream *stream, uint16_t opcode,
@@ -70,9 +73,11 @@ int np_file2_send(struct np_file2_stream *stream, const void *data, size_t lengt
 /* Returns 1 with a message, 0 once the peer's half has ended, -1 with errno
  * (ECANCELED after either side cancelled, ECONNRESET after disconnect). */
 int np_file2_receive(struct np_file2_stream *stream, struct np_file2_message *message);
-/* Abandons both directions. Idempotent; wakes blocked senders and receivers. */
+/* Abandons both directions. Idempotent and non-blocking; wakes blocked
+ * senders and receivers. */
 void np_file2_cancel(struct np_file2_stream *stream);
-/* Releasing a stream that has not finished both directions cancels it. */
+/* Releasing a stream that has not finished both directions cancels it.
+ * Never blocks, so it is safe inside callbacks. */
 void np_file2_stream_release(struct np_file2_stream *stream);
 uint32_t np_file2_stream_id(const struct np_file2_stream *stream);
 

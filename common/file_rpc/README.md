@@ -154,8 +154,9 @@ cancelled; dropping the last local reference to an unfinished stream cancels it.
 
 Flow control: each direction of a stream starts with 256 KiB of credit and the
 connection with 4 MiB; DATA consumes both. A receiver returns credit as the
-application consumes data, so memory per stream and per connection is bounded
-and a stalled reader of one stream never blocks others. Exceeding credit,
+application consumes data, so memory per stream and per connection is bounded.
+A stalled reader holds at most its stream's window, so other streams keep
+moving until stalled streams fill the connection window (16 full streams). Exceeding credit,
 out-of-order or wrong-parity IDs, a second RESPONSE, DATA after END or before
 RESPONSE, and unknown types or flags end the session with EPROTO. Frames for a
 stream that is already gone are dropped, with connection credit returned.
@@ -163,8 +164,11 @@ stream that is already gone are dropped, with connection credit returned.
 Frames are written whole. Control frames (everything except DATA) overtake
 queued DATA. The C reader thread never writes, so two peers with full socket
 buffers cannot deadlock; frames it originates go through a writer thread.
-Request and notification callbacks run on the reader and must not block. A
-peer accepts at most 256 concurrent inbound streams and cancels the rest.
+Cancelling or releasing a stream only queues its CANCEL, so it never blocks.
+Request and notification callbacks run on the reader and must not block or
+close the session. A peer accepts at most 256 concurrent inbound streams and
+cancels the rest; a peer that lets 65536 queued control frames (credit and
+refusals) accumulate without reading is dropped with ENOBUFS.
 
 `make test` runs `tests_session.c` over socketpairs; the Swift
 `FileSessionTests` also exercise Swift↔C in both roles.

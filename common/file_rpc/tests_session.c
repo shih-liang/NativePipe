@@ -12,6 +12,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
 enum { ECHO = 1, SINK, INFO };
 
 struct side {
@@ -23,7 +27,8 @@ struct side {
     uint16_t notified_opcode;
     char notified[64];
     int sink_started, sink_release, sink_done, sink_result, sink_errno;
-    struct np_file2_stream *held;
+    struct np_file2_stream *held[512];
+    unsigned held_count;
 };
 
 struct work { struct side *side; struct np_file2_stream *stream; uint16_t opcode; char body[64]; size_t length; };
@@ -101,8 +106,8 @@ static void on_hold(void *context, struct np_file2_stream *stream, uint16_t opco
     (void)opcode; (void)body; (void)length;
     struct side *side = context;
     pthread_mutex_lock(&side->lock);
-    if (side->held) np_file2_stream_release(side->held);
-    side->held = stream;
+    assert(side->held_count < sizeof(side->held) / sizeof(side->held[0]));
+    side->held[side->held_count++] = stream;
     pthread_mutex_unlock(&side->lock);
 }
 static void on_notify(void *context, uint16_t opcode, const void *body, size_t length) {
@@ -299,25 +304,40 @@ static void test_release_cancels_and_close_wakes(void) {
 static void raw_frame(int socket, uint8_t type, uint8_t flags, uint32_t id, const void *body, uint32_t length) {
     unsigned char header[NP_FILE2_HEADER] = {'N','P','2','F', type, flags, 0, 0};
     np_file_put32(header + 8, id); np_file_put32(header + 12, length);
-    assert(write(socket, header, sizeof(header)) == (ssize_t)sizeof(header));
-    if (length) assert(write(socket, body, length) == (ssize_t)length);
+    /* Writes after the violation may fail once the session has closed. */
+    if (send(socket, header, sizeof(header), MSG_NOSIGNAL) == (ssize_t)sizeof(header) && length)
+        (void)send(socket, body, length, MSG_NOSIGNAL);
 }
 static void raw_hello(int socket, enum np_file2_role role) {
     unsigned char hello[8] = {NP_FILE2_VERSION, (unsigned char)role};
     raw_frame(socket, NP_FILE2_HELLO, 0, 0, hello, sizeof(hello));
 }
-static void expect_protocol_error(void (*inject)(int socket)) {
+struct injection { void (*inject)(int socket); int socket; };
+static void *run_injection(void *argument) {
+    struct injection *injection = argument;
+#ifdef SO_NOSIGPIPE
+    int yes = 1; setsockopt(injection->socket, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
+#endif
+    injection->inject(injection->socket);
+    return NULL;
+}
+static void expect_failure(void (*inject)(int socket), int expected) {
     int sockets[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
     struct side side; init_side(&side);
     start_side(&side, sockets[0], NP_FILE2_ROLE_HOST, HOLD);
-    inject(sockets[1]);
+    /* A writer the session stops reading only wakes once the session closes. */
+    struct injection injection = {inject, sockets[1]};
+    pthread_t thread; assert(pthread_create(&thread, NULL, run_injection, &injection) == 0);
     wait_until(&side, &side.closed);
-    assert(side.closed_error == EPROTO);
+    if (side.closed_error != expected) fprintf(stderr, "closed with %d, expected %d\n", side.closed_error, expected);
+    assert(side.closed_error == expected);
     np_file2_session_close(side.session);
-    if (side.held) np_file2_stream_release(side.held);
+    for (unsigned i = 0; i < side.held_count; i++) np_file2_stream_release(side.held[i]);
+    assert(pthread_join(thread, NULL) == 0);
     close(sockets[1]);
 }
-static void bad_magic(int socket) { assert(write(socket, "NPFR\1\1\0\0\0\0\0\0\0\0\0\0", 16) == 16); }
+static void expect_protocol_error(void (*inject)(int socket)) { expect_failure(inject, EPROTO); }
+static void bad_magic(int socket) { (void)send(socket, "NPFR\1\1\0\0\0\0\0\0\0\0\0\0", 16, MSG_NOSIGNAL); }
 static void same_role(int socket) { raw_hello(socket, NP_FILE2_ROLE_HOST); }
 static void wrong_parity(int socket) {
     raw_hello(socket, NP_FILE2_ROLE_GUEST);
@@ -350,6 +370,20 @@ static void flag_on_credit(int socket) {
     raw_frame(socket, NP_FILE2_CREDIT, NP_FILE2_END_STREAM, 0, "\1\0\0\0", 4);
 }
 
+/* Past the inbound stream limit every request is refused with a CANCEL; a
+ * peer that never reads those must not grow the queue without bound. */
+static void refusal_flood(int socket) {
+    raw_hello(socket, NP_FILE2_ROLE_GUEST);
+    unsigned char frame[NP_FILE2_HEADER + 4] = {'N','P','2','F', NP_FILE2_REQUEST, 0, 0, 0};
+    np_file_put32(frame + 12, 4); np_file_put32(frame + NP_FILE2_HEADER, 1);
+    uint32_t limit = 2 * (NP_FILE2_MAX_PENDING_CONTROL + NP_FILE2_MAX_INBOUND_STREAMS + 4096);
+    for (uint32_t id = 1; id < limit; id += 2) {
+        np_file_put32(frame + 8, id);
+        /* Stops once the session drops this peer. */
+        if (send(socket, frame, sizeof(frame), MSG_NOSIGNAL) != (ssize_t)sizeof(frame)) break;
+    }
+}
+
 int main(void) {
     test_echo_exceeds_windows();
     test_multiplexed_streams_both_directions();
@@ -365,6 +399,7 @@ int main(void) {
     expect_protocol_error(stream_window_exceeded);
     expect_protocol_error(data_after_end);
     expect_protocol_error(flag_on_credit);
+    expect_failure(refusal_flood, ENOBUFS);
     puts("file session tests passed");
     return 0;
 }

@@ -7,8 +7,11 @@ import Darwin
 ///
 /// Frames are written one at a time; control frames overtake queued DATA so
 /// metadata requests stay responsive during large transfers. DATA is bounded
-/// by per-stream and per-connection credit, so a stalled reader of one stream
-/// never blocks the others or grows memory without bound.
+/// by per-stream and per-connection credit, so memory stays bounded and a
+/// stalled reader blocks other streams only once stalled streams hold the
+/// whole connection window (16 full stream windows).
+///
+/// The session stays alive until `close()` or a disconnect.
 public final class FileSession: @unchecked Sendable {
     public enum Role: UInt8, Sendable { case host = 0, guest = 1 }
 
@@ -27,6 +30,8 @@ public final class FileSession: @unchecked Sendable {
         public static let streamWindow: UInt32 = 256 * 1024
         public static let connectionWindow: UInt32 = 4 * 1024 * 1024
         public static let maximumInboundStreams = 256
+        /// Frames waiting while the peer is not reading; more drops the peer.
+        public static let maximumPendingControl = 65536
         public static let port = NativePipePort.fileSession
         public static let endStream: UInt8 = 1
     }
@@ -152,8 +157,13 @@ public final class FileSession: @unchecked Sendable {
             let last = end && offset + size == bytes.endIndex
             let frame = Self.frame(.data, flags: last ? Wire.endStream : 0, id: id,
                                    payload: bytes.subdata(in: offset..<offset + size))
-            try await write(frame, priority: false) { state in
-                if last { state.localEnded = true }
+            do {
+                try await write(frame, priority: false) { state in
+                    if last { state.localEnded = true }
+                }
+            } catch {
+                refundCredit(id, size)
+                throw error
             }
             offset += size
         } while offset < bytes.endIndex
@@ -270,6 +280,23 @@ public final class FileSession: @unchecked Sendable {
         }
     }
 
+    /// Cancelled before queueing: the peer never sees these bytes, so the credit
+    /// must be restored or the connection window shrinks for good.
+    private func refundCredit(_ id: UInt32, _ size: Int) {
+        lock.withLock {
+            guard size > 0, failure == nil else { return }
+            sendWindow += UInt32(size)
+            streams[id]?.sendWindow += UInt32(size)
+            wakeCreditLocked()
+        }
+    }
+
+    /// Frames the reader originates; a peer that never reads them is dropped.
+    private func appendPeerControlLocked(_ bytes: Data) throws {
+        guard control.count < Wire.maximumPendingControl else { throw POSIXError(.ENOBUFS) }
+        control.append(Frame(bytes: bytes, done: nil))
+    }
+
     private func usableLocked(_ state: StreamState) throws {
         if state.cancelled { throw POSIXError(.ECANCELED) }
         if let failure { throw failure }
@@ -349,7 +376,7 @@ public final class FileSession: @unchecked Sendable {
             lastPeerID = id
             let opcode = Self.decode16(payload)
             guard let onRequest, inboundStreams < Wire.maximumInboundStreams else {
-                control.append(Frame(bytes: Self.frame(.cancel, id: id, payload: Data()), done: nil))
+                try appendPeerControlLocked(Self.frame(.cancel, id: id, payload: Data()))
                 return nil
             }
             let state = StreamState(id: id, responder: true)
@@ -381,7 +408,7 @@ public final class FileSession: @unchecked Sendable {
             guard let state, !state.cancelled else {
                 // Abandoned stream: return the connection credit immediately.
                 receiveWindow += length
-                if length > 0 { control.append(Frame(bytes: Self.credit(id: 0, length), done: nil)) }
+                if length > 0 { try appendPeerControlLocked(Self.credit(id: 0, length)) }
                 return nil
             }
             guard !state.remoteEnded, state.responder || state.responded,
@@ -474,7 +501,7 @@ public final class FileSession: @unchecked Sendable {
     }
 
     private static func sessionError(_ error: Error) -> Error {
-        if let error = error as? POSIXError, error.code == .EPROTO { return error }
+        if let error = error as? POSIXError, [.EPROTO, .ENOBUFS].contains(error.code) { return error }
         return POSIXError(.ECONNRESET)
     }
 

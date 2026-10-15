@@ -14,6 +14,7 @@ final class FileSessionTests: XCTestCase {
         XCTAssertEqual(Int(FileSession.Wire.version), Int(NP_FILE2_VERSION))
         XCTAssertEqual(FileSession.Wire.endStream, UInt8(NP_FILE2_END_STREAM))
         XCTAssertEqual(FileSession.Wire.maximumInboundStreams, Int(NP_FILE2_MAX_INBOUND_STREAMS))
+        XCTAssertEqual(FileSession.Wire.maximumPendingControl, Int(NP_FILE2_MAX_PENDING_CONTROL))
         XCTAssertEqual(FileSession.FrameType.credit.rawValue, UInt8(NP_FILE2_CREDIT.rawValue))
     }
 
@@ -125,6 +126,30 @@ final class FileSessionTests: XCTestCase {
             raw.close()
         }
     }
+
+    /// Past the inbound stream limit every request is refused with a CANCEL; a
+    /// peer that never reads those must not grow the queue without bound.
+    func testPeerThatNeverReadsRefusalsIsDropped() async throws {
+        var descriptors: [Int32] = [-1, -1]
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors), 0)
+        let failure = Failure(), held = HeldStreams()
+        let session = FileSession(connection: try SocketConnection(owning: descriptors[0]), role: .host,
+                                  onRequest: { stream, _, _ in held.hold(stream) },
+                                  onClose: { failure.set($0) })
+        session.start()
+        var flood = hello(.guest)
+        let count = Wire.maximumPendingControl + Wire.maximumInboundStreams + 4096
+        for index in 0..<count {
+            flood.append(FileSession.frame(.request, id: UInt32(2 * index + 1), payload: FileSession.opcode(1)))
+        }
+        let raw = try SocketConnection(owning: descriptors[1])
+        let writer = Task { try? await raw.write(flood) }
+        let error = try await failure.wait()
+        XCTAssertEqual((error as? POSIXError)?.code, .ENOBUFS)
+        raw.close()
+        await writer.value
+    }
+    private typealias Wire = FileSession.Wire
 
     // MARK: Interoperability with the C implementation
 
