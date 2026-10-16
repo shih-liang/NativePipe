@@ -35,7 +35,8 @@ VM_CFLAGS     = $(shell $(PKG_CONFIG) --cflags libdrm 2>/dev/null)
 
 PROJECT_ROOT   := $(abspath ../..)
 FILE_RPC_DIR := $(PROJECT_ROOT)/common/file_rpc
-FILE_RPC_SOURCES := $(FILE_RPC_DIR)/np_file_wire.c $(FILE_RPC_DIR)/np_file_server.c $(FILE_RPC_DIR)/np_file_service.c
+FILE_RPC_SOURCES := $(FILE_RPC_DIR)/np_file_wire.c $(FILE_RPC_DIR)/np_file_server.c $(FILE_RPC_DIR)/np_file_service.c \
+	$(FILE_RPC_DIR)/np_file_session.c $(FILE_RPC_DIR)/np_drop_fs.c $(FILE_RPC_DIR)/np_drop_service.c
 VULKAN_HEADERS ?= $(PROJECT_ROOT)/vendor/vulkan-headers/include
 ifeq ($(shell $(PKG_CONFIG) --exists vulkan 2>/dev/null && echo yes),yes)
 VULKAN_CFLAGS := $(shell $(PKG_CONFIG) --cflags vulkan)
@@ -294,7 +295,8 @@ $(REMOTE_BINARY): $(WAYLAND_STAMP) $(WAYLAND_SERVER_ARCHIVE) $(GENERATED) $(COMM
 		-Ibackends/remote $(SOURCE_DEFINE) -o $@ \
 		$(COMMON_SOURCES) $(REMOTE_SOURCES) $(COMMON_LIBS) $(REMOTE_LIBS) -Wl,--exclude-libs,libwayland-server.a
 
-$(FILE_RPC_LIB): $(FILE_RPC_SOURCES) $(FILE_RPC_DIR)/np_file_rpc.h $(FILE_RPC_DIR)/Makefile
+$(FILE_RPC_LIB): $(FILE_RPC_SOURCES) $(FILE_RPC_DIR)/np_file_rpc.h $(FILE_RPC_DIR)/np_file_session.h \
+		$(FILE_RPC_DIR)/np_drop_fs.h $(FILE_RPC_DIR)/Makefile
 	$(MAKE) -C $(FILE_RPC_DIR) CC="$(CC)" AR="$(AR)" BUILD="$(CURDIR)/$(BUILD_DIR)/file-rpc"
 
 $(VM_BINARY): $(WAYLAND_STAMP) $(WAYLAND_SERVER_ARCHIVE) $(GENERATED) $(COMMON_SOURCES) $(VM_SOURCES) $(FILE_RPC_LIB) $(wildcard *.h backends/vmpipe/*.h) \

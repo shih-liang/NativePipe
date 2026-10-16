@@ -172,3 +172,50 @@ refusals) accumulate without reading is dropped with ENOBUFS.
 
 `make test` runs `tests_session.c` over socketpairs; the Swift
 `FileSessionTests` also exercise Swift↔C in both roles.
+
+## Drop files
+
+Mac files dropped on a Linux window are served to the guest as a FUSE
+filesystem instead of being copied. `np_drop_fs.c` is the guest's FUSE request
+handler; `np_drop_service.c` (Linux only, linked into the compositor) runs it;
+`DropFileServer.swift` answers on the host. Both sides use NPFR v2 on port 1031.
+
+**Mount.** The compositor runs as the session's ordinary user, so it asks guestd
+over `/run/nativepipe/drops.sock` (`NPDM`). guestd reads the caller's UID/GID
+with `SO_PEERCRED`, mounts `fuse` at `/run/nativepipe/drops/<uid>` (root-owned
+directories, `nosuid,nodev`, `user_id`/`group_id` of the caller,
+`default_permissions`, no `allow_other`) and passes the `/dev/fuse` descriptor
+back with `SCM_RIGHTS`, followed by the mount path. The newest request replaces
+an older mount for that user, so a restarted compositor takes over. Root is
+refused. No descriptor or mount point is ever placed in a user-writable path.
+
+**Names.** The guest sees `<mount>/<token>/<name>`: one directory per drop,
+named by a random UUID, containing only that file. The host maps the token to
+the dropped path and the name must match it exactly.
+
+**Requests** (guest to host; statuses are Linux errno values, mapped on the host):
+
+| Opcode | Body | Response |
+| --- | --- | --- |
+| LOOKUP=1 | token (36 bytes) + name (empty: the token's directory) | attributes |
+| LIST=2 | empty (all tokens) or token | DATA: name_length:u16, name, attributes, repeated |
+| OPEN=3 | token + name | handle:u64, attributes |
+| READ=4 | handle:u64, offset:u64, length:u32 (at most 1 MiB) | DATA with the bytes; short at EOF |
+| RELEASE=5 | handle:u64 | empty |
+
+Attributes are 40 bytes: kind:u8 (1 directory, 2 file), reserved:3, mode:u32
+(permission bits), size:u64, mtime_seconds:i64, mtime_nanoseconds:u32,
+reserved:u32, file_id:u64. The guest sends NOTIFY MOUNTED=1 with its mount path
+when the host connects; the host builds guest URLs from it.
+
+**Semantics.** The host behaves like any second Mac app with the file open: the
+identity is the path. LOOKUP and OPEN look at the path each time; a handle keeps
+the file it opened, so after an atomic save it still reads the old contents
+while a new open gets the new file. FUSE entry and attribute timeouts are zero
+and opens do not keep the page cache, so the guest sees host changes on its next
+stat or open. Handles belong to their session and close with it; drops outlive
+sessions so a compositor restart keeps them. This version is read-only:
+writable opens and every modifying operation return EROFS.
+
+`make test` runs `tests_drop.c` (the FUSE handler against a mock host); the
+Swift `DropFileServerTests` cover the host and drive the C handler end to end.

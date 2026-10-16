@@ -299,6 +299,9 @@ bool np_backend_session_listen(struct np_server *server)
 	}
 	np_vmpipe_backend(server)->user_files = np_file_service_start(NP_FILE_USER_PORT, "/");
 	if (!np_vmpipe_backend(server)->user_files) perror("[wayland] user file service");
+	/* Optional: without it the host copies dropped files instead. */
+	np_vmpipe_backend(server)->drops = np_drop_service_start();
+	if (!np_vmpipe_backend(server)->drops) perror("[wayland] drop file service");
 	return np_vmpipe_backend(server)->user_files != NULL;
 }
 
@@ -326,6 +329,8 @@ void np_backend_session_finish(struct np_server *server)
 {
 	np_file_service_stop(np_vmpipe_backend(server)->user_files);
 	np_vmpipe_backend(server)->user_files = NULL;
+	np_drop_service_stop(np_vmpipe_backend(server)->drops);
+	np_vmpipe_backend(server)->drops = NULL;
 	np_host_finish(&np_vmpipe_backend(server)->host);
 	np_host_finish(&np_vmpipe_backend(server)->host_control);
 	np_host_finish(&np_vmpipe_backend(server)->host_input);

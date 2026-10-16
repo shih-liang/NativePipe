@@ -5,6 +5,7 @@
 #include "hostlink.h"
 #include "vk_context.h"
 #include "np_file_rpc.h"
+#include "np_drop_fs.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -12,6 +13,7 @@
 
 struct np_vmpipe_backend {
 	struct np_file_service *user_files;
+	struct np_drop_service *drops;
 	struct np_vk_context vk;
 	bool vk_ready;
 	int drm_fd;
