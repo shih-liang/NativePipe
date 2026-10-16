@@ -193,20 +193,31 @@ refused. No descriptor or mount point is ever placed in a user-writable path.
 named by a random UUID, containing only that file. The host maps the token to
 the dropped path and the name must match it exactly.
 
-**Requests** (guest to host; statuses are Linux errno values, mapped on the host):
+**Requests** (guest to host; statuses are Linux errno values, mapped on the host).
+"path" is token (36 bytes) + name, where an empty name means the token's directory:
 
 | Opcode | Body | Response |
 | --- | --- | --- |
-| LOOKUP=1 | token (36 bytes) + name (empty: the token's directory) | attributes |
+| LOOKUP=1 | path | attributes |
 | LIST=2 | empty (all tokens) or token | DATA: name_length:u16, name, attributes, repeated |
-| OPEN=3 | token + name | handle:u64, attributes |
+| OPEN=3 | flags:u32 (Linux open flags), path | handle:u64, attributes |
 | READ=4 | handle:u64, offset:u64, length:u32 (at most 1 MiB) | DATA with the bytes; short at EOF |
 | RELEASE=5 | handle:u64 | empty |
+| WRITE=6 | handle:u64, offset:u64; then DATA with the bytes (at most 1 MiB) | written:u32 |
+| SETATTR=7 | valid:u32 (FUSE FATTR_* bits), mode:u32, size:u64, atime:i64+u32, mtime:i64+u32, handle:u64, path | attributes |
+| CREATE=8 | flags:u32, mode:u32, path | handle:u64, attributes |
+| UNLINK=9 | path | empty |
+| RENAME=10 | flags:u32 (NOREPLACE 1), old_length:u16, token, old name, new name | empty |
+| FSYNC=11 | handle:u64 | empty |
+| FLUSH=12 | handle:u64, owner:u64 | empty; ends the owner's POSIX locks on the file |
+| GETLK=13 | handle, owner, start, end (u64 each; inclusive, INT64_MAX = to the end), type:u32 (F_RDLCK 0, F_WRLCK 1, F_UNLCK 2), flags:u32 | start:u64, end:u64, type:u32, pid:u32 |
+| SETLK=14 | as GETLK; flags: FLOCK 1 (a flock(2) lock), WAIT 2 (block until granted) | empty |
 
 Attributes are 40 bytes: kind:u8 (1 directory, 2 file), reserved:3, mode:u32
 (permission bits), size:u64, mtime_seconds:i64, mtime_nanoseconds:u32,
-reserved:u32, file_id:u64. The guest sends NOTIFY MOUNTED=1 with its mount path
-when the host connects; the host builds guest URLs from it.
+reserved:u32, file_id:u64. SETATTR with only the handle bit is fstat of that
+open file. The guest sends NOTIFY MOUNTED=1 with its mount path when the host
+connects; the host builds guest URLs from it.
 
 **Semantics.** The host behaves like any second Mac app with the file open: the
 identity is the path. LOOKUP and OPEN look at the path each time; a handle keeps
@@ -214,8 +225,32 @@ the file it opened, so after an atomic save it still reads the old contents
 while a new open gets the new file. FUSE entry and attribute timeouts are zero
 and opens do not keep the page cache, so the guest sees host changes on its next
 stat or open. Handles belong to their session and close with it; drops outlive
-sessions so a compositor restart keeps them. This version is read-only:
-writable opens and every modifying operation return EROFS.
+sessions so a compositor restart keeps them.
+
+Writes follow POSIX, not any application's save strategy:
+
+- Writing through a handle writes the Mac file. O_TRUNC and SETATTR sizes truncate it.
+- Other names in a drop's directory (temporary files, backups) are files the
+  guest created; the host keeps them in a private staging directory, never in
+  the Mac folder, and deletes them with the drop.
+- RENAME of such a file onto the dropped name replaces the Mac file, as a Mac
+  app's safe save does (`replaceItemAt`, or an in-place copy when the item
+  cannot be replaced; a Mac file deleted meanwhile is recreated).
+- RENAME of the dropped name to another name gives that name a copy and hides
+  the dropped name; the Mac file stays where it is. Creating the dropped name
+  again then writes the Mac file from empty (vim's rename-and-write save).
+- UNLINK of the dropped name only hides it from the guest; the Mac file stays.
+- Renames stay within one drop's directory (EXDEV otherwise); RENAME_EXCHANGE,
+  directories, links and special files are refused.
+
+Locks are real on the Mac side, so Mac and Linux programs that lock exclude each
+other. POSIX locks become open-file-description locks on a descriptor per guest
+lock owner and file, giving POSIX ownership (any number of opens, one owner);
+FLUSH, which the kernel sends on every close(2), releases them. flock(2) locks
+are taken on the handle's own descriptor and end with it. A waiting SETLK polls
+until granted; FUSE INTERRUPT cancels the stream and the guest answers EINTR.
+Blocking lock requests run on their own threads in the guest service.
 
 `make test` runs `tests_drop.c` (the FUSE handler against a mock host); the
-Swift `DropFileServerTests` cover the host and drive the C handler end to end.
+Swift `DropFileServerTests` cover the host (writes, safe saves, backups, locks
+against Mac programs) and drive the C handler end to end.

@@ -47,6 +47,22 @@ struct npf_kstatfs {
     uint64_t blocks, bfree, bavail, files, ffree;
     uint32_t bsize, namelen, frsize, padding, spare[6];
 };
+struct npf_write_in { uint64_t fh, offset; uint32_t size, write_flags; uint64_t lock_owner; uint32_t flags, padding; };
+struct npf_write_out { uint32_t size, padding; };
+struct npf_setattr_in {
+    uint32_t valid, padding;
+    uint64_t fh, size, lock_owner, atime, mtime, ctime;
+    uint32_t atimensec, mtimensec, ctimensec, mode, unused4, uid, gid, unused5;
+};
+struct npf_create_in { uint32_t flags, mode, umask, open_flags; };
+struct npf_rename_in { uint64_t newdir; };
+struct npf_rename2_in { uint64_t newdir; uint32_t flags, padding; };
+struct npf_fsync_in { uint64_t fh; uint32_t fsync_flags, padding; };
+struct npf_flush_in { uint64_t fh; uint32_t unused, padding; uint64_t lock_owner; };
+struct npf_file_lock { uint64_t start, end; uint32_t type, pid; };
+struct npf_lk_in { uint64_t fh, owner; struct npf_file_lock lk; uint32_t lk_flags, padding; };
+struct npf_lk_out { struct npf_file_lock lk; };
+struct npf_interrupt_in { uint64_t unique; };
 
 #if defined(__linux__) && defined(__has_include)
 #if __has_include(<linux/fuse.h>)
@@ -61,11 +77,23 @@ _Static_assert(sizeof(struct npf_read_in) == sizeof(struct fuse_read_in), "fuse_
 _Static_assert(sizeof(struct npf_release_in) == sizeof(struct fuse_release_in), "fuse_release_in");
 _Static_assert(sizeof(struct npf_dirent) == sizeof(struct fuse_dirent), "fuse_dirent");
 _Static_assert(sizeof(struct npf_kstatfs) == sizeof(struct fuse_kstatfs), "fuse_kstatfs");
+_Static_assert(sizeof(struct npf_write_in) == sizeof(struct fuse_write_in), "fuse_write_in");
+_Static_assert(sizeof(struct npf_write_out) == sizeof(struct fuse_write_out), "fuse_write_out");
+_Static_assert(sizeof(struct npf_setattr_in) == sizeof(struct fuse_setattr_in), "fuse_setattr_in");
+_Static_assert(sizeof(struct npf_create_in) == sizeof(struct fuse_create_in), "fuse_create_in");
+_Static_assert(sizeof(struct npf_rename2_in) == sizeof(struct fuse_rename2_in), "fuse_rename2_in");
+_Static_assert(sizeof(struct npf_fsync_in) == sizeof(struct fuse_fsync_in), "fuse_fsync_in");
+_Static_assert(sizeof(struct npf_flush_in) == sizeof(struct fuse_flush_in), "fuse_flush_in");
+_Static_assert(sizeof(struct npf_lk_in) == sizeof(struct fuse_lk_in), "fuse_lk_in");
+_Static_assert(sizeof(struct npf_lk_out) == sizeof(struct fuse_lk_out), "fuse_lk_out");
+_Static_assert(FUSE_SETLKW == 33 && FUSE_RENAME2 == 45 && FATTR_MTIME_NOW == 256, "opcodes");
 #endif
 #endif
 _Static_assert(sizeof(struct npf_in_header) == 40, "in header");
 _Static_assert(sizeof(struct npf_attr) == 88, "attr");
 _Static_assert(sizeof(struct npf_init_out) == 64, "init out");
+_Static_assert(sizeof(struct npf_setattr_in) == 88, "setattr in");
+_Static_assert(sizeof(struct npf_lk_in) == 48, "lk in");
 
 enum {
     NPF_LOOKUP = 1, NPF_FORGET = 2, NPF_GETATTR = 3, NPF_SETATTR = 4, NPF_READLINK = 5,
@@ -73,15 +101,19 @@ enum {
     NPF_RENAME = 12, NPF_LINK = 13, NPF_OPEN = 14, NPF_READ = 15, NPF_WRITE = 16,
     NPF_STATFS = 17, NPF_RELEASE = 18, NPF_FSYNC = 20, NPF_SETXATTR = 21,
     NPF_REMOVEXATTR = 24, NPF_FLUSH = 25, NPF_INIT = 26, NPF_OPENDIR = 27,
-    NPF_READDIR = 28, NPF_RELEASEDIR = 29, NPF_FSYNCDIR = 30, NPF_CREATE = 35,
+    NPF_READDIR = 28, NPF_RELEASEDIR = 29, NPF_FSYNCDIR = 30, NPF_GETLK = 31,
+    NPF_SETLK = 32, NPF_SETLKW = 33, NPF_CREATE = 35,
     NPF_INTERRUPT = 36, NPF_DESTROY = 38, NPF_BATCH_FORGET = 42, NPF_FALLOCATE = 43,
     NPF_RENAME2 = 45, NPF_COPY_FILE_RANGE = 47, NPF_TMPFILE = 51,
 };
 /* Linux values, independent of the build host's headers. */
 #define NPF_ENOSYS 38
 #define NPF_ASYNC_READ 1u
-#define NPF_O_ACCMODE 03u
-#define NPF_O_TRUNC 01000u
+#define NPF_POSIX_LOCKS 2u
+#define NPF_ATOMIC_O_TRUNC 8u
+#define NPF_BIG_WRITES 32u
+#define NPF_FLOCK_LOCKS 1024u
+#define NPF_LK_FLOCK 1u
 #define NPF_S_IFDIR 0040000u
 #define NPF_S_IFREG 0100000u
 #define NPF_DT_DIR 4u
@@ -94,11 +126,27 @@ struct node {
     struct node *next;
     uint64_t id, lookups;
     uint8_t kind;
+    /* Unlinked or renamed over: the kernel may still use the ID, lookups may not. */
+    int dead;
     char token[NP_DROP_TOKEN + 1];
     char name[NP_DROP_NAME_MAX + 1];
 };
 
+/* A request that can wait indefinitely (a blocking lock), so INTERRUPT can
+ * cancel its host stream. */
+struct waiter {
+    struct waiter *next;
+    uint64_t unique;
+    struct np_file2_stream *stream;
+    int interrupted;
+};
+#define INTERRUPTS 16u
+
 struct np_drop_fs {
+    struct waiter *waits;
+    /* An INTERRUPT may arrive before its request starts waiting. */
+    uint64_t interrupts[INTERRUPTS];
+    unsigned next_interrupt;
     pthread_mutex_t lock;
     pthread_cond_t idle;
     struct np_file2_session *session;
@@ -173,8 +221,12 @@ struct call {
 };
 
 /* Returns 0 with the host's status, or -1 if the host is unreachable or broke
- * the protocol; the caller then answers EIO (or ENOENT for name lookups). */
-static int call_host(struct np_drop_fs *fs, uint16_t opcode, const void *body, size_t length, struct call *call) {
+ * the protocol (errno EIO; the caller answers EIO, or ENOENT for name lookups)
+ * or the request was interrupted (errno EINTR). `upload` follows as DATA. A
+ * nonzero `unique` lets INTERRUPT cancel the request. */
+static int call_host_full(struct np_drop_fs *fs, uint16_t opcode, const void *body, size_t length,
+                          const void *upload, size_t upload_length, int has_upload, uint64_t unique,
+                          struct call *call) {
     pthread_mutex_lock(&fs->lock);
     struct np_file2_session *session = fs->session;
     unsigned generation = fs->generation & 1u;
@@ -182,8 +234,20 @@ static int call_host(struct np_drop_fs *fs, uint16_t opcode, const void *body, s
     pthread_mutex_unlock(&fs->lock);
     if (!session) { errno = ENOTCONN; return -1; }
     int result = -1;
+    struct waiter wait = {NULL, unique, NULL, 0};
     struct np_file2_message *message = malloc(sizeof(*message));
-    struct np_file2_stream *stream = message ? np_file2_request(session, opcode, body, length, 1) : NULL;
+    struct np_file2_stream *stream = message ? np_file2_request(session, opcode, body, length, !has_upload) : NULL;
+    if (stream && unique) {
+        pthread_mutex_lock(&fs->lock);
+        wait.stream = stream;
+        for (unsigned i = 0; i < INTERRUPTS; i++) if (fs->interrupts[i] == unique) wait.interrupted = 1;
+        if (wait.interrupted) np_file2_cancel(stream);
+        wait.next = fs->waits; fs->waits = &wait;
+        pthread_mutex_unlock(&fs->lock);
+    }
+    if (stream && has_upload && np_file2_send(stream, upload, upload_length, 1) < 0) {
+        /* The response still arrives, or the stream reports why it cannot. */
+    }
     if (stream && np_file2_receive(stream, message) == 1 && message->type == NP_FILE2_RESPONSE &&
         message->length <= sizeof(call->head)) {
         call->status = message->status;
@@ -198,13 +262,36 @@ static int call_host(struct np_drop_fs *fs, uint16_t opcode, const void *body, s
         }
         if (received == 0) result = 0;
     }
+    if (stream && unique) {
+        pthread_mutex_lock(&fs->lock);
+        struct waiter **link = &fs->waits;
+        while (*link != &wait) link = &(*link)->next;
+        *link = wait.next;
+        pthread_mutex_unlock(&fs->lock);
+    }
     np_file2_stream_release(stream);
     free(message);
     pthread_mutex_lock(&fs->lock);
     if (--fs->users[generation] == 0) pthread_cond_broadcast(&fs->idle);
     pthread_mutex_unlock(&fs->lock);
-    if (result < 0) errno = EIO;
+    if (result < 0) errno = wait.interrupted ? EINTR : EIO;
     return result;
+}
+static int call_host(struct np_drop_fs *fs, uint16_t opcode, const void *body, size_t length, struct call *call) {
+    return call_host_full(fs, opcode, body, length, NULL, 0, 0, 0, call);
+}
+
+static void interrupt(struct np_drop_fs *fs, uint64_t unique) {
+    pthread_mutex_lock(&fs->lock);
+    struct waiter *wait = fs->waits;
+    while (wait && wait->unique != unique) wait = wait->next;
+    if (wait) {
+        wait->interrupted = 1;
+        np_file2_cancel(wait->stream);
+    } else {
+        fs->interrupts[fs->next_interrupt++ % INTERRUPTS] = unique;
+    }
+    pthread_mutex_unlock(&fs->lock);
 }
 
 static size_t path_body(unsigned char *body, const char *token, const char *name) {
@@ -258,7 +345,8 @@ static int read_node(struct np_drop_fs *fs, uint64_t id, struct node *out) {
 static uint64_t remember(struct np_drop_fs *fs, uint8_t kind, const char *token, const char *name) {
     pthread_mutex_lock(&fs->lock);
     struct node *node = fs->nodes;
-    while (node && !(node->kind == kind && !strcmp(node->token, token) && !strcmp(node->name, name))) node = node->next;
+    while (node && !(!node->dead && node->kind == kind && !strcmp(node->token, token) && !strcmp(node->name, name)))
+        node = node->next;
     if (!node && (node = calloc(1, sizeof(*node)))) {
         node->id = fs->next_id++; node->kind = kind;
         strcpy(node->token, token); strcpy(node->name, name);
@@ -298,8 +386,7 @@ static void fill_attr(const struct np_drop_fs *fs, struct npf_attr *out, uint64_
     out->blocks = (out->size + 511) / 512;
     out->atime = out->mtime = out->ctime = (uint64_t)attr->mtime_seconds;
     out->atimensec = out->mtimensec = out->ctimensec = attr->mtime_nanoseconds;
-    /* Read-only: the host's write bits are not offered. */
-    out->mode = (directory ? NPF_S_IFDIR : NPF_S_IFREG) | (attr->mode & 0555u);
+    out->mode = (directory ? NPF_S_IFDIR : NPF_S_IFREG) | (attr->mode & 07777u);
     out->nlink = directory ? 2 : 1;
     out->uid = (uint32_t)fs->owner; out->gid = (uint32_t)fs->group;
     out->blksize = 4096;
@@ -329,9 +416,10 @@ static int do_init(struct np_drop_fs *fs, const struct npf_in_header *in, const 
     /* A newer kernel adapts to our minor; an older one gets its own back. */
     out.minor = init.major > 7 || init.minor > 31 ? 31 : init.minor;
     out.max_readahead = init.max_readahead < NP_DROP_MAX_READ ? init.max_readahead : NP_DROP_MAX_READ;
-    out.flags = init.flags & NPF_ASYNC_READ;
+    /* Locks are forwarded so Mac programs and guest programs exclude each other. */
+    out.flags = init.flags & (NPF_ASYNC_READ | NPF_POSIX_LOCKS | NPF_ATOMIC_O_TRUNC | NPF_BIG_WRITES | NPF_FLOCK_LOCKS);
     out.max_background = 16; out.congestion_threshold = 12;
-    out.max_write = 4096; out.time_gran = 1;
+    out.max_write = NP_DROP_MAX_WRITE; out.time_gran = 1;
     return reply(send, context, in->unique, 0, &out, sizeof(out));
 }
 
@@ -360,11 +448,24 @@ static int do_lookup(struct np_drop_fs *fs, const struct npf_in_header *in, cons
     return reply_entry(fs, send, context, in->unique, id, &attr);
 }
 
-static int do_getattr(struct np_drop_fs *fs, const struct npf_in_header *in, np_drop_reply send, void *context) {
+static int host_setattr(struct np_drop_fs *fs, const struct node *node, uint32_t valid, uint32_t mode, uint64_t size,
+                        int64_t atime, uint32_t atime_ns, int64_t mtime, uint32_t mtime_ns, uint64_t handle,
+                        struct np_drop_attr *attr);
+
+static int do_getattr(struct np_drop_fs *fs, const struct npf_in_header *in, const unsigned char *body, size_t length,
+                      np_drop_reply send, void *context) {
     struct node node;
     if (read_node(fs, in->nodeid, &node) < 0) return reply(send, context, in->unique, NP_DROP_ENOENT, NULL, 0);
     struct np_drop_attr attr = root_attr;
-    if (node.id != ROOT_ID) {
+    /* fstat on an open file asks the host about that open file, which may no
+     * longer be at its path (renamed over, unlinked or replaced on the Mac). */
+    uint32_t flags = length >= 8 ? np_file_u32(body) : 0;
+    uint64_t handle = length >= 16 ? np_file_u64(body + 8) : 0;
+    if (node.id != ROOT_ID && node.kind == NP_DROP_FILE && (flags & 1u)) {
+        int error = host_setattr(fs, &node, NP_DROP_SET_HANDLE, 0, 0, 0, 0, 0, 0, handle, &attr);
+        if (error) return reply(send, context, in->unique, error, NULL, 0);
+    } else if (node.id != ROOT_ID) {
+        if (node.dead) return reply(send, context, in->unique, NP_DROP_ENOENT, NULL, 0);
         int error = host_lookup(fs, node.token, node.name, &attr);
         if (error) return reply(send, context, in->unique, error, NULL, 0);
     }
@@ -379,12 +480,12 @@ static int do_open(struct np_drop_fs *fs, const struct npf_in_header *in, const 
     if (length < sizeof(struct npf_open_in)) return reply(send, context, in->unique, NP_DROP_EINVAL, NULL, 0);
     if (read_node(fs, in->nodeid, &node) < 0) return reply(send, context, in->unique, NP_DROP_ENOENT, NULL, 0);
     if (node.id == ROOT_ID || node.kind != NP_DROP_FILE) return reply(send, context, in->unique, NP_DROP_EISDIR, NULL, 0);
+    if (node.dead) return reply(send, context, in->unique, NP_DROP_ENOENT, NULL, 0);
     struct npf_open_in open; memcpy(&open, body, sizeof(open));
-    if ((open.flags & NPF_O_ACCMODE) != 0 || (open.flags & NPF_O_TRUNC))
-        return reply(send, context, in->unique, NP_DROP_EROFS, NULL, 0);
-    unsigned char request[NP_DROP_TOKEN + NP_DROP_NAME_MAX];
+    unsigned char request[4 + NP_DROP_TOKEN + NP_DROP_NAME_MAX];
+    np_file_put32(request, open.flags);
     struct call call = {0};
-    if (call_host(fs, NP_DROP_OPEN, request, path_body(request, node.token, node.name), &call) < 0)
+    if (call_host(fs, NP_DROP_OPEN, request, 4 + path_body(request + 4, node.token, node.name), &call) < 0)
         return reply(send, context, in->unique, NP_DROP_EIO, NULL, 0);
     if (call.status) return reply(send, context, in->unique, (int)call.status, NULL, 0);
     if (call.head_length != 8 + NP_DROP_ATTR) return reply(send, context, in->unique, NP_DROP_EIO, NULL, 0);
@@ -498,6 +599,234 @@ static int do_statfs(const struct npf_in_header *in, np_drop_reply send, void *c
     return reply(send, context, in->unique, 0, &out, sizeof(out));
 }
 
+/* MARK: Modifying operations */
+
+static int host_setattr(struct np_drop_fs *fs, const struct node *node, uint32_t valid, uint32_t mode, uint64_t size,
+                        int64_t atime, uint32_t atime_ns, int64_t mtime, uint32_t mtime_ns, uint64_t handle,
+                        struct np_drop_attr *attr) {
+    unsigned char request[NP_DROP_SETATTR_SIZE + NP_DROP_TOKEN + NP_DROP_NAME_MAX];
+    np_file_put32(request, valid); np_file_put32(request + 4, mode); np_file_put64(request + 8, size);
+    np_file_put64(request + 16, (uint64_t)atime); np_file_put32(request + 24, atime_ns);
+    np_file_put64(request + 28, (uint64_t)mtime); np_file_put32(request + 36, mtime_ns);
+    np_file_put64(request + 40, handle);
+    size_t length = NP_DROP_SETATTR_SIZE + path_body(request + NP_DROP_SETATTR_SIZE, node->token, node->name);
+    struct call call = {0};
+    if (call_host(fs, NP_DROP_SETATTR, request, length, &call) < 0) return NP_DROP_EIO;
+    if (call.status) return (int)call.status;
+    if (np_drop_attr_decode(call.head, call.head_length, attr) < 0 || attr->kind != NP_DROP_FILE) return NP_DROP_EIO;
+    return 0;
+}
+
+/* Valid FUSE_SETATTR bits we pass on; the rest (lock owner, ctime, kill-suid)
+ * need no host action. */
+#define SETATTR_PASSED (NP_DROP_SET_MODE | NP_DROP_SET_SIZE | NP_DROP_SET_ATIME | NP_DROP_SET_MTIME | \
+                        NP_DROP_SET_HANDLE | NP_DROP_SET_ATIME_NOW | NP_DROP_SET_MTIME_NOW)
+
+static int do_setattr(struct np_drop_fs *fs, const struct npf_in_header *in, const unsigned char *body, size_t length,
+                      np_drop_reply send, void *context) {
+    if (length < sizeof(struct npf_setattr_in)) return reply(send, context, in->unique, NP_DROP_EINVAL, NULL, 0);
+    struct npf_setattr_in set; memcpy(&set, body, sizeof(set));
+    struct node node;
+    if (read_node(fs, in->nodeid, &node) < 0) return reply(send, context, in->unique, NP_DROP_ENOENT, NULL, 0);
+    if (node.id == ROOT_ID || node.kind != NP_DROP_FILE) return reply(send, context, in->unique, NP_DROP_EPERM, NULL, 0);
+    /* Ownership is the mount's; changing it to anything else is refused. */
+    if (((set.valid & NP_DROP_SET_UID) && set.uid != (uint32_t)fs->owner) ||
+        ((set.valid & NP_DROP_SET_GID) && set.gid != (uint32_t)fs->group))
+        return reply(send, context, in->unique, NP_DROP_EPERM, NULL, 0);
+    uint32_t valid = set.valid & SETATTR_PASSED;
+    if (node.dead && !(valid & NP_DROP_SET_HANDLE)) return reply(send, context, in->unique, NP_DROP_ENOENT, NULL, 0);
+    struct np_drop_attr attr;
+    int error = host_setattr(fs, &node, valid, set.mode & 07777u, set.size, (int64_t)set.atime, set.atimensec,
+                             (int64_t)set.mtime, set.mtimensec, set.fh, &attr);
+    if (error) return reply(send, context, in->unique, error, NULL, 0);
+    struct npf_attr_out out = {0};
+    fill_attr(fs, &out.attr, node.id, &attr);
+    return reply(send, context, in->unique, 0, &out, sizeof(out));
+}
+
+static int do_write(struct np_drop_fs *fs, const struct npf_in_header *in, const unsigned char *body, size_t length,
+                    np_drop_reply send, void *context) {
+    if (length < sizeof(struct npf_write_in)) return reply(send, context, in->unique, NP_DROP_EINVAL, NULL, 0);
+    struct npf_write_in write; memcpy(&write, body, sizeof(write));
+    if (write.size > length - sizeof(write) || write.size > NP_DROP_READ_MAX)
+        return reply(send, context, in->unique, NP_DROP_EINVAL, NULL, 0);
+    unsigned char request[16];
+    np_file_put64(request, write.fh); np_file_put64(request + 8, write.offset);
+    struct call call = {0};
+    if (call_host_full(fs, NP_DROP_WRITE, request, sizeof(request), body + sizeof(write), write.size, 1, 0, &call) < 0)
+        return reply(send, context, in->unique, NP_DROP_EIO, NULL, 0);
+    if (call.status) return reply(send, context, in->unique, (int)call.status, NULL, 0);
+    if (call.head_length != 4 || np_file_u32(call.head) > write.size)
+        return reply(send, context, in->unique, NP_DROP_EIO, NULL, 0);
+    struct npf_write_out out = {np_file_u32(call.head), 0};
+    return reply(send, context, in->unique, 0, &out, sizeof(out));
+}
+
+/* The parent of a create/unlink/rename must be one drop's directory. */
+static int drop_directory(struct np_drop_fs *fs, uint64_t id, struct node *out) {
+    if (read_node(fs, id, out) < 0) return NP_DROP_ENOENT;
+    if (out->id == ROOT_ID) return NP_DROP_EPERM;
+    if (out->kind != NP_DROP_DIRECTORY) return NP_DROP_ENOTDIR;
+    return 0;
+}
+
+/* After an unlink or a rename over a name, no lookup may reach the old node. */
+static void bury(struct np_drop_fs *fs, const char *token, const char *name) {
+    pthread_mutex_lock(&fs->lock);
+    for (struct node *node = fs->nodes; node; node = node->next)
+        if (!node->dead && node->kind == NP_DROP_FILE && !strcmp(node->token, token) && !strcmp(node->name, name))
+            node->dead = 1;
+    pthread_mutex_unlock(&fs->lock);
+}
+
+static int do_create(struct np_drop_fs *fs, const struct npf_in_header *in, const unsigned char *body, size_t length,
+                     np_drop_reply send, void *context) {
+    if (length <= sizeof(struct npf_create_in)) return reply(send, context, in->unique, NP_DROP_EINVAL, NULL, 0);
+    struct npf_create_in create; memcpy(&create, body, sizeof(create));
+    const char *name = (const char *)body + sizeof(create);
+    size_t name_length = strnlen(name, length - sizeof(create));
+    if (name_length == length - sizeof(create)) return reply(send, context, in->unique, NP_DROP_EINVAL, NULL, 0);
+    struct node parent;
+    int error = drop_directory(fs, in->nodeid, &parent);
+    if (error) return reply(send, context, in->unique, error, NULL, 0);
+    if (!valid_name(name, name_length)) return reply(send, context, in->unique, NP_DROP_EINVAL, NULL, 0);
+    unsigned char request[8 + NP_DROP_TOKEN + NP_DROP_NAME_MAX];
+    np_file_put32(request, create.flags);
+    np_file_put32(request + 4, create.mode & ~create.umask & 07777u);
+    struct call call = {0};
+    if (call_host(fs, NP_DROP_CREATE, request, 8 + path_body(request + 8, parent.token, name), &call) < 0)
+        return reply(send, context, in->unique, NP_DROP_EIO, NULL, 0);
+    if (call.status) return reply(send, context, in->unique, (int)call.status, NULL, 0);
+    struct np_drop_attr attr;
+    if (call.head_length != 8 + NP_DROP_ATTR || np_drop_attr_decode(call.head + 8, NP_DROP_ATTR, &attr) < 0)
+        return reply(send, context, in->unique, NP_DROP_EIO, NULL, 0);
+    uint64_t handle = np_file_u64(call.head);
+    uint64_t id = remember(fs, NP_DROP_FILE, parent.token, name);
+    if (!id) {
+        unsigned char release[8]; np_file_put64(release, handle);
+        struct call ignored = {0};
+        (void)call_host(fs, NP_DROP_RELEASE, release, sizeof(release), &ignored);
+        return reply(send, context, in->unique, NP_DROP_EIO, NULL, 0);
+    }
+    /* CREATE answers with an entry followed by the open file. */
+    struct { struct npf_entry_out entry; struct npf_open_out open; } out;
+    memset(&out, 0, sizeof(out));
+    out.entry.nodeid = id; out.entry.generation = 1;
+    fill_attr(fs, &out.entry.attr, id, &attr);
+    out.open.fh = handle;
+    return reply(send, context, in->unique, 0, &out, sizeof(out));
+}
+
+static int do_unlink(struct np_drop_fs *fs, const struct npf_in_header *in, const unsigned char *body, size_t length,
+                     np_drop_reply send, void *context) {
+    const char *name = (const char *)body;
+    size_t name_length = length ? strnlen(name, length) : 0;
+    if (name_length == length) return reply(send, context, in->unique, NP_DROP_EINVAL, NULL, 0);
+    struct node parent;
+    int error = drop_directory(fs, in->nodeid, &parent);
+    if (error) return reply(send, context, in->unique, error, NULL, 0);
+    if (!valid_name(name, name_length)) return reply(send, context, in->unique, NP_DROP_ENOENT, NULL, 0);
+    unsigned char request[NP_DROP_TOKEN + NP_DROP_NAME_MAX];
+    struct call call = {0};
+    if (call_host(fs, NP_DROP_UNLINK, request, path_body(request, parent.token, name), &call) < 0)
+        return reply(send, context, in->unique, NP_DROP_EIO, NULL, 0);
+    if (!call.status) bury(fs, parent.token, name);
+    return reply(send, context, in->unique, (int)call.status, NULL, 0);
+}
+
+static int do_rename(struct np_drop_fs *fs, const struct npf_in_header *in, const unsigned char *body, size_t length,
+                     int with_flags, np_drop_reply send, void *context) {
+    size_t fixed = with_flags ? sizeof(struct npf_rename2_in) : sizeof(struct npf_rename_in);
+    if (length <= fixed) return reply(send, context, in->unique, NP_DROP_EINVAL, NULL, 0);
+    uint64_t newdir = np_file_u64(body);
+    uint32_t flags = with_flags ? np_file_u32(body + 8) : 0;
+    const char *old_name = (const char *)body + fixed;
+    size_t rest = length - fixed, old_length = strnlen(old_name, rest);
+    if (old_length == rest) return reply(send, context, in->unique, NP_DROP_EINVAL, NULL, 0);
+    const char *new_name = old_name + old_length + 1;
+    size_t new_rest = rest - old_length - 1, new_length = strnlen(new_name, new_rest);
+    if (new_length == new_rest) return reply(send, context, in->unique, NP_DROP_EINVAL, NULL, 0);
+    struct node parent;
+    int error = drop_directory(fs, in->nodeid, &parent);
+    if (error) return reply(send, context, in->unique, error, NULL, 0);
+    /* A drop's files can only be renamed within its own directory. */
+    if (newdir != in->nodeid) return reply(send, context, in->unique, NP_DROP_EXDEV, NULL, 0);
+    if (flags & ~(uint32_t)NP_DROP_RENAME_NOREPLACE) return reply(send, context, in->unique, NP_DROP_EINVAL, NULL, 0);
+    if (!valid_name(old_name, old_length) || !valid_name(new_name, new_length))
+        return reply(send, context, in->unique, NP_DROP_EINVAL, NULL, 0);
+    unsigned char request[6 + NP_DROP_TOKEN + 2 * NP_DROP_NAME_MAX];
+    np_file_put32(request, flags);
+    request[4] = (unsigned char)old_length; request[5] = (unsigned char)(old_length >> 8);
+    memcpy(request + 6, parent.token, NP_DROP_TOKEN);
+    memcpy(request + 6 + NP_DROP_TOKEN, old_name, old_length);
+    memcpy(request + 6 + NP_DROP_TOKEN + old_length, new_name, new_length);
+    struct call call = {0};
+    if (call_host(fs, NP_DROP_RENAME, request, 6 + NP_DROP_TOKEN + old_length + new_length, &call) < 0)
+        return reply(send, context, in->unique, NP_DROP_EIO, NULL, 0);
+    if (!call.status && strcmp(old_name, new_name)) {
+        /* The kernel keeps the moved inode's ID; it now answers to the new name. */
+        bury(fs, parent.token, new_name);
+        pthread_mutex_lock(&fs->lock);
+        for (struct node *node = fs->nodes; node; node = node->next)
+            if (!node->dead && node->kind == NP_DROP_FILE && !strcmp(node->token, parent.token) && !strcmp(node->name, old_name)) {
+                memcpy(node->name, new_name, new_length); node->name[new_length] = 0;
+            }
+        pthread_mutex_unlock(&fs->lock);
+    }
+    return reply(send, context, in->unique, (int)call.status, NULL, 0);
+}
+
+static int handle_call(struct np_drop_fs *fs, const struct npf_in_header *in, uint16_t opcode,
+                       const unsigned char *request, size_t length, np_drop_reply send, void *context) {
+    struct call call = {0};
+    if (call_host(fs, opcode, request, length, &call) < 0) return reply(send, context, in->unique, NP_DROP_EIO, NULL, 0);
+    return reply(send, context, in->unique, (int)call.status, NULL, 0);
+}
+
+static int do_fsync(struct np_drop_fs *fs, const struct npf_in_header *in, const unsigned char *body, size_t length,
+                    np_drop_reply send, void *context) {
+    if (length < sizeof(struct npf_fsync_in)) return reply(send, context, in->unique, NP_DROP_EINVAL, NULL, 0);
+    unsigned char request[8]; memcpy(request, body, 8);
+    return handle_call(fs, in, NP_DROP_FSYNC, request, sizeof(request), send, context);
+}
+
+/* Every close(2) of the file flushes; POSIX locks of that owner end there. */
+static int do_flush(struct np_drop_fs *fs, const struct npf_in_header *in, const unsigned char *body, size_t length,
+                    np_drop_reply send, void *context) {
+    if (length < sizeof(struct npf_flush_in)) return reply(send, context, in->unique, NP_DROP_EINVAL, NULL, 0);
+    struct npf_flush_in flush; memcpy(&flush, body, sizeof(flush));
+    unsigned char request[16];
+    np_file_put64(request, flush.fh); np_file_put64(request + 8, flush.lock_owner);
+    struct call call = {0};
+    (void)call_host(fs, NP_DROP_FLUSH, request, sizeof(request), &call);
+    return reply(send, context, in->unique, 0, NULL, 0);
+}
+
+static int do_lock(struct np_drop_fs *fs, const struct npf_in_header *in, const unsigned char *body, size_t length,
+                   np_drop_reply send, void *context) {
+    if (length < sizeof(struct npf_lk_in)) return reply(send, context, in->unique, NP_DROP_EINVAL, NULL, 0);
+    struct npf_lk_in lock; memcpy(&lock, body, sizeof(lock));
+    if (lock.lk.type > 2 || lock.lk.start > lock.lk.end) return reply(send, context, in->unique, NP_DROP_EINVAL, NULL, 0);
+    unsigned char request[NP_DROP_LOCK_SIZE];
+    np_file_put64(request, lock.fh); np_file_put64(request + 8, lock.owner);
+    np_file_put64(request + 16, lock.lk.start); np_file_put64(request + 24, lock.lk.end);
+    np_file_put32(request + 32, lock.lk.type);
+    uint32_t flags = (lock.lk_flags & NPF_LK_FLOCK ? NP_DROP_LOCK_FLOCK : 0) |
+                     (in->opcode == NPF_SETLKW ? NP_DROP_LOCK_WAIT : 0);
+    np_file_put32(request + 36, flags);
+    struct call call = {0};
+    uint16_t opcode = in->opcode == NPF_GETLK ? NP_DROP_GETLK : NP_DROP_SETLK;
+    /* Only a waiting request can be interrupted; the others answer at once. */
+    if (call_host_full(fs, opcode, request, sizeof(request), NULL, 0, 0,
+                       in->opcode == NPF_SETLKW ? in->unique : 0, &call) < 0)
+        return reply(send, context, in->unique, errno == EINTR ? NP_DROP_EINTR : NP_DROP_EIO, NULL, 0);
+    if (call.status || in->opcode != NPF_GETLK) return reply(send, context, in->unique, (int)call.status, NULL, 0);
+    if (call.head_length != 24) return reply(send, context, in->unique, NP_DROP_EIO, NULL, 0);
+    struct npf_lk_out out = {{np_file_u64(call.head), np_file_u64(call.head + 8),
+                              np_file_u32(call.head + 16), np_file_u32(call.head + 20)}};
+    return reply(send, context, in->unique, 0, &out, sizeof(out));
+}
+
 int np_drop_fs_handle(struct np_drop_fs *fs, const void *request, size_t length,
                       np_drop_reply send, void *context) {
     struct npf_in_header in;
@@ -535,21 +864,32 @@ int np_drop_fs_handle(struct np_drop_fs *fs, const void *request, size_t length,
             }
         }
         return 0;
-    case NPF_INTERRUPT: return 0;
-    case NPF_GETATTR: return do_getattr(fs, &in, send, context);
+    case NPF_INTERRUPT:
+        if (size >= sizeof(struct npf_interrupt_in)) interrupt(fs, np_file_u64(body));
+        return 0;
+    case NPF_GETATTR: return do_getattr(fs, &in, body, size, send, context);
+    case NPF_SETATTR: return do_setattr(fs, &in, body, size, send, context);
+    case NPF_WRITE: return do_write(fs, &in, body, size, send, context);
+    case NPF_CREATE: return do_create(fs, &in, body, size, send, context);
+    case NPF_UNLINK: return do_unlink(fs, &in, body, size, send, context);
+    case NPF_RENAME: return do_rename(fs, &in, body, size, 0, send, context);
+    case NPF_RENAME2: return do_rename(fs, &in, body, size, 1, send, context);
+    case NPF_FSYNC: return do_fsync(fs, &in, body, size, send, context);
+    case NPF_FLUSH: return do_flush(fs, &in, body, size, send, context);
+    case NPF_GETLK: case NPF_SETLK: case NPF_SETLKW: return do_lock(fs, &in, body, size, send, context);
     case NPF_OPEN: return do_open(fs, &in, body, size, send, context);
     case NPF_READ: return do_read(fs, &in, body, size, send, context);
     case NPF_RELEASE: return do_release(fs, &in, body, size, send, context);
     case NPF_OPENDIR: return do_opendir(fs, &in, send, context);
     case NPF_READDIR: return do_readdir(fs, &in, body, size, send, context);
-    case NPF_RELEASEDIR: case NPF_FLUSH: case NPF_FSYNC: case NPF_FSYNCDIR:
+    case NPF_RELEASEDIR: case NPF_FSYNCDIR:
         return reply(send, context, in.unique, 0, NULL, 0);
     case NPF_STATFS: return do_statfs(&in, send, context);
-    case NPF_SETATTR: case NPF_SYMLINK: case NPF_MKNOD: case NPF_MKDIR: case NPF_UNLINK:
-    case NPF_RMDIR: case NPF_RENAME: case NPF_LINK: case NPF_WRITE: case NPF_SETXATTR:
-    case NPF_REMOVEXATTR: case NPF_CREATE: case NPF_FALLOCATE: case NPF_RENAME2:
-    case NPF_COPY_FILE_RANGE: case NPF_TMPFILE:
-        return reply(send, context, in.unique, NP_DROP_EROFS, NULL, 0);
+    /* A drop's directory holds plain files only. */
+    case NPF_SYMLINK: case NPF_MKNOD: case NPF_MKDIR: case NPF_RMDIR: case NPF_LINK: case NPF_TMPFILE:
+        return reply(send, context, in.unique, NP_DROP_EPERM, NULL, 0);
+    case NPF_FALLOCATE:
+        return reply(send, context, in.unique, NP_DROP_EOPNOTSUPP, NULL, 0);
     default:
         /* ENOSYS tells the kernel not to ask again (ACCESS, xattrs, locks...). */
         return reply(send, context, in.unique, NPF_ENOSYS, NULL, 0);

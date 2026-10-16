@@ -80,5 +80,7 @@ void np_file2_cancel(struct np_file2_stream *stream);
  * Never blocks, so it is safe inside callbacks. */
 void np_file2_stream_release(struct np_file2_stream *stream);
 uint32_t np_file2_stream_id(const struct np_file2_stream *stream);
+/* For a responder doing long work: either side cancelled, or the session ended. */
+int np_file2_stream_cancelled(struct np_file2_stream *stream);
 
 #endif

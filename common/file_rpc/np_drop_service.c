@@ -15,8 +15,10 @@
 #include <unistd.h>
 
 #define WORKERS 4u
-/* Requests carry at most max_write (4096) bytes; the kernel requires 8 KiB. */
-#define REQUEST_BUFFER (64u * 1024u)
+/* A WRITE carries max_write bytes after its headers; the kernel refuses reads
+ * into a buffer that could not hold one. */
+#define REQUEST_BUFFER (NP_DROP_MAX_WRITE + 4096u)
+#define FUSE_SETLKW_OPCODE 33u
 
 struct np_drop_service {
     struct np_drop_fs *fs;
@@ -66,6 +68,18 @@ static int write_reply(void *context, const struct iovec *vector, int count) {
     return written < 0 && errno != ENOENT ? -1 : 0;
 }
 
+struct waiting { struct np_drop_service *service; size_t length; unsigned char request[]; };
+
+/* A blocking lock may wait indefinitely; it must not occupy a worker. */
+static void *serve_waiting(void *argument) {
+    struct waiting *waiting = argument;
+    if (np_drop_fs_handle(waiting->service->fs, waiting->request, waiting->length, write_reply,
+                          &waiting->service->fuse) < 0)
+        fprintf(stderr, "[drops] malformed FUSE request\n");
+    free(waiting);
+    return NULL;
+}
+
 static void *serve_fuse(void *argument) {
     struct np_drop_service *service = argument;
     unsigned char *buffer = malloc(REQUEST_BUFFER);
@@ -75,6 +89,15 @@ static void *serve_fuse(void *argument) {
             if (errno == EINTR || errno == ENOENT || errno == EAGAIN) continue;
             /* ENODEV: unmounted, or replaced by a newer session's mount. */
             break;
+        }
+        uint32_t opcode = length >= 8 ? np_file_u32(buffer + 4) : 0;
+        struct waiting *waiting = opcode == FUSE_SETLKW_OPCODE ? malloc(sizeof(*waiting) + (size_t)length) : NULL;
+        pthread_t thread;
+        if (waiting) {
+            waiting->service = service; waiting->length = (size_t)length;
+            memcpy(waiting->request, buffer, (size_t)length);
+            if (pthread_create(&thread, NULL, serve_waiting, waiting) == 0) { pthread_detach(thread); continue; }
+            free(waiting);
         }
         if (np_drop_fs_handle(service->fs, buffer, (size_t)length, write_reply, &service->fuse) < 0)
             fprintf(stderr, "[drops] malformed FUSE request\n");

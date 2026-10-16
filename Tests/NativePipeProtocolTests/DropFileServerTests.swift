@@ -71,7 +71,7 @@ final class DropFileServerTests: XCTestCase {
         XCTAssertEqual(listed.map(\.0), ["notes # 1.txt"])
         XCTAssertEqual(listed.first?.1.size, 11)
 
-        try await expect(guest, Opcode.open, path(token, ""), Status.eisdir)
+        try await expect(guest, Opcode.open, FileSession.encode(0) + path(token, ""), Status.eisdir)
         let handle = try await open(guest, token, "notes # 1.txt")
         let middle = try await read(guest, handle, offset: 6, length: 100)
         XCTAssertEqual(middle, Data("drops".utf8))
@@ -112,7 +112,7 @@ final class DropFileServerTests: XCTestCase {
         // Deleted outright: gone by path, still readable through the old handle.
         XCTAssertEqual(unlink(file.path), 0)
         try await expect(guest, Opcode.lookup, path(token, "doc.txt"), Status.enoent)
-        try await expect(guest, Opcode.open, path(token, "doc.txt"), Status.enoent)
+        try await expect(guest, Opcode.open, FileSession.encode(0) + path(token, "doc.txt"), Status.enoent)
         let stillOld = try await read(guest, old, offset: 0, length: 64)
         XCTAssertEqual(stillOld, Data("old".utf8))
     }
@@ -130,6 +130,253 @@ final class DropFileServerTests: XCTestCase {
         // Drops outlive sessions: the guest compositor may restart.
         let attributes = try await attributes(second, Opcode.lookup, path(token, "f"))
         XCTAssertEqual(attributes.size, 4)
+    }
+
+    // MARK: Writing
+
+    private enum Linux { static let wrOnly: UInt32 = 1, rdWr: UInt32 = 2, create: UInt32 = 0o100, exclusive: UInt32 = 0o200, truncate: UInt32 = 0o1000 }
+
+    private func writeBody(_ handle: UInt64, _ offset: UInt64) -> Data { encode64(handle) + encode64(offset) }
+    private func write(_ guest: FileSession, _ handle: UInt64, offset: UInt64, _ bytes: Data) async throws -> UInt32 {
+        let stream = try await guest.request(Opcode.write, body: writeBody(handle, offset))
+        try await stream.send(bytes, end: true)
+        guard let response = try await stream.receive(), case .response(let status) = response.kind else { throw POSIXError(.EPROTO) }
+        XCTAssertEqual(status, 0)
+        return FileSession.decode32(response.body, at: 0)
+    }
+    private func create(_ guest: FileSession, _ token: String, _ name: String, flags: UInt32 = 0o101,
+                        mode: UInt32 = 0o644, status: UInt32 = 0) async throws -> UInt64? {
+        let (body, _) = try await call(guest, Opcode.create, FileSession.encode(flags) + FileSession.encode(mode) + path(token, name), status: status)
+        return status == 0 ? body.withUnsafeBytes { UInt64(littleEndian: $0.loadUnaligned(as: UInt64.self)) } : nil
+    }
+    private func renameBody(_ token: String, _ old: String, _ new: String, flags: UInt32 = 0) -> Data {
+        FileSession.encode(flags) + Data([UInt8(old.utf8.count & 0xff), UInt8(old.utf8.count >> 8)]) +
+            Data(token.utf8) + Data(old.utf8) + Data(new.utf8)
+    }
+    private func setattrBody(_ valid: UInt32, mode: UInt32 = 0, size: UInt64 = 0, mtime: Int64 = 0,
+                             handle: UInt64 = 0, _ token: String, _ name: String) -> Data {
+        FileSession.encode(valid) + FileSession.encode(mode) + encode64(size) + encode64(0) + FileSession.encode(0) +
+            encode64(UInt64(bitPattern: mtime)) + FileSession.encode(0) + encode64(handle) + path(token, name)
+    }
+    private func names(_ guest: FileSession, _ token: String) async throws -> [String] {
+        try await entries(guest, Data(token.utf8)).map(\.0)
+    }
+    private func contents(_ url: URL) -> String { (try? String(contentsOf: url, encoding: .utf8)) ?? "<missing>" }
+
+    func testWritesTruncationAndAttributes() async throws {
+        let server = DropFileServer(stagingDirectory: directory.appendingPathComponent("staging"))
+        let guest = try await connect(server)
+        defer { guest.close(); server.detach() }
+        let file = try write("doc.txt", "hello world")
+        _ = try XCTUnwrap(server.share(file))
+        let token = try XCTUnwrap(server.tokens.first)
+
+        let handle = try await open(guest, token, "doc.txt", flags: Linux.rdWr)
+        let written = try await write(guest, handle, offset: 6, Data("drops".utf8))
+        XCTAssertEqual(written, 5)
+        XCTAssertEqual(contents(file), "hello drops", "writes land in the Mac file")
+        let readBack = try await read(guest, handle, offset: 0, length: 64)
+        XCTAssertEqual(readBack, Data("hello drops".utf8))
+        // A read-only handle refuses writes, as the Mac file system would.
+        let readOnly = try await open(guest, token, "doc.txt")
+        let refused = try await guest.request(Opcode.write, body: writeBody(readOnly, 0))
+        try await refused.send(Data("x".utf8), end: true)
+        let refusal = try await refused.receive()
+        XCTAssertEqual(refusal?.kind, .response(status: Status.ebadf))
+
+        let truncated = try await attributes(guest, Opcode.setattr, setattrBody(DropFileServer.Set.size, size: 5, token, "doc.txt"))
+        XCTAssertEqual(truncated.size, 5)
+        XCTAssertEqual(contents(file), "hello")
+        let touched = try await attributes(guest, Opcode.setattr,
+                                           setattrBody(DropFileServer.Set.mtime | DropFileServer.Set.mode, mode: 0o600, mtime: 1_000_000, token, "doc.txt"))
+        XCTAssertEqual(touched.modified.tv_sec, 1_000_000)
+        XCTAssertEqual(touched.mode, 0o600)
+        try await expect(guest, Opcode.setattr, setattrBody(DropFileServer.Set.uid, token, "doc.txt"), Status.eperm)
+        // By handle: fstat of the open file.
+        let byHandle = try await attributes(guest, Opcode.setattr, setattrBody(DropFileServer.Set.handle, handle: handle, token, "doc.txt"))
+        XCTAssertEqual(byHandle.size, 5)
+        try await expect(guest, Opcode.fsync, encode64(handle), 0)
+        let truncating = try await open(guest, token, "doc.txt", flags: Linux.wrOnly | Linux.truncate)
+        XCTAssertEqual(contents(file), "")
+        try await expect(guest, Opcode.release, encode64(truncating), 0)
+    }
+
+    /// gedit, LibreOffice and friends: write a temporary file, rename it over.
+    func testSavingThroughATemporaryFileReplacesTheMacFile() async throws {
+        let staging = directory.appendingPathComponent("staging")
+        let server = DropFileServer(stagingDirectory: staging)
+        let guest = try await connect(server)
+        defer { guest.close(); server.detach() }
+        let file = try write("doc.txt", "old")
+        _ = try XCTUnwrap(server.share(file))
+        let token = try XCTUnwrap(server.tokens.first)
+
+        let created = try await create(guest, token, ".goutputstream-1")
+        let temporary = try XCTUnwrap(created)
+        _ = try await write(guest, temporary, offset: 0, Data("new contents".utf8))
+        let listed = try await names(guest, token)
+        XCTAssertEqual(Set(listed), ["doc.txt", ".goutputstream-1"])
+        XCTAssertEqual(contents(file), "old", "nothing reaches the Mac file before the rename")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent(".goutputstream-1").path),
+                       "temporary files stay out of the Mac folder")
+        try await expect(guest, Opcode.rename, renameBody(token, ".goutputstream-1", "doc.txt", flags: DropFileServer.RenameFlag.noReplace), Status.eexist)
+        try await expect(guest, Opcode.rename, renameBody(token, ".goutputstream-1", "doc.txt"), 0)
+        XCTAssertEqual(contents(file), "new contents")
+        let after = try await names(guest, token)
+        XCTAssertEqual(after, ["doc.txt"])
+        // The renamed handle now writes the Mac file's new contents.
+        _ = try await write(guest, temporary, offset: 0, Data("N".utf8))
+        XCTAssertEqual(contents(file), "New contents")
+
+        try await expect(guest, Opcode.rename, renameBody(token, "missing", "doc.txt"), Status.enoent)
+        try await expect(guest, Opcode.rename, renameBody(token, "doc.txt", "x", flags: DropFileServer.RenameFlag.exchange), Status.einval)
+        server.remove(token: token)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: staging.appendingPathComponent(token).path))
+    }
+
+    /// vim with backupcopy=no: rename the file aside, then write a new one.
+    func testBackupRenameKeepsTheMacFileInPlace() async throws {
+        let server = DropFileServer(stagingDirectory: directory.appendingPathComponent("staging"))
+        let guest = try await connect(server)
+        defer { guest.close(); server.detach() }
+        let file = try write("doc.txt", "version 1")
+        _ = try XCTUnwrap(server.share(file))
+        let token = try XCTUnwrap(server.tokens.first)
+
+        try await expect(guest, Opcode.rename, renameBody(token, "doc.txt", "doc.txt~"), 0)
+        XCTAssertEqual(contents(file), "version 1", "the Mac file is not moved")
+        let renamed = try await names(guest, token)
+        XCTAssertEqual(renamed, ["doc.txt~"])
+        try await expect(guest, Opcode.lookup, path(token, "doc.txt"), Status.enoent)
+
+        let recreated = try await create(guest, token, "doc.txt", flags: Linux.wrOnly | Linux.create | Linux.exclusive)
+        let fresh = try XCTUnwrap(recreated)
+        _ = try await write(guest, fresh, offset: 0, Data("v2".utf8))
+        XCTAssertEqual(contents(file), "v2")
+        let backup = try await open(guest, token, "doc.txt~")
+        let old = try await read(guest, backup, offset: 0, length: 64)
+        XCTAssertEqual(old, Data("version 1".utf8))
+        let both = try await names(guest, token)
+        XCTAssertEqual(Set(both), ["doc.txt", "doc.txt~"])
+        _ = try await create(guest, token, "doc.txt", flags: Linux.wrOnly | Linux.create | Linux.exclusive, status: Status.eexist)
+    }
+
+    func testUnlinkHidesButKeepsTheMacFile() async throws {
+        let server = DropFileServer(stagingDirectory: directory.appendingPathComponent("staging"))
+        let guest = try await connect(server)
+        defer { guest.close(); server.detach() }
+        let file = try write("doc.txt", "keep me")
+        _ = try XCTUnwrap(server.share(file))
+        let token = try XCTUnwrap(server.tokens.first)
+        _ = try await create(guest, token, "scratch")
+        try await expect(guest, Opcode.unlink, path(token, "scratch"), 0)
+        try await expect(guest, Opcode.unlink, path(token, "doc.txt"), 0)
+        XCTAssertEqual(contents(file), "keep me")
+        let none = try await names(guest, token)
+        XCTAssertEqual(none, [])
+        try await expect(guest, Opcode.unlink, path(token, "doc.txt"), Status.enoent)
+    }
+
+    // MARK: Locks
+
+    private enum LockType { static let read: UInt32 = 0, write: UInt32 = 1, unlock: UInt32 = 2 }
+    private func lockBody(_ handle: UInt64, owner: UInt64, _ start: UInt64, _ end: UInt64, _ type: UInt32, flags: UInt32 = 0) -> Data {
+        encode64(handle) + encode64(owner) + encode64(start) + encode64(end) + FileSession.encode(type) + FileSession.encode(flags)
+    }
+    private func macLock(_ url: URL, _ type: Int32, _ start: off_t = 0, _ length: off_t = 0) -> (Int32, Int32) {
+        let descriptor = Darwin.open(url.path, O_RDWR)
+        var lock = Darwin.flock(l_start: start, l_len: length, l_pid: 0, l_type: Int16(type), l_whence: Int16(SEEK_SET))
+        let result = fcntl(descriptor, F_OFD_SETLK, &lock)
+        return (descriptor, result == 0 ? 0 : errno)
+    }
+
+    func testPosixLocksExcludeMacProgramsAndOtherOwners() async throws {
+        let server = DropFileServer()
+        let guest = try await connect(server)
+        defer { guest.close(); server.detach() }
+        let file = try write("db", String(repeating: "x", count: 100))
+        _ = try XCTUnwrap(server.share(file))
+        let token = try XCTUnwrap(server.tokens.first)
+        let first = try await open(guest, token, "db", flags: Linux.rdWr)
+        let second = try await open(guest, token, "db", flags: Linux.rdWr)
+
+        try await expect(guest, Opcode.setlk, lockBody(first, owner: 1, 0, 9, LockType.write), 0)
+        // Same owner through another open file: POSIX ownership, no conflict.
+        try await expect(guest, Opcode.setlk, lockBody(second, owner: 1, 5, 14, LockType.write), 0)
+        try await expect(guest, Opcode.setlk, lockBody(second, owner: 2, 0, 0, LockType.read), Status.eagain)
+        let conflict = try await call(guest, Opcode.getlk, lockBody(second, owner: 2, 0, 0, LockType.read)).0
+        XCTAssertEqual(FileSession.decode32(conflict, at: 16), LockType.write)
+        XCTAssertEqual(DropFileServer.u64(conflict, 0), 0)
+        XCTAssertEqual(DropFileServer.u64(conflict, 8), 14)
+
+        let (mac, macResult) = macLock(file, F_WRLCK, 3, 1)
+        XCTAssertEqual(macResult, EAGAIN, "a Mac program cannot lock what Linux locked")
+        Darwin.close(mac)
+        let (reader, readerResult) = macLock(file, F_RDLCK, 50, 10)
+        XCTAssertEqual(readerResult, 0, "unlocked ranges stay available")
+        try await expect(guest, Opcode.setlk, lockBody(first, owner: 3, 55, 56, LockType.write), Status.eagain)
+        Darwin.close(reader)
+
+        // close(2) of either open file releases the owner's locks.
+        try await expect(guest, Opcode.flush, encode64(second) + encode64(1), 0)
+        try await expect(guest, Opcode.setlk, lockBody(second, owner: 2, 0, 0, LockType.read), 0)
+        let free = try await call(guest, Opcode.getlk, lockBody(first, owner: 3, 20, 30, LockType.write)).0
+        XCTAssertEqual(FileSession.decode32(free, at: 16), LockType.unlock)
+        try await expect(guest, Opcode.setlk, lockBody(second, owner: 2, 0, UInt64(Int64.max), LockType.unlock), 0)
+        // The session ending releases everything it held.
+        try await expect(guest, Opcode.setlk, lockBody(first, owner: 4, 0, UInt64(Int64.max), LockType.write), 0)
+        server.detach()
+        let (after, afterResult) = macLock(file, F_WRLCK)
+        XCTAssertEqual(afterResult, 0)
+        Darwin.close(after)
+    }
+
+    func testFlockExcludesMacPrograms() async throws {
+        let server = DropFileServer()
+        let guest = try await connect(server)
+        defer { guest.close(); server.detach() }
+        let file = try write("lockfile", "")
+        _ = try XCTUnwrap(server.share(file))
+        let token = try XCTUnwrap(server.tokens.first)
+        let handle = try await open(guest, token, "lockfile")
+        try await expect(guest, Opcode.setlk, lockBody(handle, owner: 1, 0, UInt64(Int64.max), LockType.write,
+                                                       flags: DropFileServer.LockFlag.flock), 0)
+        let mac = Darwin.open(file.path, O_RDONLY)
+        defer { Darwin.close(mac) }
+        XCTAssertEqual(np_drop_flock(mac, LOCK_EX | LOCK_NB), -1)
+        try await expect(guest, Opcode.release, encode64(handle), 0)
+        XCTAssertEqual(np_drop_flock(mac, LOCK_EX | LOCK_NB), 0, "closing the open file ends its flock")
+    }
+
+    func testBlockingLockWaitsForTheMacProgramAndCanBeCancelled() async throws {
+        let server = DropFileServer()
+        let guest = try await connect(server)
+        defer { guest.close(); server.detach() }
+        let file = try write("db", "data")
+        _ = try XCTUnwrap(server.share(file))
+        let token = try XCTUnwrap(server.tokens.first)
+        let handle = try await open(guest, token, "db", flags: Linux.rdWr)
+        let (mac, macResult) = macLock(file, F_WRLCK)
+        XCTAssertEqual(macResult, 0)
+
+        let waiting = try await guest.request(Opcode.setlk, body: lockBody(handle, owner: 1, 0, 3, LockType.write,
+                                                                          flags: DropFileServer.LockFlag.wait), end: true)
+        let granted = Task { try await waiting.receive() }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        Darwin.close(mac) // the Mac program unlocks
+        let response = try await granted.value
+        XCTAssertEqual(response?.kind, .response(status: 0))
+
+        let (other, otherResult) = macLock(file, F_WRLCK, 10, 1)
+        XCTAssertEqual(otherResult, 0)
+        defer { Darwin.close(other) }
+        let cancelled = try await guest.request(Opcode.setlk, body: lockBody(handle, owner: 2, 10, 10, LockType.write,
+                                                                            flags: DropFileServer.LockFlag.wait), end: true)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        cancelled.cancel()
+        // The host stops waiting; the session stays healthy.
+        let still = try await attributes(guest, Opcode.lookup, path(token, "db"))
+        XCTAssertEqual(still.size, 4)
     }
 
     // MARK: End to end through the C FUSE handler
@@ -172,9 +419,17 @@ final class DropFileServerTests: XCTestCase {
                 data.append(chunk)
             }
             try driver.release(fileNode, handle)
+            // Save as a Linux editor does: temporary file, write, rename over.
+            let (temporaryNode, temporaryHandle) = try driver.create(parent: tokenNode, ".big.bin.swp")
+            guard try driver.write(temporaryNode, temporaryHandle, offset: 0, Data("saved from Linux".utf8)) == 16 else {
+                throw POSIXError(.EIO)
+            }
+            try driver.release(temporaryNode, temporaryHandle)
+            try driver.rename(parent: tokenNode, ".big.bin.swp", "big.bin")
             return data
         }
         XCTAssertEqual(result, contents)
+        XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "saved from Linux")
     }
 
     // MARK: Helpers
@@ -228,8 +483,8 @@ final class DropFileServerTests: XCTestCase {
         let body = try await call(guest, opcode, body).0
         return try XCTUnwrap(DropFileServer.Attributes.decode(body))
     }
-    private func open(_ guest: FileSession, _ token: String, _ name: String) async throws -> UInt64 {
-        let body = try await call(guest, Opcode.open, path(token, name)).0
+    private func open(_ guest: FileSession, _ token: String, _ name: String, flags: UInt32 = 0) async throws -> UInt64 {
+        let body = try await call(guest, Opcode.open, FileSession.encode(flags) + path(token, name)).0
         XCTAssertEqual(body.count, 8 + DropFileServer.attributeSize)
         return body.withUnsafeBytes { UInt64(littleEndian: $0.loadUnaligned(as: UInt64.self)) }
     }
@@ -305,6 +560,28 @@ private final class FuseDriver: @unchecked Sendable {
         withUnsafeBytes(of: size.littleEndian) { body.append(contentsOf: $0) }
         body.append(Data(count: 20))
         return try call(15, node: node, body)
+    }
+    func create(parent: UInt64, _ name: String) throws -> (UInt64, UInt64) {
+        var body = Data()
+        for value: UInt32 in [0o101, 0o644, 0o022, 0] { withUnsafeBytes(of: value.littleEndian) { body.append(contentsOf: $0) } }
+        body.append(Data(name.utf8) + Data([0]))
+        let reply = try call(35, node: parent, body)
+        return (u64(reply, 0), u64(reply, 128))
+    }
+    func write(_ node: UInt64, _ handle: UInt64, offset: UInt64, _ bytes: Data) throws -> UInt32 {
+        var body = Data()
+        for value in [handle, offset] { withUnsafeBytes(of: value.littleEndian) { body.append(contentsOf: $0) } }
+        withUnsafeBytes(of: UInt32(bytes.count).littleEndian) { body.append(contentsOf: $0) }
+        body.append(Data(count: 20))
+        body.append(bytes)
+        let reply = try call(16, node: node, body)
+        return reply.withUnsafeBytes { UInt32(littleEndian: $0.loadUnaligned(as: UInt32.self)) }
+    }
+    func rename(parent: UInt64, _ old: String, _ new: String) throws {
+        var body = Data()
+        withUnsafeBytes(of: parent.littleEndian) { body.append(contentsOf: $0) }
+        body.append(Data(old.utf8) + Data([0]) + Data(new.utf8) + Data([0]))
+        _ = try call(12, node: parent, body)
     }
     func release(_ node: UInt64, _ handle: UInt64) throws {
         var body = Data()

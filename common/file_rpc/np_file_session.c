@@ -595,3 +595,10 @@ void np_file2_stream_release(struct np_file2_stream *stream) {
 }
 
 uint32_t np_file2_stream_id(const struct np_file2_stream *stream) { return stream->id; }
+
+int np_file2_stream_cancelled(struct np_file2_stream *stream) {
+    pthread_mutex_lock(&stream->session->lock);
+    int cancelled = stream->cancelled || stream->session->error;
+    pthread_mutex_unlock(&stream->session->lock);
+    return cancelled;
+}

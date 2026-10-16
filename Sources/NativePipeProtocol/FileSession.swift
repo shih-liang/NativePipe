@@ -197,6 +197,11 @@ public final class FileSession: @unchecked Sendable {
         pump()
     }
 
+    /// Either side cancelled the stream, or the session ended.
+    func isCancelled(_ id: UInt32) -> Bool {
+        lock.withLock { failure != nil || streams[id]?.cancelled ?? true }
+    }
+
     /// The last stream reference is gone: cancel unless finished, then forget.
     func release(_ id: UInt32) {
         cancel(id)
@@ -546,4 +551,6 @@ public final class FileSessionStream: @unchecked Sendable {
         try await session.respond(id, status: status, body: body, end: end)
     }
     public func cancel() { session.cancel(id) }
+    /// For a responder doing long work: the requester gave up or disconnected.
+    public var isCancelled: Bool { session.isCancelled(id) }
 }
