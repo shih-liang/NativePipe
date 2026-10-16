@@ -24,10 +24,12 @@
 #define NP_DROP_MAX_WRITE (128u * 1024u)
 
 /* Requests the guest sends (NPFR v2 opcodes). Tokens are 36 ASCII bytes;
- * "path" below is token + name, where an empty name is the token's directory. */
+ * "path" below is token + a relative path inside the drop ("" is the token's
+ * directory, "name" the dropped item, "name/sub/file" inside a dropped folder). */
 enum np_drop_opcode {
     NP_DROP_LOOKUP = 1,   /* path -> attr */
-    NP_DROP_LIST = 2,     /* empty (all tokens) or token -> DATA entries: name_length:u16, name, attr */
+    NP_DROP_LIST = 2,     /* start:u32, then nothing (all tokens) or path -> DATA entries from index
+                           * `start`: name_length:u16, name, attr; fewer than all when large */
     NP_DROP_OPEN = 3,     /* flags:u32 (Linux open flags), path -> handle:u64, attr */
     NP_DROP_READ = 4,     /* handle:u64, offset:u64, length:u32 (at most NP_DROP_READ_MAX) -> DATA */
     NP_DROP_RELEASE = 5,  /* handle:u64 -> empty */
@@ -40,6 +42,10 @@ enum np_drop_opcode {
     NP_DROP_FLUSH = 12,   /* handle:u64, owner:u64 -> empty; releases the owner's POSIX locks */
     NP_DROP_GETLK = 13,   /* lock request -> start:u64, end:u64, type:u32, pid:u32 */
     NP_DROP_SETLK = 14,   /* lock request -> empty */
+    NP_DROP_RMDIR = 15,   /* path -> empty */
+    NP_DROP_MKDIR = 16,   /* mode:u32, path -> attr */
+    NP_DROP_SYMLINK = 17, /* target_length:u16, target, path -> attr */
+    NP_DROP_READLINK = 18, /* path -> DATA with the target */
 };
 /* SETATTR: valid:u32 (FUSE FATTR_* bits), mode:u32, size:u64, atime_seconds:i64,
  * atime_nanoseconds:u32, mtime_seconds:i64, mtime_nanoseconds:u32, handle:u64 */
@@ -62,11 +68,12 @@ enum np_drop_notification {
 #define NP_DROP_TOKEN 36u
 #define NP_DROP_READ_MAX (1024u * 1024u)
 #define NP_DROP_NAME_MAX 255u
+#define NP_DROP_PATH_MAX 4095u
 
-/* kind:u8 (1 directory, 2 file), reserved:3, mode:u32 (permission bits),
+/* kind:u8 (1 directory, 2 file, 3 symbolic link), reserved:3, mode:u32 (permission bits),
  * size:u64, mtime_seconds:i64, mtime_nanoseconds:u32, reserved:u32, file_id:u64 */
 #define NP_DROP_ATTR 40u
-enum np_drop_kind { NP_DROP_DIRECTORY = 1, NP_DROP_FILE = 2 };
+enum np_drop_kind { NP_DROP_DIRECTORY = 1, NP_DROP_FILE = 2, NP_DROP_LINK = 3 };
 struct np_drop_attr {
     uint8_t kind;
     uint32_t mode;
@@ -85,7 +92,7 @@ enum np_drop_status {
     NP_DROP_EINVAL = 22, NP_DROP_EROFS = 30, NP_DROP_ENAMETOOLONG = 36, NP_DROP_ELOOP = 40,
     NP_DROP_ESTALE = 116, NP_DROP_EINTR = 4, NP_DROP_EAGAIN = 11, NP_DROP_EEXIST = 17,
     NP_DROP_EXDEV = 18, NP_DROP_ENOSPC = 28, NP_DROP_EDEADLK = 35, NP_DROP_ENOLCK = 37,
-    NP_DROP_ENOTEMPTY = 39, NP_DROP_EOPNOTSUPP = 95, NP_DROP_EDQUOT = 122,
+    NP_DROP_ENOTEMPTY = 39, NP_DROP_EOPNOTSUPP = 95, NP_DROP_EDQUOT = 122, NP_DROP_EBUSY = 16,
 };
 
 /* The FUSE request handler. It never touches the guest filesystem: every

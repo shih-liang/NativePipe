@@ -51,7 +51,10 @@ static int host_path(const unsigned char *body, size_t length, const char **name
     static __thread char buffer[NP_DROP_NAME_MAX + 1];
     memcpy(buffer, body + NP_DROP_TOKEN, length - NP_DROP_TOKEN); buffer[length - NP_DROP_TOKEN] = 0;
     *name = buffer;
-    return buffer[0] && strcmp(buffer, file_name) && strcmp(buffer, "tmp") ? NP_DROP_ENOENT : 0;
+    static const char *const known[] = {"tmp", "sub", "sub/inner", "sub/link", "sub/new"};
+    if (!buffer[0] || !strcmp(buffer, file_name)) return 0;
+    for (unsigned i = 0; i < sizeof(known) / sizeof(known[0]); i++) if (!strcmp(buffer, known[i])) return 0;
+    return NP_DROP_ENOENT;
 }
 
 struct work { struct np_file2_stream *stream; uint16_t opcode; unsigned char body[512]; size_t length; };
@@ -72,25 +75,54 @@ static void *host_serve(void *argument) {
     int status;
     switch (work->opcode) {
     case NP_DROP_LOOKUP:
+        record(work, NULL, 0);
         if ((status = host_path(body, work->length, &name))) { np_file2_respond(stream, status, NULL, 0, 1); break; }
-        put_attr(out, name[0] ? NP_DROP_FILE : NP_DROP_DIRECTORY, 0644, name[0] ? 11 : 0);
+        put_attr(out, !name[0] || !strcmp(name, "sub") ? NP_DROP_DIRECTORY : !strcmp(name, "sub/link") ? NP_DROP_LINK : NP_DROP_FILE,
+                 0644, name[0] ? 11 : 0);
         np_file2_respond(stream, 0, out, NP_DROP_ATTR, 1);
         break;
     case NP_DROP_LIST: {
-        unsigned char entries[2 + NP_DROP_NAME_MAX + NP_DROP_ATTR];
-        const char *listed = work->length ? file_name : TOKEN;
-        size_t n = strlen(listed);
-        if (work->length && (work->length != NP_DROP_TOKEN || memcmp(body, TOKEN, NP_DROP_TOKEN))) {
+        /* start:u32, then nothing (the root) or a directory path. */
+        record(work, NULL, 0);
+        uint32_t start = np_file_u32(body);
+        const unsigned char *path = body + 4;
+        size_t path_length = work->length - 4;
+        int root = !path_length, sub = path_length == NP_DROP_TOKEN + 3 && !memcmp(path + NP_DROP_TOKEN, "sub", 3);
+        if (!root && (path_length < NP_DROP_TOKEN || memcmp(path, TOKEN, NP_DROP_TOKEN) ||
+                      (path_length != NP_DROP_TOKEN && !sub))) {
             np_file2_respond(stream, NP_DROP_ENOENT, NULL, 0, 1); break;
         }
-        entries[0] = (unsigned char)n; entries[1] = 0; memcpy(entries + 2, listed, n);
-        put_attr(entries + 2 + n, work->length ? NP_DROP_FILE : NP_DROP_DIRECTORY, 0644, 11);
+        const char *names[3] = {root ? TOKEN : sub ? "inner" : file_name, sub ? "link" : NULL, NULL};
+        uint8_t kinds[2] = {root ? NP_DROP_DIRECTORY : NP_DROP_FILE, NP_DROP_LINK};
+        unsigned char entries[2 * (2 + NP_DROP_NAME_MAX + NP_DROP_ATTR)];
+        size_t used = 0;
+        for (unsigned i = start; i < 2 && names[i]; i++) {
+            size_t n = strlen(names[i]);
+            entries[used] = (unsigned char)n; entries[used + 1] = 0; memcpy(entries + used + 2, names[i], n);
+            put_attr(entries + used + 2 + n, kinds[i], 0644, 11);
+            used += 2 + n + NP_DROP_ATTR;
+        }
         np_file2_respond(stream, 0, NULL, 0, 0);
         /* Split mid-entry: the guest must reassemble DATA frames. */
-        np_file2_send(stream, entries, 5, 0);
-        np_file2_send(stream, entries + 5, 2 + n + NP_DROP_ATTR - 5, 1);
+        size_t split = used > 5 ? 5 : used;
+        np_file2_send(stream, entries, split, 0);
+        np_file2_send(stream, entries + split, used - split, 1);
         break;
     }
+    case NP_DROP_MKDIR: case NP_DROP_SYMLINK:
+        record(work, NULL, 0);
+        put_attr(out, work->opcode == NP_DROP_MKDIR ? NP_DROP_DIRECTORY : NP_DROP_LINK, 0755, 4);
+        np_file2_respond(stream, 0, out, NP_DROP_ATTR, 1);
+        break;
+    case NP_DROP_READLINK:
+        record(work, NULL, 0);
+        np_file2_respond(stream, 0, NULL, 0, 0);
+        np_file2_send(stream, "../tmp", 6, 1);
+        break;
+    case NP_DROP_RMDIR:
+        record(work, NULL, 0);
+        np_file2_respond(stream, 0, NULL, 0, 1);
+        break;
     case NP_DROP_OPEN:
         record(work, NULL, 0);
         if ((status = host_path(body + 4, work->length - 4, &name)) || !name[0]) { np_file2_respond(stream, status ? status : NP_DROP_EISDIR, NULL, 0, 1); break; }
@@ -231,6 +263,59 @@ static size_t list(struct np_drop_fs *fs, uint64_t node, uint64_t offset, uint32
     return count;
 }
 
+/* Folder drops: nested paths, mkdir/rmdir, symbolic links, renames between
+ * directories of one drop, and paged listings. */
+static void folders(struct np_drop_fs *fs, uint64_t token_node, struct captured *out) {
+    struct entry_out sub, inner, link;
+    char names[8][64];
+    assert(lookup(fs, token_node, "sub", &sub, out) == 0 && (sub.attr.mode & 0170000) == 0040000);
+    assert(lookup(fs, sub.nodeid, "inner", &inner, out) == 0 && (inner.attr.mode & 0170000) == 0100000);
+    assert(lookup(fs, sub.nodeid, "link", &link, out) == 0 && (link.attr.mode & 0170000) == 0120000);
+    assert(lookup(fs, inner.nodeid, "x", &link, out) == -ENOTDIR);
+    assert(lookup(fs, sub.nodeid, "link", &link, out) == 0);
+
+    assert(call(fs, 5 /* READLINK */, link.nodeid, NULL, 0, out) == 0);
+    assert(reply_length(out) == 6 && !memcmp(reply_body(out), "../tmp", 6));
+    assert(call(fs, 5, inner.nodeid, NULL, 0, out) == -NP_DROP_EINVAL);
+    uint32_t open_flags[2] = {0, 0};
+    assert(call(fs, OPEN, link.nodeid, open_flags, sizeof(open_flags), out) == -NP_DROP_ELOOP);
+
+    assert(list(fs, sub.nodeid, 0, 4096, names, out) == 4 && !strcmp(names[2], "inner") && !strcmp(names[3], "link"));
+    /* Pages continue until the host has nothing more: the last ask is past the end. */
+    assert(np_file_u32(seen_body) == 2 && !memcmp(seen_body + 4 + NP_DROP_TOKEN, "sub", 3));
+    /* Resuming after the dots asks the host from that entry on. */
+    assert(list(fs, sub.nodeid, 3, 4096, names, out) == 1 && !strcmp(names[0], "link"));
+
+    unsigned char mkdir[8 + 4] = {0};
+    np_file_put32(mkdir, 0777); np_file_put32(mkdir + 4, 022); memcpy(mkdir + 8, "new", 4);
+    assert(call(fs, MKDIR, sub.nodeid, mkdir, sizeof(mkdir), out) == 0);
+    struct entry_out made; memcpy(&made, reply_body(out), sizeof(made));
+    assert((made.attr.mode & 0170000) == 0040000 && np_file_u32(seen_body) == 0755 &&
+           !memcmp(seen_body + 4 + NP_DROP_TOKEN, "sub/new", 7));
+    unsigned char symlink[] = "ln\0target";
+    assert(call(fs, 6 /* SYMLINK */, sub.nodeid, symlink, sizeof(symlink), out) == 0);
+    assert(seen_body[0] == 6 && !memcmp(seen_body + 2, "target", 6) && !memcmp(seen_body + 8 + NP_DROP_TOKEN, "sub/ln", 6));
+
+    /* A rename between directories of the drop moves the node and its children. */
+    unsigned char rename[16 + 6 + 6] = {0};
+    np_file_put64(rename, token_node);
+    memcpy(rename + 16, "inner", 6); memcpy(rename + 22, "moved", 6);
+    assert(call(fs, RENAME2, sub.nodeid, rename, sizeof(rename), out) == 0);
+    assert(!memcmp(seen_body + 6 + NP_DROP_TOKEN, "sub/innermoved", 14));
+    unsigned char move_sub[16 + 4 + 5] = {0};
+    np_file_put64(move_sub, sub.nodeid);
+    memcpy(move_sub + 16, "sub", 4); memcpy(move_sub + 20, "deep", 5);
+    assert(call(fs, RENAME2, token_node, move_sub, sizeof(move_sub), out) == -NP_DROP_EINVAL); /* into itself */
+    np_file_put64(move_sub, token_node);
+    assert(call(fs, RENAME2, token_node, move_sub, sizeof(move_sub), out) == 0);
+    /* sub (now "deep") and its children answer to their new paths. */
+    assert(call(fs, GETATTR, made.nodeid, (unsigned char[16]){0}, 16, out) == -NP_DROP_ENOENT);
+    assert(!memcmp(seen_body + NP_DROP_TOKEN, "deep/new", 8));
+    assert(call(fs, 11 /* RMDIR */, sub.nodeid, "new", 4, out) == 0);
+    assert(seen_opcode == NP_DROP_RMDIR && !memcmp(seen_body + NP_DROP_TOKEN, "deep/new", 8));
+    assert(call(fs, GETATTR, made.nodeid, (unsigned char[16]){0}, 16, out) == -NP_DROP_ENOENT);
+}
+
 struct interrupt_after { struct np_drop_fs *fs; uint64_t unique; };
 static void *send_interrupt(void *argument) {
     struct interrupt_after *after = argument;
@@ -309,7 +394,7 @@ static void modifying_operations(struct np_drop_fs *fs, uint64_t token_node, uin
     struct entry_out found;
     assert(lookup(fs, token_node, file_name, &found, out) == 0 && found.nodeid == created.nodeid);
     np_file_put64(rename, file_node);
-    assert(call(fs, RENAME2, token_node, rename, 20 + strlen(file_name) + 1, out) == -NP_DROP_EXDEV);
+    assert(call(fs, RENAME2, token_node, rename, 20 + strlen(file_name) + 1, out) == -NP_DROP_ENOENT); /* retired node */
     np_file_put64(rename, token_node); np_file_put32(rename + 8, NP_DROP_RENAME_EXCHANGE);
     assert(call(fs, RENAME2, token_node, rename, 20 + strlen(file_name) + 1, out) == -NP_DROP_EINVAL);
 
@@ -442,7 +527,8 @@ int main(void) {
     assert(list(fs, token_node, 0, 32, names, out) == 1 && !strcmp(names[0], "."));
 
     assert(call(fs, STATFS, 1, NULL, 0, out) == 0);
-    assert(call(fs, MKDIR, token_node, "d", 2, out) == -NP_DROP_EPERM);
+    assert(call(fs, MKDIR, token_node, "d", 2, out) == -NP_DROP_EINVAL);
+    folders(fs, token_node, out);
     assert(call(fs, ACCESS, file_node, NULL, 0, out) == -38 /* ENOSYS */);
     modifying_operations(fs, token_node, file_node, out);
 

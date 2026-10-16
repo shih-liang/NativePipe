@@ -40,10 +40,15 @@ final class DropFileServerTests: XCTestCase {
         XCTAssertNil(server.share(file), "no guest mount yet")
         let guest = try await connect(server)
         defer { guest.close(); server.detach() }
-        XCTAssertNil(server.share(directory), "directories stay on virtiofs")
         let url = try XCTUnwrap(server.share(file))
         let token = try XCTUnwrap(server.tokens.first)
         XCTAssertEqual(url.path, mount + "/" + token + "/a.txt")
+        let folder = try XCTUnwrap(server.share(directory))
+        XCTAssertTrue(folder.hasDirectoryPath)
+        XCTAssertEqual(folder.lastPathComponent, directory.lastPathComponent)
+        let fifo = directory.appendingPathComponent("pipe").path
+        XCTAssertEqual(mkfifo(fifo, 0o600), 0)
+        XCTAssertNil(server.share(URL(fileURLWithPath: fifo)), "only files and folders")
     }
 
     func testLookupListOpenReadRelease() async throws {
@@ -277,6 +282,76 @@ final class DropFileServerTests: XCTestCase {
         try await expect(guest, Opcode.unlink, path(token, "doc.txt"), Status.enoent)
     }
 
+    // MARK: Folders
+
+    func testFoldersAreServedInPlaceWithoutFollowingLinksOut() async throws {
+        let server = DropFileServer(stagingDirectory: directory.appendingPathComponent("staging"))
+        let guest = try await connect(server)
+        defer { guest.close(); server.detach() }
+        let folder = directory.appendingPathComponent("Project")
+        try FileManager.default.createDirectory(at: folder.appendingPathComponent("src"), withIntermediateDirectories: true)
+        try Data("int main;".utf8).write(to: folder.appendingPathComponent("src/main.c"))
+        let outside = directory.appendingPathComponent("Secret")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try Data("private".utf8).write(to: outside.appendingPathComponent("key"))
+        XCTAssertEqual(symlink(outside.path, folder.appendingPathComponent("escape").path), 0)
+
+        let url = try XCTUnwrap(server.share(folder))
+        XCTAssertTrue(url.hasDirectoryPath)
+        let token = try XCTUnwrap(server.tokens.first)
+        let top = try await entries(guest, Data(token.utf8))
+        XCTAssertEqual(top.map(\.0), ["Project"])
+        XCTAssertEqual(top.first?.1.kind, .directory)
+        let inside = try await entries(guest, path(token, "Project"))
+        XCTAssertEqual(Set(inside.map(\.0)), ["src", "escape"])
+        XCTAssertEqual(inside.first { $0.0 == "escape" }?.1.kind, .link)
+
+        // Reading and writing go to the Mac folder itself.
+        let main = try await open(guest, token, "Project/src/main.c", flags: Linux.rdWr)
+        _ = try await write(guest, main, offset: 4, Data("MAIN".utf8))
+        XCTAssertEqual(contents(folder.appendingPathComponent("src/main.c")), "int MAIN;")
+        let created = try await create(guest, token, "Project/src/util.c")
+        let createdHandle = try XCTUnwrap(created)
+        _ = try await write(guest, createdHandle, offset: 0, Data("x".utf8))
+        XCTAssertEqual(contents(folder.appendingPathComponent("src/util.c")), "x")
+
+        // A link is shown as a link, never followed by the host.
+        let link = try await call(guest, Opcode.readlink, path(token, "Project/escape")).1
+        XCTAssertEqual(String(decoding: link, as: UTF8.self), outside.path)
+        try await expect(guest, Opcode.lookup, path(token, "Project/escape/key"), 40) // ELOOP: no way out
+        try await expect(guest, Opcode.open, FileSession.encode(0) + path(token, "Project/escape/key"), 40)
+        try await expect(guest, Opcode.open, FileSession.encode(0) + path(token, "Project/escape"), 40)
+        try await expect(guest, Opcode.lookup, path(token, "Project/../Secret"), Status.enoent)
+
+        // Directories and links are created and removed in place.
+        let made = try await attributes(guest, Opcode.mkdir, FileSession.encode(0o755) + path(token, "Project/build"))
+        XCTAssertEqual(made.kind, .directory)
+        let target = Data("../src/main.c".utf8)
+        let linked = try await attributes(guest, Opcode.symlink,
+                                          Data([UInt8(target.count), 0]) + target + path(token, "Project/build/main.c"))
+        XCTAssertEqual(linked.kind, .link)
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: folder.appendingPathComponent("build/main.c").path),
+                       "../src/main.c")
+        try await expect(guest, Opcode.rename, renameBody(token, "Project/src/util.c", "Project/build/util.c"), 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: folder.appendingPathComponent("build/util.c").path))
+        try await expect(guest, Opcode.rename, renameBody(token, "Project/build/util.c", "Project/src/main.c",
+                                                          flags: DropFileServer.RenameFlag.noReplace), Status.eexist)
+        try await expect(guest, Opcode.rmdir, path(token, "Project/build"), 39) // ENOTEMPTY
+        try await expect(guest, Opcode.unlink, path(token, "Project/build/main.c"), 0)
+        try await expect(guest, Opcode.unlink, path(token, "Project/build/util.c"), 0)
+        try await expect(guest, Opcode.rmdir, path(token, "Project/build"), 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.appendingPathComponent("build").path))
+
+        // The dropped folder itself stays put.
+        try await expect(guest, Opcode.rmdir, path(token, "Project"), Status.ebusy)
+        try await expect(guest, Opcode.rename, renameBody(token, "Project", "Other"), Status.eperm)
+        try await expect(guest, Opcode.rename, renameBody(token, "Project/src", "Project"), Status.ebusy)
+        _ = try await create(guest, token, "Sibling", status: Status.eperm)
+        server.remove(token: token)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: folder.appendingPathComponent("src/main.c").path),
+                      "forgetting a folder drop never touches the folder")
+    }
+
     // MARK: Reclamation
 
     func testIdleDropsAreReclaimedButOpenOnesNever() async throws {
@@ -479,6 +554,25 @@ final class DropFileServerTests: XCTestCase {
         }
         XCTAssertEqual(result, contents)
         XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "saved from Linux")
+
+        // A dropped folder, walked down through the handler.
+        let tree = directory.appendingPathComponent("Tree")
+        try FileManager.default.createDirectory(at: tree.appendingPathComponent("a"), withIntermediateDirectories: true)
+        try Data("deep".utf8).write(to: tree.appendingPathComponent("a/b.txt"))
+        let folderURL = try XCTUnwrap(server.share(tree))
+        let folderToken = folderURL.pathComponents[folderURL.pathComponents.count - 2]
+        let deep: Data = try await Self.onThread {
+            let driver = FuseDriver(fs)
+            let tokenNode = try driver.lookup(parent: 1, folderToken)
+            let treeNode = try driver.lookup(parent: tokenNode, "Tree")
+            guard try driver.readdir(treeNode) == [".", "..", "a"] else { throw POSIXError(.EPROTO) }
+            let aNode = try driver.lookup(parent: treeNode, "a")
+            let fileNode = try driver.lookup(parent: aNode, "b.txt")
+            let handle = try driver.open(fileNode)
+            defer { try? driver.release(fileNode, handle) }
+            return try driver.read(fileNode, handle, offset: 0, size: 4096)
+        }
+        XCTAssertEqual(deep, Data("deep".utf8))
     }
 
     // MARK: Helpers
@@ -541,7 +635,7 @@ final class DropFileServerTests: XCTestCase {
         try await call(guest, Opcode.read, readBody(handle, offset, length)).1
     }
     private func entries(_ guest: FileSession, _ body: Data) async throws -> [(String, DropFileServer.Attributes)] {
-        var data = try await call(guest, Opcode.list, body).1
+        var data = try await call(guest, Opcode.list, FileSession.encode(0) + body).1
         var result: [(String, DropFileServer.Attributes)] = []
         while data.count >= 2 {
             let length = Int(data[data.startIndex]) | Int(data[data.startIndex + 1]) << 8

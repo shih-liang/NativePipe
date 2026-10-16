@@ -22,12 +22,16 @@ public final class DropFileServer: @unchecked Sendable {
         public static let setattr: UInt16 = 7, create: UInt16 = 8, unlink: UInt16 = 9
         public static let rename: UInt16 = 10, fsync: UInt16 = 11, flush: UInt16 = 12
         public static let getlk: UInt16 = 13, setlk: UInt16 = 14
+        public static let rmdir: UInt16 = 15, mkdir: UInt16 = 16, symlink: UInt16 = 17, readlink: UInt16 = 18
     }
     public enum Notification { public static let mounted: UInt16 = 1 }
     public static let tokenLength = 36
     public static let attributeSize = 40
     public static let readMaximum = 1024 * 1024
     public static let nameMaximum = 255
+    public static let pathMaximum = 4095
+    /// One LIST answer; the guest asks again from where it stopped.
+    static let listPage = 2048
     public static let setattrSize = 48
     public static let lockSize = 40
     /// FUSE FATTR_* bits carried by SETATTR.
@@ -49,7 +53,7 @@ public final class DropFileServer: @unchecked Sendable {
     /// What a drop exposes: the kind, permission bits, size, modification
     /// time and file identity, in the wire's 40-byte layout.
     public struct Attributes: Equatable, Sendable {
-        public enum Kind: UInt8, Sendable { case directory = 1, file = 2 }
+        public enum Kind: UInt8, Sendable { case directory = 1, file = 2, link = 3 }
         public var kind: Kind
         public var mode: UInt32
         public var size: UInt64
@@ -90,6 +94,10 @@ public final class DropFileServer: @unchecked Sendable {
     private final class Drop {
         let url: URL
         let name: String
+        /// A dropped folder is served as itself, read and written in place;
+        /// paths below it resolve beneath `root` without following any link.
+        let isDirectory: Bool
+        let root: String
         let created: timespec
         let scoped: Bool
         let staging: URL
@@ -99,8 +107,9 @@ public final class DropFileServer: @unchecked Sendable {
         /// closed; reclamation only considers drops nothing has open.
         var openFiles = 0
         var lastUsed = Date()
-        init(url: URL, name: String, created: timespec, scoped: Bool, staging: URL) {
-            self.url = url; self.name = name; self.created = created; self.scoped = scoped; self.staging = staging
+        init(url: URL, name: String, isDirectory: Bool, root: String, created: timespec, scoped: Bool, staging: URL) {
+            self.url = url; self.name = name; self.isDirectory = isDirectory; self.root = root
+            self.created = created; self.scoped = scoped; self.staging = staging
         }
     }
     /// A name inside a drop's directory, resolved for one request.
@@ -108,14 +117,19 @@ public final class DropFileServer: @unchecked Sendable {
         case directory(Drop)
         case original(Drop)
         case staged(Drop, URL)
+        /// A path in a dropped folder; `top` is the folder itself.
+        case inside(Drop, String, top: Bool)
         var drop: Drop {
-            switch self { case .directory(let drop), .original(let drop), .staged(let drop, _): return drop }
+            switch self {
+            case .directory(let drop), .original(let drop), .staged(let drop, _), .inside(let drop, _, _): return drop
+            }
         }
         var path: String? {
             switch self {
             case .directory: return nil
             case .original(let drop): return drop.url.path
             case .staged(_, let url): return url.path
+            case .inside(_, let path, _): return path
             }
         }
     }
@@ -202,20 +216,29 @@ public final class DropFileServer: @unchecked Sendable {
         closeHandles()
     }
 
-    /// Makes a regular file available to the guest. Returns its guest URL, or
-    /// nil when no guest mount is ready or the item is not a regular file.
+    /// Makes a regular file or a folder available to the guest. Returns its
+    /// guest URL, or nil when no guest mount is ready or the item is neither.
     public func share(_ url: URL) -> URL? {
         guard url.isFileURL, let mount = mountPath else { return nil }
         let name = url.lastPathComponent
         guard Self.validName(name) else { return nil }
         var info = stat()
-        guard stat(url.path, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { return nil }
+        guard stat(url.path, &info) == 0 else { return nil }
+        let isDirectory = info.st_mode & S_IFMT == S_IFDIR
+        guard isDirectory || info.st_mode & S_IFMT == S_IFREG else { return nil }
+        // Everything below a folder resolves beneath its real path; nothing
+        // inside it is followed out through a symbolic link.
+        var root = url.path
+        if isDirectory {
+            guard let resolved = realpath(url.path, nil) else { return nil }
+            root = String(cString: resolved); free(resolved)
+        }
         let token = UUID().uuidString
         let scoped = url.startAccessingSecurityScopedResource()
-        let drop = Drop(url: url, name: name, created: Self.now(), scoped: scoped,
+        let drop = Drop(url: url, name: name, isDirectory: isDirectory, root: root, created: Self.now(), scoped: scoped,
                         staging: stagingRoot.appendingPathComponent(token, isDirectory: true))
         lock.withLock { drops[token] = drop }
-        return try? RemoteFileURL.make(mount + "/" + token + "/" + name)
+        return try? RemoteFileURL.make(mount + "/" + token + "/" + name, isDirectory: isDirectory)
     }
 
     /// Forgets a drop and deletes the files the guest created beside it.
@@ -335,6 +358,10 @@ public final class DropFileServer: @unchecked Sendable {
             case Opcode.flush: reply = flush(body)
             case Opcode.getlk: reply = await getlk(body)
             case Opcode.setlk: reply = await setlk(body, stream)
+            case Opcode.rmdir: reply = await removeDirectory(body)
+            case Opcode.mkdir: reply = await makeDirectory(body)
+            case Opcode.symlink: reply = await makeLink(body)
+            case Opcode.readlink: reply = await readLink(body)
             default: reply = .status(Status.einval)
             }
             switch reply {
@@ -365,6 +392,13 @@ public final class DropFileServer: @unchecked Sendable {
     private func resolve(_ token: String, _ name: String) -> Target? {
         guard let drop = lock.withLock({ drops[token] }) else { return nil }
         if name.isEmpty { return .directory(drop) }
+        let components = name.split(separator: "/", omittingEmptySubsequences: false)
+        if drop.isDirectory {
+            guard components[0] == drop.name else { return nil }
+            let rest = components.dropFirst().joined(separator: "/")
+            return .inside(drop, rest.isEmpty ? drop.root : drop.root + "/" + rest, top: rest.isEmpty)
+        }
+        guard components.count == 1 else { return nil }
         if name == drop.name { return lock.withLock({ drop.hidden }) ? nil : .original(drop) }
         let url = drop.staging.appendingPathComponent(name)
         var info = stat()
@@ -374,37 +408,78 @@ public final class DropFileServer: @unchecked Sendable {
     private func lookup(_ body: Data) async -> Reply {
         guard let (token, name) = Self.path(body), let target = resolve(token, name) else { return .status(Status.enoent) }
         guard let path = target.path else { return .body(directoryAttributes(target.drop).encoded()) }
+        if case .inside = target { return await Self.io { .body(try Self.anyAttributes(path).encoded()) } }
         return await Self.io { .body(try Self.attributes(path).encoded()) }
     }
 
     private func list(_ body: Data) async -> Reply {
-        if body.isEmpty {
-            let all = lock.withLock { drops }
-            return .data(all.reduce(into: Data()) { $0.append(Self.entry($1.key, directoryAttributes($1.value))) })
+        guard body.count >= 4 else { return .status(Status.einval) }
+        let start = Int(FileSession.decode32(body, at: 0))
+        let rest = Data(body.dropFirst(4))
+        if rest.isEmpty {
+            let all = lock.withLock { drops }.sorted { $0.key < $1.key }
+            return .data(all.dropFirst(start).prefix(Self.listPage).reduce(into: Data()) {
+                $0.append(Self.entry($1.key, directoryAttributes($1.value)))
+            })
         }
-        guard body.count == Self.tokenLength, let token = String(data: body, encoding: .ascii),
-              let drop = lock.withLock({ drops[token] }) else { return .status(Status.enoent) }
-        let hidden = lock.withLock { drop.hidden }
-        return await Self.io {
-            var entries = Data()
-            if !hidden, let attributes = try? Self.attributes(drop.url.path) {
-                entries.append(Self.entry(drop.name, attributes))
-            }
-            let staged = (try? FileManager.default.contentsOfDirectory(atPath: drop.staging.path)) ?? []
-            for name in staged.sorted() where Self.validName(name) && name != drop.name {
-                if let attributes = try? Self.attributes(drop.staging.appendingPathComponent(name).path, follow: false) {
-                    entries.append(Self.entry(name, attributes))
+        guard let (token, path) = Self.path(rest), let target = resolve(token, path) else { return .status(Status.enoent) }
+        let drop = target.drop, hidden = lock.withLock { drop.hidden }
+        switch target {
+        case .directory where drop.isDirectory:
+            guard start == 0, let attributes = try? Self.anyAttributes(drop.root) else { return .data(Data()) }
+            return .data(Self.entry(drop.name, attributes))
+        case .directory:
+            return await Self.io {
+                var entries: [Data] = []
+                if !hidden, let attributes = try? Self.attributes(drop.url.path) {
+                    entries.append(Self.entry(drop.name, attributes))
                 }
+                let staged = (try? FileManager.default.contentsOfDirectory(atPath: drop.staging.path)) ?? []
+                for name in staged.sorted() where Self.validName(name) && name != drop.name {
+                    if let attributes = try? Self.attributes(drop.staging.appendingPathComponent(name).path, follow: false) {
+                        entries.append(Self.entry(name, attributes))
+                    }
+                }
+                return .data(entries.dropFirst(start).prefix(Self.listPage).reduce(into: Data()) { $0.append($1) })
             }
-            return .data(entries)
+        case .inside(_, let directory, _):
+            return await Self.io { .data(try Self.listDirectory(directory, from: start)) }
+        default:
+            return .status(20) // ENOTDIR
         }
+    }
+
+    /// Entries of a directory in a dropped folder, from position `start`, in
+    /// the directory's own order so positions stay stable between pages.
+    private static func listDirectory(_ path: String, from start: Int) throws -> Data {
+        let descriptor = Darwin.open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW_ANY)
+        try check(descriptor)
+        guard let directory = fdopendir(descriptor) else { Darwin.close(descriptor); throw StatusError(Status.from(errno)) }
+        defer { closedir(directory) }
+        var entries = Data(), position = 0, count = 0
+        while count < listPage, let item = readdir(directory) {
+            let name = withUnsafeBytes(of: item.pointee.d_name) { raw in
+                String(decoding: raw.prefix(Int(item.pointee.d_namlen)), as: UTF8.self)
+            }
+            guard name != ".", name != "..", validName(name) else { continue }
+            defer { position += 1 }
+            guard position >= start else { continue }
+            var info = stat()
+            guard fstatat(dirfd(directory), name, &info, AT_SYMLINK_NOFOLLOW) == 0,
+                  let attributes = anyAttributes(info) else { continue }
+            entries.append(entry(name, attributes))
+            count += 1
+        }
+        return entries
     }
 
     private func open(_ body: Data) async -> Reply {
         guard body.count >= 4, let (token, name) = Self.path(body.dropFirst(4)) else { return .status(Status.einval) }
         guard let target = resolve(token, name) else { return .status(Status.enoent) }
         guard let path = target.path else { return .status(Status.eisdir) }
-        return await openFile(path, flags: Self.openFlags(FileSession.decode32(body, at: 0)), mode: 0, drop: target.drop)
+        var flags = Self.openFlags(FileSession.decode32(body, at: 0))
+        if case .inside = target { flags |= O_NOFOLLOW_ANY }
+        return await openFile(path, flags: flags, mode: 0, drop: target.drop)
     }
 
     private func create(_ body: Data) async -> Reply {
@@ -416,6 +491,12 @@ public final class DropFileServer: @unchecked Sendable {
         let mode = mode_t(FileSession.decode32(body, at: 4) & 0o7777)
         var flags = Self.openFlags(linux) | O_CREAT
         if linux & LinuxOpen.exclusive != 0 { flags |= O_EXCL }
+        if drop.isDirectory {
+            // Inside a dropped folder, files are created in the Mac folder itself.
+            guard case .inside(_, let path, let top)? = resolve(token, name) else { return .status(Status.eperm) }
+            if top { return .status(Status.eexist) }
+            return await openFile(path, flags: flags | O_NOFOLLOW_ANY, mode: mode, drop: drop)
+        }
         if name == drop.name {
             // The dropped name is the Mac file. While the guest sees it, this is
             // an open; after the guest removed it, the name starts out empty again.
@@ -530,9 +611,12 @@ public final class DropFileServer: @unchecked Sendable {
         }
         if valid & Set.handle != 0 { return await using(u64(body, 40)) { try apply($0.descriptor) } }
         guard let target = resolve(token, name), let path = target.path else { return .status(Status.enoent) }
+        var noFollow: Int32 = 0
+        if case .inside = target { noFollow = O_NOFOLLOW_ANY }
+        let options = noFollow
         return await Self.io {
             // Only a size change needs write access; times and mode follow ownership.
-            let descriptor = Darwin.open(path, (valid & Set.size != 0 ? O_WRONLY : O_RDONLY) | O_CLOEXEC | O_NONBLOCK)
+            let descriptor = Darwin.open(path, (valid & Set.size != 0 ? O_WRONLY : O_RDONLY) | O_CLOEXEC | O_NONBLOCK | options)
             try Self.check(descriptor)
             defer { Darwin.close(descriptor) }
             return try apply(descriptor)
@@ -545,6 +629,9 @@ public final class DropFileServer: @unchecked Sendable {
         }
         switch target {
         case .directory: return .status(Status.eisdir)
+        case .inside(_, _, top: true): return .status(Status.ebusy)
+        case .inside(_, let path, _):
+            return await Self.io { try Self.atParent(path) { try Self.check(unlinkat($0, $1, 0)) }; return .status(0) }
         case .original(let drop):
             // The guest can drop its name for the file, never the Mac file itself.
             lock.withLock { drop.hidden = true }
@@ -563,15 +650,31 @@ public final class DropFileServer: @unchecked Sendable {
               let token = String(data: body.subdata(in: 6..<6 + Self.tokenLength), encoding: .ascii),
               let oldName = String(data: body.subdata(in: 6 + Self.tokenLength..<6 + Self.tokenLength + oldLength), encoding: .utf8),
               let newName = String(data: body.subdata(in: 6 + Self.tokenLength + oldLength..<body.count), encoding: .utf8),
-              Self.validName(oldName), Self.validName(newName) else { return .status(Status.einval) }
+              Self.validPath(oldName), Self.validPath(newName) else { return .status(Status.einval) }
         guard flags & RenameFlag.exchange == 0, flags & ~RenameFlag.noReplace == 0 else { return .status(Status.einval) }
         guard let drop = lock.withLock({ drops[token] }) else { return .status(Status.enoent) }
+        if drop.isDirectory {
+            guard case .inside(_, let from, let fromTop)? = resolve(token, oldName),
+                  case .inside(_, let to, let toTop)? = resolve(token, newName) else { return .status(Status.eperm) }
+            // The dropped folder itself stays where the Mac has it.
+            if fromTop || toTop { return .status(Status.ebusy) }
+            let exclusive = flags & RenameFlag.noReplace != 0
+            return await Self.io {
+                try Self.atParent(from) { fromDirectory, fromName in
+                    try Self.atParent(to) { toDirectory, toName in
+                        try Self.check(renameatx_np(fromDirectory, fromName, toDirectory, toName,
+                                                    exclusive ? UInt32(RENAME_EXCL) : 0))
+                    }
+                }
+                return .status(0)
+            }
+        }
         guard let source = resolve(token, oldName) else { return .status(Status.enoent) }
         if oldName == newName { return .status(0) }
         let replacing = resolve(token, newName) != nil
         if replacing && flags & RenameFlag.noReplace != 0 { return .status(Status.eexist) }
         switch source {
-        case .directory: return .status(Status.einval)
+        case .directory, .inside: return .status(Status.einval)
         case .staged(_, let url) where newName == drop.name:
             // Saving over the dropped name replaces the Mac file, as a Mac app's
             // safe save would.
@@ -615,6 +718,68 @@ public final class DropFileServer: @unchecked Sendable {
             if let descriptor = lock.withLock({ lockFiles.removeValue(forKey: key) }) { Self.unlockAndClose(descriptor) }
         }
         return .status(0)
+    }
+
+    // MARK: Folders
+
+    /// A path strictly inside a dropped folder (not the folder itself).
+    private func inside(_ body: Data) -> String? {
+        guard let (token, path) = Self.path(body), case .inside(_, let absolute, top: false)? = resolve(token, path) else {
+            return nil
+        }
+        return absolute
+    }
+
+    private func removeDirectory(_ body: Data) async -> Reply {
+        if let (token, path) = Self.path(body), case .inside(_, _, top: true)? = resolve(token, path) { return .status(Status.ebusy) }
+        guard let path = inside(body) else { return .status(Status.eperm) }
+        return await Self.io { try Self.atParent(path) { try Self.check(unlinkat($0, $1, AT_REMOVEDIR)) }; return .status(0) }
+    }
+
+    private func makeDirectory(_ body: Data) async -> Reply {
+        guard body.count > 4, let path = inside(body.dropFirst(4)) else { return .status(Status.eperm) }
+        let mode = mode_t(FileSession.decode32(body, at: 0) & 0o7777)
+        return await Self.io {
+            try Self.atParent(path) { try Self.check(mkdirat($0, $1, mode)) }
+            return .body(try Self.anyAttributes(path).encoded())
+        }
+    }
+
+    private func makeLink(_ body: Data) async -> Reply {
+        guard body.count > 2 else { return .status(Status.einval) }
+        let length = Int(body[body.startIndex]) | Int(body[body.startIndex + 1]) << 8
+        guard length > 0, length <= Self.pathMaximum, body.count > 2 + length,
+              let target = String(data: body.subdata(in: body.startIndex + 2..<body.startIndex + 2 + length), encoding: .utf8),
+              !target.contains("\0"), let path = inside(body.dropFirst(2 + length)) else { return .status(Status.eperm) }
+        // The link is stored as given; the guest resolves it, the host never follows it.
+        return await Self.io {
+            try Self.atParent(path) { try Self.check(symlinkat(target, $0, $1)) }
+            return .body(try Self.anyAttributes(path).encoded())
+        }
+    }
+
+    private func readLink(_ body: Data) async -> Reply {
+        guard let path = inside(body) else { return .status(Status.einval) }
+        return await Self.io {
+            var buffer = [CChar](repeating: 0, count: Self.pathMaximum + 1)
+            var count = 0
+            try Self.atParent(path) { directory, name in
+                count = readlinkat(directory, name, &buffer, Self.pathMaximum)
+                try Self.check(Int32(count < 0 ? -1 : 0))
+            }
+            return .data(Data(bytes: buffer, count: count))
+        }
+    }
+
+    /// Runs `body` with the path's directory (opened without following any
+    /// link) and its last component.
+    private static func atParent(_ path: String, _ body: (Int32, String) throws -> Void) throws {
+        let url = URL(fileURLWithPath: path)
+        let name = url.lastPathComponent, parent = url.deletingLastPathComponent().path
+        let directory = Darwin.open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW_ANY)
+        try check(directory)
+        defer { Darwin.close(directory) }
+        try body(directory, name)
     }
 
     // MARK: Locks
@@ -784,6 +949,25 @@ public final class DropFileServer: @unchecked Sendable {
         return attributes(info)
     }
 
+    /// Any kind of item inside a dropped folder, never following a link.
+    private static func anyAttributes(_ path: String) throws -> Attributes {
+        var info = stat()
+        try check(fstatat(AT_FDCWD, path, &info, AT_SYMLINK_NOFOLLOW_ANY))
+        guard let attributes = anyAttributes(info) else { throw StatusError(Status.enoent) }
+        return attributes
+    }
+    private static func anyAttributes(_ info: stat) -> Attributes? {
+        let kind: Attributes.Kind
+        switch info.st_mode & S_IFMT {
+        case S_IFDIR: kind = .directory
+        case S_IFREG: kind = .file
+        case S_IFLNK: kind = .link
+        default: return nil // devices, sockets and pipes are not shared
+        }
+        return Attributes(kind: kind, mode: UInt32(info.st_mode) & 0o7777, size: UInt64(max(info.st_size, 0)),
+                          modified: info.st_mtimespec, fileID: UInt64(info.st_ino))
+    }
+
     private static func attributes(_ info: stat) -> Attributes {
         Attributes(kind: .file, mode: UInt32(info.st_mode) & 0o7777, size: UInt64(max(info.st_size, 0)),
                    modified: info.st_mtimespec, fileID: UInt64(info.st_ino))
@@ -840,13 +1024,20 @@ public final class DropFileServer: @unchecked Sendable {
         return entry
     }
 
+    /// token + a relative path whose every component is a plain name.
     private static func path(_ body: Data) -> (String, String)? {
         let bytes = Data(body)
-        guard bytes.count >= tokenLength,
+        guard bytes.count >= tokenLength, bytes.count - tokenLength <= pathMaximum,
               let token = String(data: bytes.prefix(tokenLength), encoding: .ascii),
-              let name = String(data: bytes.dropFirst(tokenLength), encoding: .utf8) else { return nil }
-        guard name.isEmpty || validName(name) else { return nil }
-        return (token, name)
+              let path = String(data: bytes.dropFirst(tokenLength), encoding: .utf8) else { return nil }
+        guard path.isEmpty || path.split(separator: "/", omittingEmptySubsequences: false).allSatisfy({ validName(String($0)) })
+        else { return nil }
+        return (token, path)
+    }
+
+    static func validPath(_ path: String) -> Bool {
+        !path.isEmpty && path.utf8.count <= pathMaximum &&
+            path.split(separator: "/", omittingEmptySubsequences: false).allSatisfy { validName(String($0)) }
     }
 
     static func validName(_ name: String) -> Bool {
@@ -872,7 +1063,7 @@ public final class DropFileServer: @unchecked Sendable {
     public enum Status {
         public static let eperm: UInt32 = 1, enoent: UInt32 = 2, eintr: UInt32 = 4, eio: UInt32 = 5
         public static let ebadf: UInt32 = 9, eagain: UInt32 = 11, eacces: UInt32 = 13, eexist: UInt32 = 17
-        public static let eisdir: UInt32 = 21, einval: UInt32 = 22
+        public static let ebusy: UInt32 = 16, eisdir: UInt32 = 21, einval: UInt32 = 22
         public static func from(_ code: Int32) -> UInt32 {
             switch code {
             case EPERM: return eperm
@@ -882,6 +1073,7 @@ public final class DropFileServer: @unchecked Sendable {
             case EAGAIN: return eagain
             case EACCES: return eacces
             case EEXIST: return eexist
+            case EBUSY: return ebusy
             case EXDEV: return 18
             case ENOTDIR: return 20
             case EISDIR: return eisdir
