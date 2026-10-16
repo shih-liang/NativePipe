@@ -24,6 +24,8 @@ public final class RemoteSession {
     public private(set) var visibleDiagnostics = ""
     private var diagnosticLines = DiagnosticLines()
     public lazy var applicationClient = ApplicationClient { [weak self] in self?.send($0) }
+    /// Dropped Mac files and folders, served in place on the remote computer.
+    public let drops = RemoteDropBridge()
     private let command: SSHCommand
     private let environment: [String: String]?
     private let executable: String
@@ -116,6 +118,9 @@ public final class RemoteSession {
             case .failed(let error): self.fail(error, token: token)
             }
         }
+        let drops = drops
+        inbound.fileSession = { drops.receive($0) }
+        drops.connect(writer: writer)
         self.inbound = inbound
         let child = Process()
         child.executableURL = URL(fileURLWithPath: executable)
@@ -233,6 +238,7 @@ public final class RemoteSession {
     }
 
     public func disconnect() {
+        drops.disconnect()
         startupTimeout?.cancel()
         startupTimeout = nil
         generation += 1
@@ -270,7 +276,7 @@ public final class RemoteSession {
                 onStateChange?(.connected)
             }
             onEvent?(event)
-        case .media, .acknowledge, .credit:
+        case .media, .acknowledge, .credit, .fileSession:
             break // Handled by this connection's reader, before UI delivery.
         case .applications(let reply):
             applicationClient.receive(reply)

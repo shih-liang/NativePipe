@@ -38,8 +38,9 @@ let targets: [Target] = [
         .target(
             name: "CNativePipeFileRPC",
             path: "common/file_rpc",
-            exclude: ["Makefile", "README.md", "tests.c", "build"],
-            sources: ["np_file_wire.c", "np_file_server.c", "np_file_service.c"],
+            exclude: ["Makefile", "README.md", "tests.c", "tests_session.c", "tests_drop.c", "build"],
+            sources: ["np_file_wire.c", "np_file_server.c", "np_file_service.c", "np_file_session.c",
+                      "np_drop_fs.c"],
             publicHeadersPath: "."
         ),
         .target(

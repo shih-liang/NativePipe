@@ -81,6 +81,7 @@ public struct SSHCommand: Codable, Sendable, Equatable {
         \(RemoteText.exports)
         \(reportStartup ? "printf 'NATIVEPIPE PHASE INSTALLING\\n' >&2" : "")
         export NATIVEPIPE_HOST_H264_HARDWARE=\(hardwareH264 ? "1" : "0")
+        export NATIVEPIPE_HOST_DROPS=1
         compositor=\(Self.quote(compositor))
         if [ "$compositor" = nativepipe-wayland ]; then
           \(prepare)

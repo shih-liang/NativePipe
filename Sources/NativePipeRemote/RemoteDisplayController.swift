@@ -37,7 +37,10 @@ public final class RemoteDisplayController {
         frames = RemoteFrameSource()
         bridge = WindowBridge(frameSource: frames)
         bridge.reportsPresentationTime = true
-        bridge.fileAccess = RemoteUserFileAccess(command: command, environment: environment)
+        let files = RemoteUserFileAccess(command: command, environment: environment)
+        // Opened in place through the remote compositor's mount when it has one.
+        files.shareFile = { [drops = session.drops] in drops.share($0) }
+        bridge.fileAccess = files
         bridge.applicationIconProvider = { [weak self] id in
             self?.applications.first(where: { $0.matches(applicationID: id) })
                 .flatMap { $0.iconData.flatMap(NSImage.init(data:)) }

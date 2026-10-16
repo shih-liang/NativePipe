@@ -3,10 +3,12 @@
 #include "compositor_internal.h"
 #include "hostlink.h"
 #include "medialink.h"
+#include "drops.h"
 #include <sys/types.h>
 struct np_remote_backend {
     struct np_host host;
     struct np_media media;
+    struct np_remote_drops drops;
     uint32_t next_media_resource_id;
     struct wl_event_source *host_connection_source;
     int output_fd;

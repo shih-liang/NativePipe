@@ -2,12 +2,15 @@ import Foundation
 
 /// SSH remains one ordered stream. Bulk records are interruptible at 16 KiB
 /// boundaries; receiver credits bound bytes hidden inside SSH/TCP buffers.
-/// Control records never wait for bulk credits. Files use separate SSH/SFTP.
+/// Control records never wait for bulk credits. File transfers use separate
+/// SSH/SFTP; the drop filesystem's NPFR v2 session rides the bulk lane as NPFS
+/// records, in order, once the remote compositor has spoken first.
 public enum RemoteWire {
     public static let fragmentSize = 16 * 1024
     public static let initialWindowSize = 65536
     public static let fragmentMagic = Data("NPRF".utf8)
     public static let acknowledgementMagic = Data("NPRA".utf8)
+    public static let fileSessionMagic = Data("NPFS".utf8)
 
     public static func acknowledgement(_ count: Int) -> Data {
         var bytes = acknowledgementMagic

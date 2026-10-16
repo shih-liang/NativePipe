@@ -123,3 +123,167 @@ WRITE updates an explicitly requested destination directly. On interruption it
 reports failure; a partial destination may remain. It never deletes a path it
 did not create. Bootstrap installation retains its existing adjacent staging
 and rename so a failed update cannot replace the running executable.
+
+## NPFR v2 sessions
+
+`np_file_session.c` (C, guest) and `FileSession.swift` (host) implement one
+long-lived, full-duplex connection carrying many concurrent streams. It is a
+transport only; operations are defined by the users of its opcodes. v1 above is
+unchanged and keeps serving recovery, bootstrap and transfers.
+
+The guest keeps listening (vsock 1031, host CID only); the host connects. After
+that either side opens streams and sends notifications. Host-opened stream IDs
+are even, guest-opened IDs odd; 0 is the connection. IDs only increase.
+
+The 16-byte header is `NP2F`, type:u8, flags:u8, reserved:u16 (zero),
+stream_id:u32, length:u32 (at most 65536), all little-endian.
+
+| Type | Stream | Payload |
+| --- | --- | --- |
+| HELLO=1 | 0 | version:u8 = 2, role:u8 (host 0, guest 1), reserved:u16, capabilities:u32. First frame from each side; the roles must differ. |
+| REQUEST=2 | new | opcode:u16, reserved:u16, body. Opens the stream. |
+| RESPONSE=3 | existing | status:u32, body. Exactly once from the responder, before its DATA. |
+| DATA=4 | existing | bytes. Counts against credit. Empty DATA only carries END. |
+| NOTIFY=5 | 0 | opcode:u16, reserved:u16, body. |
+| CANCEL=6 | existing | empty. Abandons both directions; queued data is dropped. |
+| CREDIT=7 | 0 or existing | increment:u32 (nonzero). |
+
+Only REQUEST, RESPONSE and DATA may set END_STREAM (flag 1), which finishes
+the sender's half. A stream is complete when both halves ended or either side
+cancelled; dropping the last local reference to an unfinished stream cancels it.
+
+Flow control: each direction of a stream starts with 256 KiB of credit and the
+connection with 4 MiB; DATA consumes both. A receiver returns credit as the
+application consumes data, so memory per stream and per connection is bounded.
+A stalled reader holds at most its stream's window, so other streams keep
+moving until stalled streams fill the connection window (16 full streams). Exceeding credit,
+out-of-order or wrong-parity IDs, a second RESPONSE, DATA after END or before
+RESPONSE, and unknown types or flags end the session with EPROTO. Frames for a
+stream that is already gone are dropped, with connection credit returned.
+
+Frames are written whole. Control frames (everything except DATA) overtake
+queued DATA. The C reader thread never writes, so two peers with full socket
+buffers cannot deadlock; frames it originates go through a writer thread.
+Cancelling or releasing a stream only queues its CANCEL, so it never blocks.
+Request and notification callbacks run on the reader and must not block or
+close the session. A peer accepts at most 256 concurrent inbound streams and
+cancels the rest; a peer that lets 65536 queued control frames (credit and
+refusals) accumulate without reading is dropped with ENOBUFS.
+
+`make test` runs `tests_session.c` over socketpairs; the Swift
+`FileSessionTests` also exercise Swift↔C in both roles.
+
+## Drop files
+
+Mac files dropped on a Linux window are served to the guest as a FUSE
+filesystem instead of being copied. `np_drop_fs.c` is the guest's FUSE request
+handler; `np_drop_service.c` (Linux only, linked into the compositor) runs it;
+`DropFileServer.swift` answers on the host. Both sides use NPFR v2 on port 1031.
+
+**Mount.** The compositor runs as the session's ordinary user, so it asks guestd
+over `/run/nativepipe/drops.sock` (`NPDM`). guestd reads the caller's UID/GID
+with `SO_PEERCRED`, mounts `fuse` at `/run/nativepipe/drops/<uid>` (root-owned
+directories, `nosuid,nodev`, `user_id`/`group_id` of the caller,
+`default_permissions`, no `allow_other`) and passes the `/dev/fuse` descriptor
+back with `SCM_RIGHTS`, followed by the mount path. The newest request replaces
+an older mount for that user, so a restarted compositor takes over. Root is
+refused. No descriptor or mount point is ever placed in a user-writable path.
+
+**Names.** The guest sees `<mount>/<token>/<name>`: one directory per drop,
+named by a random UUID, containing only the dropped item. The host maps the
+token to the dropped path and the name must match it exactly. A dropped folder
+is served as itself: `<mount>/<token>/<folder>/sub/file` resolves beneath the
+folder's real path with `O_NOFOLLOW_ANY`/`AT_SYMLINK_NOFOLLOW_ANY`, so no
+symbolic link inside it leads out; links are shown and created as links and
+resolved by the guest. The folder itself cannot be removed or renamed from
+Linux, and forgetting the drop never touches it.
+
+**Requests** (guest to host; statuses are Linux errno values, mapped on the host).
+"path" is token (36 bytes) + name, where an empty name means the token's directory:
+
+| Opcode | Body | Response |
+| --- | --- | --- |
+| LOOKUP=1 | path | attributes |
+| LIST=2 | start:u32, then nothing (all tokens) or path | DATA: name_length:u16, name, attributes, repeated, from position `start`; at most 2048 per answer |
+| OPEN=3 | flags:u32 (Linux open flags), path | handle:u64, attributes |
+| READ=4 | handle:u64, offset:u64, length:u32 (at most 1 MiB) | DATA with the bytes; short at EOF |
+| RELEASE=5 | handle:u64 | empty |
+| WRITE=6 | handle:u64, offset:u64; then DATA with the bytes (at most 1 MiB) | written:u32 |
+| SETATTR=7 | valid:u32 (FUSE FATTR_* bits), mode:u32, size:u64, atime:i64+u32, mtime:i64+u32, handle:u64, path | attributes |
+| CREATE=8 | flags:u32, mode:u32, path | handle:u64, attributes |
+| UNLINK=9 | path | empty |
+| RENAME=10 | flags:u32 (NOREPLACE 1), old_length:u16, token, old name, new name | empty |
+| FSYNC=11 | handle:u64 | empty |
+| FLUSH=12 | handle:u64, owner:u64 | empty; ends the owner's POSIX locks on the file |
+| GETLK=13 | handle, owner, start, end (u64 each; inclusive, INT64_MAX = to the end), type:u32 (F_RDLCK 0, F_WRLCK 1, F_UNLCK 2), flags:u32 | start:u64, end:u64, type:u32, pid:u32 |
+| SETLK=14 | as GETLK; flags: FLOCK 1 (a flock(2) lock), WAIT 2 (block until granted) | empty |
+| RMDIR=15 | path | empty |
+| MKDIR=16 | mode:u32, path | attributes |
+| SYMLINK=17 | target_length:u16, target, path | attributes |
+| READLINK=18 | path | DATA with the target |
+
+Attributes are 40 bytes: kind:u8 (1 directory, 2 file, 3 symbolic link), reserved:3, mode:u32
+(permission bits), size:u64, mtime_seconds:i64, mtime_nanoseconds:u32,
+reserved:u32, file_id:u64. SETATTR with only the handle bit is fstat of that
+open file. The guest sends NOTIFY MOUNTED=1 with its mount path when the host
+connects; the host builds guest URLs from it.
+
+**Semantics.** The host behaves like any second Mac app with the file open: the
+identity is the path. LOOKUP and OPEN look at the path each time; a handle keeps
+the file it opened, so after an atomic save it still reads the old contents
+while a new open gets the new file. FUSE entry and attribute timeouts are zero
+and opens do not keep the page cache, so the guest sees host changes on its next
+stat or open. Handles belong to their session and close with it; drops outlive
+sessions so a compositor restart keeps them.
+
+Writes follow POSIX, not any application's save strategy:
+
+- Writing through a handle writes the Mac file. O_TRUNC and SETATTR sizes truncate it.
+- Other names in a drop's directory (temporary files, backups) are files the
+  guest created; the host keeps them in a private staging directory, never in
+  the Mac folder, and deletes them with the drop.
+- RENAME of such a file onto the dropped name replaces the Mac file, as a Mac
+  app's safe save does (`replaceItemAt`, or an in-place copy when the item
+  cannot be replaced; a Mac file deleted meanwhile is recreated).
+- RENAME of the dropped name to another name gives that name a copy and hides
+  the dropped name; the Mac file stays where it is. Creating the dropped name
+  again then writes the Mac file from empty (vim's rename-and-write save).
+- UNLINK of the dropped name only hides it from the guest; the Mac file stays.
+- Renames stay within one drop (EXDEV otherwise); RENAME_EXCHANGE, hard links
+  and special files are refused. A single-file drop's directory holds plain
+  files only; inside a dropped folder, files, folders and links are created,
+  renamed and removed in the Mac folder itself.
+
+Locks are real on the Mac side, so Mac and Linux programs that lock exclude each
+other. POSIX locks become open-file-description locks on a descriptor per guest
+lock owner and file, giving POSIX ownership (any number of opens, one owner);
+FLUSH, which the kernel sends on every close(2), releases them. flock(2) locks
+are taken on the handle's own descriptor and end with it. A waiting SETLK polls
+until granted; FUSE INTERRUPT cancels the stream and the guest answers EINTR.
+Blocking lock requests run on their own threads in the guest service.
+
+**Remote computers.** The remote compositor runs the same handler. Without
+root it mounts at `$XDG_RUNTIME_DIR/nativepipe-drops` the way libfuse does: the
+system's setuid `fusermount3` (or `fusermount`) opens `/dev/fuse`, mounts and
+passes the descriptor back over `_FUSE_COMMFD`; it runs only for the mount. The
+NPFR v2 session has no connection of its own: its bytes ride the existing SSH
+stream as `NPFS` records (`NPIP` payload `"NPFS"` + session bytes) on the
+credit-paced bulk lane, in order, in both directions. The Mac asks for this with
+`NATIVEPIPE_HOST_DROPS=1` in the launch script, and the remote speaks first, so
+neither side sends an `NPFS` record to a peer that would not understand it.
+Without `fusermount` or `/dev/fuse` the remote never announces a mount and
+drops are copied over SFTP as before.
+
+**Lifetime.** The host tracks, per drop, how many guest handles are open and
+when one last opened or closed. `inventory()` lists drops for the Storage page;
+`reclaim(idleLimit:stagedLimit:)` forgets drops nothing has had open for the
+idle limit, then the least recently used idle ones while files created beside
+drops exceed the staging limit; `removeIdle()` is the "Clear Unused" action. A
+drop with an open handle is never reclaimed. A forgotten drop simply stops
+resolving: with zero FUSE timeouts the guest's next lookup gets ENOENT, so no
+revocation message is needed. LinPortal reclaims every minute with a 30-minute
+idle limit and a 2 GiB staging limit.
+
+`make test` runs `tests_drop.c` (the FUSE handler against a mock host); the
+Swift `DropFileServerTests` cover the host (writes, safe saves, backups, locks
+against Mac programs) and drive the C handler end to end.

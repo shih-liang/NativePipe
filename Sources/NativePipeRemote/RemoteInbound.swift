@@ -20,6 +20,8 @@ final class RemoteInbound: @unchecked Sendable {
     private var pending: [(event: Event, bytes: Int)] = []
     private var bytes = 0
     private var notificationInbox = GuestNotificationInbox()
+    /// Drop-file session bytes go straight to their bridge on the reader.
+    var fileSession: (@Sendable (Data) -> Void)?
 
     init(writer: WindowCommandWriter,
          media: (@Sendable (MediaWire.Header, Data) -> Bool)?,
@@ -36,6 +38,11 @@ final class RemoteInbound: @unchecked Sendable {
         switch packet {
         case .acknowledge(let count): writer.acknowledgeRemoteBytes(count, received: true)
         case .credit(let count): writer.acknowledgeRemoteBytes(count, received: false)
+        case .fileSession(let bytes):
+            let sink = fileSession
+            lock.unlock()
+            sink?(bytes)
+            return true
         case .media(let header, let data):
             if media?(header, data) == false {
                 failLocked(RemoteError.message(NPText("Remote media was rejected by the decoder.")))
