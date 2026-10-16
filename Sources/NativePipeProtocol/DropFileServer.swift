@@ -95,6 +95,10 @@ public final class DropFileServer: @unchecked Sendable {
         let staging: URL
         /// The guest unlinked or renamed away the dropped name; the Mac file stays.
         var hidden = false
+        /// Guest handles open on this drop's files, and when one last opened or
+        /// closed; reclamation only considers drops nothing has open.
+        var openFiles = 0
+        var lastUsed = Date()
         init(url: URL, name: String, created: timespec, scoped: Bool, staging: URL) {
             self.url = url; self.name = name; self.created = created; self.scoped = scoped; self.staging = staging
         }
@@ -121,10 +125,11 @@ public final class DropFileServer: @unchecked Sendable {
         let descriptor: Int32
         let path: String
         let accessMode: Int32
+        let drop: Drop
         var users = 0
         var released = false
-        init(_ descriptor: Int32, path: String, accessMode: Int32) {
-            self.descriptor = descriptor; self.path = path; self.accessMode = accessMode
+        init(_ descriptor: Int32, path: String, accessMode: Int32, drop: Drop) {
+            self.descriptor = descriptor; self.path = path; self.accessMode = accessMode; self.drop = drop
         }
     }
     /// A guest lock owner's POSIX locks on one file, as OFD locks on one descriptor.
@@ -228,6 +233,76 @@ public final class DropFileServer: @unchecked Sendable {
         try? FileManager.default.removeItem(at: stagingRoot)
     }
 
+    // MARK: Inventory and reclamation
+
+    /// One drop, as the Storage page lists it.
+    public struct DropInfo: Sendable, Equatable {
+        public var token: String
+        public var name: String
+        public var source: URL
+        /// Guest handles currently open on the drop's files.
+        public var openFiles: Int
+        /// When a guest handle last opened or closed (or the drop was made).
+        public var lastUsed: Date
+        /// Space used by files Linux apps created beside the drop.
+        public var stagedBytes: UInt64
+    }
+
+    public func inventory() -> [DropInfo] {
+        let all: [(String, Drop, Int, Date)] = lock.withLock {
+            drops.map { ($0.key, $0.value, $0.value.openFiles, $0.value.lastUsed) }
+        }
+        return all.map { token, drop, open, used in
+            DropInfo(token: token, name: drop.name, source: drop.url, openFiles: open, lastUsed: used,
+                     stagedBytes: Self.allocatedBytes(drop.staging))
+        }.sorted { $0.lastUsed > $1.lastUsed }
+    }
+
+    /// Removes drops nothing has had open for `idleLimit`, then, while files
+    /// created beside drops use more than `stagedLimit`, the least recently
+    /// used idle ones. A drop a guest program has open is never removed.
+    /// Returns the removed tokens.
+    @discardableResult
+    public func reclaim(idleLimit: TimeInterval, stagedLimit: UInt64, now: Date = Date()) -> [String] {
+        var removed: [String] = []
+        let items = inventory()
+        var staged = items.reduce(UInt64(0)) { $0 + $1.stagedBytes }
+        for item in items.sorted(by: { $0.lastUsed < $1.lastUsed }) where item.openFiles == 0 {
+            let expired = now.timeIntervalSince(item.lastUsed) >= idleLimit
+            guard expired || staged > stagedLimit else { continue }
+            if removeIfIdle(item.token) {
+                removed.append(item.token)
+                staged -= min(staged, item.stagedBytes)
+            }
+        }
+        return removed
+    }
+
+    /// Removes every drop nothing has open (the Storage page's "Clear").
+    @discardableResult
+    public func removeIdle() -> [String] {
+        inventory().filter { $0.openFiles == 0 }.compactMap { removeIfIdle($0.token) ? $0.token : nil }
+    }
+
+    private func removeIfIdle(_ token: String) -> Bool {
+        guard let drop: Drop = lock.withLock({
+            guard let drop = drops[token], drop.openFiles == 0 else { return nil }
+            drops[token] = nil
+            return drop
+        }) else { return false }
+        forget(drop)
+        return true
+    }
+
+    private static func allocatedBytes(_ directory: URL) -> UInt64 {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
+        return names.reduce(UInt64(0)) { total, name in
+            var info = stat()
+            guard lstat(directory.appendingPathComponent(name).path, &info) == 0 else { return total }
+            return total + UInt64(max(info.st_blocks, 0)) * 512
+        }
+    }
+
     private func forget(_ drop: Drop) {
         if drop.scoped { drop.url.stopAccessingSecurityScopedResource() }
         try? FileManager.default.removeItem(at: drop.staging)
@@ -329,7 +404,7 @@ public final class DropFileServer: @unchecked Sendable {
         guard body.count >= 4, let (token, name) = Self.path(body.dropFirst(4)) else { return .status(Status.einval) }
         guard let target = resolve(token, name) else { return .status(Status.enoent) }
         guard let path = target.path else { return .status(Status.eisdir) }
-        return await openFile(path, flags: Self.openFlags(FileSession.decode32(body, at: 0)), mode: 0)
+        return await openFile(path, flags: Self.openFlags(FileSession.decode32(body, at: 0)), mode: 0, drop: target.drop)
     }
 
     private func create(_ body: Data) async -> Reply {
@@ -346,16 +421,16 @@ public final class DropFileServer: @unchecked Sendable {
             // an open; after the guest removed it, the name starts out empty again.
             let hidden = lock.withLock { drop.hidden }
             if hidden { flags = (flags & ~O_EXCL) | O_TRUNC }
-            let reply = await openFile(drop.url.path, flags: flags, mode: mode)
+            let reply = await openFile(drop.url.path, flags: flags, mode: mode, drop: drop)
             if case .body = reply { lock.withLock { drop.hidden = false } }
             return reply
         }
         do { try FileManager.default.createDirectory(at: drop.staging, withIntermediateDirectories: true) }
         catch { return .status(Status.eio) }
-        return await openFile(drop.staging.appendingPathComponent(name).path, flags: flags | O_NOFOLLOW, mode: mode)
+        return await openFile(drop.staging.appendingPathComponent(name).path, flags: flags | O_NOFOLLOW, mode: mode, drop: drop)
     }
 
-    private func openFile(_ path: String, flags: Int32, mode: mode_t) async -> Reply {
+    private func openFile(_ path: String, flags: Int32, mode: mode_t, drop: Drop) async -> Reply {
         let opened: Reply = await Self.io {
             let descriptor = Darwin.open(path, flags | O_CLOEXEC | O_NONBLOCK, mode)
             try Self.check(descriptor)
@@ -374,7 +449,8 @@ public final class DropFileServer: @unchecked Sendable {
             // A handle belongs to the session that opened it.
             guard session != nil else { return nil }
             let handle = nextHandle; nextHandle += 1
-            handles[handle] = OpenFile(descriptor, path: path, accessMode: flags & O_ACCMODE)
+            handles[handle] = OpenFile(descriptor, path: path, accessMode: flags & O_ACCMODE, drop: drop)
+            drop.openFiles += 1; drop.lastUsed = Date()
             return handle
         }
         guard let handle else { Darwin.close(descriptor); return .status(Status.eio) }
@@ -660,7 +736,11 @@ public final class DropFileServer: @unchecked Sendable {
 
     private func release(_ body: Data) -> Reply {
         guard body.count == 8 else { return .status(Status.einval) }
-        guard let file = lock.withLock({ handles.removeValue(forKey: u64(body, 0)) }) else { return .status(Status.ebadf) }
+        guard let file: OpenFile = lock.withLock({
+            let file = handles.removeValue(forKey: u64(body, 0))
+            if let file { file.drop.openFiles -= 1; file.drop.lastUsed = Date() }
+            return file
+        }) else { return .status(Status.ebadf) }
         releaseFile(file)
         return .status(0)
     }
@@ -677,6 +757,8 @@ public final class DropFileServer: @unchecked Sendable {
     private func closeHandles() {
         let (files, locks): ([OpenFile], [Int32]) = lock.withLock {
             defer { handles.removeAll(); lockFiles.removeAll() }
+            let now = Date()
+            for file in handles.values { file.drop.openFiles -= 1; file.drop.lastUsed = now }
             return (Array(handles.values), Array(lockFiles.values))
         }
         locks.forEach(Self.unlockAndClose)

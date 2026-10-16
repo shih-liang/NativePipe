@@ -277,6 +277,55 @@ final class DropFileServerTests: XCTestCase {
         try await expect(guest, Opcode.unlink, path(token, "doc.txt"), Status.enoent)
     }
 
+    // MARK: Reclamation
+
+    func testIdleDropsAreReclaimedButOpenOnesNever() async throws {
+        let staging = directory.appendingPathComponent("staging")
+        let server = DropFileServer(stagingDirectory: staging)
+        let guest = try await connect(server)
+        defer { guest.close(); server.detach() }
+        _ = try XCTUnwrap(server.share(try write("a.txt", "a")))
+        let token = try XCTUnwrap(server.tokens.first)
+        let handle = try await open(guest, token, "a.txt")
+        XCTAssertEqual(server.inventory().first?.openFiles, 1)
+
+        let later = Date().addingTimeInterval(3600)
+        XCTAssertEqual(server.reclaim(idleLimit: 60, stagedLimit: 0, now: later), [], "an open drop stays")
+        XCTAssertEqual(server.removeIdle(), [])
+        try await expect(guest, Opcode.release, encode64(handle), 0)
+        XCTAssertEqual(server.inventory().first?.openFiles, 0)
+        XCTAssertEqual(server.reclaim(idleLimit: 60, stagedLimit: .max), [], "not idle long enough yet")
+        XCTAssertEqual(server.reclaim(idleLimit: 60, stagedLimit: .max, now: later), [token])
+        XCTAssertEqual(server.tokens, [])
+        try await expect(guest, Opcode.lookup, path(token, ""), Status.enoent)
+    }
+
+    func testStagedSpaceLimitReclaimsTheLeastRecentlyUsedIdleDrops() async throws {
+        let staging = directory.appendingPathComponent("staging")
+        let server = DropFileServer(stagingDirectory: staging)
+        let guest = try await connect(server)
+        defer { guest.close(); server.detach() }
+        var tokens: [String] = []
+        for name in ["old.txt", "new.txt"] {
+            _ = try XCTUnwrap(server.share(try write(name, name)))
+            let token = try XCTUnwrap(Set(server.tokens).subtracting(tokens).first)
+            tokens.append(token)
+            let created = try await create(guest, token, "." + name + ".swp")
+            let temporary = try XCTUnwrap(created)
+            _ = try await write(guest, temporary, offset: 0, Data(count: 200_000))
+            try await expect(guest, Opcode.release, encode64(temporary), 0)
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let items = server.inventory()
+        XCTAssertEqual(items.map(\.token), tokens.reversed(), "most recently used first")
+        let perDrop = try XCTUnwrap(items.first?.stagedBytes)
+        XCTAssertGreaterThanOrEqual(perDrop, 200_000)
+        XCTAssertEqual(server.reclaim(idleLimit: 3600, stagedLimit: perDrop + 1), [tokens[0]])
+        XCTAssertEqual(server.tokens, [tokens[1]])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: staging.appendingPathComponent(tokens[0]).path))
+        XCTAssertEqual(server.removeIdle(), [tokens[1]])
+    }
+
     // MARK: Locks
 
     private enum LockType { static let read: UInt32 = 0, write: UInt32 = 1, unlock: UInt32 = 2 }

@@ -251,6 +251,16 @@ are taken on the handle's own descriptor and end with it. A waiting SETLK polls
 until granted; FUSE INTERRUPT cancels the stream and the guest answers EINTR.
 Blocking lock requests run on their own threads in the guest service.
 
+**Lifetime.** The host tracks, per drop, how many guest handles are open and
+when one last opened or closed. `inventory()` lists drops for the Storage page;
+`reclaim(idleLimit:stagedLimit:)` forgets drops nothing has had open for the
+idle limit, then the least recently used idle ones while files created beside
+drops exceed the staging limit; `removeIdle()` is the "Clear Unused" action. A
+drop with an open handle is never reclaimed. A forgotten drop simply stops
+resolving: with zero FUSE timeouts the guest's next lookup gets ENOENT, so no
+revocation message is needed. LinPortal reclaims every minute with a 30-minute
+idle limit and a 2 GiB staging limit.
+
 `make test` runs `tests_drop.c` (the FUSE handler against a mock host); the
 Swift `DropFileServerTests` cover the host (writes, safe saves, backups, locks
 against Mac programs) and drive the C handler end to end.
