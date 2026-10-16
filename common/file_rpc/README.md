@@ -190,8 +190,13 @@ an older mount for that user, so a restarted compositor takes over. Root is
 refused. No descriptor or mount point is ever placed in a user-writable path.
 
 **Names.** The guest sees `<mount>/<token>/<name>`: one directory per drop,
-named by a random UUID, containing only that file. The host maps the token to
-the dropped path and the name must match it exactly.
+named by a random UUID, containing only the dropped item. The host maps the
+token to the dropped path and the name must match it exactly. A dropped folder
+is served as itself: `<mount>/<token>/<folder>/sub/file` resolves beneath the
+folder's real path with `O_NOFOLLOW_ANY`/`AT_SYMLINK_NOFOLLOW_ANY`, so no
+symbolic link inside it leads out; links are shown and created as links and
+resolved by the guest. The folder itself cannot be removed or renamed from
+Linux, and forgetting the drop never touches it.
 
 **Requests** (guest to host; statuses are Linux errno values, mapped on the host).
 "path" is token (36 bytes) + name, where an empty name means the token's directory:
@@ -199,7 +204,7 @@ the dropped path and the name must match it exactly.
 | Opcode | Body | Response |
 | --- | --- | --- |
 | LOOKUP=1 | path | attributes |
-| LIST=2 | empty (all tokens) or token | DATA: name_length:u16, name, attributes, repeated |
+| LIST=2 | start:u32, then nothing (all tokens) or path | DATA: name_length:u16, name, attributes, repeated, from position `start`; at most 2048 per answer |
 | OPEN=3 | flags:u32 (Linux open flags), path | handle:u64, attributes |
 | READ=4 | handle:u64, offset:u64, length:u32 (at most 1 MiB) | DATA with the bytes; short at EOF |
 | RELEASE=5 | handle:u64 | empty |
@@ -212,8 +217,12 @@ the dropped path and the name must match it exactly.
 | FLUSH=12 | handle:u64, owner:u64 | empty; ends the owner's POSIX locks on the file |
 | GETLK=13 | handle, owner, start, end (u64 each; inclusive, INT64_MAX = to the end), type:u32 (F_RDLCK 0, F_WRLCK 1, F_UNLCK 2), flags:u32 | start:u64, end:u64, type:u32, pid:u32 |
 | SETLK=14 | as GETLK; flags: FLOCK 1 (a flock(2) lock), WAIT 2 (block until granted) | empty |
+| RMDIR=15 | path | empty |
+| MKDIR=16 | mode:u32, path | attributes |
+| SYMLINK=17 | target_length:u16, target, path | attributes |
+| READLINK=18 | path | DATA with the target |
 
-Attributes are 40 bytes: kind:u8 (1 directory, 2 file), reserved:3, mode:u32
+Attributes are 40 bytes: kind:u8 (1 directory, 2 file, 3 symbolic link), reserved:3, mode:u32
 (permission bits), size:u64, mtime_seconds:i64, mtime_nanoseconds:u32,
 reserved:u32, file_id:u64. SETATTR with only the handle bit is fstat of that
 open file. The guest sends NOTIFY MOUNTED=1 with its mount path when the host
@@ -240,8 +249,10 @@ Writes follow POSIX, not any application's save strategy:
   the dropped name; the Mac file stays where it is. Creating the dropped name
   again then writes the Mac file from empty (vim's rename-and-write save).
 - UNLINK of the dropped name only hides it from the guest; the Mac file stays.
-- Renames stay within one drop's directory (EXDEV otherwise); RENAME_EXCHANGE,
-  directories, links and special files are refused.
+- Renames stay within one drop (EXDEV otherwise); RENAME_EXCHANGE, hard links
+  and special files are refused. A single-file drop's directory holds plain
+  files only; inside a dropped folder, files, folders and links are created,
+  renamed and removed in the Mac folder itself.
 
 Locks are real on the Mac side, so Mac and Linux programs that lock exclude each
 other. POSIX locks become open-file-description locks on a descriptor per guest
@@ -250,6 +261,18 @@ FLUSH, which the kernel sends on every close(2), releases them. flock(2) locks
 are taken on the handle's own descriptor and end with it. A waiting SETLK polls
 until granted; FUSE INTERRUPT cancels the stream and the guest answers EINTR.
 Blocking lock requests run on their own threads in the guest service.
+
+**Remote computers.** The remote compositor runs the same handler. Without
+root it mounts at `$XDG_RUNTIME_DIR/nativepipe-drops` the way libfuse does: the
+system's setuid `fusermount3` (or `fusermount`) opens `/dev/fuse`, mounts and
+passes the descriptor back over `_FUSE_COMMFD`; it runs only for the mount. The
+NPFR v2 session has no connection of its own: its bytes ride the existing SSH
+stream as `NPFS` records (`NPIP` payload `"NPFS"` + session bytes) on the
+credit-paced bulk lane, in order, in both directions. The Mac asks for this with
+`NATIVEPIPE_HOST_DROPS=1` in the launch script, and the remote speaks first, so
+neither side sends an `NPFS` record to a peer that would not understand it.
+Without `fusermount` or `/dev/fuse` the remote never announces a mount and
+drops are copied over SFTP as before.
 
 **Lifetime.** The host tracks, per drop, how many guest handles are open and
 when one last opened or closed. `inventory()` lists drops for the Storage page;

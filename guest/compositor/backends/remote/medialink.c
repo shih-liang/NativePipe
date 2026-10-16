@@ -239,6 +239,17 @@ bool np_media_send_binary(struct np_media *m, const void *payload, size_t length
         return send_binary(m, 2, payload, length);
     return send_binary(m, length > 1024 ? 2 : 0, payload, length);
 }
+bool np_media_send_background(struct np_media *m, const void *payload, size_t length)
+{
+    return send_binary(m, 2, payload, length);
+}
+size_t np_media_queued_bytes(struct np_media *m)
+{
+    pthread_mutex_lock(&m->lock);
+    size_t bytes = m->queued_bytes;
+    pthread_mutex_unlock(&m->lock);
+    return bytes;
+}
 bool np_media_send_display(struct np_media *m, const void *payload, size_t length)
 {
     if (np_notification_payload(payload, length)) return np_media_send_notification(m, payload, length);

@@ -54,9 +54,11 @@ static bool remote_command(const unsigned char *bytes, size_t size, void *data)
         if (b->input_offset != total) return true;
         unsigned char *record = b->input_record;
         b->input_record = NULL; b->input_offset = b->input_size = 0;
-        bool ok = total >= 12 && !memcmp(record, "NPIP\1\0\0\0", 8) &&
-            get32(record + 8) == total - 12 &&
-            np_applications_handle_command(record + 12, total - 12, server);
+        bool framed = total >= 12 && !memcmp(record, "NPIP\1\0\0\0", 8) && get32(record + 8) == total - 12;
+        /* Drop-file session bytes arrive in order on this one bulk lane. */
+        bool ok = framed && (total >= 16 && !memcmp(record + 12, "NPFS", 4)
+            ? np_remote_drops_receive(&b->drops, record + 16, total - 16)
+            : np_applications_handle_command(record + 12, total - 12, server));
         free(record);
         return ok;
     }
@@ -135,6 +137,9 @@ void np_backend_session_attach(struct np_server *server, struct wl_event_loop *l
         server->terminate = true; return;
     }
     np_presentation_time_clock_request(server);
+    /* Only a host that understands NPFS records asks for drops. */
+    const char *drops = getenv("NATIVEPIPE_HOST_DROPS");
+    if (drops && !strcmp(drops, "1")) (void)np_remote_drops_start(&b->drops, &b->media);
 
     if (!b->command) return;
     posix_spawn_file_actions_t actions;
@@ -183,6 +188,7 @@ void np_backend_session_finish(struct np_server *server)
         (void)waitpid(b->application_pid, NULL, WNOHANG);
     }
     np_remote_finish_scenes(server);
+    np_remote_drops_stop(&b->drops);
     np_media_finish(&b->media);
     if (b->application_fd >= 0) { close(b->application_fd); b->application_fd = -1; }
     np_host_finish(&b->host);

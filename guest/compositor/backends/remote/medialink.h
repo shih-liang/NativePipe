@@ -32,6 +32,9 @@ void np_media_wake(struct np_media *media);
 bool np_media_send_binary(struct np_media *media, const void *payload, size_t length);
 bool np_media_send_display(struct np_media *media, const void *payload, size_t length);
 bool np_media_send_notification(struct np_media *media, const void *payload, size_t length);
+/* Always the credit-paced background lane, so records keep their order. */
+bool np_media_send_background(struct np_media *media, const void *payload, size_t length);
+size_t np_media_queued_bytes(struct np_media *media);
 bool np_media_send(struct np_media *media, uint8_t codec, uint8_t flags,
     uint32_t surface_id, uint32_t resource_id, uint16_t width, uint16_t height,
     uint64_t pts_ns, uint16_t epoch, const uint8_t *payload, uint32_t length);

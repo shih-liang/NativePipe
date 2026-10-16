@@ -12,6 +12,8 @@ struct RemoteStreamDecoder {
         case applications(ApplicationReply)
         case acknowledge(Int)
         case credit(Int)
+        /// Bytes of the drop filesystem's NPFR v2 session, in order.
+        case fileSession(Data)
     }
     private var buffer = Data()
     private var ready = false
@@ -51,6 +53,9 @@ struct RemoteStreamDecoder {
         packetBytes = payload.count
         if payload.prefix(4) == ApplicationReply.magic, ready {
             return .applications(try ApplicationReply.decode(payload))
+        }
+        if payload.prefix(4) == RemoteWire.fileSessionMagic, ready {
+            return .fileSession(Data(payload.dropFirst(4)))
         }
         let event = try WindowWire.guestEvent(from: payload)
         if case .channelReady = event {

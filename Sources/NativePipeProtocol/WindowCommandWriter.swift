@@ -62,6 +62,10 @@ public final class WindowCommandWriter: @unchecked Sendable {
     private let remote: Bool
     private var bulk: Data?
     private var bulkOffset = 0
+    /// Whole records waiting for the bulk lane, sent in order: a record is
+    /// never interleaved with another, which the remote reassembles one at a time.
+    private var bulkQueue: [Data] = []
+    private var bulkQueueBytes = 0
     private var flow = RemoteWire.FlowControl()
     private var receivedBytes = 0
     private var remoteFeedback: [Data] = []
@@ -95,8 +99,30 @@ public final class WindowCommandWriter: @unchecked Sendable {
         head = 0
         writerScheduled = false
         bulk = nil; bulkOffset = 0; flow = .init(); receivedBytes = 0; remoteFeedback.removeAll()
+        bulkQueue.removeAll(); bulkQueueBytes = 0
         lock.unlock()
         try? old?.close()
+    }
+
+    /// Sends drop-file session bytes as one NPFS record on the bulk lane.
+    /// Returns false once disconnected; `fileSessionBacklog` paces the caller.
+    @discardableResult
+    public func sendFileSession(_ bytes: Data) -> Bool {
+        guard remote, let record = try? WireFormat.frame(payload: RemoteWire.fileSessionMagic + bytes) else { return false }
+        lock.lock()
+        guard handle != nil else { lock.unlock(); return false }
+        bulkQueue.append(record); bulkQueueBytes += record.count
+        let schedule = !writerScheduled
+        writerScheduled = true
+        lock.unlock()
+        if schedule { queue.async { self.drain() } }
+        return true
+    }
+
+    /// Bulk bytes not yet on the wire.
+    public var fileSessionBacklog: Int {
+        lock.lock(); defer { lock.unlock() }
+        return bulkQueueBytes + (bulk.map { $0.count - bulkOffset } ?? 0)
     }
 
     public func disconnect() {
@@ -108,6 +134,7 @@ public final class WindowCommandWriter: @unchecked Sendable {
         head = 0
         writerScheduled = false
         bulk = nil; bulkOffset = 0; flow = .init(); receivedBytes = 0; remoteFeedback.removeAll()
+        bulkQueue.removeAll(); bulkQueueBytes = 0
         lock.unlock()
         try? old?.close()
     }
@@ -300,6 +327,10 @@ public final class WindowCommandWriter: @unchecked Sendable {
             return nil
         }
         if remote { compactConsumed() }
+        if bulk == nil, !bulkQueue.isEmpty {
+            bulk = bulkQueue.removeFirst(); bulkOffset = 0
+            bulkQueueBytes -= bulk!.count
+        }
         let index = bulk == nil ? (head < pending.count ? head : nil) : pending.firstIndex {
             if case .hostSelectionData = $0 { return false }
             return true
@@ -380,7 +411,7 @@ public final class WindowCommandWriter: @unchecked Sendable {
                     if remote, case .hostSelectionData = command, payload.count > RemoteWire.fragmentSize {
                         let record = try WireFormat.frame(payload: payload)
                         lock.lock()
-                        if self.handle === owner { bulk = record; bulkOffset = 0 }
+                        if self.handle === owner { bulkQueue.append(record); bulkQueueBytes += record.count }
                         lock.unlock()
                         continue
                     }

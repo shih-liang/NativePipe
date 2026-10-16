@@ -93,7 +93,7 @@ VM_SOURCES := backends/vmpipe/backend.c backends/vmpipe/host_session.c \
 	backends/vmpipe/vk_surface_buffer.c backends/vmpipe/presentation.c \
 	backends/vmpipe/scene.c linux-drm-syncobj-v1-protocol.c
 
-REMOTE_SOURCES := backends/remote/backend.c backends/remote/host_session.c \
+REMOTE_SOURCES := backends/remote/backend.c backends/remote/host_session.c backends/remote/drops.c \
 	backends/remote/host_transport.c backends/remote/medialink.c \
 	backends/remote/dmabuf.c backends/remote/dmabuf_egl.c \
 	backends/remote/syncobj.c backends/remote/shm_texture.c \
@@ -287,13 +287,13 @@ linux-drm-syncobj-v1-server-protocol.h: $(SYNCOBJ_XML) $(WAYLAND_SCANNER) $(WAYL
 linux-drm-syncobj-v1-protocol.c: $(SYNCOBJ_XML) $(WAYLAND_SCANNER) $(WAYLAND_STAMP)
 	$(WAYLAND_SCANNER) private-code $(SYNCOBJ_XML) $@
 
-$(REMOTE_BINARY): $(WAYLAND_STAMP) $(WAYLAND_SERVER_ARCHIVE) $(GENERATED) $(COMMON_SOURCES) $(REMOTE_SOURCES) $(wildcard *.h backends/remote/*.h ../encoder/*.h ../encoder/vendor/*.h) \
+$(REMOTE_BINARY): $(WAYLAND_STAMP) $(WAYLAND_SERVER_ARCHIVE) $(GENERATED) $(COMMON_SOURCES) $(REMOTE_SOURCES) $(FILE_RPC_LIB) $(wildcard *.h backends/remote/*.h ../encoder/*.h ../encoder/vendor/*.h) \
 	../session/np-open-wire.h \
 	$(SOURCE_HASH) Makefile $(PRODUCT_VERSION_FILE) $(wildcard $(CODEC_PREFIX)/lib/libaom.a $(CODEC_PREFIX)/lib/libyuv.a) \
 	../../scripts/build-codecs.py ../../scripts/build-wayland.py | $(BUILD_DIR) check-deps-remote
 	$(CC) $(BASE_CFLAGS) $(COMMON_CFLAGS) $(REMOTE_CFLAGS) \
-		-Ibackends/remote $(SOURCE_DEFINE) -o $@ \
-		$(COMMON_SOURCES) $(REMOTE_SOURCES) $(COMMON_LIBS) $(REMOTE_LIBS) -Wl,--exclude-libs,libwayland-server.a
+		-Ibackends/remote -I$(FILE_RPC_DIR) $(SOURCE_DEFINE) -o $@ \
+		$(COMMON_SOURCES) $(REMOTE_SOURCES) $(FILE_RPC_LIB) $(COMMON_LIBS) $(REMOTE_LIBS) -Wl,--exclude-libs,libwayland-server.a
 
 $(FILE_RPC_LIB): $(FILE_RPC_SOURCES) $(FILE_RPC_DIR)/np_file_rpc.h $(FILE_RPC_DIR)/np_file_session.h \
 		$(FILE_RPC_DIR)/np_drop_fs.h $(FILE_RPC_DIR)/Makefile

@@ -121,6 +121,9 @@ static inline int np_drop_flock(int descriptor, int operation) { return flock(de
  * /dev/fuse on worker threads. Runs as the session's ordinary user. */
 struct np_drop_service;
 struct np_drop_service *np_drop_service_start(void);
+/* Remote computers: mounts at $XDG_RUNTIME_DIR/nativepipe-drops with the
+ * system's fusermount and serves one host session over `socket` (owned). */
+struct np_drop_service *np_drop_service_start_remote(int socket);
 void np_drop_service_stop(struct np_drop_service *service);
 #endif
 
