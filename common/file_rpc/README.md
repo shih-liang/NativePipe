@@ -143,32 +143,28 @@ stream_id:u32, length:u32 (at most 65536), all little-endian.
 | HELLO=1 | 0 | version:u8 = 2, role:u8 (host 0, guest 1), reserved:u16, capabilities:u32. First frame from each side; the roles must differ. |
 | REQUEST=2 | new | opcode:u16, reserved:u16, body. Opens the stream. |
 | RESPONSE=3 | existing | status:u32, body. Exactly once from the responder, before its DATA. |
-| DATA=4 | existing | bytes. Counts against credit. Empty DATA only carries END. |
+| DATA=4 | existing | bytes. Empty DATA only carries END. |
 | NOTIFY=5 | 0 | opcode:u16, reserved:u16, body. |
 | CANCEL=6 | existing | empty. Abandons both directions; queued data is dropped. |
-| CREDIT=7 | 0 or existing | increment:u32 (nonzero). |
 
 Only REQUEST, RESPONSE and DATA may set END_STREAM (flag 1), which finishes
 the sender's half. A stream is complete when both halves ended or either side
 cancelled; dropping the last local reference to an unfinished stream cancels it.
 
-Flow control: each direction of a stream starts with 256 KiB of credit and the
-connection with 4 MiB; DATA consumes both. A receiver returns credit as the
-application consumes data, so memory per stream and per connection is bounded.
-A stalled reader holds at most its stream's window, so other streams keep
-moving until stalled streams fill the connection window (16 full streams). Exceeding credit,
-out-of-order or wrong-parity IDs, a second RESPONSE, DATA after END or before
-RESPONSE, and unknown types or flags end the session with EPROTO. Frames for a
-stream that is already gone are dropped, with connection credit returned.
+There is no flow control. Each direction of a stream carries at most 1 MiB of
+DATA; an operation that needs more uses several streams. With at most 64
+concurrent inbound streams, this bounds what a peer can make the other side
+buffer. Exceeding the stream limit, out-of-order or wrong-parity IDs, a second
+RESPONSE, DATA after END or before RESPONSE, and unknown types or flags end the
+session with EPROTO. Frames for a stream that is already gone are dropped.
 
-Frames are written whole. Control frames (everything except DATA) overtake
-queued DATA. The C reader thread never writes, so two peers with full socket
-buffers cannot deadlock; frames it originates go through a writer thread.
-Cancelling or releasing a stream only queues its CANCEL, so it never blocks.
-Request and notification callbacks run on the reader and must not block or
-close the session. A peer accepts at most 256 concurrent inbound streams and
-cancels the rest; a peer that lets 65536 queued control frames (credit and
-refusals) accumulate without reading is dropped with ENOBUFS.
+Frames are written whole, in order. The C reader thread never writes; the
+CANCELs it or a callback originates go through a writer thread, so two peers
+with full socket buffers cannot deadlock. Cancelling or releasing a stream only
+queues its CANCEL, so it never blocks. Request and notification callbacks run on
+the reader and must not block or close the session. Past the inbound stream
+limit a request is cancelled; a peer that lets 65536 queued CANCELs accumulate
+without reading is dropped with ENOBUFS.
 
 `make test` runs `tests_session.c` over socketpairs; the Swift
 `FileSessionTests` also exercise Swift↔C in both roles.

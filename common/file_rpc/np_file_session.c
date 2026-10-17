@@ -9,10 +9,11 @@
 #include <unistd.h>
 
 /* Locking: `lock` guards all session and stream state. Socket writes happen
- * outside it, serialized by the `writing` gate, where control frames overtake
- * waiting DATA. The reader thread never writes: frames it must originate
- * (credit for discarded data, refusals) go through the control writer, so two
- * peers with full socket buffers cannot deadlock on each other's readers. */
+ * outside it, serialized by the `writing` gate. The reader thread never
+ * writes: the CANCELs it or a callback originates go through the control
+ * writer, so two peers with full socket buffers cannot deadlock on each
+ * other's readers. Memory stays bounded because each direction of a stream
+ * carries at most NP_FILE2_STREAM_DATA_MAX bytes of DATA. */
 
 struct inbound {
     struct inbound *next;
@@ -23,8 +24,7 @@ struct inbound {
 
 struct control {
     struct control *next;
-    uint8_t type;
-    uint32_t id, value;
+    uint32_t id;
 };
 
 struct np_file2_stream {
@@ -33,7 +33,7 @@ struct np_file2_stream {
     uint32_t id;
     int referenced, responder, responded;
     int local_ended, remote_ended, cancelled;
-    uint32_t send_window, receive_window, consumed;
+    uint32_t sent, received;
     struct inbound *head, *tail;
 };
 
@@ -49,9 +49,7 @@ struct np_file2_session {
     unsigned pending_controls;
     uint32_t next_id, last_peer_id;
     unsigned inbound_streams;
-    uint32_t send_window, receive_window, consumed;
     int writing;
-    unsigned control_waiting;
     int error, owner_closed;
     unsigned references;
     unsigned char *buffer;
@@ -108,8 +106,8 @@ static void fail(struct np_file2_session *session, int error) {
     if (first) shutdown(session->socket, SHUT_RDWR);
 }
 
-/* Locked. */
-static void queue_control(struct np_file2_session *session, uint8_t type, uint32_t id, uint32_t value) {
+/* Locked. Queues a CANCEL for the control writer. */
+static void queue_cancel(struct np_file2_session *session, uint32_t id) {
     if (session->error) return;
     struct control *control = session->pending_controls < NP_FILE2_MAX_PENDING_CONTROL
         ? calloc(1, sizeof(*control)) : NULL;
@@ -119,26 +117,21 @@ static void queue_control(struct np_file2_session *session, uint8_t type, uint32
         return;
     }
     session->pending_controls++;
-    control->type = type; control->id = id; control->value = value;
+    control->id = id;
     if (session->controls_tail) session->controls_tail->next = control;
     else session->controls = control;
     session->controls_tail = control;
     pthread_cond_broadcast(&session->changed);
 }
 
-/* Locked. Returns credit for DATA that will never be consumed. */
+/* Locked. */
 static void discard_inbound(struct np_file2_stream *stream) {
-    struct np_file2_session *session = stream->session;
-    uint32_t discarded = 0;
     while (stream->head) {
         struct inbound *message = stream->head;
         stream->head = message->next;
-        if (message->type == NP_FILE2_DATA) discarded += message->length;
         free(message);
     }
     stream->tail = NULL;
-    session->receive_window += discarded;
-    if (discarded) queue_control(session, NP_FILE2_CREDIT, 0, discarded);
 }
 
 static struct np_file2_stream *find_stream(struct np_file2_session *session, uint32_t id) {
@@ -163,11 +156,9 @@ static int maybe_destroy(struct np_file2_stream *stream) {
     return --session->references == 0;
 }
 
-static int acquire_writer(struct np_file2_session *session, int priority) {
-    if (priority) session->control_waiting++;
-    while (!session->error && (session->writing || (!priority && session->control_waiting)))
+static int acquire_writer(struct np_file2_session *session) {
+    while (!session->error && session->writing)
         pthread_cond_wait(&session->changed, &session->lock);
-    if (priority) session->control_waiting--;
     if (session->error) { pthread_cond_broadcast(&session->changed); errno = ECONNRESET; return -1; }
     session->writing = 1;
     return 0;
@@ -187,15 +178,16 @@ static int write_frame_unlocked(struct np_file2_session *session, uint8_t type, 
     pthread_cond_broadcast(&session->changed);
     if (result < 0) {
         if (fail_locked(session, error)) shutdown(session->socket, SHUT_RDWR);
-        errno = error;
+        /* The session is gone; callers see a disconnect, whatever the socket said. */
+        errno = ECONNRESET;
     }
     return result;
 }
-static int write_frame(struct np_file2_session *session, int priority, uint8_t type, uint8_t flags,
+static int write_frame(struct np_file2_session *session, uint8_t type, uint8_t flags,
                        uint32_t id, const void *prefix, size_t prefix_length,
                        const void *body, size_t length) {
     pthread_mutex_lock(&session->lock);
-    if (acquire_writer(session, priority) < 0) { pthread_mutex_unlock(&session->lock); return -1; }
+    if (acquire_writer(session) < 0) { pthread_mutex_unlock(&session->lock); return -1; }
     pthread_mutex_unlock(&session->lock);
     int result = write_frame_unlocked(session, type, flags, id, prefix, prefix_length, body, length);
     int error = errno;
@@ -214,11 +206,9 @@ static void *control_writer(void *argument) {
         session->controls = control->next;
         if (!session->controls) session->controls_tail = NULL;
         session->pending_controls--;
-        if (acquire_writer(session, 1) < 0) { free(control); break; }
+        if (acquire_writer(session) < 0) { free(control); break; }
         pthread_mutex_unlock(&session->lock);
-        unsigned char value[4]; put32(value, control->value);
-        size_t length = control->type == NP_FILE2_CREDIT ? 4 : 0;
-        write_frame_unlocked(session, control->type, 0, control->id, value, length, NULL, 0);
+        write_frame_unlocked(session, NP_FILE2_CANCEL, 0, control->id, NULL, 0, NULL, 0);
         free(control);
     }
     pthread_mutex_unlock(&session->lock);
@@ -249,17 +239,6 @@ static int dispatch(struct np_file2_session *session, uint8_t type, uint8_t flag
     int end = flags & NP_FILE2_END_STREAM;
     struct np_file2_stream *stream = id ? find_stream(session, id) : NULL;
     switch (type) {
-    case NP_FILE2_CREDIT: {
-        if (length != 4 || !get32(payload)) return protocol_error();
-        uint32_t increment = get32(payload);
-        uint32_t *window = id ? (stream && !stream->local_ended ? &stream->send_window : NULL)
-                              : &session->send_window;
-        if (!window) return 0;
-        if (*window > UINT32_MAX / 2 - increment) return protocol_error();
-        *window += increment;
-        pthread_cond_broadcast(&session->changed);
-        return 0;
-    }
     case NP_FILE2_CANCEL:
         if (!id || length) return protocol_error();
         if (stream && !stream->cancelled) {
@@ -273,14 +252,13 @@ static int dispatch(struct np_file2_session *session, uint8_t type, uint8_t flag
         session->last_peer_id = id;
         uint16_t opcode = (uint16_t)(payload[0] | payload[1] << 8);
         if (!session->handlers.request || session->inbound_streams >= NP_FILE2_MAX_INBOUND_STREAMS) {
-            queue_control(session, NP_FILE2_CANCEL, id, 0);
+            queue_cancel(session, id);
             return 0;
         }
         stream = calloc(1, sizeof(*stream));
         if (!stream) { errno = ENOMEM; return -1; }
         stream->session = session; stream->id = id; stream->referenced = 1;
         stream->responder = 1; stream->remote_ended = end;
-        stream->send_window = stream->receive_window = NP_FILE2_STREAM_WINDOW;
         stream->next = session->streams; session->streams = stream;
         session->inbound_streams++; session->references++;
         pthread_mutex_unlock(&session->lock);
@@ -301,16 +279,10 @@ static int dispatch(struct np_file2_session *session, uint8_t type, uint8_t flag
     case NP_FILE2_DATA:
         if (!id || (!is_peer_id(session, id) && id >= session->next_id) ||
             (is_peer_id(session, id) && id > session->last_peer_id)) return protocol_error();
-        if (length > session->receive_window) return protocol_error();
-        session->receive_window -= length;
-        if (!stream || stream->cancelled) {
-            session->receive_window += length;
-            if (length) queue_control(session, NP_FILE2_CREDIT, 0, length);
-            return 0;
-        }
+        if (!stream || stream->cancelled) return 0;
         if (stream->remote_ended || (!stream->responder && !stream->responded) ||
-            length > stream->receive_window) return protocol_error();
-        stream->receive_window -= length;
+            length > NP_FILE2_STREAM_DATA_MAX - stream->received) return protocol_error();
+        stream->received += length;
         /* An empty DATA only carries END; it is not delivered as a message. */
         if (length && enqueue(stream, type, (uint8_t)end, 0, payload, length) < 0) return -1;
         if (end) stream->remote_ended = 1;
@@ -336,7 +308,7 @@ static int read_frame(struct np_file2_session *session, uint8_t *type, uint8_t *
     if (read_all(session->socket, header, sizeof(header)) < 0) return -1;
     *type = header[4]; *flags = header[5]; *id = get32(header + 8); *length = get32(header + 12);
     if (memcmp(header, "NP2F", 4) || header[6] || header[7] ||
-        *type < NP_FILE2_HELLO || *type > NP_FILE2_CREDIT || *length > NP_FILE2_FRAME_MAX)
+        *type < NP_FILE2_HELLO || *type > NP_FILE2_CANCEL || *length > NP_FILE2_FRAME_MAX)
         return protocol_error();
     int may_end = *type == NP_FILE2_REQUEST || *type == NP_FILE2_RESPONSE || *type == NP_FILE2_DATA;
     if (*flags & ~(may_end ? NP_FILE2_END_STREAM : 0u)) return protocol_error();
@@ -379,7 +351,6 @@ struct np_file2_session *np_file2_session_start(int socket, enum np_file2_role r
     session->socket = socket; session->role = role; session->buffer = buffer;
     if (handlers) session->handlers = *handlers;
     session->next_id = role == NP_FILE2_ROLE_HOST ? 2 : 1;
-    session->send_window = session->receive_window = NP_FILE2_CONNECTION_WINDOW;
     session->references = 1;
     pthread_mutex_init(&session->lock, NULL);
     pthread_cond_init(&session->changed, NULL);
@@ -422,7 +393,7 @@ void np_file2_session_close(struct np_file2_session *session) {
 int np_file2_notify(struct np_file2_session *session, uint16_t opcode, const void *body, size_t length) {
     if (length > NP_FILE2_FRAME_MAX - 4) { errno = EMSGSIZE; return -1; }
     unsigned char prefix[4] = {(unsigned char)opcode, (unsigned char)(opcode >> 8), 0, 0};
-    return write_frame(session, 1, NP_FILE2_NOTIFY, 0, 0, prefix, sizeof(prefix), body, length);
+    return write_frame(session, NP_FILE2_NOTIFY, 0, 0, prefix, sizeof(prefix), body, length);
 }
 
 struct np_file2_stream *np_file2_request(struct np_file2_session *session, uint16_t opcode,
@@ -432,14 +403,13 @@ struct np_file2_stream *np_file2_request(struct np_file2_session *session, uint1
     if (!stream) { errno = ENOMEM; return NULL; }
     pthread_mutex_lock(&session->lock);
     /* IDs must reach the wire in increasing order, so allocate under the gate. */
-    if (acquire_writer(session, 1) < 0) { pthread_mutex_unlock(&session->lock); free(stream); return NULL; }
+    if (acquire_writer(session) < 0) { pthread_mutex_unlock(&session->lock); free(stream); return NULL; }
     if (session->next_id > UINT32_MAX - 2) {
         session->writing = 0; pthread_cond_broadcast(&session->changed);
         pthread_mutex_unlock(&session->lock); free(stream); errno = EOVERFLOW; return NULL;
     }
     stream->session = session; stream->id = session->next_id; session->next_id += 2;
     stream->referenced = 1; stream->local_ended = !!end_stream;
-    stream->send_window = stream->receive_window = NP_FILE2_STREAM_WINDOW;
     stream->next = session->streams; session->streams = stream;
     session->references++;
     pthread_mutex_unlock(&session->lock);
@@ -466,7 +436,7 @@ int np_file2_respond(struct np_file2_stream *stream, uint32_t status,
     pthread_mutex_lock(&session->lock);
     if (stream_unusable(stream)) { pthread_mutex_unlock(&session->lock); return -1; }
     if (!stream->responder || stream->responded) { pthread_mutex_unlock(&session->lock); errno = EINVAL; return -1; }
-    if (acquire_writer(session, 1) < 0) { pthread_mutex_unlock(&session->lock); return -1; }
+    if (acquire_writer(session) < 0) { pthread_mutex_unlock(&session->lock); return -1; }
     if (stream_unusable(stream)) {
         int error = errno;
         session->writing = 0; pthread_cond_broadcast(&session->changed);
@@ -490,26 +460,17 @@ int np_file2_send(struct np_file2_stream *stream, const void *data, size_t lengt
     if (!length && !end_stream) return 0;
     pthread_mutex_lock(&session->lock);
     if (stream->responder && !stream->responded) { pthread_mutex_unlock(&session->lock); errno = EINVAL; return -1; }
+    if (length > NP_FILE2_STREAM_DATA_MAX - stream->sent) { pthread_mutex_unlock(&session->lock); errno = EMSGSIZE; return -1; }
     do {
-        while (length && !stream->cancelled && !session->error && !stream->local_ended &&
-               (!stream->send_window || !session->send_window))
-            pthread_cond_wait(&session->changed, &session->lock);
-        if (stream_unusable(stream)) { pthread_mutex_unlock(&session->lock); return -1; }
-        size_t size = length;
-        if (size > NP_FILE2_FRAME_MAX) size = NP_FILE2_FRAME_MAX;
-        if (size > stream->send_window) size = stream->send_window;
-        if (size > session->send_window) size = session->send_window;
-        stream->send_window -= (uint32_t)size; session->send_window -= (uint32_t)size;
+        size_t size = length > NP_FILE2_FRAME_MAX ? NP_FILE2_FRAME_MAX : length;
         int last = size == length && end_stream;
-        if (acquire_writer(session, 0) < 0) { pthread_mutex_unlock(&session->lock); return -1; }
+        if (acquire_writer(session) < 0) { pthread_mutex_unlock(&session->lock); return -1; }
         if (stream_unusable(stream)) {
-            /* Cancelled while waiting: the peer never sees these bytes, so the
-             * credit must be restored or the connection window shrinks for good. */
             int error = errno;
-            stream->send_window += (uint32_t)size; session->send_window += (uint32_t)size;
             session->writing = 0; pthread_cond_broadcast(&session->changed);
             pthread_mutex_unlock(&session->lock); errno = error; return -1;
         }
+        stream->sent += (uint32_t)size;
         if (last) stream->local_ended = 1;
         pthread_mutex_unlock(&session->lock);
         if (write_frame_unlocked(session, NP_FILE2_DATA, last ? NP_FILE2_END_STREAM : 0,
@@ -537,32 +498,11 @@ int np_file2_receive(struct np_file2_stream *stream, struct np_file2_message *me
     }
     stream->head = inbound->next;
     if (!stream->head) stream->tail = NULL;
-    uint32_t stream_credit = 0, connection_credit = 0;
-    if (inbound->type == NP_FILE2_DATA) {
-        stream->consumed += inbound->length; session->consumed += inbound->length;
-        if (!stream->remote_ended && stream->consumed >= NP_FILE2_STREAM_WINDOW / 4) {
-            stream_credit = stream->consumed; stream->receive_window += stream_credit; stream->consumed = 0;
-        }
-        if (session->consumed >= NP_FILE2_CONNECTION_WINDOW / 4) {
-            connection_credit = session->consumed; session->receive_window += connection_credit; session->consumed = 0;
-        }
-    }
     pthread_mutex_unlock(&session->lock);
     message->type = inbound->type; message->end = inbound->end;
     message->status = inbound->status; message->length = inbound->length;
     memcpy(message->data, inbound->data, inbound->length);
     free(inbound);
-    /* The message is already delivered; a failed credit write ends the session,
-     * which the next call reports. */
-    unsigned char value[4];
-    if (connection_credit) {
-        put32(value, connection_credit);
-        write_frame(session, 1, NP_FILE2_CREDIT, 0, 0, value, 4, NULL, 0);
-    }
-    if (stream_credit) {
-        put32(value, stream_credit);
-        write_frame(session, 1, NP_FILE2_CREDIT, 0, stream->id, value, 4, NULL, 0);
-    }
     return 1;
 }
 
@@ -572,7 +512,7 @@ void np_file2_cancel(struct np_file2_stream *stream) {
     if (!stream->cancelled) {
         /* Queued, never written here: cancelling (and so releasing) a stream
          * must not block, including from the reader's request callback. */
-        if (!(stream->local_ended && stream->remote_ended)) queue_control(session, NP_FILE2_CANCEL, stream->id, 0);
+        if (!(stream->local_ended && stream->remote_ended)) queue_cancel(session, stream->id);
         stream->cancelled = 1;
         discard_inbound(stream);
         pthread_cond_broadcast(&session->changed);
