@@ -1,22 +1,22 @@
 import Foundation
 
 /// Local manager/launcher IPC must not re-pack a streamed catalog into one
-/// bounded control frame. Each application is a binary-plist NPFR record;
+/// bounded control frame. Each application is a binary-plist record;
 /// an empty record terminates the catalog. There is no per-record roundtrip.
 public enum ApplicationCatalogStream {
     public static func write(_ applications: [GuestApplication], to handle: FileHandle) throws {
         let encoder = PropertyListEncoder()
         encoder.outputFormat = .binary
         for application in applications {
-            try FileRPC.sendRecord(encoder.encode(application), to: handle)
+            try RecordWire.send(encoder.encode(application), to: handle)
         }
-        try FileRPC.sendRecord(Data(), to: handle)
+        try RecordWire.send(Data(), to: handle)
     }
 
     public static func read(from handle: FileHandle) throws -> [GuestApplication] {
         var result = Accumulator()
         while true {
-            let data = try FileRPC.receiveRecord(from: handle, maximum: 7 * 1024 * 1024)
+            let data = try RecordWire.receive(from: handle, maximum: 7 * 1024 * 1024)
             if data.isEmpty { return result.applications }
             try result.append(data)
         }
@@ -27,16 +27,16 @@ public enum ApplicationCatalogStream {
         let encoder = PropertyListEncoder()
         encoder.outputFormat = .binary
         for application in applications {
-            try await FileRPC.sendRecord(encoder.encode(application), to: connection, deadline: deadline)
+            try await RecordWire.send(encoder.encode(application), to: connection, deadline: deadline)
         }
-        try await FileRPC.sendRecord(Data(), to: connection, deadline: deadline)
+        try await RecordWire.send(Data(), to: connection, deadline: deadline)
     }
 
     public static func read(from connection: SocketConnection,
                             deadline: DispatchTime = .now() + .seconds(30)) async throws -> [GuestApplication] {
         var result = Accumulator()
         while true {
-            let data = try await FileRPC.receiveRecord(from: connection, maximum: 7 * 1024 * 1024, deadline: deadline)
+            let data = try await RecordWire.receive(from: connection, maximum: 7 * 1024 * 1024, deadline: deadline)
             if data.isEmpty { return result.applications }
             try result.append(data)
         }

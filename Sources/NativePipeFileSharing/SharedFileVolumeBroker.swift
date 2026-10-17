@@ -363,7 +363,7 @@ public final class SharedFileVolumeBroker {
     private func serve(_ connection: SocketConnection) async {
         do {
             let request = try JSONDecoder().decode(SharedFileRequest.self,
-                from: await FileRPC.receiveRecord(from: connection, maximum: 16 * 1024, deadline: .now() + .seconds(5)))
+                from: await RecordWire.receive(from: connection, maximum: 16 * 1024, deadline: .now() + .seconds(5)))
             guard request.token == descriptor.token, !stopped else { throw POSIXError(.EACCES) }
             try await withThrowingTaskGroup(of: Void.self) { group in
                 group.addTask { @MainActor in
@@ -397,7 +397,7 @@ public final class SharedFileVolumeBroker {
         }
     }
     private func send(_ reply: SharedFileReply, to connection: SocketConnection) async throws {
-        try await FileRPC.sendRecord(try JSONEncoder().encode(reply), to: connection, deadline: .now() + .seconds(30))
+        try await RecordWire.send(try JSONEncoder().encode(reply), to: connection, deadline: .now() + .seconds(30))
     }
     static func errorCode(_ error: Error) -> Int32 {
         if let error = error as? POSIXError { return error.code.rawValue }

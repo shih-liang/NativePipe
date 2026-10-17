@@ -42,9 +42,9 @@ final class SharedFilesRangeTests: XCTestCase {
         try server.start { connection in
             do {
                 let request = try JSONDecoder().decode(SharedFileRequest.self,
-                    from: await FileRPC.receiveRecord(from: connection, maximum: 16 * 1024, deadline: .now() + .seconds(5)))
+                    from: await RecordWire.receive(from: connection, maximum: 16 * 1024, deadline: .now() + .seconds(5)))
                 let response = await reads.response(request)
-                try await FileRPC.sendRecord(JSONEncoder().encode(response), to: connection, deadline: .now() + .seconds(5))
+                try await RecordWire.send(JSONEncoder().encode(response), to: connection, deadline: .now() + .seconds(5))
             } catch { connection.close() }
         }
         let volume = SharedFilesVolume(client: try SharedFileVolumeClient(directory: directory))

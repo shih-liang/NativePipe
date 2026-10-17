@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #undef NDEBUG
 #include "np_file_rpc.h"
+#include "np_file_session.h"
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -17,75 +18,132 @@ struct server { int socket, root, read_only, result; };
 static void *serve(void *arg) {
     struct server *s = arg;
     s->result = np_file_serve(s->socket, s->root, s->read_only);
-    close(s->socket);
     return NULL;
 }
-static void request(int fd, int type, const char *path, int replace) {
-    unsigned char body[4096 + 8]; size_t n = strlen(path);
-    np_file_put32(body, (uint32_t)n); memcpy(body + 4, path, n);
-    if (type == NP_FILE_WRITE) np_file_put32(body + 4 + n, 0600);
-    assert(np_file_send(fd, type, replace, 0, body, n + 4 + (type == NP_FILE_WRITE ? 4 : 0)) == 0);
-}
-static void range_request(int fd, const char *path, uint64_t offset, uint32_t count,
-                          const unsigned char revision[NP_FILE_REVISION]) {
-    unsigned char body[4096 + 4 + 12 + NP_FILE_REVISION]; size_t n = strlen(path);
-    np_file_put32(body, (uint32_t)n); memcpy(body + 4, path, n);
-    np_file_put64(body + 4 + n, offset); np_file_put32(body + 12 + n, count);
-    memcpy(body + 16 + n, revision, NP_FILE_REVISION);
-    assert(np_file_send(fd, NP_FILE_RANGE, 0, 0, body, n + 16 + NP_FILE_REVISION) == 0);
-}
-static int start(struct server *s, pthread_t *thread) {
+struct client { struct np_file2_session *session; pthread_t thread; };
+static struct client connect_server(struct server *s) {
     int sockets[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
     s->socket = sockets[0];
+    struct client client;
     pthread_attr_t attributes;
     assert(pthread_attr_init(&attributes) == 0);
     /* Exercise musl's small default even on hosts with larger defaults. */
     assert(pthread_attr_setstacksize(&attributes, 128 * 1024) == 0);
-    assert(pthread_create(thread, &attributes, serve, s) == 0);
+    assert(pthread_create(&client.thread, &attributes, serve, s) == 0);
     assert(pthread_attr_destroy(&attributes) == 0);
-    return sockets[1];
+    client.session = np_file2_session_start(sockets[1], NP_FILE2_ROLE_HOST, NULL);
+    assert(client.session);
+    return client;
 }
-static void finish(int fd, pthread_t thread) {
-    shutdown(fd, SHUT_RDWR); close(fd); assert(pthread_join(thread, NULL) == 0);
+static void disconnect(struct client client) {
+    np_file2_session_close(client.session);
+    assert(pthread_join(client.thread, NULL) == 0);
 }
 
-static void staging_request(int fd, int type, const char *path,
-                            const unsigned char token[NP_FILE_STAGING_TOKEN], const char *destination) {
-    unsigned char body[8192 + NP_FILE_STAGING_TOKEN]; size_t n = strlen(path), size = 4 + n;
+struct reply {
+    uint32_t status;
+    size_t length, data_length;
+    unsigned char body[65536];
+    unsigned char *data;  /* NP_FILE_IO_MAX bytes */
+};
+static struct reply *new_reply(void) {
+    struct reply *reply = calloc(1, sizeof(*reply));
+    assert(reply && (reply->data = malloc(NP_FILE_IO_MAX)));
+    return reply;
+}
+static void free_reply(struct reply *reply) { free(reply->data); free(reply); }
+
+/* One request; `data` (if any) follows as DATA. Returns the status. */
+static uint32_t call(struct client client, uint16_t opcode, const void *body, size_t length,
+                     const void *data, size_t data_length, struct reply *reply) {
+    struct np_file2_stream *stream = np_file2_request(client.session, opcode, body, length, !data);
+    assert(stream);
+    if (data) np_file2_send(stream, data, data_length, 1);
+    struct np_file2_message *message = malloc(sizeof(*message)); assert(message);
+    assert(np_file2_receive(stream, message) == 1 && message->type == NP_FILE2_RESPONSE);
+    reply->status = message->status; reply->length = message->length;
+    memcpy(reply->body, message->data, message->length);
+    reply->data_length = 0;
+    int result;
+    while ((result = np_file2_receive(stream, message)) == 1) {
+        assert(message->type == NP_FILE2_DATA && reply->data_length + message->length <= NP_FILE_IO_MAX);
+        memcpy(reply->data + reply->data_length, message->data, message->length);
+        reply->data_length += message->length;
+    }
+    assert(result == 0);
+    free(message);
+    np_file2_stream_release(stream);
+    return reply->status;
+}
+static size_t put_path(unsigned char *body, const char *path) {
+    size_t n = strlen(path);
     np_file_put32(body, (uint32_t)n); memcpy(body + 4, path, n);
-    if (token) { memcpy(body + size, token, NP_FILE_STAGING_TOKEN); size += NP_FILE_STAGING_TOKEN; }
-    if (destination) {
-        size_t target = strlen(destination);
-        np_file_put32(body + size, (uint32_t)target); memcpy(body + size + 4, destination, target); size += 4 + target;
-    }
-    assert(np_file_send(fd, type, 0, 0, body, size) == 0);
+    return 4 + n;
 }
-static uint32_t staging_operation(struct server *s, int type, const char *path,
-                                 unsigned char token[NP_FILE_STAGING_TOKEN], const char *destination) {
-    pthread_t thread; int fd = start(s, &thread);
-    struct np_file_frame *frame = malloc(sizeof(*frame)); assert(frame);
-    if (type == NP_FILE_CREATE_STAGING) assert(getentropy(token, NP_FILE_STAGING_TOKEN) == 0);
-    staging_request(fd, type, path, token, destination);
-    assert(np_file_receive(fd, frame) == 0);
-    uint32_t status = frame->status;
-    if (!status) {
-        if (type == NP_FILE_CREATE_STAGING) {
-            assert(frame->type == NP_FILE_METADATA && frame->length == NP_FILE_STAGING_TOKEN);
-            memcpy(token, frame->data, NP_FILE_STAGING_TOKEN);
-        } else assert(frame->type == NP_FILE_END && !frame->length);
-    }
-    finish(fd, thread); free(frame); return status;
+static uint32_t path_call(struct client client, uint16_t opcode, const char *path, struct reply *reply) {
+    unsigned char body[4100];
+    return call(client, opcode, body, put_path(body, path), NULL, 0, reply);
 }
+static uint32_t open_path(struct client client, unsigned flags, unsigned mode, const char *path,
+                          struct reply *reply, uint64_t *handle) {
+    unsigned char body[4108];
+    np_file_put32(body, flags); np_file_put32(body + 4, mode);
+    uint32_t status = call(client, NP_FILE_OPEN, body, 8 + put_path(body + 8, path), NULL, 0, reply);
+    if (!status) { assert(reply->length >= 8 + NP_FILE_METADATA); *handle = np_file_u64(reply->body); }
+    return status;
+}
+static uint32_t handle_call(struct client client, uint16_t opcode, uint64_t handle, uint32_t count,
+                            const void *data, size_t data_length, struct reply *reply) {
+    unsigned char body[12];
+    np_file_put64(body, handle); np_file_put32(body + 8, count);
+    return call(client, opcode, body, opcode == NP_FILE_READ ? 12 : 8, data, data_length, reply);
+}
+static uint32_t range(struct client client, const char *path, uint64_t offset, uint32_t count,
+                      const unsigned char revision[NP_FILE_REVISION], struct reply *reply) {
+    unsigned char body[12 + NP_FILE_REVISION + 4100];
+    np_file_put64(body, offset); np_file_put32(body + 8, count);
+    memcpy(body + 12, revision, NP_FILE_REVISION);
+    return call(client, NP_FILE_RANGE, body, 12 + NP_FILE_REVISION + put_path(body + 12 + NP_FILE_REVISION, path),
+                NULL, 0, reply);
+}
+static uint32_t staging(struct server *s, uint16_t opcode, const char *path,
+                        unsigned char token[NP_FILE_STAGING_TOKEN], const char *destination) {
+    struct client client = connect_server(s);
+    struct reply *reply = new_reply();
+    if (opcode == NP_FILE_CREATE_STAGING) assert(getentropy(token, NP_FILE_STAGING_TOKEN) == 0);
+    unsigned char body[8300]; size_t size = NP_FILE_STAGING_TOKEN;
+    memcpy(body, token, NP_FILE_STAGING_TOKEN);
+    if (destination) size += put_path(body + size, destination);
+    size += put_path(body + size, path);
+    uint32_t status = call(client, opcode, body, size, NULL, 0, reply);
+    assert(status || (!reply->length && !reply->data_length));
+    free_reply(reply); disconnect(client);
+    return status;
+}
+
+/* Counts plain directory records, checking that none is split. */
+static unsigned count_names(const struct reply *reply, unsigned expected_length) {
+    unsigned names = 0;
+    for (size_t i = 0; i < reply->data_length;) {
+        assert(i + 3 <= reply->data_length);
+        unsigned n = reply->data[i + 1] | reply->data[i + 2] << 8;
+        assert(n && i + 3 + n <= reply->data_length && (!expected_length || n == expected_length));
+        i += 3 + n; names++;
+    }
+    return names;
+}
+
 static void test_staging(struct server *s) {
     const char *stage = "/.nativepipe-upload-12345678-1234-1234-1234-123456789abc";
     unsigned char token[NP_FILE_STAGING_TOKEN], invalid[NP_FILE_STAGING_TOKEN] = {0};
     s->read_only = 1;
-    assert(staging_operation(s, NP_FILE_CREATE_STAGING, stage, token, NULL) == EROFS);
+    assert(staging(s, NP_FILE_CREATE_STAGING, stage, token, NULL) == EROFS);
     s->read_only = 0;
-    assert(staging_operation(s, NP_FILE_CREATE_STAGING, "/arbitrary", token, NULL) == EINVAL);
-    assert(staging_operation(s, NP_FILE_CREATE_STAGING, stage, token, NULL) == 0);
-    assert(staging_operation(s, NP_FILE_CREATE_STAGING, stage, invalid, NULL) == EEXIST);
-    assert(staging_operation(s, NP_FILE_DISCARD_STAGING, stage, invalid, NULL) == EACCES);
+    assert(staging(s, NP_FILE_CREATE_STAGING, "/arbitrary", token, NULL) == EINVAL);
+    assert(staging(s, NP_FILE_CREATE_STAGING, stage, token, NULL) == 0);
+    assert(staging(s, NP_FILE_CREATE_STAGING, stage, invalid, NULL) == EEXIST);
+    memset(invalid, 0, sizeof(invalid));
+    assert(staging(s, NP_FILE_DISCARD_STAGING, stage, invalid, NULL) == EACCES);
 
     /* Copying an ownership marker to a different inode never gives it the
      * authority to remove the copied-to directory. */
@@ -98,41 +156,41 @@ static void test_staging(struct server *s) {
     unsigned char marker[56]; assert(read(original_marker, marker, sizeof(marker)) == sizeof(marker));
     assert(write(duplicate_marker, marker, sizeof(marker)) == sizeof(marker));
     close(original_marker); close(duplicate_marker); close(original);
-    assert(staging_operation(s, NP_FILE_DISCARD_STAGING, copy, token, NULL) == EACCES);
+    assert(staging(s, NP_FILE_DISCARD_STAGING, copy, token, NULL) == EACCES);
     assert(unlinkat(duplicate, ".nativepipe-owner", 0) == 0); close(duplicate);
     assert(unlinkat(s->root, copy + 1, AT_REMOVEDIR) == 0);
-    int staging = openat(s->root, stage + 1, O_RDONLY | O_DIRECTORY | O_NOFOLLOW); assert(staging >= 0);
-    int payload = openat(staging, ".payload", O_CREAT | O_EXCL | O_WRONLY, 0640); assert(payload >= 0);
+    int stage_fd = openat(s->root, stage + 1, O_RDONLY | O_DIRECTORY | O_NOFOLLOW); assert(stage_fd >= 0);
+    int payload = openat(stage_fd, ".payload", O_CREAT | O_EXCL | O_WRONLY, 0640); assert(payload >= 0);
     assert(write(payload, "published", 9) == 9); close(payload);
     s->read_only = 1;
-    assert(staging_operation(s, NP_FILE_PUBLISH_STAGING, stage, token, "/target") == EROFS);
-    assert(staging_operation(s, NP_FILE_DISCARD_STAGING, stage, token, NULL) == EROFS);
+    assert(staging(s, NP_FILE_PUBLISH_STAGING, stage, token, "/target") == EROFS);
+    assert(staging(s, NP_FILE_DISCARD_STAGING, stage, token, NULL) == EROFS);
     s->read_only = 0;
-    assert(staging_operation(s, NP_FILE_PUBLISH_STAGING, stage, token, "/source") == EEXIST);
-    assert(staging_operation(s, NP_FILE_PUBLISH_STAGING, stage, token, "/target") == 0);
+    assert(staging(s, NP_FILE_PUBLISH_STAGING, stage, token, "/source") == EEXIST);
+    assert(staging(s, NP_FILE_PUBLISH_STAGING, stage, token, "/target") == 0);
     struct stat st;
     assert(fstatat(s->root, stage + 1, &st, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT);
     payload = openat(s->root, "target", O_RDONLY); assert(payload >= 0);
     char bytes[9]; assert(read(payload, bytes, 9) == 9 && !memcmp(bytes, "published", 9)); close(payload);
-    assert(unlinkat(s->root, "target", 0) == 0); close(staging);
+    assert(unlinkat(s->root, "target", 0) == 0); close(stage_fd);
 
     /* Folder commit preserves the whole subtree without merging; cancellation
      * cleanup also removes legitimate nested files named like the marker. */
-    assert(staging_operation(s, NP_FILE_CREATE_STAGING, stage, token, NULL) == 0);
-    staging = openat(s->root, stage + 1, O_RDONLY | O_DIRECTORY | O_NOFOLLOW); assert(staging >= 0);
-    assert(mkdirat(staging, ".payload", 0700) == 0);
-    payload = openat(staging, ".payload", O_RDONLY | O_DIRECTORY); assert(payload >= 0);
+    assert(staging(s, NP_FILE_CREATE_STAGING, stage, token, NULL) == 0);
+    stage_fd = openat(s->root, stage + 1, O_RDONLY | O_DIRECTORY | O_NOFOLLOW); assert(stage_fd >= 0);
+    assert(mkdirat(stage_fd, ".payload", 0700) == 0);
+    payload = openat(stage_fd, ".payload", O_RDONLY | O_DIRECTORY); assert(payload >= 0);
     int leaf = openat(payload, ".nativepipe-owner", O_CREAT | O_EXCL | O_WRONLY, 0600); assert(leaf >= 0); close(leaf);
-    assert(staging_operation(s, NP_FILE_PUBLISH_STAGING, stage, token, "/folder") == 0);
-    close(payload); close(staging);
-    assert(staging_operation(s, NP_FILE_CREATE_STAGING, stage, token, NULL) == 0);
-    staging = openat(s->root, stage + 1, O_RDONLY | O_DIRECTORY | O_NOFOLLOW); assert(staging >= 0);
-    assert(mkdirat(staging, ".payload", 0700) == 0);
-    payload = openat(staging, ".payload", O_RDONLY | O_DIRECTORY); assert(payload >= 0);
+    assert(staging(s, NP_FILE_PUBLISH_STAGING, stage, token, "/folder") == 0);
+    close(payload); close(stage_fd);
+    assert(staging(s, NP_FILE_CREATE_STAGING, stage, token, NULL) == 0);
+    stage_fd = openat(s->root, stage + 1, O_RDONLY | O_DIRECTORY | O_NOFOLLOW); assert(stage_fd >= 0);
+    assert(mkdirat(stage_fd, ".payload", 0700) == 0);
+    payload = openat(stage_fd, ".payload", O_RDONLY | O_DIRECTORY); assert(payload >= 0);
     leaf = openat(payload, ".nativepipe-owner", O_CREAT | O_EXCL | O_WRONLY, 0600); assert(leaf >= 0); close(leaf);
     assert(symlinkat("/source", payload, "link") == 0);
-    close(payload); close(staging);
-    assert(staging_operation(s, NP_FILE_DISCARD_STAGING, stage, token, NULL) == 0);
+    close(payload); close(stage_fd);
+    assert(staging(s, NP_FILE_DISCARD_STAGING, stage, token, NULL) == 0);
     assert(fstatat(s->root, "source", &st, AT_SYMLINK_NOFOLLOW) == 0);
     payload = openat(s->root, "folder", O_RDONLY | O_DIRECTORY); assert(payload >= 0);
     assert(unlinkat(payload, ".nativepipe-owner", 0) == 0); close(payload);
@@ -141,18 +199,18 @@ static void test_staging(struct server *s) {
     /* A matching prefix is not ownership. Neither arbitrary directories nor
      * symlinked parents are eligible for destructive cleanup. */
     assert(mkdirat(s->root, stage + 1, 0700) == 0);
-    assert(staging_operation(s, NP_FILE_DISCARD_STAGING, stage, token, NULL) != 0);
+    assert(staging(s, NP_FILE_DISCARD_STAGING, stage, token, NULL) != 0);
     assert(unlinkat(s->root, stage + 1, AT_REMOVEDIR) == 0);
     assert(symlinkat(".", s->root, "staging-parent") == 0);
-    assert(staging_operation(s, NP_FILE_CREATE_STAGING,
+    assert(staging(s, NP_FILE_CREATE_STAGING,
         "/staging-parent/.nativepipe-upload-12345678-1234-1234-1234-123456789abc", token, NULL) != 0);
 
-    pthread_t thread; int fd = start(s, &thread);
-    struct np_file_frame *frame = malloc(sizeof(*frame)); assert(frame);
-    request(fd, NP_FILE_WRITE, "/staging-parent/blocked", NP_FILE_NOFOLLOW);
-    assert(np_file_receive(fd, frame) == 0 && frame->status); finish(fd, thread);
-    fd = start(s, &thread); request(fd, NP_FILE_MKDIR, "/staging-parent/blocked", NP_FILE_NOFOLLOW);
-    assert(np_file_receive(fd, frame) == 0 && frame->status); finish(fd, thread); free(frame);
+    struct client client = connect_server(s);
+    struct reply *reply = new_reply(); uint64_t handle;
+    assert(open_path(client, NP_FILE_OPEN_WRITE | NP_FILE_NOFOLLOW, 0600, "/staging-parent/blocked", reply, &handle) != 0);
+    unsigned char body[64]; np_file_put32(body, NP_FILE_NOFOLLOW);
+    assert(call(client, NP_FILE_MKDIR, body, 4 + put_path(body + 4, "/staging-parent/blocked"), NULL, 0, reply) != 0);
+    free_reply(reply); disconnect(client);
     assert(fstatat(s->root, "blocked", &st, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT);
     assert(unlinkat(s->root, "staging-parent", 0) == 0);
 }
@@ -179,139 +237,153 @@ int main(void) {
         puts("file service: AF_VSOCK unavailable on test host (skip)");
     }
 #endif
-    struct server s = {.root = root}; pthread_t thread;
-    struct np_file_frame frame;
-    /* More than the old 7 MiB control-message limit; no whole-file allocation. */
-    int source = openat(root, "source", O_CREAT | O_EXCL | O_RDWR, 0600); assert(source >= 0);
-    unsigned char block[NP_FILE_CHUNK];
-    for (unsigned i = 0; i < sizeof(block); i++) block[i] = (unsigned char)(i * 37);
-    for (unsigned i = 0; i < 160; i++) assert(write(source, block, sizeof(block)) == sizeof(block));
-    assert(lseek(source, 0, SEEK_SET) == 0);
-    int fd = start(&s, &thread); request(fd, NP_FILE_WRITE, "/uploaded", 0);
-    assert(np_file_receive(fd, &frame) == 0 && frame.type == NP_FILE_METADATA);
-    assert(np_file_send_stream(fd, source, UINT64_MAX) == 0);
-    assert(np_file_receive(fd, &frame) == 0 && frame.type == NP_FILE_END && frame.status == 0);
-    assert(np_file_u64(frame.data) == 160 * sizeof(block)); finish(fd, thread);
-    fd = start(&s, &thread); request(fd, NP_FILE_READ, "/uploaded", 0);
-    assert(np_file_receive(fd, &frame) == 0 && frame.type == NP_FILE_METADATA);
+    struct server s = {.root = root};
+    struct reply *reply = new_reply();
+    uint64_t handle;
+
+    /* A file larger than one request moves through one handle in order. */
+    unsigned char *block = malloc(NP_FILE_IO_MAX); assert(block);
+    for (unsigned i = 0; i < NP_FILE_IO_MAX; i++) block[i] = (unsigned char)(i * 37);
+    struct client client = connect_server(&s);
+    assert(open_path(client, NP_FILE_OPEN_WRITE, 0640, "/uploaded", reply, &handle) == 0);
+    assert(S_ISREG(np_file_u32(reply->body + 8)));
+    for (unsigned i = 0; i < 10; i++) {
+        assert(handle_call(client, NP_FILE_WRITE, handle, 0, block, NP_FILE_IO_MAX, reply) == 0);
+        assert(reply->length == 4 && np_file_u32(reply->body) == NP_FILE_IO_MAX);
+    }
+    assert(handle_call(client, NP_FILE_CLOSE, handle, 0, NULL, 0, reply) == 0);
+    /* A closed handle is gone. */
+    assert(handle_call(client, NP_FILE_CLOSE, handle, 0, NULL, 0, reply) == EBADF);
+    struct stat st; assert(fstatat(root, "uploaded", &st, 0) == 0);
+    assert(st.st_size == 10 * NP_FILE_IO_MAX && (st.st_mode & 0777) == 0640);
+    assert(open_path(client, 0, 0, "/uploaded", reply, &handle) == 0);
+    assert(np_file_u64(reply->body + 8 + 12) == 10 * NP_FILE_IO_MAX);
+    assert(handle_call(client, NP_FILE_WRITE, handle, 0, "x", 1, reply) == EBADF);
     unsigned blocks = 0;
     for (;;) {
-        assert(np_file_receive(fd, &frame) == 0 && !frame.status);
-        if (frame.type == NP_FILE_END) break;
-        assert(frame.type == NP_FILE_DATA && frame.length == sizeof(block));
-        assert(!memcmp(frame.data, block, sizeof(block))); blocks++;
+        assert(handle_call(client, NP_FILE_READ, handle, NP_FILE_IO_MAX, NULL, 0, reply) == 0);
+        if (!reply->data_length) break;
+        assert(reply->data_length == NP_FILE_IO_MAX && !memcmp(reply->data, block, NP_FILE_IO_MAX));
+        blocks++;
     }
-    assert(blocks == 160); finish(fd, thread);
+    assert(blocks == 10);
+    assert(handle_call(client, NP_FILE_READ, handle, NP_FILE_IO_MAX + 1, NULL, 0, reply) == EINVAL);
+    assert(handle_call(client, NP_FILE_READ, handle, 0, NULL, 0, reply) == EINVAL);
+    assert(handle_call(client, NP_FILE_READ, handle + 100, 1, NULL, 0, reply) == EBADF);
+    /* Handles are bounded per session and released with it. */
+    unsigned opened = 1;
+    while (open_path(client, 0, 0, "/uploaded", reply, &handle) == 0) opened++;
+    assert(reply->status == EMFILE && opened == NP_FILE_HANDLES);
+    disconnect(client);
+    client = connect_server(&s);
+    assert(open_path(client, 0, 0, "/uploaded", reply, &handle) == 0);
+    disconnect(client);
+    free(block);
+
     /* Reads transfer exactly a requested sparse-file range, never its prefix
      * or the entire multi-terabyte apparent size. The revision pins identity. */
     int sparse = openat(root, "sparse", O_CREAT | O_EXCL | O_RDWR, 0751); assert(sparse >= 0);
     uint64_t large_offset = UINT64_C(1) << 40;
     assert(pwrite(sparse, "range-bytes", 11, (off_t)large_offset) == 11);
-    fd = start(&s, &thread); request(fd, NP_FILE_SNAPSHOT, "/sparse", 0);
-    assert(np_file_receive(fd, &frame) == 0 && !frame.status && frame.length == 28 + NP_FILE_REVISION);
-    assert(np_file_u64(frame.data + 12) == large_offset + 11);
-    unsigned char version[NP_FILE_REVISION]; memcpy(version, frame.data + 28, sizeof(version)); finish(fd, thread);
-    fd = start(&s, &thread); range_request(fd, "/sparse", large_offset + 2, 5, version);
-    assert(np_file_receive(fd, &frame) == 0 && !frame.status && frame.type == NP_FILE_DATA && frame.length == 5);
-    assert(!memcmp(frame.data, "nge-b", 5));
-    assert(np_file_receive(fd, &frame) == 0 && !frame.status && frame.type == NP_FILE_END && np_file_u64(frame.data) == 5);
-    finish(fd, thread);
-    fd = start(&s, &thread); range_request(fd, "/sparse", large_offset + 9, 8, version);
-    assert(np_file_receive(fd, &frame) == 0 && !frame.status && frame.type == NP_FILE_DATA && frame.length == 2);
-    assert(!memcmp(frame.data, "es", 2));
-    assert(np_file_receive(fd, &frame) == 0 && !frame.status && np_file_u64(frame.data) == 2); finish(fd, thread);
+    client = connect_server(&s);
+    assert(path_call(client, NP_FILE_SNAPSHOT, "/sparse", reply) == 0);
+    assert(reply->length == NP_FILE_METADATA + NP_FILE_REVISION && np_file_u64(reply->body + 12) == large_offset + 11);
+    unsigned char version[NP_FILE_REVISION]; memcpy(version, reply->body + NP_FILE_METADATA, sizeof(version));
+    assert(range(client, "/sparse", large_offset + 2, 5, version, reply) == 0);
+    assert(reply->data_length == 5 && !memcmp(reply->data, "nge-b", 5));
+    assert(range(client, "/sparse", large_offset + 9, 8, version, reply) == 0);
+    assert(reply->data_length == 2 && !memcmp(reply->data, "es", 2));
     for (unsigned i = 0; i < 2; i++) {
-        fd = start(&s, &thread); range_request(fd, "/sparse", large_offset + 11, i ? 0 : 10, version);
-        assert(np_file_receive(fd, &frame) == 0 && !frame.status && frame.type == NP_FILE_END && !np_file_u64(frame.data));
-        finish(fd, thread);
+        assert(range(client, "/sparse", large_offset + 11, i ? 0 : 10, version, reply) == 0 && !reply->data_length);
     }
-    fd = start(&s, &thread); range_request(fd, "/sparse", UINT64_MAX, 1, version);
-    assert(np_file_receive(fd, &frame) == 0 && frame.status == EINVAL); finish(fd, thread);
-    fd = start(&s, &thread); range_request(fd, "/sparse", 0, NP_FILE_RANGE_MAX + 1, version);
-    assert(np_file_receive(fd, &frame) == 0 && frame.status == EINVAL); finish(fd, thread);
+    assert(range(client, "/sparse", UINT64_MAX, 1, version, reply) == EINVAL);
+    assert(range(client, "/sparse", 0, NP_FILE_IO_MAX + 1, version, reply) == EINVAL);
     assert(symlinkat("sparse", root, "sparse-link") == 0);
-    fd = start(&s, &thread); range_request(fd, "/sparse-link", large_offset, 5, version);
-    assert(np_file_receive(fd, &frame) == 0 && frame.status); finish(fd, thread);
+    assert(range(client, "/sparse-link", large_offset, 5, version, reply) != 0);
     assert(symlinkat(".", root, "folder-link") == 0);
-    fd = start(&s, &thread); range_request(fd, "/folder-link/sparse", large_offset, 5, version);
-    assert(np_file_receive(fd, &frame) == 0 && frame.status); finish(fd, thread);
-    fd = start(&s, &thread); request(fd, NP_FILE_DIRECTORY, "/folder-link", 0);
-    assert(np_file_receive(fd, &frame) == 0 && frame.status); finish(fd, thread);
+    assert(range(client, "/folder-link/sparse", large_offset, 5, version, reply) != 0);
+    assert(open_path(client, NP_FILE_OPEN_DIRECTORY | NP_FILE_NOFOLLOW, 0, "/folder-link", reply, &handle) != 0);
     assert(pwrite(sparse, "changed", 7, (off_t)large_offset) == 7);
-    fd = start(&s, &thread); range_request(fd, "/sparse", large_offset, 7, version);
-    assert(np_file_receive(fd, &frame) == 0 && frame.type == NP_FILE_END && frame.status == NP_FILE_STALE); finish(fd, thread);
+    assert(range(client, "/sparse", large_offset, 7, version, reply) == NP_FILE_STALE && !reply->data_length);
+    disconnect(client);
     assert(unlinkat(root, "sparse-link", 0) == 0); assert(unlinkat(root, "folder-link", 0) == 0);
     close(sparse); assert(unlinkat(root, "sparse", 0) == 0);
-    /* No silent overwrite, special-file blocking or read-only bypass. */
-    fd = start(&s, &thread); request(fd, NP_FILE_WRITE, "/uploaded", 0);
-    assert(np_file_receive(fd, &frame) == 0 && frame.status == EEXIST); finish(fd, thread);
-    assert(mkfifoat(root, "fifo", 0600) == 0);
-    fd = start(&s, &thread); request(fd, NP_FILE_READ, "/fifo", 0);
-    assert(np_file_receive(fd, &frame) == 0 && frame.status == EINVAL); finish(fd, thread);
-    s.read_only = 1; fd = start(&s, &thread); request(fd, NP_FILE_WRITE, "/denied", 0);
-    assert(np_file_receive(fd, &frame) == 0 && frame.status == EROFS); finish(fd, thread);
-    s.read_only = 0;
-    /* Cancelling while the sender is backpressured must wake it. */
-    fd = start(&s, &thread); request(fd, NP_FILE_READ, "/uploaded", 0);
-    assert(np_file_receive(fd, &frame) == 0 && frame.type == NP_FILE_METADATA);
-    finish(fd, thread); assert(s.result < 0);
-    /* Empty files still get a complete END, and listings preserve names. */
-    assert(ftruncate(source, 0) == 0);
-    fd = start(&s, &thread); request(fd, NP_FILE_READ, "/source", 0);
-    assert(np_file_receive(fd, &frame) == 0 && frame.type == NP_FILE_METADATA);
-    assert(np_file_receive(fd, &frame) == 0 && frame.type == NP_FILE_END && !np_file_u64(frame.data));
-    finish(fd, thread);
-    fd = start(&s, &thread); request(fd, NP_FILE_LIST, "/", 0);
-    assert(np_file_receive(fd, &frame) == 0 && frame.type == NP_FILE_METADATA);
-    assert(np_file_receive(fd, &frame) == 0 && frame.type == NP_FILE_ENTRIES);
-    unsigned names = 0;
-    for (size_t i = 0; i < frame.length;) {
-        assert(i + 3 <= frame.length); unsigned n = frame.data[i + 1] | frame.data[i + 2] << 8;
-        i += 3 + n; assert(i <= frame.length); names++;
-    }
-    assert(names == 3);
-    assert(np_file_receive(fd, &frame) == 0 && frame.type == NP_FILE_END); finish(fd, thread);
-    fd = start(&s, &thread);
-    assert(!np_file_peer_is_host(fd));
-    unsigned char malformed[16] = {'N','P','F','R',1,NP_FILE_READ};
-    np_file_put32(malformed + 8, NP_FILE_CHUNK + 1);
-    assert(write(fd, malformed, sizeof(malformed)) == sizeof(malformed)); finish(fd, thread);
-    assert(s.result < 0);
 
-    /* The actual user home and all lstat fields arrive in one bounded stream;
+    /* No silent overwrite, special-file blocking or read-only bypass. */
+    client = connect_server(&s);
+    assert(open_path(client, NP_FILE_OPEN_WRITE, 0600, "/uploaded", reply, &handle) == EEXIST);
+    assert(mkfifoat(root, "fifo", 0600) == 0);
+    assert(open_path(client, 0, 0, "/fifo", reply, &handle) == EINVAL);
+    assert(open_path(client, NP_FILE_REPLACE, 0, "/uploaded", reply, &handle) == EINVAL);
+    assert(open_path(client, NP_FILE_OPEN_WRITE | NP_FILE_OPEN_DIRECTORY, 0600, "/new", reply, &handle) == EINVAL);
+    assert(path_call(client, 99, "/uploaded", reply) == ENOSYS);
+    disconnect(client);
+    s.read_only = 1; client = connect_server(&s);
+    assert(open_path(client, NP_FILE_OPEN_WRITE, 0600, "/denied", reply, &handle) == EROFS);
+    disconnect(client); s.read_only = 0;
+
+    /* Replacing truncates; an empty file reads as an immediate end. */
+    int source = openat(root, "source", O_CREAT | O_EXCL | O_RDWR, 0600); assert(source >= 0);
+    assert(write(source, "old contents", 12) == 12);
+    client = connect_server(&s);
+    assert(open_path(client, NP_FILE_OPEN_WRITE | NP_FILE_REPLACE, 0600, "/source", reply, &handle) == 0);
+    assert(np_file_u64(reply->body + 8 + 12) == 0);
+    assert(handle_call(client, NP_FILE_CLOSE, handle, 0, NULL, 0, reply) == 0);
+    assert(open_path(client, 0, 0, "/source", reply, &handle) == 0);
+    assert(handle_call(client, NP_FILE_READ, handle, 4096, NULL, 0, reply) == 0 && !reply->data_length);
+    assert(path_call(client, NP_FILE_STAT, "/source", reply) == 0 && reply->length == NP_FILE_METADATA);
+    assert(open_path(client, 0, 0, "/", reply, &handle) == 0 && S_ISDIR(np_file_u32(reply->body + 8)));
+    assert(handle_call(client, NP_FILE_READ, handle, NP_FILE_IO_MAX, NULL, 0, reply) == 0);
+    assert(count_names(reply, 0) == 3);
+    assert(handle_call(client, NP_FILE_READ, handle, NP_FILE_IO_MAX, NULL, 0, reply) == 0 && !reply->data_length);
+    assert(open_path(client, NP_FILE_OPEN_DIRECTORY, 0, "/source", reply, &handle) == ENOTDIR);
+    disconnect(client);
+
+    /* A malformed frame ends the session, and the server returns. */
+    int sockets[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    s.socket = sockets[0];
+    pthread_t thread; assert(pthread_create(&thread, NULL, serve, &s) == 0);
+    unsigned char malformed[16] = {'N','P','F','R',1,3};
+    assert(write(sockets[1], malformed, sizeof(malformed)) == sizeof(malformed));
+    assert(pthread_join(thread, NULL) == 0 && s.result == 0);
+    close(sockets[1]);
+
+    /* The actual user home and all lstat fields arrive with the listing;
      * links and special files appear without opening their targets. */
     char *saved_home = getenv("HOME") ? strdup(getenv("HOME")) : NULL;
     assert(setenv("HOME", "/", 1) == 0);
     assert(symlinkat("source", root, "browse-link") == 0);
-    fd = start(&s, &thread); request(fd, NP_FILE_BROWSE, "", 0);
-    assert(np_file_receive(fd, &frame) == 0 && !frame.status && frame.type == NP_FILE_METADATA);
-    assert(frame.length == 10 && np_file_u32(frame.data) == 1 && np_file_u32(frame.data + 4) == 1);
-    assert(frame.data[8] == '/' && frame.data[9] == '/');
+    const unsigned browse = NP_FILE_OPEN_DIRECTORY | NP_FILE_OPEN_STAT | NP_FILE_OPEN_HOME | NP_FILE_NOFOLLOW;
+    client = connect_server(&s);
+    assert(open_path(client, browse, 0, "", reply, &handle) == 0);
+    size_t base = 8 + NP_FILE_METADATA;
+    assert(reply->length == base + 10 && np_file_u32(reply->body + base) == 1 && np_file_u32(reply->body + base + 4) == 1);
+    assert(reply->body[base + 8] == '/' && reply->body[base + 9] == '/');
+    assert(handle_call(client, NP_FILE_READ, handle, NP_FILE_IO_MAX, NULL, 0, reply) == 0);
     unsigned seen = 0;
-    while (np_file_receive(fd, &frame) == 0 && frame.type != NP_FILE_END) {
-        assert(frame.type == NP_FILE_ENTRIES && !frame.status && frame.length <= NP_FILE_CHUNK);
-        for (size_t i = 0; i < frame.length;) {
-            assert(i + 30 <= frame.length);
-            unsigned n = frame.data[i] | frame.data[i + 1] << 8;
-            assert(n && n <= 255 && i + 30 + n <= frame.length);
-            char entry[256]; memcpy(entry, frame.data + i + 30, n); entry[n] = 0;
-            struct stat info; assert(fstatat(root, entry, &info, AT_SYMLINK_NOFOLLOW) == 0);
-            assert(np_file_u32(frame.data + i + 2) == (uint32_t)info.st_mode);
-            assert(np_file_u64(frame.data + i + 14) == (uint64_t)info.st_size);
-            assert(np_file_u64(frame.data + i + 22) == (uint64_t)info.st_mtime);
-            seen++; i += 30 + n;
-        }
+    for (size_t i = 0; i < reply->data_length;) {
+        assert(i + 30 <= reply->data_length);
+        unsigned n = reply->data[i] | reply->data[i + 1] << 8;
+        assert(n && n <= 255 && i + 30 + n <= reply->data_length);
+        char entry[256]; memcpy(entry, reply->data + i + 30, n); entry[n] = 0;
+        struct stat info; assert(fstatat(root, entry, &info, AT_SYMLINK_NOFOLLOW) == 0);
+        assert(np_file_u32(reply->data + i + 2) == (uint32_t)info.st_mode);
+        assert(np_file_u64(reply->data + i + 14) == (uint64_t)info.st_size);
+        assert(np_file_u64(reply->data + i + 22) == (uint64_t)info.st_mtime);
+        seen++; i += 30 + n;
     }
-    assert(frame.type == NP_FILE_END && !frame.status && frame.length == 8 && np_file_u64(frame.data) == seen && seen == 4);
-    finish(fd, thread);
+    assert(seen == 4);
+    assert(handle_call(client, NP_FILE_READ, handle, NP_FILE_IO_MAX, NULL, 0, reply) == 0 && !reply->data_length);
     if (saved_home) { assert(setenv("HOME", saved_home, 1) == 0); free(saved_home); }
     else assert(unsetenv("HOME") == 0);
-    fd = start(&s, &thread); request(fd, NP_FILE_BROWSE, "/browse-link", 0);
-    assert(np_file_receive(fd, &frame) == 0 && frame.status); finish(fd, thread);
+    assert(open_path(client, browse, 0, "/browse-link", reply, &handle) != 0);
+    assert(open_path(client, NP_FILE_OPEN_DIRECTORY, 0, "", reply, &handle) == EINVAL);
+    disconnect(client);
     assert(unlinkat(root, "browse-link", 0) == 0);
     test_staging(&s);
 
-    /* Directory batches must cross a frame boundary without splitting names. */
+    /* Directory pages never split a name, and a page too small for the next
+     * name is refused rather than skipping it. */
     assert(mkdirat(root, "many", 0700) == 0);
     int many = openat(root, "many", O_RDONLY | O_DIRECTORY); assert(many >= 0);
     char name[220];
@@ -319,44 +391,42 @@ int main(void) {
         memset(name, 'x', 200); snprintf(name + 200, sizeof(name) - 200, "%04u", i);
         int file = openat(many, name, O_CREAT | O_EXCL | O_WRONLY, 0600); assert(file >= 0); close(file);
     }
-    fd = start(&s, &thread); request(fd, NP_FILE_LIST, "/many", 0);
-    assert(np_file_receive(fd, &frame) == 0 && frame.type == NP_FILE_METADATA);
-    unsigned entries = 0, batches = 0;
-    while (np_file_receive(fd, &frame) == 0 && frame.type != NP_FILE_END) {
-        assert(frame.type == NP_FILE_ENTRIES && !frame.status); batches++;
-        for (size_t i = 0; i < frame.length;) {
-            assert(i + 3 <= frame.length);
-            unsigned n = frame.data[i + 1] | frame.data[i + 2] << 8;
-            assert(n == 204 && i + 3 + n <= frame.length); entries++; i += 3 + n;
-        }
+    client = connect_server(&s);
+    assert(open_path(client, 0, 0, "/many", reply, &handle) == 0);
+    assert(handle_call(client, NP_FILE_READ, handle, 100, NULL, 0, reply) == EMSGSIZE);
+    unsigned entries = 0, pages = 0;
+    for (;;) {
+        assert(handle_call(client, NP_FILE_READ, handle, 65536, NULL, 0, reply) == 0);
+        if (!reply->data_length) break;
+        entries += count_names(reply, 204); pages++;
     }
-    assert(frame.type == NP_FILE_END && !frame.status && entries == 600 && batches > 1); finish(fd, thread);
-
-    fd = start(&s, &thread); request(fd, NP_FILE_BROWSE, "/many", 0);
-    assert(np_file_receive(fd, &frame) == 0 && frame.type == NP_FILE_METADATA && !frame.status);
-    entries = 0; batches = 0;
-    while (np_file_receive(fd, &frame) == 0 && frame.type != NP_FILE_END) {
-        assert(frame.type == NP_FILE_ENTRIES && !frame.status && frame.length <= NP_FILE_CHUNK); batches++;
-        for (size_t i = 0; i < frame.length;) {
-            assert(i + 30 <= frame.length);
-            unsigned n = frame.data[i] | frame.data[i + 1] << 8;
-            assert(n == 204 && i + 30 + n <= frame.length);
-            assert(S_ISREG(np_file_u32(frame.data + i + 2)) && !np_file_u64(frame.data + i + 14));
+    assert(entries == 600 && pages > 1);
+    assert(open_path(client, NP_FILE_OPEN_DIRECTORY | NP_FILE_OPEN_STAT | NP_FILE_NOFOLLOW, 0, "/many", reply, &handle) == 0);
+    entries = 0; pages = 0;
+    for (;;) {
+        assert(handle_call(client, NP_FILE_READ, handle, 65536, NULL, 0, reply) == 0);
+        if (!reply->data_length) break;
+        for (size_t i = 0; i < reply->data_length;) {
+            unsigned n = reply->data[i] | reply->data[i + 1] << 8;
+            assert(n == 204 && i + 30 + n <= reply->data_length);
+            assert(S_ISREG(np_file_u32(reply->data + i + 2)) && !np_file_u64(reply->data + i + 14));
             entries++; i += 30 + n;
         }
+        pages++;
     }
-    assert(frame.type == NP_FILE_END && !frame.status && np_file_u64(frame.data) == 600 && entries == 600 && batches > 1);
-    finish(fd, thread);
-
+    assert(entries == 600 && pages > 1);
+    disconnect(client);
     for (unsigned i = 0; i < 600; i++) {
         memset(name, 'x', 200); snprintf(name + 200, sizeof(name) - 200, "%04u", i);
         assert(unlinkat(many, name, 0) == 0);
     }
     close(many); assert(unlinkat(root, "many", AT_REMOVEDIR) == 0);
+
     if (geteuid() != 0) {
         assert(fchmod(source, 0) == 0);
-        fd = start(&s, &thread); request(fd, NP_FILE_READ, "/source", 0);
-        assert(np_file_receive(fd, &frame) == 0 && frame.status == EACCES); finish(fd, thread);
+        client = connect_server(&s);
+        assert(open_path(client, 0, 0, "/source", reply, &handle) == EACCES);
+        disconnect(client);
         assert(fchmod(source, 0600) == 0);
     }
 #ifdef __linux__
@@ -367,21 +437,16 @@ int main(void) {
     assert(symlinkat("/etc/passwd", root, "outside") == 0);
     assert(np_file_open(root, "/outside", O_RDONLY, 0) < 0);
     assert(unlinkat(root, "outside", 0) == 0);
-    /* procfs often reports st_size=0 while its read stream is nonempty. */
+    /* procfs often reports st_size=0 while its contents are nonempty. */
     int system_root = open("/", O_RDONLY | O_DIRECTORY); assert(system_root >= 0);
-    s.root = system_root; fd = start(&s, &thread); request(fd, NP_FILE_READ, "/proc/meminfo", 0);
-    assert(np_file_receive(fd, &frame) == 0 && frame.type == NP_FILE_METADATA);
-    assert(np_file_receive(fd, &frame) == 0 && frame.type == NP_FILE_DATA && frame.length > 0);
-    finish(fd, thread); close(system_root); s.root = root;
+    s.root = system_root; client = connect_server(&s);
+    assert(open_path(client, 0, 0, "/proc/meminfo", reply, &handle) == 0);
+    assert(handle_call(client, NP_FILE_READ, handle, NP_FILE_IO_MAX, NULL, 0, reply) == 0 && reply->data_length > 0);
+    disconnect(client); close(system_root); s.root = root;
 #endif
-    /* A source read failure must fail locally as well as at the receiver. */
-    int pair[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
-    assert(np_file_send_stream(pair[0], -1, UINT64_MAX) < 0 && errno == EBADF);
-    assert(np_file_receive(pair[1], &frame) == 0);
-    assert(frame.type == NP_FILE_END && frame.status == EBADF);
-    close(pair[0]); close(pair[1]);
+    free_reply(reply);
     close(source); assert(unlinkat(root, "source", 0) == 0);
     assert(unlinkat(root, "uploaded", 0) == 0); assert(unlinkat(root, "fifo", 0) == 0);
     close(root); assert(rmdir(dir) == 0);
-    puts("file RPC: large transfer, content, EOF, cancellation, listing and file safety PASS");
+    puts("file service: transfer, ranges, handles, listings and file safety PASS");
 }

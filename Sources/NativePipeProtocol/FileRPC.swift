@@ -3,115 +3,19 @@ import Foundation
 import Darwin
 import CNativePipeFileRPC
 
-/// One cancellable operation per connection; identical framing for privileged
-/// recovery/guestd and the compositor's unprivileged file worker. The connector
-/// selects the endpoint, never a UID supplied by the caller.
+/// Guest file services: one NPFR session per operation, identical for
+/// privileged recovery/guestd and the compositor's unprivileged file worker.
+/// The connector selects the endpoint, never a UID supplied by the caller.
+/// Closing the session releases every handle the operation opened.
 public struct FileRPC: Sendable {
-    public static let rootPort: UInt32 = 1025
-    public static let userPort: UInt32 = 1026
+    public static let rootPort = NP_FILE_ROOT_PORT
+    public static let userPort = NP_FILE_USER_PORT
     public typealias Connector = @Sendable () async throws -> FileHandle
     public typealias Progress = @Sendable (_ completed: UInt64, _ expected: UInt64) -> Void
     private let connect: Connector
+    private static let ioMaximum = Int(NP_FILE_IO_MAX)
 
     public init(connect: @escaping Connector) { self.connect = connect }
-
-    public static func sendRecord(_ data: Data, to connection: SocketConnection,
-                                  deadline: DispatchTime) async throws {
-        func frame(_ type: np_file_type, _ body: Data) -> Data {
-            var result = Data([78, 80, 70, 82, UInt8(NP_FILE_VERSION), UInt8(type.rawValue), 0, 0])
-            result.append(Socket.encode(UInt32(body.count)))
-            result.append(Socket.encode(UInt32(0)))
-            result.append(body)
-            return result
-        }
-        var offset = 0
-        while offset < data.count {
-            let end = min(offset + Int(NP_FILE_CHUNK), data.count)
-            try await connection.write(frame(NP_FILE_DATA, data.subdata(in: offset..<end)), deadline: deadline)
-            offset = end
-        }
-        try await connection.write(frame(NP_FILE_END, Socket.encode(UInt64(data.count))), deadline: deadline)
-    }
-
-    public static func receiveRecord(from connection: SocketConnection, maximum: Int,
-                                     deadline: DispatchTime) async throws -> Data {
-        guard maximum >= 0 else { throw Failure.protocolError }
-        var result = Data()
-        while true {
-            let header = try await connection.readExactly(Int(NP_FILE_HEADER), deadline: deadline)
-            guard header.prefix(5) == Data([78, 80, 70, 82, UInt8(NP_FILE_VERSION)]),
-                  header[6] == 0, header[7] == 0 else { throw Failure.protocolError }
-            let length = header.withUnsafeBytes { Int(UInt32(littleEndian: $0.loadUnaligned(fromByteOffset: 8, as: UInt32.self))) }
-            let status = header.withUnsafeBytes { UInt32(littleEndian: $0.loadUnaligned(fromByteOffset: 12, as: UInt32.self)) }
-            guard status == 0 else { throw Failure.remote(Int32(clamping: status)) }
-            guard length <= Int(NP_FILE_CHUNK) else { throw Failure.protocolError }
-            let body = try await connection.readExactly(length, deadline: deadline)
-            if header[5] == UInt8(NP_FILE_END.rawValue) {
-                guard length == 8,
-                      body.withUnsafeBytes({ UInt64(littleEndian: $0.loadUnaligned(as: UInt64.self)) }) == result.count
-                else { throw Failure.protocolError }
-                return result
-            }
-            guard header[5] == UInt8(NP_FILE_DATA.rawValue), length > 0,
-                  length <= maximum - result.count else { throw Failure.protocolError }
-            result.append(body)
-        }
-    }
-
-    /// An in-memory record over the same DATA/END wire used by file streams.
-    /// The receiver chooses a record bound; file upload/download have no such
-    /// aggregate bound and never collect a whole file in memory.
-    public static func sendRecord(_ data: Data, to handle: FileHandle) throws {
-        let socket = Socket(fd: handle.fileDescriptor)
-        var offset = 0
-        while offset < data.count {
-            let end = min(offset + Int(NP_FILE_CHUNK), data.count)
-            try socket.send(NP_FILE_DATA, data.subdata(in: offset..<end))
-            offset = end
-        }
-        try socket.send(NP_FILE_END, Socket.encode(UInt64(data.count)))
-    }
-
-    public static func receiveRecord(from handle: FileHandle, maximum: Int) throws -> Data {
-        guard maximum >= 0 else { throw Failure.protocolError }
-        let socket = Socket(fd: handle.fileDescriptor)
-        var data = Data()
-        while true {
-            let frame = try socket.receive()
-            if frame.type == NP_FILE_END.rawValue {
-                try socket.checkEnd(frame, total: UInt64(data.count))
-                return data
-            }
-            guard frame.type == NP_FILE_DATA.rawValue, !frame.data.isEmpty,
-                  frame.data.count <= maximum - data.count else { throw Failure.protocolError }
-            data.append(frame.data)
-        }
-    }
-
-    /// NPAG retains named-artifact negotiation; its payload is this same stream.
-    public static func sendStream(_ source: FileHandle, count: UInt64, to socket: FileHandle) throws {
-        let result = np_file_send_stream(socket.fileDescriptor, source.fileDescriptor, count)
-        guard result == 0 else {
-            throw Failure.local(errno)
-        }
-    }
-
-    public static func receiveStream(from socket: FileHandle, to destination: FileHandle, count: UInt64) throws {
-        let wire = Socket(fd: socket.fileDescriptor)
-        var received: UInt64 = 0
-        while true {
-            let frame = try wire.receive()
-            if frame.type == NP_FILE_END.rawValue {
-                try wire.checkEnd(frame, total: received)
-                break
-            }
-            guard frame.type == NP_FILE_DATA.rawValue, !frame.data.isEmpty,
-                  UInt64(frame.data.count) <= count - received else { throw Failure.protocolError }
-            try destination.write(contentsOf: frame.data)
-            received += UInt64(frame.data.count)
-        }
-        guard received == count else { throw Failure.protocolError }
-    }
 
     public enum Failure: LocalizedError {
         case protocolError, invalidPath, tooLarge, sourceChanged(String), local(Int32), remote(Int32)
@@ -153,48 +57,37 @@ public struct FileRPC: Sendable {
     /// Small-file convenience for configuration/procfs. Large file consumers
     /// use download/upload, not this bounded in-memory API.
     public func read(_ path: String, maximum: Int = 8 * 1024 * 1024) async throws -> PathContents {
-        try await readContents(path, request: NP_FILE_READ, maximum: maximum)
+        try await readContents(path, flags: 0, maximum: maximum)
     }
     /// A lazy directory listing pins the same no-symlink root as range reads.
     public func directoryEntries(_ path: String, maximum: Int = 8 * 1024 * 1024) async throws -> [DirEntry] {
         try UserFileRange.validate(RemoteFileURL.make(path))
-        return try await readContents(path, request: NP_FILE_DIRECTORY, maximum: maximum).entries
+        return try await readContents(path, flags: NP_FILE_OPEN_DIRECTORY | NP_FILE_NOFOLLOW, maximum: maximum).entries
     }
-    private func readContents(_ path: String, request: np_file_type, maximum: Int) async throws -> PathContents {
+    private func readContents(_ path: String, flags: UInt32, maximum: Int) async throws -> PathContents {
         guard maximum >= 0 else { throw Failure.protocolError }
-        return try await operation { socket in
-            try socket.request(request, path: path)
-            let info = try socket.metadata(path)
+        return try await operation { session in
+            let (handle, info) = try session.open(path, flags: flags)
             var contents = PathContents(path: path, isDirectory: info.isDirectory)
-            var total: UInt64 = 0
+            var total = 0
             while true {
-                let frame = try socket.receive()
-                if frame.type == NP_FILE_END.rawValue {
-                    try socket.checkEnd(frame, total: info.isDirectory ? nil : total)
-                    return contents
-                }
-                if info.isDirectory {
-                    guard frame.type == NP_FILE_ENTRIES.rawValue else { throw Failure.protocolError }
-                    var offset = 0
-                    while offset < frame.data.count {
-                        guard offset + 3 <= frame.data.count else { throw Failure.protocolError }
-                        let type = frame.data[offset]
-                        let count = Int(frame.data[offset + 1]) | Int(frame.data[offset + 2]) << 8
-                        offset += 3
-                        guard count > 0, offset + count <= frame.data.count,
-                              let name = String(data: frame.data[offset..<offset + count], encoding: .utf8),
-                              name != ".", name != "..", !name.contains("/"), !name.contains("\0")
-                        else { throw Failure.protocolError }
-                        total += UInt64(count + 3)
-                        guard total <= maximum else { throw Failure.tooLarge }
-                        contents.entries.append(DirEntry(name: name, fileType: DirEntryType(rawValue: type) ?? .unknown))
-                        offset += count
-                    }
-                } else {
-                    guard frame.type == NP_FILE_DATA.rawValue, !frame.data.isEmpty else { throw Failure.protocolError }
-                    total += UInt64(frame.data.count)
-                    guard total <= maximum else { throw Failure.tooLarge }
-                    contents.data.append(frame.data)
+                let page = try session.read(handle)
+                if page.isEmpty { return contents }
+                total += page.count
+                guard total <= maximum else { throw Failure.tooLarge }
+                guard info.isDirectory else { contents.data.append(page); continue }
+                var offset = page.startIndex
+                while offset < page.endIndex {
+                    guard page.endIndex - offset >= 3 else { throw Failure.protocolError }
+                    let type = page[offset]
+                    let count = Int(page[offset + 1]) | Int(page[offset + 2]) << 8
+                    offset += 3
+                    guard count > 0, count <= page.endIndex - offset,
+                          let name = String(data: page[offset..<offset + count], encoding: .utf8),
+                          name != ".", name != "..", !name.contains("/"), !name.contains("\0")
+                    else { throw Failure.protocolError }
+                    contents.entries.append(DirEntry(name: name, fileType: DirEntryType(rawValue: type) ?? .unknown))
+                    offset += count
                 }
             }
         }
@@ -214,45 +107,42 @@ public struct FileRPC: Sendable {
         }
     }
 
-    /// One stream returns the path, actual worker home and lstat for each name.
-    /// Entry frames remain bounded, and no per-entry connection is necessary.
+    /// The listing carries the path, the worker's actual home and lstat for
+    /// each name; no request per entry is necessary.
     public func browse(_ path: String? = nil) async throws -> DirectoryListing {
         if let path { try UserFileRange.validate(RemoteFileURL.make(path)) }
-        return try await operation { socket in
-            try socket.request(NP_FILE_BROWSE, path: path ?? "")
-            let frame = try socket.receive()
-            guard frame.type == NP_FILE_METADATA.rawValue, frame.data.count >= 8 else { throw Failure.protocolError }
-            let pathLength = Int(socket.integer(frame.data, 0, as: UInt32.self))
-            let homeLength = Int(socket.integer(frame.data, 4, as: UInt32.self))
+        return try await operation { session in
+            let flags = NP_FILE_OPEN_DIRECTORY | NP_FILE_OPEN_STAT | NP_FILE_OPEN_HOME | NP_FILE_NOFOLLOW
+            let reply = try session.call(NP_FILE_OPEN, Session.encode(flags) + Session.encode(UInt32(0))
+                + Session.path(path ?? "", allowEmpty: true)).body
+            let base = 8 + Int(NP_FILE_METADATA)
+            guard reply.count >= base + 8 else { throw Failure.protocolError }
+            let handle: UInt64 = Session.integer(reply, 0)
+            let pathLength = Int(Session.integer(reply, base, as: UInt32.self))
+            let homeLength = Int(Session.integer(reply, base + 4, as: UInt32.self))
             guard pathLength > 0, pathLength <= 4095, homeLength > 0, homeLength <= 4095,
-                  frame.data.count == 8 + pathLength + homeLength,
-                  let resolved = String(data: frame.data[8..<(8 + pathLength)], encoding: .utf8),
-                  let home = String(data: frame.data[(8 + pathLength)..<frame.data.count], encoding: .utf8)
+                  reply.count == base + 8 + pathLength + homeLength,
+                  let resolved = String(data: reply.subdata(in: (base + 8)..<(base + 8 + pathLength)), encoding: .utf8),
+                  let home = String(data: reply.subdata(in: (base + 8 + pathLength)..<reply.count), encoding: .utf8)
             else { throw Failure.protocolError }
             try UserFileRange.validate(RemoteFileURL.make(resolved)); try UserFileRange.validate(RemoteFileURL.make(home))
             var entries: [DirectoryEntry] = [], names = Set<Data>(), metadataBytes = 0
             while true {
-                let batch = try socket.receive()
-                if batch.type == NP_FILE_END.rawValue {
-                    try socket.checkEnd(batch, total: UInt64(entries.count))
-                    return DirectoryListing(path: resolved, home: home, entries: entries)
-                }
-                guard batch.type == NP_FILE_ENTRIES.rawValue, !batch.data.isEmpty else { throw Failure.protocolError }
-                metadataBytes += batch.data.count
+                let page = try session.read(handle)
+                if page.isEmpty { return DirectoryListing(path: resolved, home: home, entries: entries) }
+                metadataBytes += page.count
                 guard metadataBytes <= 64 * 1024 * 1024 else { throw Failure.tooLarge }
                 var offset = 0
-                while offset < batch.data.count {
-                    guard batch.data.count - offset >= 30 else { throw Failure.protocolError }
-                    let count = Int(batch.data[offset]) | Int(batch.data[offset + 1]) << 8
-                    guard count > 0, count <= 255, count <= batch.data.count - offset - 30 else { throw Failure.protocolError }
-                    let bytes = batch.data.subdata(in: (offset + 30)..<(offset + 30 + count))
+                while offset < page.count {
+                    guard page.count - offset >= 30 else { throw Failure.protocolError }
+                    let count = Int(page[offset]) | Int(page[offset + 1]) << 8
+                    guard count > 0, count <= 255, count <= page.count - offset - 30 else { throw Failure.protocolError }
+                    let bytes = page.subdata(in: (offset + 30)..<(offset + 30 + count))
                     guard names.insert(bytes).inserted, let name = String(data: bytes, encoding: .utf8),
                           name != ".", name != "..", !name.contains("/"), !name.contains("\0") else { throw Failure.protocolError }
                     let child = try RemoteFileURL.appending(name, to: RemoteFileURL.make(resolved, isDirectory: true))
-                    let stat = PathStat(path: child.path, mode: socket.integer(batch.data, offset + 2),
-                        uid: socket.integer(batch.data, offset + 6), gid: socket.integer(batch.data, offset + 10),
-                        size: socket.integer(batch.data, offset + 14), mtime: socket.integer(batch.data, offset + 22))
-                    entries.append(.init(name: name, metadata: stat)); offset += 30 + count
+                    entries.append(.init(name: name, metadata: Session.metadata(page, at: offset + 2, path: child.path)))
+                    offset += 30 + count
                 }
             }
         }
@@ -268,10 +158,8 @@ public struct FileRPC: Sendable {
         token.withUnsafeMutableBytes { arc4random_buf($0.baseAddress, $0.count) }
         let staging = UploadStaging(path: path, token: token)
         do {
-            return try await operation { socket in
-                try socket.request(NP_FILE_CREATE_STAGING, path: path, suffix: staging.token)
-                let reply = try socket.receive()
-                guard reply.type == NP_FILE_METADATA.rawValue, reply.data == staging.token else { throw Failure.protocolError }
+            return try await operation { session in
+                _ = try session.call(NP_FILE_CREATE_STAGING, staging.token + Session.path(path))
                 return staging
             }
         } catch {
@@ -284,24 +172,22 @@ public struct FileRPC: Sendable {
     }
     public func publishStaging(_ staging: UploadStaging, to destination: String) async throws {
         try UserFileRange.validate(RemoteFileURL.make(destination))
-        try await operation { socket in
-            let name = Data(destination.utf8)
-            var suffix = staging.token; suffix.append(Socket.encode(UInt32(name.count))); suffix.append(name)
-            try socket.request(NP_FILE_PUBLISH_STAGING, path: staging.path, suffix: suffix)
-            try socket.checkEnd(socket.receive(), total: nil)
+        try await operation { session in
+            _ = try session.call(NP_FILE_PUBLISH_STAGING,
+                                 staging.token + Session.path(destination) + Session.path(staging.path))
         }
     }
     public func discardStaging(_ staging: UploadStaging) async throws {
-        try await operation { socket in
-            try socket.request(NP_FILE_DISCARD_STAGING, path: staging.path, suffix: staging.token)
-            try socket.checkEnd(socket.receive(), total: nil)
+        try await operation { session in
+            _ = try session.call(NP_FILE_DISCARD_STAGING, staging.token + Session.path(staging.path))
         }
     }
 
     public func stat(_ path: String) async throws -> PathStat {
-        try await operation { socket in
-            try socket.request(NP_FILE_STAT, path: path)
-            return try socket.metadata(path)
+        try await operation { session in
+            let reply = try session.call(NP_FILE_STAT, Session.path(path)).body
+            guard reply.count == Int(NP_FILE_METADATA) else { throw Failure.protocolError }
+            return Session.metadata(reply, at: 0, path: path)
         }
     }
 
@@ -309,71 +195,53 @@ public struct FileRPC: Sendable {
     /// modification/change times. No file contents are read by this request.
     public func snapshot(_ path: String) async throws -> UserFileMetadata {
         try UserFileRange.validate(RemoteFileURL.make(path))
-        return try await operation { socket in
-            try socket.request(NP_FILE_SNAPSHOT, path: path)
-            let frame = try socket.receive()
-            guard frame.type == NP_FILE_METADATA.rawValue, frame.data.count == 28 + Int(NP_FILE_REVISION) else {
-                throw Failure.protocolError
-            }
-            let mode: UInt32 = socket.integer(frame.data, 0)
+        return try await operation { session in
+            let reply = try session.call(NP_FILE_SNAPSHOT, Session.path(path)).body
+            guard reply.count == Int(NP_FILE_METADATA + NP_FILE_REVISION) else { throw Failure.protocolError }
+            let mode: UInt32 = Session.integer(reply, 0)
             let kind: UserFileMetadata.Kind = switch mode & 0o170000 {
             case 0o100000: .file
             case 0o040000: .directory
             case 0o120000: .symbolicLink
             default: .other
             }
-            let mtime: Int64 = socket.integer(frame.data, 20)
+            let mtime: Int64 = Session.integer(reply, 20)
             return UserFileMetadata(url: try RemoteFileURL.make(path, isDirectory: kind == .directory), kind: kind,
-                size: socket.integer(frame.data, 12), modified: Date(timeIntervalSince1970: Double(mtime)), permissions: mode,
-                version: frame.data.subdata(in: 28..<frame.data.count))
+                size: Session.integer(reply, 12), modified: Date(timeIntervalSince1970: Double(mtime)), permissions: mode,
+                version: reply.subdata(in: Int(NP_FILE_METADATA)..<reply.count))
         }
     }
 
     public func readRange(_ path: String, offset: UInt64, length: Int, expectedVersion: Data) async throws -> Data {
         try UserFileRange.validate(RemoteFileURL.make(path), offset: offset, length: length)
-        guard expectedVersion.count == Int(NP_FILE_REVISION) else { throw Failure.protocolError }
+        guard expectedVersion.count == Int(NP_FILE_REVISION), length <= Self.ioMaximum else { throw Failure.protocolError }
         do {
-            return try await operation { socket in
-                var range = Socket.encode(offset); range.append(Socket.encode(UInt32(length))); range.append(expectedVersion)
-                try socket.request(NP_FILE_RANGE, path: path, suffix: range)
-                var bytes = Data()
-                while true {
-                    let frame = try socket.receive()
-                    if frame.type == NP_FILE_END.rawValue {
-                        try socket.checkEnd(frame, total: UInt64(bytes.count))
-                        return bytes
-                    }
-                    guard frame.type == NP_FILE_DATA.rawValue, !frame.data.isEmpty,
-                          frame.data.count <= length - bytes.count else { throw Failure.protocolError }
-                    bytes.append(frame.data)
-                }
+            return try await operation { session in
+                let data = try session.call(NP_FILE_RANGE, Session.encode(offset) + Session.encode(UInt32(length))
+                    + expectedVersion + Session.path(path)).data
+                guard data.count <= length else { throw Failure.protocolError }
+                return data
             }
         } catch Failure.remote(let code) where code == Int32(NP_FILE_STALE) { throw Failure.sourceChanged(path) }
     }
 
     public func createDirectory(_ path: String, noFollow: Bool = false) async throws {
-        try await operation { socket in
-            try socket.request(NP_FILE_MKDIR, path: path, noFollow: noFollow)
-            try socket.checkEnd(socket.receive(), total: nil)
+        try await operation { session in
+            _ = try session.call(NP_FILE_MKDIR, Session.encode(noFollow ? NP_FILE_NOFOLLOW : 0) + Session.path(path))
         }
     }
 
     public func download(_ path: String, to destination: FileHandle,
                          progress: @escaping Progress = { _, _ in }) async throws {
-        try await operation { socket in
-            try socket.request(NP_FILE_READ, path: path)
-            let info = try socket.metadata(path)
+        try await operation { session in
+            let (handle, info) = try session.open(path, flags: 0)
             guard info.isRegular else { throw Failure.local(EISDIR) }
             var total: UInt64 = 0
             while true {
-                let frame = try socket.receive()
-                if frame.type == NP_FILE_END.rawValue {
-                    try socket.checkEnd(frame, total: total)
-                    return
-                }
-                guard frame.type == NP_FILE_DATA.rawValue, !frame.data.isEmpty else { throw Failure.protocolError }
-                try destination.write(contentsOf: frame.data)
-                total += UInt64(frame.data.count)
+                let bytes = try session.read(handle)
+                if bytes.isEmpty { return }
+                try destination.write(contentsOf: bytes)
+                total += UInt64(bytes.count)
                 progress(total, info.size)
             }
         }
@@ -381,41 +249,35 @@ public struct FileRPC: Sendable {
 
     public func upload(_ source: FileHandle, to path: String, mode: UInt32 = 0o600,
                        replace: Bool = false, noFollow: Bool = false, progress: @escaping Progress = { _, _ in }) async throws {
-        try await operation { socket in
+        try await operation { session in
             var st = Darwin.stat()
             guard fstat(source.fileDescriptor, &st) == 0 else { throw Failure.local(errno) }
             guard st.st_mode & S_IFMT == S_IFREG else { throw Failure.local(EINVAL) }
-            try socket.request(NP_FILE_WRITE, path: path, mode: mode, replace: replace, noFollow: noFollow)
-            _ = try socket.metadata(path)
+            let handle = try session.create(path, mode: mode, replace: replace, noFollow: noFollow)
             var total: UInt64 = 0
-            while let bytes = try source.read(upToCount: Int(NP_FILE_CHUNK)), !bytes.isEmpty {
-                try socket.checkForEarlyFailure()
-                try socket.send(NP_FILE_DATA, bytes)
+            while let bytes = try source.read(upToCount: Self.ioMaximum), !bytes.isEmpty {
+                try session.write(handle, bytes)
                 total += UInt64(bytes.count)
                 progress(total, UInt64(max(0, st.st_size)))
             }
-            try socket.send(NP_FILE_END, Socket.encode(total))
-            try socket.checkEnd(socket.receive(), total: total)
+            try session.close(handle)
         }
     }
 
     public func write(_ data: Data, to path: String, mode: UInt32 = 0o600,
                       replace: Bool = true) async throws {
-        try await operation { socket in
-            try socket.request(NP_FILE_WRITE, path: path, mode: mode, replace: replace)
-            _ = try socket.metadata(path)
-            var offset = 0
-            while offset < data.count {
-                try socket.checkForEarlyFailure()
-                let end = min(offset + Int(NP_FILE_CHUNK), data.count)
-                try socket.send(NP_FILE_DATA, data.subdata(in: offset..<end)); offset = end
+        try await operation { session in
+            let handle = try session.create(path, mode: mode, replace: replace, noFollow: false)
+            var offset = data.startIndex
+            while offset < data.endIndex {
+                let end = min(offset + Self.ioMaximum, data.endIndex)
+                try session.write(handle, data.subdata(in: offset..<end)); offset = end
             }
-            try socket.send(NP_FILE_END, Socket.encode(UInt64(data.count)))
-            try socket.checkEnd(socket.receive(), total: UInt64(data.count))
+            try session.close(handle)
         }
     }
 
-    private func operation<T: Sendable>(_ body: @escaping @Sendable (Socket) throws -> T) async throws -> T {
+    private func operation<T: Sendable>(_ body: @escaping @Sendable (Session) throws -> T) async throws -> T {
         let cancellation = Cancellation()
         return try await withTaskCancellationHandler {
             try Task.checkCancellation()
@@ -424,8 +286,11 @@ public struct FileRPC: Sendable {
             try cancellation.bind(handle.fileDescriptor)
             return try await withCheckedThrowingContinuation { continuation in
                 DispatchQueue.global(qos: .utility).async {
-                    do { continuation.resume(returning: try body(Socket(fd: handle.fileDescriptor))) }
-                    catch { continuation.resume(throwing: cancellation.isCancelled ? CancellationError() : error) }
+                    do {
+                        let session = try Session(socket: handle.fileDescriptor)
+                        defer { session.close() }
+                        continuation.resume(returning: try body(session))
+                    } catch { continuation.resume(throwing: cancellation.isCancelled ? CancellationError() : error) }
                 }
             }
         } onCancel: { cancellation.cancel() }
@@ -454,59 +319,93 @@ public struct FileRPC: Sendable {
         }
     }
 
-    private struct Socket {
-        let fd: Int32
-        struct Frame { var type: UInt32; var data: Data }
+    /// A blocking NPFR session on a duplicate of the operation's socket, so
+    /// shutting the original down (cancellation) also ends this session.
+    private final class Session {
+        private let raw: OpaquePointer
+        private let message = UnsafeMutablePointer<np_file2_message>.allocate(capacity: 1)
+
+        init(socket: Int32) throws {
+            let duplicate = dup(socket)
+            guard duplicate >= 0 else { message.deallocate(); throw Failure.local(errno) }
+            guard let raw = np_file2_session_start(duplicate, NP_FILE2_ROLE_HOST, nil) else {
+                message.deallocate(); throw Failure.local(errno)
+            }
+            self.raw = raw
+        }
+        func close() { np_file2_session_close(raw); message.deallocate() }
+
+        /// One request: its response body and any DATA. A nonzero status
+        /// throws the guest's error.
+        func call(_ opcode: np_file_opcode, _ body: Data, data: Data? = nil) throws -> (body: Data, data: Data) {
+            let stream = body.withUnsafeBytes {
+                np_file2_request(raw, UInt16(opcode.rawValue), $0.baseAddress, $0.count, data == nil ? 1 : 0)
+            }
+            guard let stream else { throw Failure.local(errno) }
+            defer { np_file2_stream_release(stream) }
+            // A guest that fails early still answers; read its status first.
+            var sendError: Int32 = 0
+            if let data, data.withUnsafeBytes({ np_file2_send(stream, $0.baseAddress, $0.count, 1) }) != 0 {
+                sendError = errno
+            }
+            guard np_file2_receive(stream, message) == 1 else { throw Failure.local(errno) }
+            guard message.pointee.type == UInt8(NP_FILE2_RESPONSE.rawValue) else { throw Failure.protocolError }
+            let status = message.pointee.status
+            let reply = Data(bytes: np_file2_message_data(message), count: Int(message.pointee.length))
+            var received = Data()
+            while true {
+                let result = np_file2_receive(stream, message)
+                if result == 0 { break }
+                guard result == 1 else { throw Failure.local(errno) }
+                guard message.pointee.type == UInt8(NP_FILE2_DATA.rawValue) else { throw Failure.protocolError }
+                received.append(np_file2_message_data(message), count: Int(message.pointee.length))
+            }
+            guard status == 0 else { throw Failure.remote(Int32(clamping: status)) }
+            guard sendError == 0 else { throw Failure.local(sendError) }
+            return (reply, received)
+        }
+
+        func open(_ path: String, flags: UInt32) throws -> (UInt64, PathStat) {
+            let reply = try call(NP_FILE_OPEN, Self.encode(flags) + Self.encode(UInt32(0)) + Self.path(path)).body
+            guard reply.count == 8 + Int(NP_FILE_METADATA) else { throw Failure.protocolError }
+            return (Self.integer(reply, 0), Self.metadata(reply, at: 8, path: path))
+        }
+        func create(_ path: String, mode: UInt32, replace: Bool, noFollow: Bool) throws -> UInt64 {
+            let flags = NP_FILE_OPEN_WRITE | (replace ? NP_FILE_REPLACE : 0) | (noFollow ? NP_FILE_NOFOLLOW : 0)
+            let reply = try call(NP_FILE_OPEN, Self.encode(flags) + Self.encode(mode) + Self.path(path)).body
+            guard reply.count == 8 + Int(NP_FILE_METADATA) else { throw Failure.protocolError }
+            return Self.integer(reply, 0)
+        }
+        /// The next page; empty at the end of a file or directory.
+        func read(_ handle: UInt64) throws -> Data {
+            let data = try call(NP_FILE_READ, Self.encode(handle) + Self.encode(NP_FILE_IO_MAX)).data
+            guard data.count <= Int(NP_FILE_IO_MAX) else { throw Failure.protocolError }
+            return data
+        }
+        func write(_ handle: UInt64, _ bytes: Data) throws {
+            let reply = try call(NP_FILE_WRITE, Self.encode(handle), data: bytes).body
+            guard reply.count == 4, Self.integer(reply, 0, as: UInt32.self) == UInt32(bytes.count) else {
+                throw Failure.protocolError
+            }
+        }
+        /// For a written file, reports the guest's chmod, fsync and close.
+        func close(_ handle: UInt64) throws { _ = try call(NP_FILE_CLOSE, Self.encode(handle)) }
+
         static func encode<T: FixedWidthInteger>(_ value: T) -> Data {
             var value = value.littleEndian; return withUnsafeBytes(of: &value) { Data($0) }
         }
-        func send(_ type: np_file_type, _ data: Data, flags: UInt16 = 0) throws {
-            let rc = data.withUnsafeBytes { np_file_send(fd, UInt8(type.rawValue), flags, 0, $0.baseAddress, $0.count) }
-            guard rc == 0 else { throw Failure.local(errno) }
-        }
-        func request(_ type: np_file_type, path: String, mode: UInt32 = 0, replace: Bool = false, noFollow: Bool = false, suffix: Data = Data()) throws {
+        static func path(_ path: String, allowEmpty: Bool = false) throws -> Data {
             let bytes = Data(path.utf8)
-            guard (path.hasPrefix("/") || (type == NP_FILE_BROWSE && path.isEmpty)), !path.contains("\0"), bytes.count <= 4095 else { throw Failure.invalidPath }
-            var body = Self.encode(UInt32(bytes.count)); body.append(bytes)
-            if type == NP_FILE_WRITE { body.append(Self.encode(mode)) }
-            body.append(suffix)
-            try send(type, body, flags: (replace ? UInt16(NP_FILE_REPLACE) : 0) | (noFollow ? UInt16(NP_FILE_NOFOLLOW) : 0))
+            guard path.hasPrefix("/") || (allowEmpty && path.isEmpty), !path.contains("\0"),
+                  bytes.count <= Int(NP_FILE_PATH_MAX) else { throw Failure.invalidPath }
+            return encode(UInt32(bytes.count)) + bytes
         }
-        func receive() throws -> Frame {
-            let frame = UnsafeMutablePointer<np_file_frame>.allocate(capacity: 1)
-            defer { frame.deallocate() }
-            guard np_file_receive(fd, frame) == 0 else { throw Failure.local(errno) }
-            guard frame.pointee.status == 0 else { throw Failure.remote(Int32(clamping: frame.pointee.status)) }
-            let data = Data(bytes: np_file_frame_data(frame), count: Int(frame.pointee.length))
-            return Frame(type: UInt32(frame.pointee.type), data: data)
-        }
-        /// A failed receiver can reply before the upload ends (e.g. ENOSPC).
-        /// Observe that reply without a per-chunk acknowledgement roundtrip.
-        func checkForEarlyFailure() throws {
-            var incoming = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
-            let ready = poll(&incoming, 1, 0)
-            if ready < 0 && errno == EINTR { return }
-            guard ready >= 0 else { throw Failure.local(errno) }
-            if incoming.revents != 0 {
-                _ = try receive() // Nonzero status throws the receiver's error.
-                throw Failure.protocolError // Success is only valid after END.
-            }
-        }
-        func integer<T: FixedWidthInteger>(_ data: Data, _ offset: Int, as: T.Type = T.self) -> T {
+        static func integer<T: FixedWidthInteger>(_ data: Data, _ offset: Int, as: T.Type = T.self) -> T {
             data.withUnsafeBytes { T(littleEndian: $0.loadUnaligned(fromByteOffset: offset, as: T.self)) }
         }
-        func metadata(_ path: String) throws -> PathStat {
-            let frame = try receive()
-            guard frame.type == NP_FILE_METADATA.rawValue, frame.data.count == 28 else { throw Failure.protocolError }
-            let data = frame.data
-            return PathStat(path: path, mode: integer(data, 0), uid: integer(data, 4), gid: integer(data, 8),
-                            size: integer(data, 12), mtime: integer(data, 20))
-        }
-        func checkEnd(_ frame: Frame, total: UInt64?) throws {
-            guard frame.type == NP_FILE_END.rawValue else { throw Failure.protocolError }
-            if let total {
-                guard frame.data.count == 8, integer(frame.data, 0, as: UInt64.self) == total else { throw Failure.protocolError }
-            } else if !frame.data.isEmpty { throw Failure.protocolError }
+        static func metadata(_ data: Data, at offset: Int, path: String) -> PathStat {
+            PathStat(path: path, mode: integer(data, offset), uid: integer(data, offset + 4), gid: integer(data, offset + 8),
+                     size: integer(data, offset + 12), mtime: integer(data, offset + 20))
         }
     }
 }
