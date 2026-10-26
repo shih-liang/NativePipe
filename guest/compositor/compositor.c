@@ -6,6 +6,7 @@
 #define _GNU_SOURCE
 
 #include "applications.h"
+#include "accessibility.h"
 #include "activation.h"
 #include "presentation_time.h"
 #include "compositor.h"
@@ -167,6 +168,8 @@ int np_frontend_run(int argc, char **argv, void *backend_state)
      * nothing for applications to call. */
     if (!np_notifications_init(&server))
         np_debug_log("[notifications] not started\n");
+    if (!np_accessibility_init(&server))
+        np_debug_log("[accessibility] not started\n");
     if (!applications_started) {
         np_user_text("STARTUP_FAILED", "The NativePipe compositor couldn’t start (%s).", "cannot start the application service", NULL);
         server.terminate = true;
@@ -183,6 +186,7 @@ int np_frontend_run(int argc, char **argv, void *backend_state)
 
     np_host_open_finish(&server);
     np_notifications_finish(&server);
+    np_accessibility_finish(&server);
     np_applications_finish(&server);
 	wl_display_destroy_clients(server.display);
 	np_backend_session_finish(&server);

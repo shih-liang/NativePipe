@@ -296,3 +296,5 @@
 "The display did not finish preparing for the virtual machine state change." = "Подготовка отображения к изменению состояния виртуальной машины не завершилась.";
 "The display connection changed during the virtual machine state change." = "Подключение отображения изменилось во время изменения состояния виртуальной машины.";
 "Another display state change is already in progress." = "Другое изменение состояния отображения уже выполняется.";
+"Invalid accessibility reply." = "Недопустимый ответ универсального доступа.";
+"Invalid accessibility tree: %@" = "Недопустимое дерево универсального доступа: %@";

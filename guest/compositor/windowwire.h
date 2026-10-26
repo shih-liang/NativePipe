@@ -7,7 +7,7 @@
 
 #define NP_WINDOW_MAX_FIELD (8u * 1024u * 1024u)
 #define NP_WINDOW_MAX_COLLECTION 4096u
-#define NP_WINDOW_PROTOCOL_VERSION 15u
+#define NP_WINDOW_PROTOCOL_VERSION 16u
 
 enum np_window_direction {
 	NP_WINDOW_GUEST_TO_HOST = 1,
@@ -103,6 +103,7 @@ enum np_window_host_opcode {
 	NP_HOST_PRESENTATION_PAUSE = 38,
 	NP_HOST_PRESENTATION_DRAIN = 39,
 	NP_HOST_PRESENTATION_RESUME = 40,
+	NP_HOST_ACCESSIBILITY_REQUEST = 41,
 };
 
 enum np_window_pixel_format {

@@ -73,7 +73,7 @@ GENERATED := xdg-shell-server-protocol.h xdg-shell-client-protocol.h xdg-shell-p
 
 ENTRY_SOURCE := main.c
 
-FRONTEND_SOURCES := compositor.c activation.c presentation_time.c applications.c applications_worker.c application_icons.c notifications.c notify_dbus.c host_open.c surface.c surface_commit.c presentation.c \
+FRONTEND_SOURCES := compositor.c activation.c presentation_time.c applications.c applications_worker.c application_icons.c accessibility.c accessibility_worker.c notifications.c notify_dbus.c host_open.c surface.c surface_commit.c presentation.c \
 	subcompositor.c input.c keymap.c decoration.c scale.c scene.c region.c perf.c \
 	windowwire.c window_events.c \
 	xdg_shell.c text_input.c fifo.c \
@@ -133,7 +133,7 @@ test-remote-transport: | $(BUILD_DIR)
 		backends/remote/host_transport.c backends/remote/medialink.c -pthread
 	$(BUILD_DIR)/remote-transport-test
 
-.PHONY: test-applications test-file-drag test-notify-dbus test-host-open test-xwayland-session test-remote-encoder test-scene-damage test-user-text
+.PHONY: test-applications test-accessibility test-file-drag test-notify-dbus test-host-open test-xwayland-session test-remote-encoder test-scene-damage test-user-text
 test-xwayland-session: | $(BUILD_DIR)
 	$(CC) -O0 -g -Wall -Wextra -Werror -std=gnu11 -I. \
 		$$(pkg-config --cflags wayland-server) tests/xwayland_session_test.c user_text.c \
@@ -197,6 +197,14 @@ test-user-text: | $(BUILD_DIR)
 	$(CC) -O0 -g -Wall -Wextra -Werror -std=gnu11 -I. \
 		tests/user_text_test.c user_text.c -o $(BUILD_DIR)/user-text-test
 	$(BUILD_DIR)/user-text-test
+
+# The AT-SPI2 worker against a fake registry and application on a private
+# session bus; no Wayland and no real toolkit.
+test-accessibility: | $(BUILD_DIR)
+	$(CC) -O2 -Wall -Wextra -Werror -std=gnu11 -I. $$(pkg-config --cflags gio-unix-2.0) \
+		tests/accessibility_test.c accessibility_worker.c windowwire.c \
+		$$(pkg-config --libs gio-unix-2.0) -lm -o $(BUILD_DIR)/accessibility-test
+	dbus-run-session -- $(BUILD_DIR)/accessibility-test
 
 # org.freedesktop.Notifications over a point-to-point D-Bus connection: real
 # method calls and signals with no bus daemon and no Wayland, so GIO is enough.

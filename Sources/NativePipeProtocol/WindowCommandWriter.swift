@@ -24,7 +24,7 @@ extension Windowing.HostCommand {
         case .frameReleased, .presentationClockSample, .sceneClockSample,
              .presentationFeedback, .presentationDrain:
             return .feedback
-        case .applicationRequest, .fileDrag, .notificationClosed, .notificationAction, .hostOpenResponse:
+        case .applicationRequest, .accessibilityRequest, .fileDrag, .notificationClosed, .notificationAction, .hostOpenResponse:
             return .control
         }
     }

@@ -574,6 +574,8 @@ extension Windowing {
         case forceQuit(window: UInt32)
         /// Ordinary-user application service shared by VM and remote backends.
         case applicationRequest(token: UInt32, action: ApplicationAction, application: String)
+        /// AT-SPI2 query or action for agents; answered with an NPAP reply.
+        case accessibilityRequest(token: UInt32, request: GuestAccessibilityRequest)
 
         /// Dismiss a popup: the click went elsewhere, or the parent lost focus.
         /// Like close, this is a request; the client tears the popup down.

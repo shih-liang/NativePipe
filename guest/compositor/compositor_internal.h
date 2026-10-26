@@ -43,6 +43,8 @@ struct np_server {
     struct np_apps *applications;
     struct wl_event_source *application_source;
     uint64_t application_generation;
+    struct np_a11y *accessibility;
+    struct wl_event_source *accessibility_source;
     bool terminate;
 	uint32_t next_id;
 	uint32_t next_presentation_id;

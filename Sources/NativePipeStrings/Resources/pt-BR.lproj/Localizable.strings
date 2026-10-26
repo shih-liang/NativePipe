@@ -296,3 +296,5 @@
 "The display did not finish preparing for the virtual machine state change." = "A tela não terminou de se preparar para a mudança de estado da máquina virtual.";
 "The display connection changed during the virtual machine state change." = "A conexão da tela mudou durante a mudança de estado da máquina virtual.";
 "Another display state change is already in progress." = "Outra mudança de estado da tela já está em andamento.";
+"Invalid accessibility reply." = "Resposta de acessibilidade inválida.";
+"Invalid accessibility tree: %@" = "Árvore de acessibilidade inválida: %@";

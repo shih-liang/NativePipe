@@ -7,7 +7,7 @@ import QuartzCore
 /// NPIP supplies only bounded length framing. Integer fields are explicitly
 /// little endian; this is a wire format, never a Swift struct memory dump.
 public enum WindowWire {
-    public static let windowProtocolVersion: UInt32 = 15
+    public static let windowProtocolVersion: UInt32 = 16
     public static let motionMagic: [UInt8] = Array("NPMO".utf8)
     public static let motionPayloadSize = 16
     public static let scrollMagic: [UInt8] = Array("NPSC".utf8)
@@ -509,6 +509,7 @@ public enum WindowWire {
         case .inputPreferences: opcode = 25
         case .captureFrame: opcode = 26
         case .applicationRequest: opcode = 27
+        case .accessibilityRequest: opcode = 41
         }
         var payload = Data(lifecycleMagic)
         payload.append(2)
@@ -572,6 +573,19 @@ public enum WindowWire {
             append(token, to: &payload)
             append(action.rawValue, to: &payload)
             try append(application, to: &payload)
+        case .accessibilityRequest(let token, let request):
+            guard token != 0, request.number.isFinite,
+                  request.element.utf8.count <= GuestAccessibilityRequest.maximumElementSize,
+                  request.argument.utf8.count <= GuestAccessibilityRequest.maximumArgumentSize else {
+                throw EncodeError.invalidValue
+            }
+            append(token, to: &payload)
+            append(request.window, to: &payload)
+            append(request.operation.rawValue, to: &payload)
+            append(request.flags, to: &payload)
+            append(request.number.bitPattern, to: &payload)
+            try append(request.element, to: &payload)
+            try append(request.argument, to: &payload)
         case .close(let window), .forceQuit(let window),
              .dismissPopup(let window), .pointerLeft(let window):
             append(window, to: &payload)

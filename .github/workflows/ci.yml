@@ -52,6 +52,8 @@ jobs:
         run: make -C guest/compositor test-remote-transport test-remote-encoder test-remote-scheduler
       - name: Test ordinary-user application service
         run: make -C guest/compositor test-applications
+      - name: Test the AT-SPI2 accessibility worker
+        run: make -C guest/compositor test-accessibility
       - name: Test file drag lifecycle and scene damage
         run: make -C guest/compositor test-file-drag test-scene-damage
       - name: Test Wayland protocol versions and lifecycle

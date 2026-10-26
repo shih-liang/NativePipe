@@ -296,3 +296,5 @@
 "The display did not finish preparing for the virtual machine state change." = "Die Anzeige konnte die Vorbereitung für die Zustandsänderung der virtuellen Maschine nicht abschließen.";
 "The display connection changed during the virtual machine state change." = "Die Anzeigeverbindung hat sich während der Zustandsänderung der virtuellen Maschine geändert.";
 "Another display state change is already in progress." = "Eine andere Änderung des Anzeigezustands wird bereits ausgeführt.";
+"Invalid accessibility reply." = "Ungültige Bedienungshilfen-Antwort.";
+"Invalid accessibility tree: %@" = "Ungültiger Bedienungshilfen-Baum: %@";

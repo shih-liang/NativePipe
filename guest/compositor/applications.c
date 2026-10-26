@@ -1,4 +1,5 @@
 #include "applications.h"
+#include "accessibility.h"
 #include "compositor_internal.h"
 #include "windowwire.h"
 #include <errno.h>
@@ -35,9 +36,11 @@ void np_applications_finish(struct np_server *s)
 }
 bool np_applications_handle_command(const unsigned char *payload, size_t length, void *data)
 {
+    struct np_server *s = data;
+    if (length >= 8 && !memcmp(payload, "NPW2", 4) && payload[5] == NP_HOST_ACCESSIBILITY_REQUEST)
+        return np_accessibility_handle_command(s, payload, length);
     if (length < 8 || memcmp(payload, "NPW2", 4) || payload[5] != 27)
         return np_input_handle_host_binary(payload, length, data);
-    struct np_server *s = data;
     struct np_window_reader r;
     if (!np_window_reader_init(&r, payload, length, NP_WINDOW_HOST_TO_GUEST)) return false;
     uint32_t token = np_window_read_u32(&r), action = np_window_read_u32(&r);

@@ -87,10 +87,10 @@ final class HostOpenWindowWireTests: XCTestCase {
 
     func testThePreviousWindowProtocolIsRejected() {
         var ready = event(1, token: 123)
-        append(UInt32(14), to: &ready)
-        XCTAssertEqual(WindowWire.windowProtocolVersion, 15)
+        append(UInt32(15), to: &ready)
+        XCTAssertEqual(WindowWire.windowProtocolVersion, 16)
         XCTAssertThrowsError(try WindowWire.guestEvent(from: ready)) {
-            XCTAssertEqual($0 as? WindowWire.DecodeError, .unsupportedWindowVersion(14))
+            XCTAssertEqual($0 as? WindowWire.DecodeError, .unsupportedWindowVersion(15))
         }
     }
 }

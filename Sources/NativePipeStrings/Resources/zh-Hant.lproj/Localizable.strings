@@ -296,3 +296,5 @@
 "The display did not finish preparing for the virtual machine state change." = "顯示未能完成虛擬機器狀態變更前的準備。";
 "The display connection changed during the virtual machine state change." = "虛擬機器狀態變更期間，顯示連線發生了變化。";
 "Another display state change is already in progress." = "另一項顯示狀態變更正在進行。";
+"Invalid accessibility reply." = "輔助使用回覆無效。";
+"Invalid accessibility tree: %@" = "輔助使用樹無效：%@";
