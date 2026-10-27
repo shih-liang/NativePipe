@@ -38,7 +38,7 @@ tokens and revokes them on focus changes, unmapping, destruction and disconnect.
 The host independently checks its recent input and active origin window. Native
 application-catalog launches retain their existing activation behavior.
 
-## Keyboard focus
+## Keyboard focus and pointers
 
 Keyboard focus is per client, with two owners. The user's focus follows the
 macOS key window. The agent's focus follows agent input
@@ -49,13 +49,25 @@ holds the user's focus the user wins, so the agent may share the user's window
 but is refused another window of that client, and the user taking a window of
 the agent's client ends the agent's focus there. A popup grab takes the user's
 focus when the user is typing in its client and otherwise the agent's, and
-gives it back on destruction. The selection goes to both focused clients.
+gives it back on destruction. The selection goes to both focused clients. The
+compositor reports the agent's toplevel (`agentFocusChanged`), and the host
+configures it as activated alongside its key window, at once rather than on the
+next display tick.
 
-Agent keys update the latest input serial, so they can open menus, but never
-authorize `xdg_activation_v1`. Agent text is committed to the agent focus's
-enabled field without the host IME epoch, waiting up to 500 ms for the client
-to enable one; the reply says how many events were delivered and why the rest
-were not. The pointer remains shared between the user and the agent.
+The agent also has its own pointer, carried in the same requests. It holds its
+client's `wl_pointer` only during a request and while one of its buttons stays
+down, then gives the client back to the user's pointer with a fresh enter. While
+it holds a client the user's pointer events for that client update the user's
+state but are not delivered; it cannot take a client in which the user holds a
+button. Agent enters never change the Mac's cursor, and an agent press is not a
+grab serial for interactive move, resize or drag-and-drop, which follow the
+Mac's mouse. A click gives the agent's keyboard focus to its window.
+
+Agent keys and presses update the latest input serial, so they can open menus,
+but never authorize `xdg_activation_v1`. Agent text is committed to the agent
+focus's enabled field without the host IME epoch, waiting up to 500 ms for the
+client to enable one; the reply says how many events were delivered and why the
+rest were not.
 
 ## Presentation and buffer lifetime
 

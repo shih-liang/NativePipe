@@ -461,15 +461,15 @@ final class RemoteApplicationTests: XCTestCase {
         if env["NATIVEPIPE_TEST_MOVE"] == "1" {
             for _ in 0..<8 {
                 let x = native.contentView!.bounds.midX
-                XCTAssertTrue(display.bridge.computerPointerMove(window: window.id, x: x, y: 18))
-                XCTAssertTrue(display.bridge.computerPointerButton(window: window.id, button: .left, pressed: true))
+                XCTAssertTrue(display.bridge.synthesizeUserPointerMove(window: window.id, x: x, y: 18))
+                XCTAssertTrue(display.bridge.synthesizeUserPointerButton(window: window.id, button: .left, pressed: true))
                 try await Task.sleep(for: .milliseconds(30))
                 moveSent = ProcessInfo.processInfo.systemUptime
-                XCTAssertTrue(display.bridge.computerPointerMove(window: window.id, x: x + 40, y: 18))
+                XCTAssertTrue(display.bridge.synthesizeUserPointerMove(window: window.id, x: x + 40, y: 18))
                 let deadline = Date().addingTimeInterval(3)
                 while moveSent != nil && Date() < deadline { try await Task.sleep(for: .milliseconds(5)) }
                 XCTAssertNil(moveSent, "GTK must request a title-bar move for this held drag")
-                XCTAssertTrue(display.bridge.computerPointerButton(window: window.id, button: .left, pressed: false))
+                XCTAssertTrue(display.bridge.synthesizeUserPointerButton(window: window.id, button: .left, pressed: false))
                 try await Task.sleep(for: .milliseconds(150))
             }
             moveLatencies.sort()
@@ -510,10 +510,10 @@ final class RemoteApplicationTests: XCTestCase {
             for click in 1...6 {
                 inputTarget = click
                 inputSent = ProcessInfo.processInfo.systemUptime
-                XCTAssertTrue(display.bridge.computerPointerMove(window: window.id,
+                XCTAssertTrue(display.bridge.synthesizeUserPointerMove(window: window.id,
                     x: native.contentView!.bounds.midX, y: native.contentView!.bounds.midY))
-                XCTAssertTrue(display.bridge.computerPointerButton(window: window.id, button: .left, pressed: true))
-                XCTAssertTrue(display.bridge.computerPointerButton(window: window.id, button: .left, pressed: false))
+                XCTAssertTrue(display.bridge.synthesizeUserPointerButton(window: window.id, button: .left, pressed: true))
+                XCTAssertTrue(display.bridge.synthesizeUserPointerButton(window: window.id, button: .left, pressed: false))
                 let deadline = Date().addingTimeInterval(3)
                 while inputSent != nil && Date() < deadline {
                     try await Task.sleep(for: .milliseconds(5))

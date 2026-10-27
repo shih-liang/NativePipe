@@ -974,7 +974,7 @@ final class NativeWindow: NSObject, DisplayClockTarget {
         bridge?.send(.pointerMoved(window: windowID, x: point.x, y: point.y))
     }
 
-    private func windowPoint(from contentPoint: CGPoint) -> CGPoint {
+    func windowPoint(from contentPoint: CGPoint) -> CGPoint {
         SurfaceCoordinateSpace(windowGeometry).windowPoint(fromContent: contentPoint)
     }
 
@@ -1208,6 +1208,13 @@ extension NativeWindow: NSWindowDelegate {
         bridge?.parentGeometryChanged(windowID)
     }
 
+    /// Sent at once: an agent works in windows that may be hidden, where no
+    /// display tick would carry the change.
+    func refreshActiveState() {
+        guard !isPopup, sendConfigure(states: activeStates()) else { return }
+        flushConfigure()
+    }
+
     func windowDidBecomeKey(_ notification: Notification) {
         Self.note("window \(windowID) became key")
         guard !isPopup else { return }
@@ -1235,7 +1242,8 @@ extension NativeWindow: NSWindowDelegate {
     fileprivate func activeStates() -> [Windowing.ToplevelState] {
         guard let window else { return [] }
         var states: [Windowing.ToplevelState] = []
-        if window.isKeyWindow { states.append(.activated) }
+        // The agent's focused window looks active too: it is receiving input.
+        if window.isKeyWindow || bridge?.agentFocusWindow == windowID { states.append(.activated) }
         // Clients use this to skip expensive work mid-drag.
         if window.inLiveResize { states.append(.resizing) }
         if window.isZoomed { states.append(.maximized) }

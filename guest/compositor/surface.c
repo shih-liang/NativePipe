@@ -250,6 +250,11 @@ static void surface_resource_destroy(struct wl_resource *resource) {
 		surface->server->pointer_surface = 0;
 		surface->server->pointer_window = 0;
 	}
+	if (surface->server->agent_pointer_surface == surface->id) {
+		surface->server->agent_pointer_surface = 0;
+		surface->server->agent_pointer_window = 0;
+		surface->server->agent_pointer_buttons = 0;
+	}
 	if (surface->server->drag_focus_surface == surface->id)
 		surface->server->drag_focus_surface = 0;
 

@@ -35,6 +35,35 @@ final class AgentInputWireTests: XCTestCase {
         }
     }
 
+    func testPointerEventsMatchTheCompositorReader() throws {
+        let payload = try WindowWire.commandPayload(for: .agentInput(token: 4, window: 2, events: [
+            .pointerMove(x: 10.5, y: -2), .pointerButton(.right, pressed: true), .scroll(dx: 0, dy: 3, isPrecise: true),
+        ]))
+        var expected = Data("NPW2".utf8) + [2, 42, 0, 0]
+        for value: UInt32 in [4, 2, 3] { withUnsafeBytes(of: value.littleEndian) { expected.append(contentsOf: $0) } }
+        expected.append(3)
+        for value in [10.5, -2.0] { withUnsafeBytes(of: value.bitPattern.littleEndian) { expected.append(contentsOf: $0) } }
+        expected += [4, 2, 1, 5]
+        for value in [0.0, 3.0] { withUnsafeBytes(of: value.bitPattern.littleEndian) { expected.append(contentsOf: $0) } }
+        expected.append(1)
+        XCTAssertEqual(payload, expected)
+        XCTAssertThrowsError(try WindowWire.commandPayload(for: .agentInput(token: 4, window: 2, events: [.pointerMove(x: .nan, y: 0)])))
+        XCTAssertThrowsError(try WindowWire.commandPayload(for: .agentInput(token: 4, window: 2, events: [.scroll(dx: .infinity, dy: 0, isPrecise: false)])))
+    }
+
+    func testAgentFocusEventNamesTheWindowOrNone() throws {
+        func event(_ window: UInt32) -> Data {
+            var data = Data("NPW2".utf8) + [1, 51, 0, 0]
+            withUnsafeBytes(of: window.littleEndian) { data.append(contentsOf: $0) }
+            return data
+        }
+        guard case .agentFocusChanged(7) = try WindowWire.guestEvent(from: event(7)),
+              case .agentFocusChanged(nil) = try WindowWire.guestEvent(from: event(0)) else {
+            return XCTFail("Expected agent focus events")
+        }
+        XCTAssertThrowsError(try WindowWire.guestEvent(from: event(7) + [0]))
+    }
+
     func testReplyDecodesAsTheCompositorEncodesIt() throws {
         var data = Data("NPAP".utf8) + [1, 8, 0, 0]
         for value: UInt32 in [5, 1] { withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) } }

@@ -19,8 +19,18 @@ static struct np_surface *key_surfaces[8];
 static unsigned key_surface_count, key_activations;
 struct np_surface *np_surface_by_id(struct np_server *server, uint32_t id)
 {
-	return fixture_surface && fixture_surface->id == id ? fixture_surface : NULL;
+    for (unsigned i = 0; i < key_surface_count; i++)
+        if (key_surfaces[i]->id == id) return key_surfaces[i];
+    return fixture_surface && fixture_surface->id == id ? fixture_surface : NULL;
 }
+static struct np_surface *hit_surface;
+struct np_surface *np_scene_hit_test(struct np_surface *root, double x, double y,
+                                     double *local_x, double *local_y)
+{
+    *local_x = x; *local_y = y;
+    return hit_surface && hit_surface->window_id == root->window_id ? hit_surface : NULL;
+}
+static uint32_t reported_agent_window = UINT32_MAX;
 
 struct np_surface *np_surface_by_window(struct np_server *server, uint32_t window)
 {
@@ -45,6 +55,11 @@ void np_scale_changed(struct np_surface *surface, int scale) { surface->preferre
 bool np_xwayland_owns_client(struct np_server *server, struct wl_client *client) { return false; }
 bool np_window_event_send(struct np_server *server, uint8_t opcode, const uint32_t *values, size_t count)
 {
+    if (opcode == NP_GUEST_AGENT_FOCUS_CHANGED) {
+        assert(count == 1);
+        reported_agent_window = values[0];
+        return true;
+    }
     if (fixture_cursor) {
         assert(opcode == NP_GUEST_CURSOR_CHANGED && count == 4);
         assert(values[0] == fixture_cursor->id || values[0] == 0);
@@ -673,6 +688,152 @@ static void test_agent_focus_alongside_user(void)
     close(user_pair[1]); close(agent_pair[1]);
 }
 
+/* Counts one client's wl_pointer events by name. */
+struct pointer_events { unsigned enter, leave, motion, button, axis; uint32_t entered, entered_serial; };
+static struct pointer_events pointer_events(struct np_server *server, int peer, uint32_t pointer)
+{
+    wl_display_flush_clients(server->display);
+    struct pointer_events events = {0};
+    unsigned char bytes[4096];
+    for (;;) {
+        ssize_t size = recv(peer, bytes, sizeof(bytes), MSG_DONTWAIT);
+        if (size < 0) { assert(errno == EAGAIN || errno == EWOULDBLOCK); break; }
+        for (size_t offset = 0; offset < (size_t)size;) {
+            uint32_t object, header;
+            memcpy(&object, bytes + offset, 4); memcpy(&header, bytes + offset + 4, 4);
+            assert((header >> 16) >= 8 && offset + (header >> 16) <= (size_t)size);
+            if (object == pointer) {
+                const char *name = wl_pointer_interface.events[header & 0xffff].name;
+                if (!strcmp(name, "enter")) {
+                    events.enter++;
+                    memcpy(&events.entered_serial, bytes + offset + 8, 4);
+                    memcpy(&events.entered, bytes + offset + 12, 4);
+                } else if (!strcmp(name, "leave")) events.leave++;
+                else if (!strcmp(name, "motion")) events.motion++;
+                else if (!strcmp(name, "button")) events.button++;
+                else if (!strcmp(name, "axis")) events.axis++;
+            }
+            offset += header >> 16;
+        }
+    }
+    return events;
+}
+
+enum { POINTER_MOVE = 3, POINTER_PRESS, POINTER_RELEASE, POINTER_SCROLL };
+static bool pointer_request(struct np_server *server, uint32_t token, uint32_t window,
+                            const int *kinds, unsigned count)
+{
+    struct np_window_message message;
+    np_window_message_init(&message, NP_WINDOW_HOST_TO_GUEST, NP_HOST_AGENT_INPUT);
+    np_window_put_u32(&message, token); np_window_put_u32(&message, window);
+    np_window_put_u32(&message, count);
+    for (unsigned i = 0; i < count; i++) {
+        if (kinds[i] == POINTER_MOVE) {
+            np_window_put_u8(&message, 3);
+            np_window_put_f64(&message, 12); np_window_put_f64(&message, 8);
+        } else if (kinds[i] == POINTER_SCROLL) {
+            np_window_put_u8(&message, 5);
+            np_window_put_f64(&message, 0); np_window_put_f64(&message, 3); np_window_put_bool(&message, true);
+        } else {
+            np_window_put_u8(&message, 4);
+            np_window_put_u8(&message, 1); np_window_put_bool(&message, kinds[i] == POINTER_PRESS);
+        }
+    }
+    assert(message.ok);
+    struct np_window_reader reader;
+    assert(np_window_reader_init(&reader, message.data, message.len, NP_WINDOW_HOST_TO_GUEST));
+    bool accepted = handle_agent_input(server, &reader);
+    np_window_message_clear(&message);
+    return accepted;
+}
+
+static void test_agent_pointer_alongside_user(void)
+{
+    int user_pair[2], agent_pair[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, user_pair) == 0);
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, agent_pair) == 0);
+    struct np_server server = {.display = wl_display_create()};
+    assert(server.display);
+    wl_list_init(&server.surfaces); wl_list_init(&server.keyboards);
+    wl_list_init(&server.pointers); wl_list_init(&server.data_devices);
+    struct wl_client *editor = wl_client_create(server.display, user_pair[0]);
+    struct wl_client *terminal = wl_client_create(server.display, agent_pair[0]);
+    struct np_surface notes = {.id = 41, .window_id = 1}, shell = {.id = 43, .window_id = 3};
+    notes.resource = wl_resource_create(editor, &wl_surface_interface, 6, 2);
+    shell.resource = wl_resource_create(terminal, &wl_surface_interface, 6, 2);
+    struct np_input editor_pointer = {.server = &server, .resource = wl_resource_create(editor, &wl_pointer_interface, 9, 3)};
+    struct np_input terminal_pointer = {.server = &server, .resource = wl_resource_create(terminal, &wl_pointer_interface, 9, 3)};
+    assert(notes.resource && shell.resource && editor_pointer.resource && terminal_pointer.resource);
+    wl_resource_set_user_data(editor_pointer.resource, &editor_pointer);
+    wl_list_insert(&server.pointers, &editor_pointer.link);
+    wl_list_insert(&server.pointers, &terminal_pointer.link);
+    key_surfaces[0] = &notes; key_surfaces[1] = &shell; key_surface_count = 2;
+    reply.count = 0; reported_agent_window = UINT32_MAX; key_activations = 0;
+
+    /* The user's pointer rests over the editor. */
+    server.pointer_window = 1; server.pointer_surface = notes.id;
+    server.pointer_x = 30; server.pointer_y = 40;
+
+    /* The agent clicks in the terminal: its own pointer, the user's untouched.
+     * The click also gives the agent's keyboard focus, shown as activated. */
+    hit_surface = &shell;
+    const int click[] = {POINTER_MOVE, POINTER_PRESS, POINTER_RELEASE};
+    assert(pointer_request(&server, 21, 3, click, 3));
+    assert(reply.count == 1 && reply.accepted == 3 && !reply.problem[0]);
+    struct pointer_events e = pointer_events(&server, agent_pair[1], 3);
+    assert(e.enter == 1 && e.entered == 2 && e.button == 2 && e.leave == 1);
+    e = pointer_events(&server, user_pair[1], 3);
+    assert(!e.enter && !e.leave && !e.button);
+    assert(!server.agent_pointer_surface && server.pointer_surface == notes.id);
+    assert(server.agent_window == 3 && reported_agent_window == 3);
+    assert(server.last_input_client == terminal && !key_activations);
+
+    /* In the user's client the user's pointer steps aside and comes back. */
+    hit_surface = &notes;
+    assert(pointer_request(&server, 22, 1, click, 3));
+    assert(reply.count == 2 && reply.accepted == 3);
+    e = pointer_events(&server, user_pair[1], 3);
+    assert(e.leave == 2 && e.enter == 2 && e.button == 2);
+    assert(!editor_pointer.agent_enter && editor_pointer.last_enter_serial == e.entered_serial);
+
+    /* A held agent button keeps the client's pointer: the user's events wait,
+     * and the agent's enter cannot change the Mac's cursor. */
+    const int press[] = {POINTER_MOVE, POINTER_PRESS}, release[] = {POINTER_SCROLL, POINTER_RELEASE};
+    assert(pointer_request(&server, 23, 1, press, 2));
+    assert(reply.count == 3 && reply.accepted == 2 && server.agent_pointer_buttons == 1);
+    assert(editor_pointer.agent_enter);
+    pointer_events(&server, user_pair[1], 3);
+    handle_pointer_scroll(&server, 1, 0, 1, false, false);
+    assert(!pointer_events(&server, user_pair[1], 3).axis);
+    struct wl_resource *cursor = wl_resource_create(editor, &wl_surface_interface, 6, 4);
+    struct np_surface cursor_surface = {.id = 44};
+    wl_resource_set_user_data(cursor, &cursor_surface);
+    pointer_set_cursor(editor, editor_pointer.resource, editor_pointer.last_enter_serial, cursor, 0, 0);
+    assert(cursor_surface.role == NP_SURFACE_ROLE_NONE && !server.cursor_surface);
+    assert(pointer_request(&server, 24, 1, release, 2));
+    assert(reply.count == 4 && reply.accepted == 2 && !server.agent_pointer_surface);
+    e = pointer_events(&server, user_pair[1], 3);
+    assert(e.axis == 1 && e.button == 1 && e.leave == 1 && e.enter == 1 && !editor_pointer.agent_enter);
+
+    /* The user holding a button in that client keeps it. */
+    server.pointer_buttons = 1;
+    const int move[] = {POINTER_MOVE};
+    assert(pointer_request(&server, 25, 1, move, 1));
+    assert(reply.count == 5 && reply.accepted == 0 && strstr(reply.problem, "using the mouse"));
+    assert(!pointer_events(&server, user_pair[1], 3).leave);
+    server.pointer_buttons = 0;
+    /* A press needs the agent's pointer over the window first. */
+    hit_surface = NULL;
+    const int lost[] = {POINTER_MOVE, POINTER_PRESS};
+    assert(pointer_request(&server, 26, 1, lost, 2));
+    assert(reply.count == 6 && reply.accepted == 1 && strstr(reply.problem, "Move the pointer"));
+
+    key_surface_count = 0; hit_surface = NULL;
+    wl_list_remove(&editor_pointer.link); wl_list_remove(&terminal_pointer.link);
+    wl_client_destroy(editor); wl_client_destroy(terminal); wl_display_destroy(server.display);
+    close(user_pair[1]); close(agent_pair[1]);
+}
+
 int main(void)
 {
 	for (uint32_t version = 4; version <= 9; version++) {
@@ -685,8 +846,9 @@ int main(void)
 	test_capture_reuses_scene_and_flat_pending_identity();
 	test_keyboard_window_isolation_and_popup_ancestors();
 	test_agent_focus_alongside_user();
+	test_agent_pointer_alongside_user();
 	assert(wheel_value120(1e300) == INT32_MAX);
 	assert(wheel_value120(-1e300) == INT32_MIN);
-	puts("PASS: pointer v4-v9 scroll, disconnect, cursor activation, capture replay and keyboard window isolation, agent focus");
+	puts("PASS: pointer v4-v9 scroll, disconnect, cursor activation, capture replay and keyboard window isolation, agent focus and pointer");
 	return 0;
 }

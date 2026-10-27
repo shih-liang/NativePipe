@@ -503,7 +503,6 @@ public final class WindowBridge: NSObject {
     private var presentationSuspended = false
     private var suspendedVisibleWindows: [UInt32] = []
     private var suspendedKeyWindow: UInt32?
-    private var computerPointerWindow: UInt32?
     private var integrationPreferences = WindowIntegrationPreferences()
     private var keyUpMonitor: Any?
 
@@ -1017,15 +1016,17 @@ public final class WindowBridge: NSObject {
         return context.makeImage()
     }
 
+    /// Drives the user's pointer path, as the Mac's mouse would, for live
+    /// latency tests. Computer use has its own pointer: `agentPointerPosition`.
     @discardableResult
-    public func computerPointerMove(window id: UInt32, x: Double, y: Double) -> Bool {
+    public func synthesizeUserPointerMove(window id: UInt32, x: Double, y: Double) -> Bool {
         guard acceptsKeyboardInput, x.isFinite, y.isFinite,
               let native = dockWindow(id), let view = native.window?.contentView,
               view.bounds.contains(CGPoint(x: x, y: y)) else { return false }
         let point = CGPoint(x: x, y: y)
-        if computerPointerWindow != id {
-            if let old = computerPointerWindow { windows[old]?.pointerLeft() }
-            computerPointerWindow = id
+        if syntheticPointerWindow != id {
+            if let old = syntheticPointerWindow { windows[old]?.pointerLeft() }
+            syntheticPointerWindow = id
             native.pointerEntered(at: point)
         }
         native.pointerMoved(to: point)
@@ -1033,24 +1034,29 @@ public final class WindowBridge: NSObject {
     }
 
     @discardableResult
-    public func computerPointerButton(
+    public func synthesizeUserPointerButton(
         window id: UInt32, button: Windowing.PointerButton, pressed: Bool
     ) -> Bool {
-        guard acceptsKeyboardInput, computerPointerWindow == id,
+        guard acceptsKeyboardInput, syntheticPointerWindow == id,
               let native = dockWindow(id) else { return false }
         native.pointerButton(button, pressed: pressed)
         return true
     }
 
-    @discardableResult
-    public func computerScroll(
-        window id: UInt32, dx: Double, dy: Double, precise: Bool
-    ) -> Bool {
-        guard acceptsKeyboardInput, computerPointerWindow == id,
-              dx.isFinite, dy.isFinite, let native = dockWindow(id) else { return false }
-        native.pointerScroll(dx: dx, dy: dy, precise: precise)
-        return true
+    /// An agent pointer position in the guest's window coordinates, or nil when
+    /// the window is gone or the content point lies outside it. The agent has
+    /// its own pointer in the guest; the Mac's mouse is untouched.
+    public func agentPointerPosition(window id: UInt32, x: Double, y: Double) -> Windowing.AgentInputEvent? {
+        guard x.isFinite, y.isFinite, let native = dockWindow(id), let view = native.window?.contentView,
+              view.bounds.contains(CGPoint(x: x, y: y)) else { return nil }
+        let point = native.windowPoint(from: CGPoint(x: x, y: y))
+        return .pointerMove(x: point.x, y: point.y)
     }
+
+    /// The toplevel holding the agent's keyboard focus in the guest. It is
+    /// shown as activated alongside the macOS key window.
+    public private(set) var agentFocusWindow: UInt32?
+    private var syntheticPointerWindow: UInt32?
 
     /// An agent key in the guest's evdev terms, or nil for a key the guest
     /// keymap lacks. Agent keys and text go through `ApplicationClient.agentInput`,
@@ -1474,7 +1480,7 @@ public final class WindowBridge: NSObject {
             }
             if let windowID = surfaceToWindow.removeValue(forKey: surface) {
                 mappedApplicationWindows.remove(windowID)
-                if computerPointerWindow == windowID { computerPointerWindow = nil }
+                if syntheticPointerWindow == windowID { syntheticPointerWindow = nil }
                 windows.removeValue(forKey: windowID)?.close()
             }
 
@@ -1552,8 +1558,8 @@ public final class WindowBridge: NSObject {
 
         case .toplevelDestroyed(let window):
             forceQuitCapabilities.removeValue(forKey: window)
+            if syntheticPointerWindow == window { syntheticPointerWindow = nil }
             if let native = windows.removeValue(forKey: window) {
-                if computerPointerWindow == window { computerPointerWindow = nil }
                 mappedApplicationWindows.remove(window)
                 surfaceToWindow.removeValue(forKey: native.surfaceID)
                 native.close()
@@ -1696,6 +1702,11 @@ public final class WindowBridge: NSObject {
 
         case .activationRequested(let window, let origin, let age):
             activateGuestWindow(window, originID: origin, inputAge: age)
+
+        case .agentFocusChanged(let window):
+            let previous = agentFocusWindow
+            agentFocusWindow = window
+            for id in Set([previous, window].compactMap { $0 }) { windows[id]?.refreshActiveState() }
 
         case .textInputEnabled(let window, let epoch, let enabled):
             windows[window]?.setTextInput(enabled: enabled, epoch: epoch)
@@ -2424,7 +2435,8 @@ public final class WindowBridge: NSObject {
         presentationDrawingGated = false
         suspendedVisibleWindows.removeAll(keepingCapacity: true)
         suspendedKeyWindow = nil
-        computerPointerWindow = nil
+        agentFocusWindow = nil
+        syntheticPointerWindow = nil
         notifyDockWindowsChanged()
     }
 }

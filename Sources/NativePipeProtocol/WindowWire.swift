@@ -418,6 +418,9 @@ public enum WindowWire {
             guard window != 0, origin != 0, age <= 5_000 else { throw DecodeError.malformed }
             return try finished(.activationRequested(
                 window: window, originWindow: origin, inputAgeMilliseconds: age))
+        case 51:
+            let window: UInt32 = try reader.integer()
+            return try finished(.agentFocusChanged(window: window == 0 ? nil : window))
         case 44:
             let token: UInt32 = try reader.integer()
             let session: UInt64 = try reader.integer()
@@ -608,6 +611,22 @@ public enum WindowWire {
                     guard !text.isEmpty, !text.utf8.contains(0) else { throw EncodeError.invalidValue }
                     payload.append(2)
                     try append(text, to: &payload)
+                case .pointerMove(let x, let y):
+                    guard x.isFinite, y.isFinite else { throw EncodeError.invalidValue }
+                    payload.append(3)
+                    append(x.bitPattern, to: &payload)
+                    append(y.bitPattern, to: &payload)
+                case .pointerButton(let button, let pressed):
+                    payload.append(4)
+                    let code: UInt8 = switch button { case .left: 1; case .right: 2; case .middle: 3 }
+                    payload.append(code)
+                    payload.append(pressed ? 1 : 0)
+                case .scroll(let dx, let dy, let precise):
+                    guard dx.isFinite, dy.isFinite else { throw EncodeError.invalidValue }
+                    payload.append(5)
+                    append(dx.bitPattern, to: &payload)
+                    append(dy.bitPattern, to: &payload)
+                    payload.append(precise ? 1 : 0)
                 }
             }
         case .close(let window), .forceQuit(let window),

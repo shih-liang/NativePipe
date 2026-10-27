@@ -46,7 +46,7 @@ static void device_set_shape(struct wl_client *client, struct wl_resource *resou
 	}
 	if (!device || !device->pointer) return;
 	struct np_input *pointer = wl_resource_get_user_data(device->pointer);
-	if (!pointer || serial != pointer->last_enter_serial) return;
+	if (!pointer || serial != pointer->last_enter_serial || pointer->agent_enter) return;
 	pointer->server->cursor_surface = NULL;
 	uint32_t fields[] = {shape};
 	np_window_event_send(pointer->server, NP_GUEST_CURSOR_SHAPE_CHANGED,

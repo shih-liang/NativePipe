@@ -88,8 +88,14 @@ struct np_server {
 	/* Keyboard focus is per client. focused_window follows the host's key
 	 * window; agent_window follows agent input, in any other client. */
 	uint32_t agent_window;
+	/* The toplevel last reported to the host as the agent's, which the host
+	 * shows as activated alongside its key window. */
+	uint32_t agent_reported_window;
 	uint32_t pointer_window;
 	uint32_t pointer_surface;
+	/* The agent's pointer, separate from the user's. It holds its client's
+	 * wl_pointer during an agent request and while its buttons stay down. */
+	uint32_t agent_pointer_window, agent_pointer_surface, agent_pointer_buttons;
 	struct wl_client *pointer_grab_client;
 	uint32_t pointer_grab_serial;
 	uint32_t pointer_buttons;
@@ -119,6 +125,8 @@ struct np_input {
 	struct np_server *server;
 	uint32_t last_enter_serial;
 	uint8_t active_scroll_axes;
+	/* The last enter was the agent's pointer, whose cursor the host never shows. */
+	bool agent_enter;
 };
 
 struct np_output {
