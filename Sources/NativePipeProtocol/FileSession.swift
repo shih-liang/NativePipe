@@ -5,11 +5,9 @@ import Darwin
 /// streams, matching `common/file_rpc/np_file_session.c`. Either side opens
 /// streams and sends notifications; the role only decides stream ID parity.
 ///
-/// Frames are written one at a time; control frames overtake queued DATA so
-/// metadata requests stay responsive during large transfers. DATA is bounded
-/// by per-stream and per-connection credit, so memory stays bounded and a
-/// stalled reader blocks other streams only once stalled streams hold the
-/// whole connection window (16 full stream windows).
+/// Frames are written one at a time, in order. Each direction of a stream
+/// carries at most `Wire.streamDataMaximum` bytes of DATA, which with the
+/// inbound stream limit bounds what a peer can make this side buffer.
 ///
 /// The session stays alive until `close()` or a disconnect.
 public final class FileSession: @unchecked Sendable {
@@ -27,9 +25,9 @@ public final class FileSession: @unchecked Sendable {
         public static let version: UInt8 = 2
         public static let headerSize = 16
         public static let frameMaximum = 65536
-        public static let streamWindow: UInt32 = 256 * 1024
-        public static let connectionWindow: UInt32 = 4 * 1024 * 1024
-        public static let maximumInboundStreams = 256
+        /// DATA one direction of a stream may carry; more ends the session.
+        public static let streamDataMaximum = 1024 * 1024
+        public static let maximumInboundStreams = 64
         /// Frames waiting while the peer is not reading; more drops the peer.
         public static let maximumPendingControl = 65536
         public static let port = NativePipePort.fileSession
@@ -37,7 +35,7 @@ public final class FileSession: @unchecked Sendable {
     }
 
     enum FrameType: UInt8 {
-        case hello = 1, request, response, data, notify, cancel, credit
+        case hello = 1, request, response, data, notify, cancel
     }
 
     /// Runs on the reader; must not block. The stream is cancelled when the
@@ -57,7 +55,7 @@ public final class FileSession: @unchecked Sendable {
         let id: UInt32
         let responder: Bool
         var responded = false, localEnded = false, remoteEnded = false, cancelled = false
-        var sendWindow = Wire.streamWindow, receiveWindow = Wire.streamWindow, consumed: UInt32 = 0
+        var sent = 0, received = 0
         var inbound: [Message] = []
         var receiver: CheckedContinuation<Message?, Error>?
         init(id: UInt32, responder: Bool) { self.id = id; self.responder = responder }
@@ -72,13 +70,7 @@ public final class FileSession: @unchecked Sendable {
     private var nextID: UInt32
     private var lastPeerID: UInt32 = 0
     private var inboundStreams = 0
-    private var sendWindow = Wire.connectionWindow
-    private var receiveWindow = Wire.connectionWindow
-    private var consumed: UInt32 = 0
-    /// Senders waiting for credit; each retries its reservation when woken.
-    private var creditWaiters: [() -> Void] = []
-    private var control: [Frame] = []
-    private var data: [Frame] = []
+    private var frames: [Frame] = []
     private var writing = false
     private var failure: Error?
     private var started = false
@@ -106,7 +98,7 @@ public final class FileSession: @unchecked Sendable {
         guard first else { return }
         var hello = Data([Wire.version, role.rawValue, 0, 0])
         hello.append(contentsOf: [0, 0, 0, 0])
-        enqueue(Self.frame(.hello, id: 0, payload: hello), priority: true)
+        enqueue(Self.frame(.hello, id: 0, payload: hello))
         Task.detached { [self] in await self.readLoop() }
     }
 
@@ -123,7 +115,7 @@ public final class FileSession: @unchecked Sendable {
             let state = StreamState(id: id, responder: false)
             state.localEnded = end
             streams[id] = state
-            control.append(Frame(bytes: Self.frame(.request, flags: end ? Wire.endStream : 0, id: id,
+            frames.append(Frame(bytes: Self.frame(.request, flags: end ? Wire.endStream : 0, id: id,
                                                    payload: Self.opcode(opcode) + body), done: nil))
             return id
         }
@@ -133,7 +125,7 @@ public final class FileSession: @unchecked Sendable {
 
     public func notify(_ opcode: UInt16, body: Data = Data()) async throws {
         guard body.count <= Wire.frameMaximum - 4 else { throw POSIXError(.EMSGSIZE) }
-        try await write(Self.frame(.notify, id: 0, payload: Self.opcode(opcode) + body), priority: true)
+        try await write(Self.frame(.notify, id: 0, payload: Self.opcode(opcode) + body))
     }
 
     // MARK: Stream operations
@@ -141,8 +133,7 @@ public final class FileSession: @unchecked Sendable {
     func respond(_ id: UInt32, status: UInt32, body: Data, end: Bool) async throws {
         guard body.count <= Wire.frameMaximum - 4 else { throw POSIXError(.EMSGSIZE) }
         var payload = Self.encode(status); payload.append(body)
-        try await write(Self.frame(.response, flags: end ? Wire.endStream : 0, id: id, payload: payload),
-                        priority: true) { state in
+        try await write(Self.frame(.response, flags: end ? Wire.endStream : 0, id: id, payload: payload)) { state in
             guard state.responder, !state.responded else { throw POSIXError(.EINVAL) }
             state.responded = true
             if end { state.localEnded = true }
@@ -151,27 +142,29 @@ public final class FileSession: @unchecked Sendable {
 
     func send(_ id: UInt32, _ bytes: Data, end: Bool) async throws {
         if bytes.isEmpty && !end { return }
+        // Refuse the whole send rather than end it part way.
+        try lock.withLock {
+            guard let state = streams[id] else { throw POSIXError(.ECANCELED) }
+            guard bytes.count <= Wire.streamDataMaximum - state.sent else { throw POSIXError(.EMSGSIZE) }
+        }
         var offset = bytes.startIndex
         repeat {
-            let size = try await reserveCredit(id, wanted: bytes.endIndex - offset)
+            let size = min(bytes.endIndex - offset, Wire.frameMaximum)
             let last = end && offset + size == bytes.endIndex
             let frame = Self.frame(.data, flags: last ? Wire.endStream : 0, id: id,
                                    payload: bytes.subdata(in: offset..<offset + size))
-            do {
-                try await write(frame, priority: false) { state in
-                    if last { state.localEnded = true }
-                }
-            } catch {
-                refundCredit(id, size)
-                throw error
+            try await write(frame) { state in
+                if state.responder && !state.responded { throw POSIXError(.EINVAL) }
+                guard size <= Wire.streamDataMaximum - state.sent else { throw POSIXError(.EMSGSIZE) }
+                state.sent += size
+                if last { state.localEnded = true }
             }
             offset += size
         } while offset < bytes.endIndex
     }
 
     func receive(_ id: UInt32) async throws -> Message? {
-        defer { pump() } // consuming may have queued credit
-        return try await withTaskCancellationHandler {
+        try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 lock.lock(); defer { lock.unlock() }
                 guard let state = streams[id] else { continuation.resume(throwing: POSIXError(.ECANCELED)); return }
@@ -190,11 +183,10 @@ public final class FileSession: @unchecked Sendable {
             guard let state = streams[id], !state.cancelled else { return false }
             state.cancelled = true
             discardLocked(state)
-            wakeLocked(state)
+            deliverLocked(state)
             return failure == nil && !state.finished
         }
-        if send { enqueue(Self.frame(.cancel, id: id, payload: Data()), priority: true) }
-        pump()
+        if send { enqueue(Self.frame(.cancel, id: id, payload: Data())) }
     }
 
     /// Either side cancelled the stream, or the session ended.
@@ -215,8 +207,7 @@ public final class FileSession: @unchecked Sendable {
 
     // MARK: Writing
 
-    private func write(_ bytes: Data, priority: Bool,
-                       update: ((StreamState) throws -> Void)? = nil) async throws {
+    private func write(_ bytes: Data, update: ((StreamState) throws -> Void)? = nil) async throws {
         let id = bytes.withUnsafeBytes { UInt32(littleEndian: $0.loadUnaligned(fromByteOffset: 8, as: UInt32.self)) }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             let queued: Bool = lock.withLock {
@@ -226,8 +217,7 @@ public final class FileSession: @unchecked Sendable {
                     do { try usableLocked(state); try update(state) }
                     catch { continuation.resume(throwing: error); return false }
                 }
-                let frame = Frame(bytes: bytes, done: continuation)
-                if priority { control.append(frame) } else { data.append(frame) }
+                frames.append(Frame(bytes: bytes, done: continuation))
                 return true
             }
             // The continuation completes only once the frame is written.
@@ -235,11 +225,10 @@ public final class FileSession: @unchecked Sendable {
         }
     }
 
-    private func enqueue(_ bytes: Data, priority: Bool) {
+    private func enqueue(_ bytes: Data) {
         lock.withLock {
             guard failure == nil else { return }
-            let frame = Frame(bytes: bytes, done: nil)
-            if priority { control.append(frame) } else { data.append(frame) }
+            frames.append(Frame(bytes: bytes, done: nil))
         }
         pump()
     }
@@ -247,9 +236,9 @@ public final class FileSession: @unchecked Sendable {
     private func pump() {
         let next: Frame? = lock.withLock {
             guard !writing, failure == nil else { return nil }
-            let frame = !control.isEmpty ? control.removeFirst() : !data.isEmpty ? data.removeFirst() : nil
-            if frame != nil { writing = true }
-            return frame
+            guard !frames.isEmpty else { return nil }
+            writing = true
+            return frames.removeFirst()
         }
         guard let next else { return }
         connection.send(next.bytes) { [self] result in
@@ -264,42 +253,10 @@ public final class FileSession: @unchecked Sendable {
         }
     }
 
-    private func reserveCredit(_ id: UInt32, wanted: Int) async throws -> Int {
-        while true {
-            let granted: Int? = try await withCheckedThrowingContinuation { continuation in
-                lock.lock(); defer { lock.unlock() }
-                do {
-                    guard let state = streams[id] else { throw POSIXError(.ECANCELED) }
-                    try usableLocked(state)
-                    if state.responder && !state.responded { throw POSIXError(.EINVAL) }
-                    if wanted == 0 { continuation.resume(returning: 0); return }
-                    let size = min(wanted, Wire.frameMaximum, Int(state.sendWindow), Int(sendWindow))
-                    if size > 0 {
-                        state.sendWindow -= UInt32(size); sendWindow -= UInt32(size)
-                        continuation.resume(returning: size); return
-                    }
-                    creditWaiters.append { continuation.resume(returning: nil) }
-                } catch { continuation.resume(throwing: error) }
-            }
-            if let granted { return granted }
-        }
-    }
-
-    /// Cancelled before queueing: the peer never sees these bytes, so the credit
-    /// must be restored or the connection window shrinks for good.
-    private func refundCredit(_ id: UInt32, _ size: Int) {
-        lock.withLock {
-            guard size > 0, failure == nil else { return }
-            sendWindow += UInt32(size)
-            streams[id]?.sendWindow += UInt32(size)
-            wakeCreditLocked()
-        }
-    }
-
-    /// Frames the reader originates; a peer that never reads them is dropped.
-    private func appendPeerControlLocked(_ bytes: Data) throws {
-        guard control.count < Wire.maximumPendingControl else { throw POSIXError(.ENOBUFS) }
-        control.append(Frame(bytes: bytes, done: nil))
+    /// Refusals the reader originates; a peer that never reads them is dropped.
+    private func appendRefusalLocked(_ bytes: Data) throws {
+        guard frames.count < Wire.maximumPendingControl else { throw POSIXError(.ENOBUFS) }
+        frames.append(Frame(bytes: bytes, done: nil))
     }
 
     private func usableLocked(_ state: StreamState) throws {
@@ -355,25 +312,12 @@ public final class FileSession: @unchecked Sendable {
         switch frame.type {
         case .hello:
             throw POSIXError(.EPROTO)
-        case .credit:
-            guard payload.count == 4 else { throw POSIXError(.EPROTO) }
-            let increment = Self.decode32(payload, at: 0)
-            guard increment > 0 else { throw POSIXError(.EPROTO) }
-            if id == 0 {
-                guard sendWindow <= UInt32.max / 2 - increment else { throw POSIXError(.EPROTO) }
-                sendWindow += increment
-            } else if let state, !state.localEnded {
-                guard state.sendWindow <= UInt32.max / 2 - increment else { throw POSIXError(.EPROTO) }
-                state.sendWindow += increment
-            }
-            wakeCreditLocked()
-            return nil
         case .cancel:
             guard id != 0, payload.isEmpty else { throw POSIXError(.EPROTO) }
             if let state, !state.cancelled {
                 state.cancelled = true
                 discardLocked(state)
-                wakeLocked(state)
+                deliverLocked(state)
             }
             return nil
         case .request:
@@ -381,7 +325,7 @@ public final class FileSession: @unchecked Sendable {
             lastPeerID = id
             let opcode = Self.decode16(payload)
             guard let onRequest, inboundStreams < Wire.maximumInboundStreams else {
-                try appendPeerControlLocked(Self.frame(.cancel, id: id, payload: Data()))
+                try appendRefusalLocked(Self.frame(.cancel, id: id, payload: Data()))
                 return nil
             }
             let state = StreamState(id: id, responder: true)
@@ -407,20 +351,13 @@ public final class FileSession: @unchecked Sendable {
         case .data:
             guard id != 0,
                   isPeerID(id) ? id <= lastPeerID : id < nextID else { throw POSIXError(.EPROTO) }
-            let length = UInt32(payload.count)
-            guard length <= receiveWindow else { throw POSIXError(.EPROTO) }
-            receiveWindow -= length
-            guard let state, !state.cancelled else {
-                // Abandoned stream: return the connection credit immediately.
-                receiveWindow += length
-                if length > 0 { try appendPeerControlLocked(Self.credit(id: 0, length)) }
-                return nil
-            }
+            // Abandoned stream: drop its data.
+            guard let state, !state.cancelled else { return nil }
             guard !state.remoteEnded, state.responder || state.responded,
-                  length <= state.receiveWindow else { throw POSIXError(.EPROTO) }
-            state.receiveWindow -= length
+                  payload.count <= Wire.streamDataMaximum - state.received else { throw POSIXError(.EPROTO) }
+            state.received += payload.count
             // An empty DATA only carries END; it is not delivered as a message.
-            if length > 0 { state.inbound.append(Message(kind: .data, body: payload, end: end)) }
+            if !payload.isEmpty { state.inbound.append(Message(kind: .data, body: payload, end: end)) }
             if end { state.remoteEnded = true }
             deliverLocked(state)
             return nil
@@ -447,61 +384,23 @@ public final class FileSession: @unchecked Sendable {
         }
     }
 
-    /// Removes the next message and returns consumed credit to the peer.
-    private func takeLocked(_ state: StreamState) -> Message {
-        let message = state.inbound.removeFirst()
-        guard message.kind == .data else { return message }
-        let length = UInt32(message.body.count)
-        state.consumed += length; consumed += length
-        if consumed >= Wire.connectionWindow / 4 {
-            receiveWindow += consumed
-            control.append(Frame(bytes: Self.credit(id: 0, consumed), done: nil))
-            consumed = 0
-        }
-        if !state.remoteEnded && state.consumed >= Wire.streamWindow / 4 {
-            state.receiveWindow += state.consumed
-            control.append(Frame(bytes: Self.credit(id: state.id, state.consumed), done: nil))
-            state.consumed = 0
-        }
-        return message
-    }
+    private func takeLocked(_ state: StreamState) -> Message { state.inbound.removeFirst() }
 
-    /// Unconsumed DATA will never be read: return its connection credit.
-    private func discardLocked(_ state: StreamState) {
-        let discarded = state.inbound.reduce(UInt32(0)) {
-            $1.kind == .data ? $0 + UInt32($1.body.count) : $0
-        }
-        state.inbound.removeAll()
-        guard discarded > 0, failure == nil else { return }
-        receiveWindow += discarded
-        control.append(Frame(bytes: Self.credit(id: 0, discarded), done: nil))
-    }
-
-    private func wakeLocked(_ state: StreamState) {
-        deliverLocked(state)
-        wakeCreditLocked()
-    }
-
-    private func wakeCreditLocked() {
-        let waiters = creditWaiters; creditWaiters = []
-        waiters.forEach { $0() }
-    }
+    /// Unconsumed DATA will never be read.
+    private func discardLocked(_ state: StreamState) { state.inbound.removeAll() }
 
     private func fail(_ error: Error) {
         let (first, frames, states): (Bool, [Frame], [StreamState]) = lock.withLock {
             guard failure == nil else { return (false, [], []) }
             failure = error
-            let frames = control + data
-            control = []; data = []
-            return (true, frames, Array(streams.values))
+            let pending = frames
+            frames = []
+            return (true, pending, Array(streams.values))
         }
         guard first else { return }
         connection.close()
         frames.forEach { $0.done?.resume(throwing: error) }
-        lock.withLock {
-            states.forEach { deliverLocked($0) }
-            wakeCreditLocked()
-        }
+        lock.withLock { states.forEach { deliverLocked($0) } }
         onClose?(error)
     }
 
@@ -518,9 +417,6 @@ public final class FileSession: @unchecked Sendable {
         bytes.append(encode(id)); bytes.append(encode(UInt32(payload.count)))
         bytes.append(payload)
         return bytes
-    }
-    private static func credit(id: UInt32, _ increment: UInt32) -> Data {
-        frame(.credit, id: id, payload: encode(increment))
     }
     static func opcode(_ value: UInt16) -> Data { Data([UInt8(value & 0xff), UInt8(value >> 8), 0, 0]) }
     static func encode(_ value: UInt32) -> Data { withUnsafeBytes(of: value.littleEndian) { Data($0) } }
@@ -544,7 +440,8 @@ public final class FileSessionStream: @unchecked Sendable {
     /// The next RESPONSE or DATA message; nil once the peer's half has ended.
     /// Cancelling the calling task cancels the stream.
     public func receive() async throws -> FileSession.Message? { try await session.receive(id) }
-    /// Waits for flow-control credit; splits into frames. Empty + end finishes.
+    /// Splits into frames; throws EMSGSIZE beyond `Wire.streamDataMaximum` in
+    /// total. Empty + end finishes.
     public func send(_ data: Data, end: Bool = false) async throws { try await session.send(id, data, end: end) }
     /// Responder only, exactly once, before any DATA.
     public func respond(status: UInt32 = 0, body: Data = Data(), end: Bool = false) async throws {

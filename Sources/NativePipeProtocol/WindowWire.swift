@@ -7,7 +7,7 @@ import QuartzCore
 /// NPIP supplies only bounded length framing. Integer fields are explicitly
 /// little endian; this is a wire format, never a Swift struct memory dump.
 public enum WindowWire {
-    public static let windowProtocolVersion: UInt32 = 15
+    public static let windowProtocolVersion: UInt32 = 16
     public static let motionMagic: [UInt8] = Array("NPMO".utf8)
     public static let motionPayloadSize = 16
     public static let scrollMagic: [UInt8] = Array("NPSC".utf8)
@@ -418,6 +418,9 @@ public enum WindowWire {
             guard window != 0, origin != 0, age <= 5_000 else { throw DecodeError.malformed }
             return try finished(.activationRequested(
                 window: window, originWindow: origin, inputAgeMilliseconds: age))
+        case 51:
+            let window: UInt32 = try reader.integer()
+            return try finished(.agentFocusChanged(window: window == 0 ? nil : window))
         case 44:
             let token: UInt32 = try reader.integer()
             let session: UInt64 = try reader.integer()
@@ -509,6 +512,8 @@ public enum WindowWire {
         case .inputPreferences: opcode = 25
         case .captureFrame: opcode = 26
         case .applicationRequest: opcode = 27
+        case .accessibilityRequest: opcode = 41
+        case .agentInput: opcode = 42
         }
         var payload = Data(lifecycleMagic)
         payload.append(2)
@@ -572,6 +577,58 @@ public enum WindowWire {
             append(token, to: &payload)
             append(action.rawValue, to: &payload)
             try append(application, to: &payload)
+        case .accessibilityRequest(let token, let request):
+            guard token != 0, request.number.isFinite,
+                  request.element.utf8.count <= GuestAccessibilityRequest.maximumElementSize,
+                  request.argument.utf8.count <= GuestAccessibilityRequest.maximumArgumentSize else {
+                throw EncodeError.invalidValue
+            }
+            append(token, to: &payload)
+            append(request.window, to: &payload)
+            append(request.operation.rawValue, to: &payload)
+            append(request.flags, to: &payload)
+            append(request.number.bitPattern, to: &payload)
+            try append(request.element, to: &payload)
+            try append(request.argument, to: &payload)
+        case .agentInput(let token, let window, let events):
+            let textBytes = events.reduce(0) { total, event in
+                if case .text(let text) = event { return total + text.utf8.count }
+                return total
+            }
+            guard token != 0, !events.isEmpty, events.count <= Windowing.AgentInputEvent.maximumEvents,
+                  textBytes <= Windowing.AgentInputEvent.maximumTextBytes else { throw EncodeError.invalidValue }
+            append(token, to: &payload)
+            append(window, to: &payload)
+            append(UInt32(events.count), to: &payload)
+            for event in events {
+                switch event {
+                case .key(let keycode, let pressed, let modifiers):
+                    payload.append(1)
+                    append(keycode, to: &payload)
+                    payload.append(pressed ? 1 : 0)
+                    append(modifiers.rawValue, to: &payload)
+                case .text(let text):
+                    guard !text.isEmpty, !text.utf8.contains(0) else { throw EncodeError.invalidValue }
+                    payload.append(2)
+                    try append(text, to: &payload)
+                case .pointerMove(let x, let y):
+                    guard x.isFinite, y.isFinite else { throw EncodeError.invalidValue }
+                    payload.append(3)
+                    append(x.bitPattern, to: &payload)
+                    append(y.bitPattern, to: &payload)
+                case .pointerButton(let button, let pressed):
+                    payload.append(4)
+                    let code: UInt8 = switch button { case .left: 1; case .right: 2; case .middle: 3 }
+                    payload.append(code)
+                    payload.append(pressed ? 1 : 0)
+                case .scroll(let dx, let dy, let precise):
+                    guard dx.isFinite, dy.isFinite else { throw EncodeError.invalidValue }
+                    payload.append(5)
+                    append(dx.bitPattern, to: &payload)
+                    append(dy.bitPattern, to: &payload)
+                    payload.append(precise ? 1 : 0)
+                }
+            }
         case .close(let window), .forceQuit(let window),
              .dismissPopup(let window), .pointerLeft(let window):
             append(window, to: &payload)

@@ -33,6 +33,9 @@
 #include <xkbcommon/xkbcommon.h>
 
 static bool same_client(struct wl_resource *a, struct wl_resource *b);
+static bool user_pointer(struct np_server *server, struct np_input *entry,
+                         struct np_surface *surface);
+static void agent_pointer_release(struct np_server *server);
 
 static uint32_t input_now_ms(void)
 {
@@ -143,7 +146,8 @@ static void pointer_set_cursor(struct wl_client *client, struct wl_resource *res
                                uint32_t serial, struct wl_resource *surface,
                                int32_t hotspot_x, int32_t hotspot_y) {
 	struct np_input *entry = wl_resource_get_user_data(resource);
-	if (!entry || serial != entry->last_enter_serial) return;
+	/* The agent's pointer has no visible cursor; the Mac's shows the user's. */
+	if (!entry || serial != entry->last_enter_serial || entry->agent_enter) return;
 	struct np_server *server = entry->server;
 	uint32_t surface_id = 0;
 	uint32_t pixel_scale = 1;
@@ -304,7 +308,7 @@ static void clear_pointer_focus(struct np_server *server) {
 		uint32_t serial = wl_display_next_serial(server->display);
 		struct np_input *entry;
 		wl_list_for_each(entry, &server->pointers, link) {
-			if (!same_client(entry->resource, surface->resource)) continue;
+			if (!user_pointer(server, entry, surface)) continue;
 			wl_pointer_send_leave(
 				entry->resource, serial, surface->resource);
 			pointer_frame(entry->resource);
@@ -345,10 +349,11 @@ void np_input_restore_pointer_focus_after_drag(struct np_server *server,
 	/* np_input_clear_pointer_focus_for_drag() already sent the leave at grab start. At
 	 * grab end the default pointer focus is empty, so only enter is valid here. */
 	wl_list_for_each(entry, &server->pointers, link) {
-		if (!same_client(entry->resource, target->resource)) continue;
+		if (!user_pointer(server, entry, target)) continue;
 		wl_pointer_send_enter(entry->resource, serial, target->resource,
 		                      input_fixed_from(local_x), input_fixed_from(local_y));
 		entry->last_enter_serial = serial;
+		entry->agent_enter = false;
 		pointer_frame(entry->resource);
 	}
 	server->pointer_window = surface->window_id;
@@ -363,8 +368,16 @@ static bool same_client(struct wl_resource *a, struct wl_resource *b) {
 	return wl_resource_get_client(a) == wl_resource_get_client(b);
 }
 
-/// Delivers keyboard focus, which in Wayland is leave-then-enter rather than a
-/// single "focus is now X" event.
+/// A client's wl_pointer belongs to the agent while the agent's pointer is in
+/// that client. The user's events for it keep updating the user's state and
+/// reach the client again when the agent lets go.
+static bool user_pointer(struct np_server *server, struct np_input *entry,
+                         struct np_surface *surface) {
+	if (!same_client(entry->resource, surface->resource)) return false;
+	struct np_surface *agent = server->agent_pointer_surface
+		? np_surface_by_id(server, server->agent_pointer_surface) : NULL;
+	return !agent || !agent->resource || !same_client(agent->resource, surface->resource);
+}
 
 // ---------------------------------------------------------------------------
 // zwp_text_input_v3
@@ -380,61 +393,159 @@ static bool same_client(struct wl_resource *a, struct wl_resource *b) {
 // stopped receiving them while a text field was focused would be unusable.
 // ---------------------------------------------------------------------------
 
+/// The innermost popup holding a grab for the user's or the agent's focus.
+/// Surfaces are head-inserted, so the first match walking forward is the most
 /// recently created one — the innermost menu level.
-static struct np_surface *grabbing_popup(struct np_server *server) {
+static struct np_surface *grabbing_popup(struct np_server *server, bool agent) {
 	struct np_surface *surface;
 	wl_list_for_each(surface, &server->surfaces, link) {
-		if (surface->has_grab) return surface;
+		if (surface->has_grab && surface->grab_agent == agent) return surface;
 	}
 	return NULL;
 }
 
-void np_set_keyboard_focus(struct np_server *server, uint32_t window_id) {
-	if (server->focused_window == window_id) return;
+static struct np_surface *window_surface(struct np_server *server, uint32_t window) {
+	struct np_surface *surface = window ? np_surface_by_window(server, window) : NULL;
+	return surface && surface->resource ? surface : NULL;
+}
 
-	struct np_surface *previous = server->focused_window
-		? np_surface_by_window(server, server->focused_window) : NULL;
-	struct np_surface *next = window_id ? np_surface_by_window(server, window_id) : NULL;
+static struct wl_client *surface_client(struct np_surface *surface) {
+	return surface ? wl_resource_get_client(surface->resource) : NULL;
+}
+
+/// Keyboard focus is per client. The user's focus follows the host's key
+/// window and the agent's follows its own input; the user's wins in its own
+/// client, so every client still sees exactly one wl_keyboard focus.
+static struct np_surface *focus_among(struct np_surface *user, struct np_surface *agent,
+                                      struct wl_client *client) {
+	if (!client) return NULL;
+	if (surface_client(user) == client) return user;
+	if (surface_client(agent) == client) return agent;
+	return NULL;
+}
+
+struct np_surface *np_keyboard_focus(struct np_server *server, struct wl_client *client) {
+	return focus_among(window_surface(server, server->focused_window),
+	                   window_surface(server, server->agent_window), client);
+}
+
+/// Delivers keyboard focus, which in Wayland is leave-then-enter rather than a
+/// single "focus is now X" event.
+static void send_keyboard_focus(struct np_server *server, struct wl_client *client,
+                                struct np_surface *previous, struct np_surface *next,
+                                uint32_t serial) {
 	struct np_input *entry;
-	uint32_t serial = wl_display_next_serial(server->display);
-
 	if (previous) {
 		wl_list_for_each(entry, &server->keyboards, link) {
-			if (!same_client(entry->resource, previous->resource)) continue;
+			if (wl_resource_get_client(entry->resource) != client) continue;
 			wl_keyboard_send_leave(entry->resource, serial, previous->resource);
 		}
 	}
-	if (next) {
-		struct wl_array keys;
-		wl_array_init(&keys);
-		// The selection belongs to the keyboard-focused client. The core
-		// protocol requires this event immediately before keyboard.enter, not
-		// while an unfocused client is merely constructing its data device.
-		wl_list_for_each(entry, &server->data_devices, link) {
-			if (!same_client(entry->resource, next->resource)) continue;
-			np_data_send_selection(server, entry->resource);
-		}
-		int delivered = 0;
-		wl_list_for_each(entry, &server->keyboards, link) {
-			if (!same_client(entry->resource, next->resource)) continue;
-			wl_keyboard_send_enter(entry->resource, serial, next->resource, &keys);
-			delivered++;
-		}
-		wl_array_release(&keys);
-		if (np_trace_enabled()) {
-			fprintf(stderr, "[wayland] focus -> window %u surface %u, %d keyboards\n",
-			        window_id, next->id, delivered);
-		}
-	} else if (np_trace_enabled()) {
-		fprintf(stderr, "[wayland] focus -> window %u: no such surface\n", window_id);
+	if (!next) return;
+	struct wl_array keys;
+	wl_array_init(&keys);
+	// The selection belongs to the keyboard-focused client. The core
+	// protocol requires this event immediately before keyboard.enter, not
+	// while an unfocused client is merely constructing its data device.
+	wl_list_for_each(entry, &server->data_devices, link) {
+		if (wl_resource_get_client(entry->resource) != client) continue;
+		np_data_send_selection(server, entry->resource);
 	}
-	server->focused_window = window_id;
-	np_text_input_focus_changed(server, previous, next);
+	int delivered = 0;
+	wl_list_for_each(entry, &server->keyboards, link) {
+		if (wl_resource_get_client(entry->resource) != client) continue;
+		wl_keyboard_send_enter(entry->resource, serial, next->resource, &keys);
+		delivered++;
+	}
+	wl_array_release(&keys);
+	if (np_trace_enabled())
+		fprintf(stderr, "[wayland] focus -> window %u surface %u, %d keyboards\n",
+		        next->window_id, next->id, delivered);
+}
+
+/// Tells the host which toplevel holds the agent's focus, so it can show that
+/// window as activated while macOS keeps its own key window.
+static void report_agent_focus(struct np_server *server) {
+	struct np_surface *surface = window_surface(server, server->agent_window);
+	for (unsigned depth = 0; surface && surface->popup_parent_window && depth < 64; depth++)
+		surface = window_surface(server, surface->popup_parent_window);
+	uint32_t window = surface ? surface->window_id : 0;
+	if (window == server->agent_reported_window) return;
+	server->agent_reported_window = window;
+	np_window_event_send(server, NP_GUEST_AGENT_FOCUS_CHANGED, &window, 1);
+}
+
+static void change_keyboard_focus(struct np_server *server, uint32_t user_window,
+                                  uint32_t agent_window) {
+	struct np_surface *old_user = window_surface(server, server->focused_window);
+	struct np_surface *old_agent = window_surface(server, server->agent_window);
+	struct np_surface *user = window_surface(server, user_window);
+	struct np_surface *agent = window_surface(server, agent_window);
+	if (agent && user && agent != user && surface_client(agent) == surface_client(user))
+		agent = NULL;
+	if (!user && user_window && np_trace_enabled())
+		fprintf(stderr, "[wayland] focus -> window %u: no such surface\n", user_window);
+	server->focused_window = user_window;
+	server->agent_window = agent ? agent_window : 0;
+	struct wl_client *clients[] = {
+		surface_client(old_user), surface_client(old_agent),
+		surface_client(user), surface_client(agent),
+	};
+	uint32_t serial = 0;
+	for (size_t i = 0; i < sizeof(clients) / sizeof(*clients); i++) {
+		bool seen = !clients[i];
+		for (size_t j = 0; j < i && !seen; j++) seen = clients[j] == clients[i];
+		if (seen) continue;
+		struct np_surface *before = focus_among(old_user, old_agent, clients[i]);
+		struct np_surface *after = focus_among(user, agent, clients[i]);
+		if (before == after) continue;
+		if (!serial) serial = wl_display_next_serial(server->display);
+		send_keyboard_focus(server, clients[i], before, after, serial);
+	}
+	np_text_input_focus_changed(server);
+	report_agent_focus(server);
+}
+
+void np_set_keyboard_focus(struct np_server *server, uint32_t window_id) {
+	if (server->focused_window == window_id) return;
+	change_keyboard_focus(server, window_id, server->agent_window);
+}
+
+/// A popup is a non-activating NSPanel, so its grab moves focus here rather
+/// than following the host. It takes the user's focus when the user is typing
+/// in the popup's client, and otherwise the agent's: the user can only have
+/// opened a menu in a window that macOS made key.
+void np_keyboard_focus_grab(struct np_server *server, struct np_surface *popup) {
+	struct np_surface *user = window_surface(server, server->focused_window);
+	popup->grab_agent = !user || !popup->resource || surface_client(user) != surface_client(popup);
+	if (popup->grab_agent) {
+		popup->focus_restore_window = server->agent_window;
+		change_keyboard_focus(server, server->focused_window, popup->window_id);
+	} else {
+		popup->focus_restore_window = server->focused_window;
+		np_set_keyboard_focus(server, popup->window_id);
+	}
+}
+
+/// Hands focus back only if this popup still holds it; an inner level may
+/// already have moved on.
+void np_keyboard_focus_ungrab(struct np_server *server, struct np_surface *popup) {
+	uint32_t restore = window_surface(server, popup->focus_restore_window)
+		? popup->focus_restore_window : 0;
+	if (popup->grab_agent) {
+		if (server->agent_window == popup->window_id)
+			change_keyboard_focus(server, server->focused_window, restore);
+	} else if (server->focused_window == popup->window_id) {
+		np_set_keyboard_focus(server, restore);
+	}
+	popup->grab_agent = false;
 }
 
 void np_input_host_disconnected(struct np_server *server)
 {
-    np_set_keyboard_focus(server, 0);
+    np_agent_input_finish(server);
+    agent_pointer_release(server);
+    change_keyboard_focus(server, 0, 0);
     clear_pointer_focus(server);
     server->pointer_buttons = 0;
     server->pointer_grab_client = NULL;
@@ -544,7 +655,7 @@ static void handle_pointer_position(struct np_server *server, uint32_t window_id
 		struct np_surface *previous = np_surface_by_id(server, server->pointer_surface);
 		if (previous) {
 			wl_list_for_each(entry, &server->pointers, link) {
-				if (!same_client(entry->resource, previous->resource)) continue;
+				if (!user_pointer(server, entry, previous)) continue;
 				wl_pointer_send_leave(entry->resource, serial, previous->resource);
 				pointer_frame(entry->resource);
 			}
@@ -553,10 +664,11 @@ static void handle_pointer_position(struct np_server *server, uint32_t window_id
 	int delivered = 0, total = 0;
 	wl_list_for_each(entry, &server->pointers, link) {
 		total++;
-		if (!same_client(entry->resource, surface->resource)) continue;
+		if (!user_pointer(server, entry, surface)) continue;
 		if (entering) {
 			wl_pointer_send_enter(entry->resource, serial, surface->resource, sx, sy);
 			entry->last_enter_serial = serial;
+			entry->agent_enter = false;
 		}
 		else wl_pointer_send_motion(entry->resource, time, sx, sy);
 		pointer_frame(entry->resource);
@@ -619,22 +731,16 @@ static void pointer_send_wheel_axis(
 	wl_pointer_send_axis(resource, time, axis, input_fixed_from(value));
 }
 
-static void handle_pointer_scroll(struct np_server *server, uint32_t window_id,
-                                  double dx, double dy, bool precise, bool inverted) {
-	if (!isfinite(dx) || !isfinite(dy)) return;
-	struct np_surface *surface = np_surface_by_id(server, server->pointer_surface);
-	if (!surface || server->pointer_window != window_id) {
-		if (np_trace_enabled())
-			fprintf(stderr,
-			        "[wayland] scroll dropped: pointer_surface=%u pointer_window=%u event_window=%u\n",
-			        server->pointer_surface, server->pointer_window, window_id);
-		return;
-	}
+/// Scrolls surface's client through the user's pointer, or the agent's.
+static void send_scroll(struct np_server *server, struct np_surface *surface,
+                        double dx, double dy, bool precise, bool inverted, bool agent) {
 	struct np_input *entry;
 	uint32_t time = input_now_ms();
 	int delivered = 0;
+	uint32_t window_id = surface->window_id;
 	wl_list_for_each(entry, &server->pointers, link) {
-		if (!same_client(entry->resource, surface->resource)) continue;
+		if (agent ? !same_client(entry->resource, surface->resource)
+		          : !user_pointer(server, entry, surface)) continue;
 		delivered++;
 		uint32_t version = (uint32_t)wl_resource_get_version(entry->resource);
 		if (np_trace_enabled())
@@ -693,6 +799,20 @@ static void handle_pointer_scroll(struct np_server *server, uint32_t window_id,
 	wl_display_flush_clients(server->display);
 }
 
+static void handle_pointer_scroll(struct np_server *server, uint32_t window_id,
+                                  double dx, double dy, bool precise, bool inverted) {
+	if (!isfinite(dx) || !isfinite(dy)) return;
+	struct np_surface *surface = np_surface_by_id(server, server->pointer_surface);
+	if (!surface || server->pointer_window != window_id) {
+		if (np_trace_enabled())
+			fprintf(stderr,
+			        "[wayland] scroll dropped: pointer_surface=%u pointer_window=%u event_window=%u\n",
+			        server->pointer_surface, server->pointer_window, window_id);
+		return;
+	}
+	send_scroll(server, surface, dx, dy, precise, inverted, false);
+}
+
 static void handle_close(struct np_server *server, uint32_t window_id,
 	                     bool force_quit) {
 	struct np_surface *surface = np_surface_by_window(server, window_id);
@@ -722,7 +842,7 @@ static void handle_close(struct np_server *server, uint32_t window_id,
 }
 
 static void handle_keyboard_focus(struct np_server *server, uint32_t window) {
-	struct np_surface *popup = grabbing_popup(server);
+	struct np_surface *popup = grabbing_popup(server, false);
 	np_set_keyboard_focus(server, popup && window != 0 ? popup->window_id : window);
 	wl_display_flush_clients(server->display);
 }
@@ -735,7 +855,7 @@ static bool keyboard_source_matches_focus(struct np_server *server,
 	/* A grabbing popup is a non-key AppKit panel. Its toplevel (or an outer
 	 * grabbing popup) still sends the keys, but an unrelated old window cannot
 	 * acquire that exception merely because some popup currently has focus. */
-	if (!focused->has_grab || grabbing_popup(server) != focused) return false;
+	if (!focused->has_grab || grabbing_popup(server, focused->grab_agent) != focused) return false;
 	struct np_surface *current = focused;
 	for (unsigned depth = 0; depth < 64 && current->has_grab; depth++) {
 		struct np_surface *parent = np_surface_by_window(server, current->popup_parent_window);
@@ -747,11 +867,10 @@ static bool keyboard_source_matches_focus(struct np_server *server,
 	return false;
 }
 
-static void handle_key(struct np_server *server, uint32_t window_id, uint32_t keycode,
-	                   bool pressed, uint32_t modifiers) {
-	struct np_surface *surface = np_surface_by_window(
-		server, server->focused_window);
-	if (!keyboard_source_matches_focus(server, surface, window_id)) return;
+/// Activation (xdg-activation) is only for the user's own input; an agent key
+/// still counts for popup grabs, which check the latest input serial.
+static void deliver_key(struct np_server *server, struct np_surface *surface, uint32_t keycode,
+                        bool pressed, uint32_t modifiers, bool user) {
 	send_modifiers(server, surface, modifiers);
 	struct np_input *entry;
 	uint32_t serial = wl_display_next_serial(server->display);
@@ -769,11 +888,19 @@ static void handle_key(struct np_server *server, uint32_t window_id, uint32_t ke
 		                             : WL_KEYBOARD_KEY_STATE_RELEASED);
 		delivered++;
 	}
-	if (pressed && delivered) np_activation_record_input(server, surface, serial);
+	if (user && pressed && delivered) np_activation_record_input(server, surface, serial);
 	if (np_trace_enabled())
-		fprintf(stderr, "[wayland] key %u -> %d of %d keyboards (surface %u)\n",
-		        keycode, delivered, total, surface->id);
+		fprintf(stderr, "[wayland] %s key %u -> %d of %d keyboards (surface %u)\n",
+		        user ? "user" : "agent", keycode, delivered, total, surface->id);
 	wl_display_flush_clients(server->display);
+}
+
+static void handle_key(struct np_server *server, uint32_t window_id, uint32_t keycode,
+	                   bool pressed, uint32_t modifiers) {
+	struct np_surface *surface = np_surface_by_window(
+		server, server->focused_window);
+	if (!keyboard_source_matches_focus(server, surface, window_id)) return;
+	deliver_key(server, surface, keycode, pressed, modifiers, true);
 }
 
 static bool handle_host_key(struct np_server *server, struct np_window_reader *reader) {
@@ -785,6 +912,359 @@ static bool handle_host_key(struct np_server *server, struct np_window_reader *r
 	 * affect a client. Truncation must not look like a valid key release. */
 	if (!np_window_reader_finished(reader)) return false;
 	handle_key(server, window, keycode, pressed, modifiers);
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Agent input
+//
+// An agent types into a window through its own keyboard focus, so it needs
+// neither the host's key window nor the macOS frontmost application, and the
+// user can keep typing in another application meanwhile. Requests carry a
+// token and are answered with how many events were delivered.
+// ---------------------------------------------------------------------------
+
+#define NP_AGENT_INPUT_EVENTS 1024u
+#define NP_AGENT_INPUT_TEXT_WAIT_MS 500u
+#define NP_AGENT_INPUT_REPLY 8
+
+enum np_agent_event_kind {
+	NP_AGENT_KEY = 1,
+	NP_AGENT_TEXT,
+	NP_AGENT_POINTER_MOVE,
+	NP_AGENT_POINTER_BUTTON,
+	NP_AGENT_SCROLL,
+};
+
+struct np_agent_event {
+	uint8_t kind;
+	bool pressed, precise;
+	/* A key's evdev code, or a pointer button (1 left, 2 right, 3 middle). */
+	uint32_t code, modifiers;
+	/* A window position in root coordinates, or scroll deltas. */
+	double x, y;
+	char *string;
+};
+
+struct np_agent_input {
+	uint32_t token, window, count, next;
+	/* Monotonic deadline while waiting for the focus to enable text input. */
+	uint64_t wait_until_ms;
+	struct wl_event_source *timer;
+	struct np_agent_event events[];
+};
+
+static uint64_t monotonic_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static bool agent_input_reply(struct np_server *server, uint32_t token, uint32_t accepted,
+                              const char *problem)
+{
+	struct np_window_message message;
+	np_window_message_init(&message, NP_WINDOW_GUEST_TO_HOST, NP_AGENT_INPUT_REPLY);
+	if (message.ok) memcpy(message.data, "NPAP", 4);
+	np_window_put_u32(&message, token);
+	np_window_put_u32(&message, accepted);
+	np_window_put_string(&message, problem ? problem : "");
+	bool ok = message.ok && np_backend_send_binary(server, message.data, message.len);
+	np_window_message_clear(&message);
+	return ok;
+}
+
+static void agent_input_free(struct np_agent_input *request)
+{
+	if (!request) return;
+	if (request->timer) wl_event_source_remove(request->timer);
+	for (uint32_t i = 0; i < request->count; i++) free(request->events[i].string);
+	free(request);
+}
+
+void np_agent_input_finish(struct np_server *server)
+{
+	agent_input_free(server->agent_input);
+	server->agent_input = NULL;
+}
+
+/// The agent's focus for input addressed to window. Inside the client holding
+/// the user's focus the agent can only share the user's window: Wayland gives
+/// each client one keyboard focus, and the user's wins.
+static struct np_surface *agent_focus(struct np_server *server, uint32_t window,
+                                      const char **problem)
+{
+	struct np_surface *target = window_surface(server, window);
+	if (!target) {
+		*problem = "The window closed. List windows again.";
+		return NULL;
+	}
+	struct np_surface *user = window_surface(server, server->focused_window);
+	if (user && same_client(user->resource, target->resource)) {
+		if (keyboard_source_matches_focus(server, user, window)) return user;
+		*problem = "The user is typing in another window of this application. "
+		           "Use accessibility actions, or try again after they switch away.";
+		return NULL;
+	}
+	struct np_surface *agent = window_surface(server, server->agent_window);
+	if (keyboard_source_matches_focus(server, agent, window)) return agent;
+	change_keyboard_focus(server, server->focused_window, window);
+	wl_display_flush_clients(server->display);
+	return window_surface(server, server->agent_window);
+}
+
+static void agent_pointer_enter(struct np_server *server, struct np_surface *surface,
+                                double x, double y, bool agent, uint32_t serial) {
+	struct np_input *entry;
+	wl_list_for_each(entry, &server->pointers, link) {
+		if (!same_client(entry->resource, surface->resource)) continue;
+		wl_pointer_send_enter(entry->resource, serial, surface->resource,
+		                      input_fixed_from(x), input_fixed_from(y));
+		entry->last_enter_serial = serial;
+		entry->agent_enter = agent;
+		pointer_frame(entry->resource);
+	}
+}
+
+static void agent_pointer_leave(struct np_server *server, struct np_surface *surface,
+                                uint32_t serial) {
+	struct np_input *entry;
+	wl_list_for_each(entry, &server->pointers, link) {
+		if (!same_client(entry->resource, surface->resource)) continue;
+		wl_pointer_send_leave(entry->resource, serial, surface->resource);
+		pointer_frame(entry->resource);
+	}
+}
+
+/// Ends the agent's hold on its client's wl_pointer and hands it back to the
+/// user's pointer if that is over the same client.
+static void agent_pointer_release(struct np_server *server) {
+	struct np_surface *agent = server->agent_pointer_surface
+		? np_surface_by_id(server, server->agent_pointer_surface) : NULL;
+	server->agent_pointer_surface = server->agent_pointer_window = server->agent_pointer_buttons = 0;
+	if (!agent || !agent->resource) return;
+	uint32_t serial = wl_display_next_serial(server->display);
+	agent_pointer_leave(server, agent, serial);
+	struct np_surface *user = server->pointer_surface
+		? np_surface_by_id(server, server->pointer_surface) : NULL;
+	double x, y;
+	if (user && user->resource && same_client(user->resource, agent->resource) &&
+	    !server->drag_source && surface_local_position(user, server->pointer_x, server->pointer_y, &x, &y))
+		agent_pointer_enter(server, user, x, y, false, serial);
+	wl_display_flush_clients(server->display);
+}
+
+/// Moves the agent's pointer to root coordinates in window. Within a client the
+/// user's pointer steps aside, unless the user is holding a button there.
+static const char *agent_pointer_move(struct np_server *server, uint32_t window,
+                                      double x, double y) {
+	struct np_surface *root = window_surface(server, window);
+	if (!root) return "The window closed. List windows again.";
+	struct np_surface *current = server->agent_pointer_surface
+		? np_surface_by_id(server, server->agent_pointer_surface) : NULL;
+	double local_x = x, local_y = y;
+	struct np_surface *target;
+	if (server->agent_pointer_buttons) {
+		/* The implicit grab keeps the pressed surface. */
+		if (server->agent_pointer_window != window)
+			return "Release the pointer button before moving to another window.";
+		target = current;
+		if (target && !surface_local_position(target, x, y, &local_x, &local_y)) target = NULL;
+	} else {
+		target = np_scene_hit_test(root, x, y, &local_x, &local_y);
+	}
+	if (!target || !target->resource) {
+		agent_pointer_release(server);
+		return NULL;
+	}
+	struct np_surface *user = server->pointer_surface
+		? np_surface_by_id(server, server->pointer_surface) : NULL;
+	bool user_here = user && user->resource && same_client(user->resource, target->resource);
+	if (target != current && user_here && server->pointer_buttons &&
+	    !(current && same_client(current->resource, target->resource)))
+		return "The user is using the mouse in this application. Try again after they release the button.";
+	uint32_t serial = wl_display_next_serial(server->display);
+	if (target == current) {
+		struct np_input *entry;
+		wl_list_for_each(entry, &server->pointers, link) {
+			if (!same_client(entry->resource, target->resource)) continue;
+			wl_pointer_send_motion(entry->resource, input_now_ms(),
+			                       input_fixed_from(local_x), input_fixed_from(local_y));
+			pointer_frame(entry->resource);
+		}
+	} else {
+		if (current && current->resource && same_client(current->resource, target->resource)) {
+			agent_pointer_leave(server, current, serial);
+		} else {
+			if (current) agent_pointer_release(server);
+			if (user_here && !server->drag_source) agent_pointer_leave(server, user, serial);
+		}
+		agent_pointer_enter(server, target, local_x, local_y, true, serial);
+		server->agent_pointer_surface = target->id;
+	}
+	server->agent_pointer_window = window;
+	wl_display_flush_clients(server->display);
+	return NULL;
+}
+
+/// Agent presses count for popup grabs but not for interactive move, resize
+/// or drag-and-drop, which follow the Mac's own mouse.
+static const char *agent_pointer_button(struct np_server *server, uint32_t which, bool pressed) {
+	static const uint32_t codes[] = {0, BTN_LEFT, BTN_RIGHT, BTN_MIDDLE};
+	if (which < 1 || which > 3) return "Unknown pointer button.";
+	struct np_surface *surface = server->agent_pointer_surface
+		? np_surface_by_id(server, server->agent_pointer_surface) : NULL;
+	uint32_t bit = 1u << (which - 1);
+	if (!surface || !surface->resource) {
+		server->agent_pointer_buttons &= ~bit;
+		return pressed ? "Move the pointer over the window before pressing a button." : NULL;
+	}
+	if (pressed) server->agent_pointer_buttons |= bit;
+	else server->agent_pointer_buttons &= ~bit;
+	uint32_t serial = wl_display_next_serial(server->display);
+	if (pressed) {
+		server->last_input_serial = serial;
+		server->last_input_client = wl_resource_get_client(surface->resource);
+	}
+	struct np_input *entry;
+	wl_list_for_each(entry, &server->pointers, link) {
+		if (!same_client(entry->resource, surface->resource)) continue;
+		wl_pointer_send_button(entry->resource, serial, input_now_ms(), codes[which],
+		                       pressed ? WL_POINTER_BUTTON_STATE_PRESSED
+		                               : WL_POINTER_BUTTON_STATE_RELEASED);
+		pointer_frame(entry->resource);
+	}
+	wl_display_flush_clients(server->display);
+	return NULL;
+}
+
+static const char *agent_pointer_scroll(struct np_server *server, double dx, double dy,
+                                        bool precise) {
+	struct np_surface *surface = server->agent_pointer_surface
+		? np_surface_by_id(server, server->agent_pointer_surface) : NULL;
+	if (!surface || !surface->resource) return "Move the pointer over the window before scrolling.";
+	send_scroll(server, surface, dx, dy, precise, false, true);
+	/* Each agent scroll is a complete finger gesture. */
+	if (precise) send_scroll(server, surface, 0, 0, true, false, true);
+	return NULL;
+}
+
+static int agent_input_resume(void *data);
+
+/// Delivers events in order. Text waits briefly for the client to enable a
+/// text field, since a click or a fresh keyboard enter reaches the field only
+/// after the client's next round trip.
+static void agent_input_run(struct np_server *server, struct np_agent_input *request)
+{
+	const char *problem = NULL;
+	while (request->next < request->count) {
+		struct np_agent_event *event = &request->events[request->next];
+		if (event->kind == NP_AGENT_POINTER_MOVE) {
+			problem = agent_pointer_move(server, request->window, event->x, event->y);
+		} else if (event->kind == NP_AGENT_POINTER_BUTTON) {
+			/* A click focuses the window, as it would for a person, unless the
+			 * user is typing in another window of the same application. */
+			const char *unfocused = NULL;
+			if (event->pressed) (void)agent_focus(server, request->window, &unfocused);
+			problem = agent_pointer_button(server, event->code, event->pressed);
+		} else if (event->kind == NP_AGENT_SCROLL) {
+			problem = agent_pointer_scroll(server, event->x, event->y, event->precise);
+		}
+		if (problem) break;
+		if (event->kind != NP_AGENT_KEY && event->kind != NP_AGENT_TEXT) {
+			request->next++;
+			continue;
+		}
+		struct np_surface *focus = agent_focus(server, request->window, &problem);
+		if (!focus) break;
+		if (event->kind == NP_AGENT_KEY) {
+			deliver_key(server, focus, event->code, event->pressed, event->modifiers, false);
+		} else if (!np_text_input_commit_agent(server, focus, event->string)) {
+			uint64_t now = monotonic_ms();
+			if (!request->wait_until_ms) request->wait_until_ms = now + NP_AGENT_INPUT_TEXT_WAIT_MS;
+			if (now < request->wait_until_ms) {
+				if (!request->timer)
+					request->timer = wl_event_loop_add_timer(
+						wl_display_get_event_loop(server->display), agent_input_resume, server);
+				if (request->timer && !wl_event_source_timer_update(request->timer, 20)) {
+					server->agent_input = request;
+					return;
+				}
+			}
+			problem = "The focused control doesn't accept text input (no text-input). Type with key presses instead.";
+			break;
+		}
+		request->wait_until_ms = 0;
+		request->next++;
+	}
+	if (!server->agent_pointer_buttons) agent_pointer_release(server);
+	(void)agent_input_reply(server, request->token, request->next, problem);
+	agent_input_free(request);
+}
+
+static int agent_input_resume(void *data)
+{
+	struct np_server *server = data;
+	struct np_agent_input *request = server->agent_input;
+	server->agent_input = NULL;
+	if (request) agent_input_run(server, request);
+	np_backend_session_sync(server);
+	return 0;
+}
+
+/// NP_HOST_AGENT_INPUT: token, window, count, then per event a kind byte
+/// (1 key: keycode, pressed, modifiers; 2 text: string; 3 pointer move: x, y;
+/// 4 button: button, pressed; 5 scroll: dx, dy, precise). The record is
+/// validated whole before any event reaches a client.
+static bool handle_agent_input(struct np_server *server, struct np_window_reader *reader)
+{
+	uint32_t token = np_window_read_u32(reader);
+	uint32_t window = np_window_read_u32(reader);
+	uint32_t count = np_window_read_u32(reader);
+	if (!reader->ok || !token || count > NP_AGENT_INPUT_EVENTS) return false;
+	struct np_agent_input *request = calloc(1, sizeof(*request) + count * sizeof(struct np_agent_event));
+	if (!request) return agent_input_reply(server, token, 0, "Not enough memory for agent input.");
+	request->token = token;
+	request->window = window;
+	for (; request->count < count; request->count++) {
+		struct np_agent_event *event = &request->events[request->count];
+		event->kind = np_window_read_u8(reader);
+		if (event->kind == NP_AGENT_KEY) {
+			event->code = np_window_read_u32(reader);
+			event->pressed = np_window_read_bool(reader);
+			event->modifiers = np_window_read_u32(reader);
+		} else if (event->kind == NP_AGENT_TEXT) {
+			event->string = np_window_read_string(reader);
+			if (!event->string || !event->string[0] || !np_text_input_valid_text(event->string))
+				reader->ok = false;
+		} else if (event->kind == NP_AGENT_POINTER_MOVE || event->kind == NP_AGENT_SCROLL) {
+			event->x = np_window_read_f64(reader);
+			event->y = np_window_read_f64(reader);
+			if (event->kind == NP_AGENT_SCROLL) event->precise = np_window_read_bool(reader);
+			if (!isfinite(event->x) || !isfinite(event->y)) reader->ok = false;
+		} else if (event->kind == NP_AGENT_POINTER_BUTTON) {
+			event->code = np_window_read_u8(reader);
+			event->pressed = np_window_read_bool(reader);
+			if (event->code < 1 || event->code > 3) reader->ok = false;
+		} else {
+			reader->ok = false;
+		}
+		if (!reader->ok) {
+			free(event->string);
+			event->string = NULL;
+			break;
+		}
+	}
+	if (!np_window_reader_finished(reader)) {
+		agent_input_free(request);
+		return false;
+	}
+	if (server->agent_input) {
+		agent_input_free(request);
+		return agent_input_reply(server, token, 0, "Another agent input is still running. Try again.");
+	}
+	agent_input_run(server, request);
 	return true;
 }
 
@@ -838,7 +1318,7 @@ static void handle_pointer_button(struct np_server *server, uint32_t window_id,
 	int delivered = 0, total = 0;
 	wl_list_for_each(entry, &server->pointers, link) {
 		total++;
-		if (!same_client(entry->resource, surface->resource)) continue;
+		if (!user_pointer(server, entry, surface)) continue;
 		wl_pointer_send_button(entry->resource, serial, time, code,
 		                       pressed ? WL_POINTER_BUTTON_STATE_PRESSED
 		                               : WL_POINTER_BUTTON_STATE_RELEASED);
@@ -1063,6 +1543,8 @@ bool np_input_handle_host_binary(const unsigned char *payload, size_t length,
 		break;
 	case NP_HOST_KEY:
 		return handle_host_key(server, &reader);
+	case NP_HOST_AGENT_INPUT:
+		return handle_agent_input(server, &reader);
 	case NP_HOST_POINTER_ENTERED:
 	case NP_HOST_POINTER_MOVED: {
 		uint32_t window = np_window_read_u32(&reader);
@@ -1132,15 +1614,10 @@ bool np_input_handle_host_binary(const unsigned char *payload, size_t length,
 			wl_data_source_send_cancelled(server->selection_source);
 			server->selection_source = NULL;
 		}
-		struct np_surface *focused = server->focused_window
-			? np_surface_by_window(server, server->focused_window) : NULL;
-		if (focused) {
-			struct np_input *device;
-			wl_list_for_each(device, &server->data_devices, link) {
-				if (wl_resource_get_client(device->resource) !=
-				    wl_resource_get_client(focused->resource)) continue;
-				np_data_send_selection(server, device->resource);
-			}
+		struct np_input *device;
+		wl_list_for_each(device, &server->data_devices, link) {
+			if (!np_keyboard_focus(server, wl_resource_get_client(device->resource))) continue;
+			np_data_send_selection(server, device->resource);
 		}
 		wl_display_flush_clients(server->display);
 		break;

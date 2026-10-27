@@ -162,7 +162,7 @@ jobs:
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-applications
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-file-drag test-scene-damage
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-core-protocols test-input-protocol test-activation test-xdg-output test-presentation-time test-scene-admission test-flat-feedback test-vmpipe-syncobj test-vmpipe-dmabuf test-text-input
-              make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-host-open test-notify-dbus test-xwayland-session
+              make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" test-host-open test-notify-dbus test-accessibility test-xwayland-session
               make -C common/file_rpc test-linux
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" dist-vmpipe
               make -C guest/compositor ARCH="$ARCH" LIBC="$LIBC" dist-remote

@@ -101,13 +101,13 @@ public final class SharedFileVolumeClient: Sendable {
     private func request(_ operation: SharedFileOperation) async throws -> [SharedFileReply] {
         let connection = try await SocketConnection.connect(to: socket)
         defer { connection.close() }
-        try await FileRPC.sendRecord(try JSONEncoder().encode(SharedFileRequest(token: descriptor.token, operation: operation)),
+        try await RecordWire.send(try JSONEncoder().encode(SharedFileRequest(token: descriptor.token, operation: operation)),
                                      to: connection, deadline: .now() + .seconds(5))
         var replies: [SharedFileReply] = []
         var metadataBytes = 0
         repeat {
             try Task.checkCancellation()
-            let data = try await FileRPC.receiveRecord(from: connection, maximum: 2 * 1024 * 1024,
+            let data = try await RecordWire.receive(from: connection, maximum: 2 * 1024 * 1024,
                                                       deadline: .now() + .seconds(60))
             let reply = try JSONDecoder().decode(SharedFileReply.self, from: data)
             if let error = reply.error { throw POSIXError(POSIXErrorCode(rawValue: error) ?? .EIO) }

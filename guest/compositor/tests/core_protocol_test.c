@@ -34,6 +34,8 @@ void np_scale_surface_bounds(const struct np_surface *surface, int32_t *width, i
 void np_decoration_use_client_default(struct np_surface *surface) {}
 bool np_xwayland_owns_client(struct np_server *server, struct wl_client *client) { return false; }
 void np_set_keyboard_focus(struct np_server *server, uint32_t window) {}
+void np_keyboard_focus_grab(struct np_server *server, struct np_surface *popup) {}
+void np_keyboard_focus_ungrab(struct np_server *server, struct np_surface *popup) {}
 bool np_window_event_send(struct np_server *server, uint8_t op,
                            const uint32_t *values, size_t count) { return true; }
 bool np_window_event_send_message(struct np_server *server,

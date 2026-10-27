@@ -4,14 +4,16 @@ import Foundation
 /// Named file transfer over vsock (bootstrap, provision extras, self-update).
 ///
 /// Guest → host request:
-///   `"NPAG"` | wire(u8=1) | flags(u8=1; NPFR required)
+///   `"NPAG"` | wire(u8=1) | flags(u8=0)
 ///          | name_len(u16 LE) | name bytes
 ///          | ver_len(u16 LE) | ver bytes
 ///
 /// Host → guest response:
 ///   `"NPAG"` | wire(u8=1) | status(u8: 0=file, 1=uptodate, 2=notfound)
 ///          | ver_len(u16 LE) | ver bytes
-///          | if status==0: payload_len(u64 LE) + NPFR payload stream
+///          | if status==0: payload_len(u64 LE) + exactly that many bytes
+///
+/// A request with flags 1 (the retired NPFR-framed payload) is refused.
 ///
 public enum AgentWire {
     public static let magic = Data("NPAG".utf8)
@@ -33,7 +35,7 @@ public enum AgentWire {
         }
     }
 
-    /// Response metadata; file contents follow as an NPFR stream.
+    /// Response metadata; file contents follow as raw bytes.
     public enum Response: Equatable {
         case file(hostVersion: String, payloadLength: UInt64)
         case uptodate(hostVersion: String)
@@ -66,7 +68,7 @@ public enum AgentWire {
         var out = Data()
         out.append(magic)
         out.append(version)
-        out.append(1)
+        out.append(0)
         out.append(contentsOf: u16le(UInt16(name.count)))
         out.append(name)
         out.append(contentsOf: u16le(UInt16(ver.count)))
@@ -77,7 +79,7 @@ public enum AgentWire {
     public static func decodeRequest(from data: Data) throws -> Request {
         guard data.count >= 8 else { throw Failure.truncated }
         guard data.prefix(4) == magic else { throw Failure.badMagic }
-        guard data[4] == version, data[5] == 1 else { throw Failure.unsupportedWire }
+        guard data[4] == version, data[5] == 0 else { throw Failure.unsupportedWire }
         let nameLen = Int(u16le(data, at: 6))
         guard nameLen <= maxNameLength else { throw Failure.nameTooLong }
         guard data.count >= 8 + nameLen + 2 else { throw Failure.truncated }

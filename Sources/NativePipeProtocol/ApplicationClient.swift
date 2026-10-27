@@ -17,7 +17,8 @@ public final class ApplicationClient {
     private var iconTask: Task<Void, Never>?
     private var taskGeneration: UInt64 = 0
     private struct Request {
-        let action: ApplicationAction
+        /// Nil for an accessibility or agent input request.
+        let action: ApplicationAction?
         let continuation: CheckedContinuation<ApplicationReply, Error>
         var apps: [GuestApplication] = []
         var ids: Set<String> = []
@@ -72,12 +73,22 @@ public final class ApplicationClient {
         case .icon(let token, _):
             guard pending[token]?.action == .icon else { return }
             finish(token, .success(reply))
+        case .accessibility(let token, let message, _):
+            guard let request = pending[token], request.action == nil else { return }
+            finish(token, message.isEmpty ? .success(reply) : .failure(Failure(message)))
+        case .agentInput(let token, _, _):
+            guard let request = pending[token], request.action == nil else { return }
+            finish(token, .success(reply))
         }
     }
     private func finish(_ token: UInt32, _ result: Result<ApplicationReply, Error>) {
         pending.removeValue(forKey: token)?.continuation.resume(with: result)
     }
     private func request(_ action: ApplicationAction, _ id: String = "") async throws -> ApplicationReply {
+        try await request(action) { .applicationRequest(token: $0, action: action, application: id) }
+    }
+    private func request(_ action: ApplicationAction?,
+                         _ command: (UInt32) -> Windowing.HostCommand) async throws -> ApplicationReply {
         guard connected else { throw Failure(NPText("NativePipe isn’t connected to the Linux computer.")) }
         repeat { nextToken &+= 1 } while nextToken == 0 || pending[nextToken] != nil
         let token = nextToken
@@ -90,7 +101,7 @@ public final class ApplicationClient {
             try Task.checkCancellation()
             return try await withCheckedThrowingContinuation { continuation in
                 pending[token] = Request(action: action, continuation: continuation)
-                send(.applicationRequest(token: token, action: action, application: id))
+                send(command(token))
             }
         } onCancel: { Task { @MainActor [weak self] in self?.finish(token, .failure(CancellationError())) } }
     }
@@ -154,6 +165,36 @@ public final class ApplicationClient {
     /// Zero means D-Bus activation succeeded without creating a child process.
     public func setAppearance(_ scheme: DesktopPreferences.ColorScheme) async throws {
         _ = try await request(.appearance, scheme == .dark ? "dark" : "light")
+    }
+
+    /// The accessibility worker's JSON document: a `GuestAccessibilityTree` for a
+    /// tree request, otherwise an acknowledgement.
+    public func accessibility(_ request: GuestAccessibilityRequest) async throws -> Data {
+        guard case .accessibility(_, _, let document) = try await self.request(nil, {
+            .accessibilityRequest(token: $0, request: request)
+        }) else { throw Failure(NPText("Invalid accessibility reply.")) }
+        return document
+    }
+    public func accessibilityTree(_ request: GuestAccessibilityRequest) async throws -> GuestAccessibilityTree {
+        do { return try JSONDecoder().decode(GuestAccessibilityTree.self, from: try await accessibility(request)) }
+        catch let error as DecodingError { throw Failure(NPText("Invalid accessibility tree: %@", String(describing: error))) }
+    }
+
+    /// How far an agent input request got. `problem` explains why the events
+    /// after `accepted` were not delivered.
+    public struct AgentInputReceipt: Sendable, Equatable {
+        public let accepted: Int
+        public let problem: String?
+        public init(accepted: Int, problem: String?) { self.accepted = accepted; self.problem = problem }
+    }
+
+    /// Delivers keys and text through the agent's own keyboard focus in the
+    /// guest, whichever window macOS has made key.
+    public func agentInput(window: UInt32, events: [Windowing.AgentInputEvent]) async throws -> AgentInputReceipt {
+        guard case .agentInput(_, let accepted, let problem) = try await request(nil, {
+            .agentInput(token: $0, window: window, events: events)
+        }), accepted <= events.count else { throw Failure(NPText("Invalid agent input reply.")) }
+        return AgentInputReceipt(accepted: Int(accepted), problem: problem.isEmpty ? nil : problem)
     }
 
     /// Zero means D-Bus activation succeeded without creating a child process.

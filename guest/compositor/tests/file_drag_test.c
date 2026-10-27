@@ -13,6 +13,10 @@ static unsigned icon_changes, icon_replays, icon_queues;
 static uint32_t icon_replay_id;
 struct np_surface *np_surface_by_window(struct np_server *s, uint32_t id) { return id == 1 ? &surface : NULL; }
 struct np_surface *np_surface_by_id(struct np_server *s, uint32_t id) { return id == 1 ? &surface : NULL; }
+struct np_surface *np_keyboard_focus(struct np_server *s, struct wl_client *client) {
+    struct np_surface *focused = s->focused_window ? np_surface_by_window(s, s->focused_window) : NULL;
+    return focused && wl_resource_get_client(focused->resource) == client ? focused : NULL;
+}
 struct np_surface *np_scene_root(struct np_surface *s) { return s; }
 struct np_surface *np_scene_hit_test(struct np_surface *s, double x, double y, double *lx, double *ly) {
     *lx = x; *ly = y; return s;

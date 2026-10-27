@@ -17,6 +17,14 @@ struct np_surface *np_surface_by_window(struct np_server *server, uint32_t windo
 		if (surface->window_id == window) return surface;
 	return NULL;
 }
+/* The production rule from input.c: the user's focus wins in its client. */
+struct np_surface *np_keyboard_focus(struct np_server *server, struct wl_client *client) {
+	struct np_surface *user = server->focused_window ? np_surface_by_window(server, server->focused_window) : NULL;
+	struct np_surface *agent = server->agent_window ? np_surface_by_window(server, server->agent_window) : NULL;
+	if (user && wl_resource_get_client(user->resource) == client) return user;
+	if (agent && wl_resource_get_client(agent->resource) == client) return agent;
+	return NULL;
+}
 bool np_window_event_send_message(struct np_server *server, struct np_window_message *message) {
 	assert(sent_count < sizeof(sent) / sizeof(sent[0]));
 	struct np_window_reader reader;
@@ -78,8 +86,9 @@ static struct np_text_input *make_input(struct wl_client *client, uint32_t id) {
 	return wl_resource_get_user_data(resource);
 }
 static void focus(struct np_server *server, struct np_surface *old, struct np_surface *next) {
+	(void)old;
 	server->focused_window = next ? next->window_id : 0;
-	np_text_input_focus_changed(server, old, next);
+	np_text_input_focus_changed(server);
 }
 int main(void) {
 	struct np_server server = {0}; server.display = wl_display_create(); assert(server.display);
@@ -232,11 +241,38 @@ int main(void) {
 	assert(drain(&server, first_peer, 5, ZWP_TEXT_INPUT_V3_DONE, NULL) == 0);
 	np_text_input_deliver(&server, 5, input->epoch, "reconnected field", NULL, 0, 0, 0, 0);
 	assert(drain(&server, first_peer, 5, ZWP_TEXT_INPUT_V3_DONE, NULL) == 1);
+
+	/* The agent's focus in another client gets its own field. Host IME text
+	 * still reaches only the user's field, and agent text only the agent's. */
+	drain(&server, second_peer, 4, ZWP_TEXT_INPUT_V3_ENTER, NULL);
+	server.agent_window = other.window_id;
+	np_text_input_focus_changed(&server);
+	assert(drain(&server, second_peer, 4, ZWP_TEXT_INPUT_V3_ENTER, NULL) == 1);
+	assert(background->entered_surface == other.id && input->entered_surface == reconnected.id);
+	sent_count = 0;
+	text_input_enable(second, background->resource); text_input_commit(second, background->resource);
+	assert(background->enabled && input->enabled && sent[0].window == other.window_id);
+	drain(&server, second_peer, 4, ZWP_TEXT_INPUT_V3_DONE, NULL);
+	np_text_input_deliver(&server, other.window_id, background->epoch, "host", NULL, 0, 0, 0, 0);
+	assert(drain(&server, second_peer, 4, ZWP_TEXT_INPUT_V3_DONE, NULL) == 0);
+	assert(np_text_input_commit_agent(&server, &other, "agent"));
+	assert(drain(&server, second_peer, 4, ZWP_TEXT_INPUT_V3_COMMIT_STRING, NULL) == 1);
+	assert(drain(&server, first_peer, 5, ZWP_TEXT_INPUT_V3_COMMIT_STRING, NULL) == 0);
+	np_text_input_deliver(&server, 5, input->epoch, "user", NULL, 0, 0, 0, 0);
+	assert(drain(&server, first_peer, 5, ZWP_TEXT_INPUT_V3_DONE, NULL) == 1);
+	assert(drain(&server, second_peer, 4, ZWP_TEXT_INPUT_V3_DONE, NULL) == 0);
+	assert(np_text_input_valid_text("中") && !np_text_input_valid_text("\xff"));
+	/* Losing the agent's focus retires only the agent's field. */
+	server.agent_window = 0;
+	np_text_input_focus_changed(&server);
+	assert(!background->enabled && !background->entered_surface && input->enabled);
+	assert(drain(&server, second_peer, 4, ZWP_TEXT_INPUT_V3_LEAVE, NULL) == 1);
+
 	/* Fixture surfaces intentionally do not own production destroy callbacks. */
 	server.focused_window = 0;
 
 	wl_display_destroy_clients(server.display);
 	close(first_peer); close(second_peer); wl_display_destroy(server.display);
-	puts("text-input-v3: focus ownership, atomic reconversion, UTF-8 and field resets passed");
+	puts("text-input-v3: focus ownership, agent fields, atomic reconversion, UTF-8 and field resets passed");
 	return 0;
 }

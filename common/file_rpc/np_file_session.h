@@ -10,17 +10,19 @@
 #define NP_FILE2_VERSION 2
 #define NP_FILE2_HEADER 16u
 #define NP_FILE2_FRAME_MAX 65536u
-#define NP_FILE2_STREAM_WINDOW (256u * 1024u)
-#define NP_FILE2_CONNECTION_WINDOW (4u * 1024u * 1024u)
-#define NP_FILE2_MAX_INBOUND_STREAMS 256u
-/* Frames the reader originates (credit, refusals) wait here while the peer is
+/* DATA one direction of a stream may carry. Operations that need more use
+ * several streams; exceeding it ends the session (EPROTO). With the inbound
+ * stream limit this bounds what a peer can make the other side buffer. */
+#define NP_FILE2_STREAM_DATA_MAX (1024u * 1024u)
+#define NP_FILE2_MAX_INBOUND_STREAMS 64u
+/* CANCELs the reader or a callback originates wait here while the peer is
  * not reading; a peer that lets this many accumulate is dropped (ENOBUFS). */
 #define NP_FILE2_MAX_PENDING_CONTROL 65536u
 #define NP_FILE2_PORT 1031u
 
 enum np_file2_type {
     NP_FILE2_HELLO = 1, NP_FILE2_REQUEST, NP_FILE2_RESPONSE, NP_FILE2_DATA,
-    NP_FILE2_NOTIFY, NP_FILE2_CANCEL, NP_FILE2_CREDIT
+    NP_FILE2_NOTIFY, NP_FILE2_CANCEL
 };
 #define NP_FILE2_END_STREAM 1u
 /* Host-opened streams are even, guest-opened streams odd; 0 is the connection. */
@@ -68,7 +70,8 @@ struct np_file2_stream *np_file2_request(struct np_file2_session *session, uint1
 /* Responder only, exactly once, before any DATA. */
 int np_file2_respond(struct np_file2_stream *stream, uint32_t status,
                      const void *body, size_t length, int end_stream);
-/* Blocks for flow-control credit; splits into frames. Empty + end finishes. */
+/* Splits into frames; fails with EMSGSIZE beyond NP_FILE2_STREAM_DATA_MAX in
+ * total. Empty + end finishes. */
 int np_file2_send(struct np_file2_stream *stream, const void *data, size_t length, int end_stream);
 /* Returns 1 with a message, 0 once the peer's half has ended, -1 with errno
  * (ECANCELED after either side cancelled, ECONNRESET after disconnect). */

@@ -296,3 +296,6 @@
 "The display did not finish preparing for the virtual machine state change." = "가상 머신 상태 변경을 위한 화면 준비가 완료되지 않았습니다.";
 "The display connection changed during the virtual machine state change." = "가상 머신 상태 변경 중 화면 연결이 변경되었습니다.";
 "Another display state change is already in progress." = "다른 화면 상태 변경이 진행 중입니다.";
+"Invalid accessibility reply." = "손쉬운 사용 응답이 유효하지 않습니다.";
+"Invalid agent input reply." = "에이전트 입력 응답이 잘못되었습니다.";
+"Invalid accessibility tree: %@" = "손쉬운 사용 트리가 유효하지 않습니다: %@";

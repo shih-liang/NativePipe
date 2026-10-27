@@ -874,8 +874,7 @@ static void popup_grab(struct wl_client *client, struct wl_resource *resource,
 	// on reporting the parent as focused. Leaving focus there would send the
 	// menu's arrow keys and mnemonics to the surface underneath it.
 	surface->has_grab = true;
-	surface->focus_restore_window = server->focused_window;
-	np_set_keyboard_focus(server, surface->window_id);
+	np_keyboard_focus_grab(server, surface);
 	wl_display_flush_clients(server->display);
 }
 
@@ -926,13 +925,7 @@ static void popup_resource_destroy(struct wl_resource *resource) {
 	if (surface->has_grab) {
 		struct np_server *server = surface->server;
 		surface->has_grab = false;
-		// Only hand focus back if this popup still holds it; an inner level may
-		// already have moved on.
-		if (server->focused_window == surface->window_id) {
-			uint32_t restore = surface->focus_restore_window;
-			np_set_keyboard_focus(server,
-			                   np_surface_by_window(server, restore) ? restore : 0);
-		}
+		np_keyboard_focus_ungrab(server, surface);
 	}
 	uint32_t fields[] = {surface->window_id};
 	np_window_event_send(surface->server, NP_GUEST_POPUP_DESTROYED, fields, 1);

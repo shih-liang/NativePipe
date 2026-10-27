@@ -33,54 +33,41 @@ final class FileRPCTests: XCTestCase {
     }
 
     func testSnapshotPreservesTheRequestedLinuxPathBytesInItsMetadataURL() async throws {
+        let server = try Server()
         let path = "/guest/\u{e9}.txt"
-        var descriptors: [Int32] = [-1, -1]
-        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors), 0)
-        let peer = descriptors[0], client = FileHandle(fileDescriptor: descriptors[1], closeOnDealloc: true)
-        let finished = DispatchGroup(); finished.enter()
-        DispatchQueue.global().async {
-            defer { close(peer); finished.leave() }
-            let frame = UnsafeMutablePointer<np_file_frame>.allocate(capacity: 1)
-            defer { frame.deallocate() }
-            guard np_file_receive(peer, frame) == 0 else { return }
-            XCTAssertEqual(frame.pointee.type, UInt8(NP_FILE_SNAPSHOT.rawValue))
-            let payload = Data(bytes: np_file_frame_data(frame), count: Int(frame.pointee.length))
-            XCTAssertEqual(payload.dropFirst(4), Data(path.utf8))
-            var metadata = [UInt8](repeating: 0, count: 28 + Int(NP_FILE_REVISION))
-            np_file_put32(&metadata, 0o100600)
-            _ = np_file_send(peer, UInt8(NP_FILE_METADATA.rawValue), 0, 0, &metadata, metadata.count)
-        }
-        let info = try await FileRPC { client }.snapshot(path)
+        try FileManager.default.createDirectory(at: server.root.appendingPathComponent("guest"), withIntermediateDirectories: false)
+        try Data("x".utf8).write(to: server.root.appendingPathComponent(String(path.dropFirst())))
+        let info = try await server.rpc.snapshot(path)
         XCTAssertEqual(Data(info.url.path.utf8), Data(path.utf8))
-        XCTAssertEqual(finished.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(server.workers.wait(timeout: .now() + 2), .success)
     }
-    func testAsyncRecordDecoderRejectsMalformedAndTruncatedFrames() async throws {
-        func header(type: UInt8 = UInt8(NP_FILE_DATA.rawValue), length: UInt32, flags: UInt8 = 0) -> Data {
-            var bytes = Data([78, 80, 70, 82, UInt8(NP_FILE_VERSION), type, flags, 0])
-            var length = length.littleEndian
-            withUnsafeBytes(of: &length) { bytes.append(contentsOf: $0) }
-            bytes.append(Data(repeating: 0, count: 4))
-            return bytes
-        }
-        let invalid = [
-            header(length: 1, flags: 1) + Data([0]),
-            header(type: 255, length: 1) + Data([0]),
-            header(length: UInt32(NP_FILE_CHUNK) + 1),
-            header(length: 9) + Data(repeating: 0, count: 9), // Record limit is 8.
-            header(type: UInt8(NP_FILE_END.rawValue), length: 8) + Data([1, 0, 0, 0, 0, 0, 0, 0]),
-            header(length: 1), // EOF in payload.
-            Data([78, 80, 70]) // EOF in header.
-        ]
-        for bytes in invalid {
+
+    func testRecordsRoundTripAndRejectOversizedAndTruncatedInput() async throws {
+        func pair() throws -> (SocketConnection, SocketConnection) {
             var descriptors: [Int32] = [-1, -1]
             XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors), 0)
-            let receiver = try SocketConnection(owning: descriptors[0])
-            let sender = try SocketConnection(owning: descriptors[1])
+            return (try SocketConnection(owning: descriptors[0]), try SocketConnection(owning: descriptors[1]))
+        }
+        let (receiver, sender) = try pair()
+        for record in [Data("first".utf8), Data(), Data(repeating: 7, count: 70_000)] {
+            async let sent: Void = RecordWire.send(record, to: sender, deadline: .now() + .seconds(5))
+            let received = try await RecordWire.receive(from: receiver, maximum: 70_000, deadline: .now() + .seconds(5))
+            try await sent
+            XCTAssertEqual(received, record)
+        }
+        receiver.close(); sender.close()
+        let invalid = [
+            Data([9, 0, 0, 0]) + Data(repeating: 0, count: 9), // Record limit is 8.
+            Data([1, 0, 0, 0]),                                 // EOF in payload.
+            Data([1, 0])                                        // EOF in the length.
+        ]
+        for bytes in invalid {
+            let (receiver, sender) = try pair()
             defer { receiver.close(); sender.close() }
             try await sender.write(bytes)
             sender.finishWriting()
             do {
-                _ = try await FileRPC.receiveRecord(from: receiver, maximum: 8, deadline: .now() + .seconds(1))
+                _ = try await RecordWire.receive(from: receiver, maximum: 8, deadline: .now() + .seconds(1))
                 XCTFail("Malformed record was accepted")
             } catch is FileRPC.Failure {
             } catch is SocketConnection.Failure {
@@ -108,10 +95,11 @@ final class FileRPCTests: XCTestCase {
             let server = fds[0], client = fds[1]
             workers.enter()
             DispatchQueue.global().async { [self] in
-                defer { close(server); workers.leave() }
+                defer { workers.leave() }
                 let fd = open(root.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-                guard fd >= 0 else { return }
+                guard fd >= 0 else { close(server); return }
                 defer { close(fd) }
+                // Owns the socket from here on.
                 _ = np_file_serve(server, fd, readOnly ? 1 : 0)
             }
             return FileHandle(fileDescriptor: client, closeOnDealloc: true)
@@ -315,9 +303,7 @@ final class FileRPCTests: XCTestCase {
         defer { close(peer) }
         let requestArrived = expectation(description: "Range request reached the server")
         DispatchQueue.global().async {
-            let frame = UnsafeMutablePointer<np_file_frame>.allocate(capacity: 1)
-            defer { frame.deallocate() }
-            if np_file_receive(peer, frame) == 0, frame.pointee.type == UInt8(NP_FILE_RANGE.rawValue) { requestArrived.fulfill() }
+            if Self.firstRequestOpcode(peer) == UInt16(NP_FILE_RANGE.rawValue) { requestArrived.fulfill() }
         }
         let access = FileRPCUserAccess(rpc: FileRPC { client })
         let task = Task { try await access.read(URL(fileURLWithPath: "/waiting"), offset: 0, length: 1,
@@ -459,11 +445,12 @@ final class FileRPCTests: XCTestCase {
         XCTAssertEqual(progress.values.filter(\.isComplete).count, 1)
     }
 
-    func testBootstrapRequiresFramedPayload() throws {
+    func testBootstrapRefusesTheRetiredFramedPayload() throws {
         let request = AgentWire.Request(name: "nativepipe-guestd")
         var encoded = try AgentWire.encodeRequest(request)
+        XCTAssertEqual(encoded[5], 0)
         XCTAssertEqual(try AgentWire.decodeRequest(from: encoded), request)
-        encoded[5] = 0
+        encoded[5] = 1
         XCTAssertThrowsError(try AgentWire.decodeRequest(from: encoded))
     }
 
@@ -476,22 +463,20 @@ final class FileRPCTests: XCTestCase {
         defer { try? source.close() }
         var fds: [Int32] = [-1, -1]
         XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds), 0)
-        let peer = fds[0], client = FileHandle(fileDescriptor: fds[1], closeOnDealloc: true)
-        let finished = DispatchGroup()
-        finished.enter()
-        DispatchQueue.global().async {
-            defer { close(peer); finished.leave() }
-            let frame = UnsafeMutablePointer<np_file_frame>.allocate(capacity: 1)
-            defer { frame.deallocate() }
-            guard np_file_receive(peer, frame) == 0 else { return }
-            var metadata = [UInt8](repeating: 0, count: 28)
-            _ = np_file_send(peer, UInt8(NP_FILE_METADATA.rawValue), 0, 0, &metadata, metadata.count)
-            guard np_file_receive(peer, frame) == 0 else { return }
-            _ = np_file_send(peer, UInt8(NP_FILE_END.rawValue), 0, UInt32(ENOSPC), nil, 0)
-            shutdown(peer, SHUT_WR)
-            var buffer = [UInt8](repeating: 0, count: 65536)
-            while read(peer, &buffer, buffer.count) > 0 {}
-        }
+        let client = FileHandle(fileDescriptor: fds[1], closeOnDealloc: true)
+        // A guest that accepts the file, then runs out of space on the first write.
+        let guest = FileSession(connection: try SocketConnection(owning: fds[0]), role: .guest, onRequest: { stream, opcode, _ in
+            Task {
+                if opcode == UInt16(NP_FILE_OPEN.rawValue) {
+                    try await stream.respond(body: FileSession.encode(1) + Data(count: 4 + Int(NP_FILE_METADATA)), end: true)
+                } else {
+                    try await stream.respond(status: 28, end: true) // Linux ENOSPC
+                    while try await stream.receive() != nil {}
+                }
+            }
+        })
+        guest.start()
+        defer { guest.close() }
         do {
             try await FileRPC { client }.upload(source, to: "/destination")
             XCTFail("Receiver failure was ignored")
@@ -499,6 +484,21 @@ final class FileRPCTests: XCTestCase {
             XCTAssertEqual(code, ENOSPC)
         }
         XCTAssertLessThan(try source.offset(), UInt64(size))
-        XCTAssertEqual(finished.wait(timeout: .now() + 2), .success)
+    }
+
+    /// Reads the HELLO frame, then returns the opcode of the first REQUEST.
+    private static func firstRequestOpcode(_ socket: Int32) -> UInt16? {
+        func read(_ count: Int) -> [UInt8]? {
+            var bytes = [UInt8](repeating: 0, count: count), filled = 0
+            while filled < count {
+                let n = bytes.withUnsafeMutableBytes { Darwin.read(socket, $0.baseAddress! + filled, count - filled) }
+                guard n > 0 else { return nil }
+                filled += n
+            }
+            return bytes
+        }
+        guard read(Int(NP_FILE2_HEADER) + 8) != nil, let header = read(Int(NP_FILE2_HEADER)),
+              header[4] == UInt8(NP_FILE2_REQUEST.rawValue), let opcode = read(2) else { return nil }
+        return UInt16(opcode[0]) | UInt16(opcode[1]) << 8
     }
 }

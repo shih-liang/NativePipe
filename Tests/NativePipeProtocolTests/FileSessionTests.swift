@@ -15,14 +15,28 @@ final class FileSessionTests: XCTestCase {
         XCTAssertEqual(FileSession.Wire.endStream, UInt8(NP_FILE2_END_STREAM))
         XCTAssertEqual(FileSession.Wire.maximumInboundStreams, Int(NP_FILE2_MAX_INBOUND_STREAMS))
         XCTAssertEqual(FileSession.Wire.maximumPendingControl, Int(NP_FILE2_MAX_PENDING_CONTROL))
-        XCTAssertEqual(FileSession.FrameType.credit.rawValue, UInt8(NP_FILE2_CREDIT.rawValue))
+        XCTAssertEqual(FileSession.Wire.streamDataMaximum, Int(NP_FILE2_STREAM_DATA_MAX))
+        XCTAssertEqual(FileSession.FrameType.cancel.rawValue, UInt8(NP_FILE2_CANCEL.rawValue))
     }
 
-    func testEchoLargerThanBothWindows() async throws {
+    func testEchoUpToTheStreamLimit() async throws {
         let (host, guest) = try pair(guestServes: true)
         defer { host.close(); guest.close() }
-        try await echo(host, size: Int(FileSession.Wire.connectionWindow) * 3 / 2 + 12345, seed: 7)
+        try await echo(host, size: Wire.streamDataMaximum, seed: 7)
         try await echo(host, size: 0, seed: 1)
+    }
+
+    func testSendBeyondTheStreamLimitIsRefused() async throws {
+        let (host, guest) = try pair(guestServes: true)
+        defer { host.close(); guest.close() }
+        let stream = try await host.request(Opcode.echo)
+        _ = try await stream.receive()
+        // Nothing is sent: the whole send is refused, not cut short.
+        do { try await stream.send(Data(count: Wire.streamDataMaximum + 1)); XCTFail("Expected EMSGSIZE") }
+        catch let error as POSIXError { XCTAssertEqual(error.code, .EMSGSIZE) }
+        try await stream.send(Data(count: Wire.streamDataMaximum))
+        do { try await stream.send(Data([1]), end: true); XCTFail("Expected EMSGSIZE") }
+        catch let error as POSIXError { XCTAssertEqual(error.code, .EMSGSIZE) }
     }
 
     func testMultiplexedStreamsInBothDirections() async throws {
@@ -31,7 +45,7 @@ final class FileSessionTests: XCTestCase {
         try await withThrowingTaskGroup(of: Void.self) { group in
             for index in 0..<12 {
                 let session = index % 2 == 0 ? host : guest
-                group.addTask { try await self.echo(session, size: 1_048_576 + index * 977, seed: UInt8(index + 1)) }
+                group.addTask { try await self.echo(session, size: Wire.streamDataMaximum - index * 977, seed: UInt8(index + 1)) }
             }
             try await group.waitForAll()
         }
@@ -63,21 +77,20 @@ final class FileSessionTests: XCTestCase {
         catch let error as POSIXError { XCTAssertEqual(error.code, .ECANCELED) }
     }
 
-    func testCreditStallsOneStreamWithoutBlockingOthers() async throws {
+    func testStalledStreamDoesNotBlockOthers() async throws {
         let held = HeldStreams()
         let (host, guest) = try pair(guestRequest: { stream, opcode, body in
             if opcode == Opcode.sink { held.hold(stream) } else { Self.serve(stream, opcode, body) }
         })
         defer { host.close(); guest.close() }
         let stream = try await host.request(Opcode.sink)
-        let sender = Task { try await stream.send(Data(count: Int(FileSession.Wire.streamWindow) * 4)) }
-        try await Task.sleep(nanoseconds: 200_000_000)
+        // The responder reads nothing, so a full stream's data waits in its session.
+        try await stream.send(Data(count: Wire.streamDataMaximum))
         try await echo(host, size: 100_000, seed: 5)
         stream.cancel()
-        do { try await sender.value; XCTFail("Expected cancellation") }
-        catch let error as POSIXError { XCTAssertEqual(error.code, .ECANCELED) }
         // The responder sees the cancellation; buffered data was dropped.
         let responder = try await held.next()
+        for _ in 0..<1000 where !responder.isCancelled { try await Task.sleep(nanoseconds: 10_000_000) }
         do { _ = try await responder.receive(); XCTFail("Expected cancellation") }
         catch let error as POSIXError { XCTAssertEqual(error.code, .ECANCELED) }
     }
@@ -106,7 +119,12 @@ final class FileSessionTests: XCTestCase {
             ("decreasing id", [hello(.guest), FileSession.frame(.request, id: 5, payload: FileSession.opcode(1)),
                                FileSession.frame(.request, id: 3, payload: FileSession.opcode(1))]),
             ("unsolicited response", [hello(.guest), FileSession.frame(.response, id: 2, payload: Data(count: 4))]),
-            ("flag on credit", [hello(.guest), FileSession.frame(.credit, flags: 1, id: 0, payload: FileSession.encode(1))]),
+            // Type 7 was CREDIT before flow control was removed.
+            ("unknown type", [hello(.guest), Data("NP2F".utf8) + Data([7, 0, 0, 0]) + FileSession.encode(0)
+                + FileSession.encode(4) + FileSession.encode(1)]),
+            ("stream data limit", [hello(.guest), FileSession.frame(.request, id: 1, payload: FileSession.opcode(1))]
+                + Array(repeating: FileSession.frame(.data, id: 1, payload: Data(count: Wire.frameMaximum)),
+                        count: Wire.streamDataMaximum / Wire.frameMaximum + 1)),
             ("data after end", [hello(.guest), FileSession.frame(.request, flags: 1, id: 1, payload: FileSession.opcode(1)),
                                 FileSession.frame(.data, id: 1, payload: Data([1]))]),
         ]
@@ -163,7 +181,7 @@ final class FileSessionTests: XCTestCase {
         host.start()
         try await withThrowingTaskGroup(of: Void.self) { group in
             for index in 0..<4 {
-                group.addTask { try await self.echo(host, size: 3_000_000 + index, seed: UInt8(index + 1)) }
+                group.addTask { try await self.echo(host, size: Wire.streamDataMaximum - index, seed: UInt8(index + 1)) }
             }
             try await group.waitForAll()
         }
@@ -177,7 +195,7 @@ final class FileSessionTests: XCTestCase {
         let guest = FileSession(connection: try SocketConnection(owning: descriptors[1]), role: .guest,
                                 onRequest: Self.serve)
         guest.start()
-        let size = 5_000_001
+        let size = Wire.streamDataMaximum
         let received: Data = try await withCheckedThrowingContinuation { continuation in
             Thread.detachNewThread {
                 continuation.resume(with: Result { try CEcho.roundTrip(socket: descriptors[0], size: size) })

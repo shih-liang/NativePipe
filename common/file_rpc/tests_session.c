@@ -66,8 +66,10 @@ static void *serve(void *argument) {
         work->side->sink_started = 1;
         pthread_cond_broadcast(&work->side->changed);
         pthread_mutex_unlock(&work->side->lock);
-        /* Consumes nothing until released: the requester stalls on credit. */
+        /* Consumes nothing until released: its data waits in the session. */
         wait_until(work->side, &work->side->sink_release);
+        /* The requester cancels before releasing; let the CANCEL arrive. */
+        for (int i = 0; i < 1000 && !np_file2_stream_cancelled(stream); i++) usleep(10000);
         int result = np_file2_receive(stream, message), error = errno;
         pthread_mutex_lock(&work->side->lock);
         work->side->sink_result = result;
@@ -200,18 +202,31 @@ static void echo(struct np_file2_session *session, size_t size, unsigned seed) {
     free(message);
 }
 
-static void test_echo_exceeds_windows(void) {
+static void test_echo_up_to_the_stream_limit(void) {
     struct side host, guest; pair(&host, &guest, 0, 1);
-    /* Larger than both the stream and connection windows. */
-    echo(host.session, 3 * NP_FILE2_CONNECTION_WINDOW / 2 + 12345, 7);
+    echo(host.session, NP_FILE2_STREAM_DATA_MAX, 7);
     echo(host.session, 0, 1);
+    close_pair(&host, &guest);
+}
+
+static void test_send_beyond_the_stream_limit_is_refused(void) {
+    struct side host, guest; pair(&host, &guest, 0, 1);
+    struct np_file2_stream *stream = np_file2_request(host.session, ECHO, NULL, 0, 0);
+    struct np_file2_message message;
+    assert(stream && np_file2_receive(stream, &message) == 1);
+    static unsigned char bytes[NP_FILE2_STREAM_DATA_MAX + 1];
+    /* Nothing is sent: the whole send is refused, not cut short. */
+    assert(np_file2_send(stream, bytes, sizeof(bytes), 1) == -1 && errno == EMSGSIZE);
+    assert(np_file2_send(stream, bytes, NP_FILE2_STREAM_DATA_MAX, 0) == 0);
+    assert(np_file2_send(stream, bytes, 1, 1) == -1 && errno == EMSGSIZE);
+    np_file2_stream_release(stream);
     close_pair(&host, &guest);
 }
 
 struct concurrent { struct np_file2_session *session; unsigned seed; };
 static void *concurrent_echo(void *argument) {
     struct concurrent *c = argument;
-    echo(c->session, 1024 * 1024 + c->seed * 977, c->seed);
+    echo(c->session, NP_FILE2_STREAM_DATA_MAX - c->seed * 977, c->seed);
     return NULL;
 }
 static void test_multiplexed_streams_both_directions(void) {
@@ -256,22 +271,20 @@ static void test_unserved_request_is_cancelled(void) {
     close_pair(&host, &guest);
 }
 
-static void test_credit_stall_and_cancel(void) {
+static void test_stalled_stream_and_cancel(void) {
     struct side host, guest; pair(&host, &guest, 0, 1);
     struct np_file2_stream *stream = np_file2_request(host.session, SINK, NULL, 0, 0);
     assert(stream);
     struct np_file2_message message;
     assert(np_file2_receive(stream, &message) == 1 && message.type == NP_FILE2_RESPONSE);
     wait_until(&guest, &guest.sink_started);
-    /* The sink only reads once; the rest stalls on stream credit. */
-    struct transfer transfer = {stream, 4 * NP_FILE2_STREAM_WINDOW, 3, 0, 0};
+    /* The sink reads nothing yet, so a full stream's data waits in its session. */
+    struct transfer transfer = {stream, NP_FILE2_STREAM_DATA_MAX, 3, 0, 0};
     pthread_t sender; assert(pthread_create(&sender, NULL, send_pattern, &transfer) == 0);
-    usleep(200000);
+    assert(pthread_join(sender, NULL) == 0 && transfer.result == 0);
     /* Another stream on the same connection still makes progress. */
     echo(host.session, 100000, 5);
     np_file2_cancel(stream);
-    assert(pthread_join(sender, NULL) == 0);
-    assert(transfer.result == -1 && transfer.error == ECANCELED);
     np_file2_stream_release(stream);
     /* The responder sees the cancellation, and buffered data is dropped. */
     set_flag(&guest, &guest.sink_release);
@@ -352,12 +365,11 @@ static void unsolicited_response(int socket) {
     raw_hello(socket, NP_FILE2_ROLE_GUEST);
     raw_frame(socket, NP_FILE2_RESPONSE, 0, 2, "\0\0\0\0", 4);
 }
-static void stream_window_exceeded(int socket) {
+static void stream_data_limit_exceeded(int socket) {
     raw_hello(socket, NP_FILE2_ROLE_GUEST);
     static unsigned char chunk[NP_FILE2_FRAME_MAX];
-    /* The held stream never consumes, so no credit is returned. */
     raw_frame(socket, NP_FILE2_REQUEST, 0, 1, "\1\0\0\0", 4);
-    for (unsigned i = 0; i <= NP_FILE2_STREAM_WINDOW / NP_FILE2_FRAME_MAX; i++)
+    for (unsigned i = 0; i <= NP_FILE2_STREAM_DATA_MAX / NP_FILE2_FRAME_MAX; i++)
         raw_frame(socket, NP_FILE2_DATA, 0, 1, chunk, sizeof(chunk));
 }
 static void data_after_end(int socket) {
@@ -365,9 +377,10 @@ static void data_after_end(int socket) {
     raw_frame(socket, NP_FILE2_REQUEST, NP_FILE2_END_STREAM, 1, "\1\0\0\0", 4);
     raw_frame(socket, NP_FILE2_DATA, 0, 1, "x", 1);
 }
-static void flag_on_credit(int socket) {
+/* Type 7 was CREDIT before flow control was removed. */
+static void unknown_type(int socket) {
     raw_hello(socket, NP_FILE2_ROLE_GUEST);
-    raw_frame(socket, NP_FILE2_CREDIT, NP_FILE2_END_STREAM, 0, "\1\0\0\0", 4);
+    raw_frame(socket, 7, 0, 0, "\1\0\0\0", 4);
 }
 
 /* Past the inbound stream limit every request is refused with a CANCEL; a
@@ -385,20 +398,21 @@ static void refusal_flood(int socket) {
 }
 
 int main(void) {
-    test_echo_exceeds_windows();
+    test_echo_up_to_the_stream_limit();
+    test_send_beyond_the_stream_limit_is_refused();
     test_multiplexed_streams_both_directions();
     test_request_response_and_notifications();
     test_unserved_request_is_cancelled();
-    test_credit_stall_and_cancel();
+    test_stalled_stream_and_cancel();
     test_release_cancels_and_close_wakes();
     expect_protocol_error(bad_magic);
     expect_protocol_error(same_role);
     expect_protocol_error(wrong_parity);
     expect_protocol_error(decreasing_id);
     expect_protocol_error(unsolicited_response);
-    expect_protocol_error(stream_window_exceeded);
+    expect_protocol_error(stream_data_limit_exceeded);
     expect_protocol_error(data_after_end);
-    expect_protocol_error(flag_on_credit);
+    expect_protocol_error(unknown_type);
     expect_failure(refusal_flood, ENOBUFS);
     puts("file session tests passed");
     return 0;
