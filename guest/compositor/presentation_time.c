@@ -50,11 +50,26 @@ struct np_display_scene {
     uint32_t owner, scene, output;
     bool submitted, terminal;
 };
-static uint64_t now_ns(void)
+static uint64_t clock_ns(clockid_t id)
 {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(id, &ts);
     return (uint64_t)ts.tv_sec * 1000000000u + ts.tv_nsec;
+}
+/* The host clock and the guest counter tick together, but NTP slews guest
+ * CLOCK_MONOTONIC by up to 500 ppm, and a jittery time server makes that slew
+ * fast enough to look like a discontinuity. Calibrate against the raw counter
+ * and move to CLOCK_MONOTONIC only when reporting a recent display time. */
+static uint64_t now_ns(void)
+{
+    return clock_ns(CLOCK_MONOTONIC_RAW);
+}
+static bool public_time(uint64_t raw, uint64_t *monotonic)
+{
+    uint64_t now = now_ns(), public_now = clock_ns(CLOCK_MONOTONIC);
+    if (raw > now || now - raw > public_now) return false;
+    *monotonic = public_now - (now - raw);
+    return true;
 }
 static bool has_list(struct np_surface *surface)
 {
@@ -162,9 +177,10 @@ static bool flush_result(struct np_display_scene *scene)
         finish_drain(state);
         return true;
     }
-    uint64_t guest = 0;
+    uint64_t raw = 0, guest = 0;
     if (scene->host && !wl_list_empty(&scene->feedbacks) &&
-        !np_presentation_clock_convert(&scene->clock, scene->host, now_ns(), &guest)) return false;
+        (!np_presentation_clock_convert(&scene->clock, scene->host, now_ns(), &raw) ||
+         !public_time(raw, &guest))) return false;
     struct np_display_feedback *feedback, *tmp;
     wl_list_for_each_safe(feedback, tmp, &scene->feedbacks, link) {
         if (!scene->host) { defer_current_feedback(feedback, scene); continue; }
@@ -484,17 +500,19 @@ bool np_presentation_time_prepare_scene(struct np_server *server, uint32_t owner
     struct np_surface *surface;
     bool queried = false;
     wl_list_for_each(surface, &server->surfaces, link) {
-        struct np_display_feedback *feedback;
+        struct np_display_feedback *feedback, *tmp;
         if (!has_list(surface)) continue;
-        wl_list_for_each(feedback, &surface->presentation_feedbacks, link) {
+        wl_list_for_each_safe(feedback, tmp, &surface->presentation_feedbacks, link) {
             if (!feedback->scene || !packet_samples_surface(packet, size, feedback->surface_id)) continue;
             feedback->owner = owner;
             feedback->scene = id;
-            queried = true;
             if (state->faulted) {
-                feedback_fail(feedback, "NativePipe presentation clock is unavailable for this scene");
-                return false;
+                /* Nothing has been sent yet. Without a clock this attempt
+                 * cannot report a time, so it renders without the query. */
+                discard(feedback);
+                continue;
             }
+            queried = true;
             if (!state->clock.valid) return false;
         }
     }

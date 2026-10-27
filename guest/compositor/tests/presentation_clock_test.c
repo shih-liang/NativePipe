@@ -209,15 +209,17 @@ static void discontinuity_excludes_measured_transport_uncertainty(void)
     struct np_presentation_clock clock = {.epoch = UINT64_MAX};
     assert(np_presentation_clock_sample_at(&clock,
         SECOND, SECOND + 2 * MS, 10 * SECOND + MS));
-    /* Old half-RTT + new half-RTT + 1 ms is a tolerated offset difference. */
+    /* Old half-RTT + new half-RTT + 1 ms, plus 500 ppm of the 102 ms since
+     * the anchor, is a tolerated offset difference. */
+    uint64_t drift = 102 * MS / 2000;
     assert(!np_presentation_clock_discontinuous(&clock,
-        SECOND + 100 * MS, SECOND + 104 * MS, 10 * SECOND + 106 * MS));
+        SECOND + 100 * MS, SECOND + 104 * MS, 10 * SECOND + 106 * MS + drift));
     assert(np_presentation_clock_discontinuous(&clock,
-        SECOND + 100 * MS, SECOND + 104 * MS, 10 * SECOND + 106 * MS + 1));
+        SECOND + 100 * MS, SECOND + 104 * MS, 10 * SECOND + 106 * MS + drift + 1));
     assert(!np_presentation_clock_discontinuous(&clock,
-        SECOND + 100 * MS, SECOND + 104 * MS, 10 * SECOND + 98 * MS));
+        SECOND + 100 * MS, SECOND + 104 * MS, 10 * SECOND + 98 * MS - drift));
     assert(np_presentation_clock_discontinuous(&clock,
-        SECOND + 100 * MS, SECOND + 104 * MS, 10 * SECOND + 98 * MS - 1));
+        SECOND + 100 * MS, SECOND + 104 * MS, 10 * SECOND + 98 * MS - drift - 1));
     assert(clock.epoch == UINT64_MAX && clock.epoch_host == 0);
 
     /* Both offset signs can be enormous; subtraction must not wrap uint64. */
@@ -226,6 +228,18 @@ static void discontinuity_excludes_measured_transport_uncertainty(void)
         UINT64_MAX - 4 * MS, UINT64_MAX - 2 * MS, 100 * MS));
     assert(np_presentation_clock_discontinuous(&clock,
         UINT64_MAX - 2 * MS, UINT64_MAX, UINT64_MAX));
+}
+
+static void slow_drift_of_an_aged_anchor_is_not_a_discontinuity(void)
+{
+    struct np_presentation_clock clock = {0};
+    assert(np_presentation_clock_sample_at(&clock,
+        SECOND, SECOND + 2 * MS, 10 * SECOND + MS));
+    /* A minute later, 300 ppm of drift is ordinary; a 40 ms step is not. */
+    assert(!np_presentation_clock_discontinuous(&clock,
+        61 * SECOND, 61 * SECOND + 2 * MS, 70 * SECOND + MS - 18 * MS));
+    assert(np_presentation_clock_discontinuous(&clock,
+        61 * SECOND, 61 * SECOND + 2 * MS, 70 * SECOND + MS - 40 * MS));
 }
 
 static void first_scene_keeps_its_actual_time_until_qualified(void)
@@ -330,6 +344,7 @@ int main(void)
     slower_remote_sample_cannot_jitter_an_aged_best_anchor();
     vm_pause_requires_an_explicit_new_epoch();
     discontinuity_excludes_measured_transport_uncertainty();
+    slow_drift_of_an_aged_anchor_is_not_a_discontinuity();
     first_scene_keeps_its_actual_time_until_qualified();
     scene_sample_and_saved_anchor_are_independent_of_global_updates();
     overflow_and_future_times_are_rejected();
