@@ -32,7 +32,10 @@ static inline bool np_presentation_clock_discontinuous(
     __int128 previous = (__int128)clock->guest - clock->host;
     __int128 difference = offset - previous;
     if (difference < 0) difference = -difference;
-    return difference > (__int128)(clock->rtt / 2 + rtt / 2 + 1000000u);
+    /* Separate machines' clocks drift by tens of ppm. Allow 500 ppm, the
+     * NTP slew limit, so an anchor kept for minutes is not a discontinuity. */
+    uint64_t drift = received > clock->sampled_at ? (received - clock->sampled_at) / 2000u : 0;
+    return difference > (__int128)(clock->rtt / 2 + rtt / 2 + 1000000u) + drift;
 }
 static inline bool np_presentation_clock_sample_at(struct np_presentation_clock *clock,
     uint64_t sent, uint64_t received, uint64_t host)

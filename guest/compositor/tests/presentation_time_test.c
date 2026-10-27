@@ -49,6 +49,7 @@ struct fixture {
     int peer;
     uint32_t next_id, clock_token;
     unsigned clock_requests, clock_ids, output_calls, errors;
+    uint64_t slew; /* NTP's CLOCK_MONOTONIC correction relative to the raw counter. */
     uint64_t now;
     bool boundary_ready, unsupported_child;
     struct feedback_event events[32];
@@ -60,9 +61,10 @@ static struct fixture *active;
 
 static int fixture_clock_gettime(clockid_t clock, struct timespec *time)
 {
-    assert(active && clock == CLOCK_MONOTONIC);
-    time->tv_sec = active->now / SECOND;
-    time->tv_nsec = active->now % SECOND;
+    assert(active && (clock == CLOCK_MONOTONIC_RAW || clock == CLOCK_MONOTONIC));
+    uint64_t now = active->now + (clock == CLOCK_MONOTONIC ? active->slew : 0);
+    time->tv_sec = now / SECOND;
+    time->tv_nsec = now % SECOND;
     return 0;
 }
 
@@ -850,7 +852,7 @@ static void slower_remote_validation_extends_history_without_rewriting_saved_map
     teardown(&fixture);
 }
 
-static void actual_queried_render_after_clock_timeout_errors_only_that_attempt(void)
+static void actual_queried_render_after_clock_timeout_discards_only_that_attempt(void)
 {
     struct fixture fixture;
     setup(&fixture, true);
@@ -876,10 +878,12 @@ static void actual_queried_render_after_clock_timeout_errors_only_that_attempt(v
     assert(prepare_packet(&fixture, fixture.child.id, 7499, packet));
     assert(wl_list_empty(&fixture.server.presentation_time->scenes));
     /* Only an actual mapped rendering attempt is now unable to honour its
-     * feedback promise. The timer cannot classify every waiting role this way. */
-    assert(!prepare_packet(&fixture, fixture.root.id, 7401, packet));
-    assert(fixture.errors == 1 && !fixture.event_count && !fixture.output_calls);
-    assert(!wl_client_get_object(fixture.client, mapped));
+     * feedback promise. It renders, and the unsent query is discarded rather
+     * than disconnecting the client. The timer cannot classify waiting roles. */
+    assert(prepare_packet(&fixture, fixture.root.id, 7401, packet));
+    assert(!fixture.errors && fixture.event_count == 1 && !fixture.output_calls);
+    expect_event(&fixture, 0, mapped, false, 0);
+    assert(wl_list_empty(&fixture.server.presentation_time->scenes));
     assert(wl_client_get_object(fixture.client, late_role));
     assert(prepare_packet(&fixture, fixture.child.id, 7499, packet));
     assert(wl_list_empty(&fixture.server.presentation_time->scenes));
@@ -947,6 +951,26 @@ static void submitted_unknown_outcome_errors_without_discard(void)
     tick(fixture.server.presentation_time);
     assert(fixture.errors == 1 && !fixture.event_count);
     assert(!wl_client_get_object(fixture.client, unknown));
+    teardown(&fixture);
+}
+
+static void ntp_slew_moves_only_the_reported_clock(void)
+{
+    struct fixture fixture;
+    setup(&fixture, true);
+    uint32_t feedback = request_feedback(&fixture, &fixture.root);
+    attach_scene(&fixture.root, 1, 6251);
+    submit_scene(&fixture, fixture.root.id, 6251);
+    /* Calibration runs on the raw counter, which ticks with the host clock.
+     * A slewed CLOCK_MONOTONIC is neither a discontinuity nor a wrong time. */
+    fixture.slew = 7 * MS;
+    fixture.now = 100 * SECOND + 50 * MS;
+    np_presentation_time_clock_request(&fixture.server);
+    fixture.now += 2 * MS;
+    clock_reply(&fixture, 900 * SECOND + 51 * MS);
+    assert(!fixture.server.presentation_time->faulted);
+    result(&fixture, 1, fixture.root.id, 6251, 900 * SECOND + 20 * MS);
+    expect_event(&fixture, 0, feedback, true, 100 * SECOND + 27 * MS);
     teardown(&fixture);
 }
 
@@ -1537,9 +1561,10 @@ int main(void)
     calibration_failure_retries_without_fabricating_feedback();
     remote_initial_clock_and_timeout_recovery_advertise_only_after_a_valid_sample();
     slower_remote_validation_extends_history_without_rewriting_saved_mapping();
-    actual_queried_render_after_clock_timeout_errors_only_that_attempt();
+    actual_queried_render_after_clock_timeout_discards_only_that_attempt();
     reconnect_changed_offset_preserves_only_verified_history();
     submitted_unknown_outcome_errors_without_discard();
+    ntp_slew_moves_only_the_reported_clock();
     legitimate_late_role_keeps_unsubmitted_feedback_alive();
     clock_discontinuity_preserves_trustworthy_history();
     first_terminal_time_is_not_overwritten_while_unmappable();
