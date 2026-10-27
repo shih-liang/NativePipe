@@ -297,4 +297,5 @@
 "The display connection changed during the virtual machine state change." = "仮想マシンの状態変更中に画面の接続が変更されました。";
 "Another display state change is already in progress." = "別の画面状態の変更が進行中です。";
 "Invalid accessibility reply." = "アクセシビリティの応答が無効です。";
+"Invalid agent input reply." = "エージェント入力の応答が無効です。";
 "Invalid accessibility tree: %@" = "アクセシビリティツリーが無効です: %@";

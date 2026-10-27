@@ -510,6 +510,7 @@ public enum WindowWire {
         case .captureFrame: opcode = 26
         case .applicationRequest: opcode = 27
         case .accessibilityRequest: opcode = 41
+        case .agentInput: opcode = 42
         }
         var payload = Data(lifecycleMagic)
         payload.append(2)
@@ -586,6 +587,29 @@ public enum WindowWire {
             append(request.number.bitPattern, to: &payload)
             try append(request.element, to: &payload)
             try append(request.argument, to: &payload)
+        case .agentInput(let token, let window, let events):
+            let textBytes = events.reduce(0) { total, event in
+                if case .text(let text) = event { return total + text.utf8.count }
+                return total
+            }
+            guard token != 0, !events.isEmpty, events.count <= Windowing.AgentInputEvent.maximumEvents,
+                  textBytes <= Windowing.AgentInputEvent.maximumTextBytes else { throw EncodeError.invalidValue }
+            append(token, to: &payload)
+            append(window, to: &payload)
+            append(UInt32(events.count), to: &payload)
+            for event in events {
+                switch event {
+                case .key(let keycode, let pressed, let modifiers):
+                    payload.append(1)
+                    append(keycode, to: &payload)
+                    payload.append(pressed ? 1 : 0)
+                    append(modifiers.rawValue, to: &payload)
+                case .text(let text):
+                    guard !text.isEmpty, !text.utf8.contains(0) else { throw EncodeError.invalidValue }
+                    payload.append(2)
+                    try append(text, to: &payload)
+                }
+            }
         case .close(let window), .forceQuit(let window),
              .dismissPopup(let window), .pointerLeft(let window):
             append(window, to: &payload)

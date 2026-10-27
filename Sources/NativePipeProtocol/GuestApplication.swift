@@ -36,6 +36,8 @@ public enum ApplicationReply: Sendable {
     case exited(Int32, Int32)
     /// Token, error message (empty on success) and the worker's JSON document.
     case accessibility(UInt32, String, Data)
+    /// Token, events delivered, and why the rest were not (empty when all were).
+    case agentInput(UInt32, UInt32, String)
     public static let magic = Data("NPAP".utf8)
 
     public static func decode(_ data: Data) throws -> Self {
@@ -70,6 +72,7 @@ public enum ApplicationReply: Sendable {
             reply = try .exited(Int32(bitPattern: r.number()), Int32(bitPattern: r.number()))
         case 7:
             reply = try .accessibility(token, r.string(), r.bytes(limit: GuestAccessibilityRequest.maximumReplySize))
+        case 8: reply = try .agentInput(token, r.number(), r.string())
         default: throw WindowWire.DecodeError.malformed
         }
         guard r.offset == data.count else { throw WindowWire.DecodeError.malformed }

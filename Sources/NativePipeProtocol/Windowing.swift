@@ -576,6 +576,10 @@ extension Windowing {
         case applicationRequest(token: UInt32, action: ApplicationAction, application: String)
         /// AT-SPI2 query or action for agents; answered with an NPAP reply.
         case accessibilityRequest(token: UInt32, request: GuestAccessibilityRequest)
+        /// An agent's keys and text, through the agent's own keyboard focus in
+        /// the guest rather than the macOS key window; answered with an NPAP
+        /// reply giving how many events were delivered.
+        case agentInput(token: UInt32, window: UInt32, events: [AgentInputEvent])
 
         /// Dismiss a popup: the click went elsewhere, or the parent lost focus.
         /// Like close, this is a request; the client tears the popup down.
@@ -699,6 +703,17 @@ extension Windowing {
     }
 
     /// Encoded as a bare little-endian bit field by WindowWire.
+    /// One event of an agent's keyboard input. Keys are evdev codes, as in
+    /// `key`; text goes to the focused field's text-input-v3 object.
+    public enum AgentInputEvent: Sendable, Equatable {
+        case key(keycode: UInt32, pressed: Bool, modifiers: Modifiers)
+        case text(String)
+
+        public static let maximumEvents = 1024
+        /// Text bytes per request, across all of its text events.
+        public static let maximumTextBytes = 65_535
+    }
+
     public struct Modifiers: OptionSet, Codable, Sendable {
         public let rawValue: UInt32
         public init(rawValue: UInt32) { self.rawValue = rawValue }

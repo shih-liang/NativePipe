@@ -14,6 +14,7 @@ struct np_shm_texture;
 struct np_sync_surface;
 struct np_sync_point;
 struct np_xwayland;
+struct np_agent_input;
 struct np_notifications;
 struct np_host_open;
 struct np_activation;
@@ -45,6 +46,8 @@ struct np_server {
     uint64_t application_generation;
     struct np_a11y *accessibility;
     struct wl_event_source *accessibility_source;
+    /* An agent request waiting for its target to enable text input. */
+    struct np_agent_input *agent_input;
     bool terminate;
 	uint32_t next_id;
 	uint32_t next_presentation_id;
@@ -82,6 +85,9 @@ struct np_server {
 	double pointer_x, pointer_y;
 	size_t keymap_size;
 	uint32_t focused_window;
+	/* Keyboard focus is per client. focused_window follows the host's key
+	 * window; agent_window follows agent input, in any other client. */
+	uint32_t agent_window;
 	uint32_t pointer_window;
 	uint32_t pointer_surface;
 	struct wl_client *pointer_grab_client;
@@ -395,6 +401,8 @@ struct np_surface {
 	int32_t pending_maximum_width, pending_maximum_height;
 	bool pending_size_constraints_changed;
 	bool has_grab;
+	/* The grab took the agent's focus rather than the user's. */
+	bool grab_agent;
 	uint32_t focus_restore_window;
 	bool decoration_negotiated;
 	bool decoration_server_side;
@@ -483,6 +491,10 @@ void np_presentation_set_current_buffer(struct np_surface *surface,
 bool np_input_handle_host_binary(const unsigned char *payload, size_t length,
                                  void *user_data);
 void np_set_keyboard_focus(struct np_server *server, uint32_t window_id);
+struct np_surface *np_keyboard_focus(struct np_server *server, struct wl_client *client);
+void np_keyboard_focus_grab(struct np_server *server, struct np_surface *popup);
+void np_keyboard_focus_ungrab(struct np_server *server, struct np_surface *popup);
+void np_agent_input_finish(struct np_server *server);
 void np_input_clear_pointer_focus_for_drag(struct np_server *server);
 void np_input_restore_pointer_focus_after_drag(struct np_server *server,
                                                struct np_surface *surface);

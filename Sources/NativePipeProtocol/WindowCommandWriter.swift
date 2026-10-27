@@ -19,7 +19,8 @@ extension Windowing.HostCommand {
             return .control
         case .keyboardFocus, .key, .pointerEntered, .pointerMoved,
              .pointerLeft, .pointerButton, .pointerScroll,
-             .textCommit, .textPreedit, .textDeleteSurrounding, .textEdit:
+             .textCommit, .textPreedit, .textDeleteSurrounding, .textEdit, .agentInput:
+            // Agent input stays ordered with the agent's pointer events.
             return .input
         case .frameReleased, .presentationClockSample, .sceneClockSample,
              .presentationFeedback, .presentationDrain:

@@ -297,4 +297,5 @@
 "The display connection changed during the virtual machine state change." = "虚拟机状态变更期间，显示连接发生了变化。";
 "Another display state change is already in progress." = "另一项显示状态变更正在进行。";
 "Invalid accessibility reply." = "辅助功能回复无效。";
+"Invalid agent input reply." = "代理输入回复无效。";
 "Invalid accessibility tree: %@" = "辅助功能树无效：%@";

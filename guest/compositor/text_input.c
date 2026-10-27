@@ -50,12 +50,22 @@ static void send_enabled(struct np_server *server, uint32_t window, uint32_t epo
 	send_message(server, &message);
 }
 
+/// The surface this input entered, while it still holds its client's keyboard
+/// focus, whether that focus is the user's or the agent's.
 static struct np_surface *focused_input(struct np_text_input *input) {
-	struct np_surface *surface = input->server->focused_window
-		? np_surface_by_window(input->server, input->server->focused_window) : NULL;
-	return surface && surface->id == input->entered_surface &&
-	       wl_resource_get_client(surface->resource) ==
-	           wl_resource_get_client(input->resource) ? surface : NULL;
+	struct np_surface *surface = np_keyboard_focus(
+		input->server, wl_resource_get_client(input->resource));
+	return surface && surface->id == input->entered_surface ? surface : NULL;
+}
+
+/// Each client has its own keyboard focus, so each may have one enabled field.
+static bool other_field_enabled(struct np_text_input *input) {
+	struct np_text_input *other;
+	wl_list_for_each(other, &input->server->text_inputs, link)
+		if (other != input && other->enabled && focused_input(other) &&
+		    wl_resource_get_client(other->resource) == wl_resource_get_client(input->resource))
+			return true;
+	return false;
 }
 
 static void clear_pending(struct np_text_input *input) {
@@ -79,10 +89,7 @@ static void clear_focus_state(struct np_text_input *input) {
 
 static void text_input_enable(struct wl_client *client, struct wl_resource *resource) {
 	struct np_text_input *input = wl_resource_get_user_data(resource);
-	if (!input || !focused_input(input)) return;
-	struct np_text_input *other;
-	wl_list_for_each(other, &input->server->text_inputs, link)
-		if (other != input && other->enabled && focused_input(other)) return;
+	if (!input || !focused_input(input) || other_field_enabled(input)) return;
 	clear_pending(input);
 	input->pending_enabled = true;
 	input->pending_reset = true;
@@ -166,13 +173,8 @@ static void text_input_commit(struct wl_client *client, struct wl_resource *reso
 	input->serial++;
 	struct np_surface *focused = focused_input(input);
 	if (!focused) { clear_pending(input); return; }
-	if (input->pending_enabled) {
-		struct np_text_input *other;
-		wl_list_for_each(other, &server->text_inputs, link) {
-			if (other != input && other->enabled && focused_input(other)) {
-				clear_pending(input); return;
-			}
-		}
+	if (input->pending_enabled && other_field_enabled(input)) {
+		clear_pending(input); return;
 	}
 	/* An inactive object's disable must not turn off another text input from
 	 * the same client which still owns this seat's enabled field. */
@@ -258,32 +260,48 @@ static void text_input_resource_destroy(struct wl_resource *resource) {
 	free(input);
 }
 
-/// Tells each client's text input whether the focused surface is now theirs.
-/// v3 requires enter/leave to track keyboard focus exactly.
-void np_text_input_focus_changed(struct np_server *server,
-                                     struct np_surface *previous,
-                                     struct np_surface *next) {
+/// Moves each text input to its client's current keyboard focus. v3 requires
+/// enter/leave to track keyboard focus exactly.
+void np_text_input_focus_changed(struct np_server *server) {
 	struct np_text_input *input;
 	wl_list_for_each(input, &server->text_inputs, link) {
-		struct wl_client *owner = wl_resource_get_client(input->resource);
-		bool leaving = previous && owner == wl_resource_get_client(previous->resource);
-		bool entering = next && owner == wl_resource_get_client(next->resource);
-		if (leaving)
+		struct np_surface *next = np_keyboard_focus(server, wl_resource_get_client(input->resource));
+		if (input->entered_surface == (next ? next->id : 0)) continue;
+		struct np_surface *previous = input->entered_window
+			? np_surface_by_window(server, input->entered_window) : NULL;
+		if (previous && previous->id == input->entered_surface && previous->resource &&
+		    wl_resource_get_client(previous->resource) == wl_resource_get_client(input->resource))
 			zwp_text_input_v3_send_leave(input->resource, previous->resource);
-		/* A missing previous pointer can mean that its wl_surface was already
-		 * destroyed. Empty focus still retires all fields, including their
-		 * unapplied requests; a fresh enter also cannot inherit that state. */
-		if (leaving || entering || !next) {
-			if (input->enabled && input->entered_window)
-				send_enabled(server, input->entered_window, input->epoch, false);
-			clear_focus_state(input);
-		}
-		if (entering) {
+		/* A destroyed surface gets no leave, but its field still retires with
+		 * its unapplied requests; a fresh enter also cannot inherit that state. */
+		if (input->enabled && input->entered_window)
+			send_enabled(server, input->entered_window, input->epoch, false);
+		clear_focus_state(input);
+		if (next) {
 			input->entered_surface = next->id;
 			input->entered_window = next->window_id;
 			zwp_text_input_v3_send_enter(input->resource, next->resource);
 		}
 	}
+}
+
+bool np_text_input_valid_text(const char *text) {
+	return text && g_utf8_validate(text, -1, NULL);
+}
+
+/// Agent text goes straight to the enabled field of the agent's focus. The
+/// host's input-method epoch belongs to the user's typing and is not involved.
+bool np_text_input_commit_agent(struct np_server *server, struct np_surface *focus,
+                                const char *text) {
+	struct np_text_input *input;
+	wl_list_for_each(input, &server->text_inputs, link) {
+		if (!input->enabled || !focus || focused_input(input) != focus) continue;
+		zwp_text_input_v3_send_commit_string(input->resource, text);
+		zwp_text_input_v3_send_done(input->resource, input->serial);
+		wl_display_flush_clients(server->display);
+		return true;
+	}
+	return false;
 }
 
 /// Delivers what the macOS input method produced. Everything in one batch is
@@ -293,7 +311,9 @@ void np_text_input_deliver(struct np_server *server, uint32_t window, uint32_t e
                                const char *commit_text, const char *preedit_text,
                                int32_t cursor_begin, int32_t cursor_end,
                                uint32_t delete_before, uint32_t delete_after) {
-	if (!window || !epoch || server->focused_window != window) return;
+	struct np_surface *focus = window && server->focused_window == window
+		? np_surface_by_window(server, window) : NULL;
+	if (!focus || !epoch) return;
 	if ((commit_text && !g_utf8_validate(commit_text, -1, NULL)) ||
 	    (preedit_text && (!g_utf8_validate(preedit_text, -1, NULL) ||
 	      !((cursor_begin == -1 && cursor_end == -1) ||
@@ -301,7 +321,7 @@ void np_text_input_deliver(struct np_server *server, uint32_t window, uint32_t e
 		return;
 	struct np_text_input *input;
 	wl_list_for_each(input, &server->text_inputs, link) {
-		if (!input->enabled || input->epoch != epoch || !focused_input(input)) continue;
+		if (!input->enabled || input->epoch != epoch || focused_input(input) != focus) continue;
 		if (delete_before || delete_after) {
 			if (!input->surrounding) continue;
 			int32_t begin = input->cursor_index < input->anchor_index
@@ -348,9 +368,8 @@ static void text_input_manager_get(struct wl_client *client, struct wl_resource 
 
 	// A client that binds while already focused must be told so, or it will sit
 	// waiting for an enter that already happened.
-	struct np_surface *focused = server->focused_window
-		? np_surface_by_window(server, server->focused_window) : NULL;
-	if (focused && wl_resource_get_client(focused->resource) == client) {
+	struct np_surface *focused = np_keyboard_focus(server, client);
+	if (focused) {
 		input->entered_surface = focused->id;
 		input->entered_window = focused->window_id;
 		zwp_text_input_v3_send_enter(created, focused->resource);

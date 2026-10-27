@@ -617,6 +617,9 @@ public final class WindowBridge: NSObject {
     }
 
     var acceptsKeyboardInput: Bool { !presentationSuspended && !presentationDrawingGated }
+    /// Computer-use input, including agent keys that bypass the key window, waits
+    /// out a suspended or gated presentation like the user's input does.
+    public var acceptsComputerInput: Bool { acceptsKeyboardInput }
 
     @objc private func applicationDidResignActive(_ notification: Notification) {
         pointerPresentationWindow = nil
@@ -1049,28 +1052,16 @@ public final class WindowBridge: NSObject {
         return true
     }
 
-    @discardableResult
-    public func computerKey(
-        window id: UInt32, macKeyCode: UInt16, pressed: Bool,
-        modifierFlags: UInt64
-    ) -> Bool {
-        guard acceptsKeyboardInput, KeyTranslation.evdevCode(for: macKeyCode) != nil, let native = dockWindow(id) else { return false }
-        native.activateFromDock()
-        guard native.window?.isKeyWindow == true, NSApp.isActive else { return false }
-        native.key(
-            macKeyCode, pressed: pressed,
-            flags: NSEvent.ModifierFlags(rawValue: UInt(modifierFlags)))
-        return true
-    }
-
-    @discardableResult
-    public func computerCommitText(window id: UInt32, text: String) -> Bool {
-        guard acceptsKeyboardInput, !text.isEmpty, text.utf8.count <= 65_535,
-              !text.contains("\0"), let native = dockWindow(id) else { return false }
-        native.activateFromDock()
-        guard native.window?.isKeyWindow == true, NSApp.isActive, native.acceptsCommittedText else { return false }
-        native.commitText(text)
-        return true
+    /// An agent key in the guest's evdev terms, or nil for a key the guest
+    /// keymap lacks. Agent keys and text go through `ApplicationClient.agentInput`,
+    /// which uses the agent's own keyboard focus in the guest: the window need
+    /// not be key and LinPortal need not be the frontmost application.
+    public nonisolated static func agentKey(
+        macKeyCode: UInt16, pressed: Bool, modifierFlags: UInt64
+    ) -> Windowing.AgentInputEvent? {
+        guard let code = KeyTranslation.evdevCode(for: macKeyCode) else { return nil }
+        return .key(keycode: code, pressed: pressed,
+                    modifiers: KeyTranslation.modifiers(from: NSEvent.ModifierFlags(rawValue: UInt(modifierFlags))))
     }
 
     @discardableResult

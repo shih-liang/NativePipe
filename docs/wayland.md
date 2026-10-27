@@ -38,6 +38,25 @@ tokens and revokes them on focus changes, unmapping, destruction and disconnect.
 The host independently checks its recent input and active origin window. Native
 application-catalog launches retain their existing activation behavior.
 
+## Keyboard focus
+
+Keyboard focus is per client, with two owners. The user's focus follows the
+macOS key window. The agent's focus follows agent input
+(`HostCommand.agentInput`), which therefore needs neither a key window nor a
+frontmost LinPortal, and lets the user keep typing elsewhere. Each client still
+sees a single `wl_keyboard` and `zwp_text_input_v3` focus: in the client that
+holds the user's focus the user wins, so the agent may share the user's window
+but is refused another window of that client, and the user taking a window of
+the agent's client ends the agent's focus there. A popup grab takes the user's
+focus when the user is typing in its client and otherwise the agent's, and
+gives it back on destruction. The selection goes to both focused clients.
+
+Agent keys update the latest input serial, so they can open menus, but never
+authorize `xdg_activation_v1`. Agent text is committed to the agent focus's
+enabled field without the host IME epoch, waiting up to 500 ms for the client
+to enable one; the reply says how many events were delivered and why the rest
+were not. The pointer remains shared between the user and the agent.
+
 ## Presentation and buffer lifetime
 
 Buffer-read completion, FIFO/frame callbacks and actual display presentation are

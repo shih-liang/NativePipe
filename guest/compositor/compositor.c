@@ -187,6 +187,7 @@ int np_frontend_run(int argc, char **argv, void *backend_state)
     np_host_open_finish(&server);
     np_notifications_finish(&server);
     np_accessibility_finish(&server);
+    np_agent_input_finish(&server);
     np_applications_finish(&server);
 	wl_display_destroy_clients(server.display);
 	np_backend_session_finish(&server);

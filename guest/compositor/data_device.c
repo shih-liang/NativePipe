@@ -1060,13 +1060,10 @@ static void data_device_set_selection(struct wl_client *client, struct wl_resour
 	server->host_mime_count = 0;
 	announce_selection_to_host(server);
 
-	struct np_surface *focused = server->focused_window
-		? np_surface_by_window(server, server->focused_window) : NULL;
-	if (!focused) return;
+	/* Every keyboard-focused client sees it: the user's and the agent's. */
 	struct np_input *device;
 	wl_list_for_each(device, &server->data_devices, link) {
-		if (wl_resource_get_client(device->resource) !=
-		    wl_resource_get_client(focused->resource)) continue;
+		if (!np_keyboard_focus(server, wl_resource_get_client(device->resource))) continue;
 		np_data_send_selection(server, device->resource);
 	}
 }

@@ -297,4 +297,5 @@
 "The display connection changed during the virtual machine state change." = "La connessione dello schermo è cambiata durante il cambio di stato della macchina virtuale.";
 "Another display state change is already in progress." = "È già in corso un’altra modifica dello stato dello schermo.";
 "Invalid accessibility reply." = "Risposta di accessibilità non valida.";
+"Invalid agent input reply." = "Risposta di input dell’agente non valida.";
 "Invalid accessibility tree: %@" = "Albero di accessibilità non valido: %@";

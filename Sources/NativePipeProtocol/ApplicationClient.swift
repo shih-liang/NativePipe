@@ -17,7 +17,7 @@ public final class ApplicationClient {
     private var iconTask: Task<Void, Never>?
     private var taskGeneration: UInt64 = 0
     private struct Request {
-        /// Nil for an accessibility request.
+        /// Nil for an accessibility or agent input request.
         let action: ApplicationAction?
         let continuation: CheckedContinuation<ApplicationReply, Error>
         var apps: [GuestApplication] = []
@@ -76,6 +76,9 @@ public final class ApplicationClient {
         case .accessibility(let token, let message, _):
             guard let request = pending[token], request.action == nil else { return }
             finish(token, message.isEmpty ? .success(reply) : .failure(Failure(message)))
+        case .agentInput(let token, _, _):
+            guard let request = pending[token], request.action == nil else { return }
+            finish(token, .success(reply))
         }
     }
     private func finish(_ token: UInt32, _ result: Result<ApplicationReply, Error>) {
@@ -175,6 +178,23 @@ public final class ApplicationClient {
     public func accessibilityTree(_ request: GuestAccessibilityRequest) async throws -> GuestAccessibilityTree {
         do { return try JSONDecoder().decode(GuestAccessibilityTree.self, from: try await accessibility(request)) }
         catch let error as DecodingError { throw Failure(NPText("Invalid accessibility tree: %@", String(describing: error))) }
+    }
+
+    /// How far an agent input request got. `problem` explains why the events
+    /// after `accepted` were not delivered.
+    public struct AgentInputReceipt: Sendable, Equatable {
+        public let accepted: Int
+        public let problem: String?
+        public init(accepted: Int, problem: String?) { self.accepted = accepted; self.problem = problem }
+    }
+
+    /// Delivers keys and text through the agent's own keyboard focus in the
+    /// guest, whichever window macOS has made key.
+    public func agentInput(window: UInt32, events: [Windowing.AgentInputEvent]) async throws -> AgentInputReceipt {
+        guard case .agentInput(_, let accepted, let problem) = try await request(nil, {
+            .agentInput(token: $0, window: window, events: events)
+        }), accepted <= events.count else { throw Failure(NPText("Invalid agent input reply.")) }
+        return AgentInputReceipt(accepted: Int(accepted), problem: problem.isEmpty ? nil : problem)
     }
 
     /// Zero means D-Bus activation succeeded without creating a child process.

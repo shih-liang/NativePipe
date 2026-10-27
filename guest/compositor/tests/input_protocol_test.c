@@ -15,7 +15,7 @@ static unsigned capture_replays, capture_queues, capture_flushes, capture_member
 static unsigned capture_expected_queues;
 static uint32_t capture_owner, capture_id;
 static struct np_surface *capture_members[3];
-static struct np_surface *key_surfaces[4];
+static struct np_surface *key_surfaces[8];
 static unsigned key_surface_count, key_activations;
 struct np_surface *np_surface_by_id(struct np_server *server, uint32_t id)
 {
@@ -90,11 +90,32 @@ void np_presentation_flush(struct np_server *server)
     assert(capture_queues == capture_expected_queues && !capture_flushes);
     capture_flushes++;
 }
-void np_text_input_focus_changed(struct np_server *server, struct np_surface *previous, struct np_surface *next)
+void np_text_input_focus_changed(struct np_server *server)
 {
-    assert(previous == fixture_surface && !next);
     focus_resets++;
 }
+static bool text_field_ready;
+static unsigned agent_texts;
+bool np_text_input_valid_text(const char *text) { return text && !strchr(text, 0xff); }
+bool np_text_input_commit_agent(struct np_server *server, struct np_surface *focus, const char *text)
+{
+    assert(focus && focus->window_id == server->agent_window);
+    if (text_field_ready) agent_texts++;
+    return text_field_ready;
+}
+static struct { unsigned count; uint32_t token, accepted; char problem[256]; } reply;
+bool np_backend_send_binary(struct np_server *server, const void *data, size_t length)
+{
+    const unsigned char *bytes = data;
+    uint32_t size;
+    assert(length >= 20 && !memcmp(bytes, "NPAP", 4) && bytes[5] == NP_AGENT_INPUT_REPLY);
+    memcpy(&reply.token, bytes + 8, 4); memcpy(&reply.accepted, bytes + 12, 4); memcpy(&size, bytes + 16, 4);
+    assert(length == 20 + size && size < sizeof(reply.problem));
+    memcpy(reply.problem, bytes + 20, size); reply.problem[size] = 0;
+    reply.count++;
+    return true;
+}
+void np_backend_session_sync(struct np_server *server) {}
 void np_activation_revoke_surface(struct np_surface *surface)
 {
     assert(surface == fixture_surface);
@@ -472,6 +493,186 @@ static void test_capture_reuses_scene_and_flat_pending_identity(void)
 
 bool np_trace_enabled(void) { return false; }
 
+
+/* Counts one client's wl_keyboard events by name. */
+struct keyboard_events { unsigned enter, leave, key, modifiers; uint32_t entered; };
+static struct keyboard_events keyboard_events(struct np_server *server, int peer, uint32_t keyboard)
+{
+    wl_display_flush_clients(server->display);
+    struct keyboard_events events = {0};
+    unsigned char bytes[4096];
+    for (;;) {
+        ssize_t size = recv(peer, bytes, sizeof(bytes), MSG_DONTWAIT);
+        if (size < 0) { assert(errno == EAGAIN || errno == EWOULDBLOCK); break; }
+        assert(size > 0);
+        for (size_t offset = 0; offset < (size_t)size;) {
+            uint32_t object, header;
+            memcpy(&object, bytes + offset, 4); memcpy(&header, bytes + offset + 4, 4);
+            assert(object == keyboard && (header >> 16) >= 8 && offset + (header >> 16) <= (size_t)size);
+            const char *name = wl_keyboard_interface.events[header & 0xffff].name;
+            if (!strcmp(name, "enter")) { events.enter++; memcpy(&events.entered, bytes + offset + 12, 4); }
+            else if (!strcmp(name, "leave")) events.leave++;
+            else if (!strcmp(name, "key")) events.key++;
+            else { assert(!strcmp(name, "modifiers")); events.modifiers++; }
+            offset += header >> 16;
+        }
+    }
+    return events;
+}
+
+enum { AGENT_KEY = 1, AGENT_TEXT = 2, AGENT_BAD = 3 };
+static bool agent_request(struct np_server *server, uint32_t token, uint32_t window,
+                          const int *kinds, unsigned count)
+{
+    struct np_window_message message;
+    np_window_message_init(&message, NP_WINDOW_HOST_TO_GUEST, NP_HOST_AGENT_INPUT);
+    np_window_put_u32(&message, token); np_window_put_u32(&message, window);
+    np_window_put_u32(&message, count);
+    for (unsigned i = 0; i < count; i++) {
+        np_window_put_u8(&message, (uint8_t)kinds[i]);
+        if (kinds[i] == AGENT_TEXT) np_window_put_string(&message, "你好");
+        else { np_window_put_u32(&message, 30); np_window_put_bool(&message, i % 2 == 0); np_window_put_u32(&message, 1); }
+    }
+    assert(message.ok);
+    struct np_window_reader reader;
+    assert(np_window_reader_init(&reader, message.data, message.len, NP_WINDOW_HOST_TO_GUEST));
+    bool accepted = handle_agent_input(server, &reader);
+    np_window_message_clear(&message);
+    return accepted;
+}
+
+static void test_agent_focus_alongside_user(void)
+{
+    int user_pair[2], agent_pair[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, user_pair) == 0);
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, agent_pair) == 0);
+    struct np_server server = {.display = wl_display_create()};
+    assert(server.display);
+    wl_list_init(&server.surfaces); wl_list_init(&server.keyboards);
+    wl_list_init(&server.pointers); wl_list_init(&server.data_devices);
+    struct wl_client *editor = wl_client_create(server.display, user_pair[0]);
+    struct wl_client *terminal = wl_client_create(server.display, agent_pair[0]);
+    assert(editor && terminal);
+    struct np_surface notes = {.id = 31, .window_id = 1}, other_notes = {.id = 32, .window_id = 2};
+    struct np_surface shell = {.id = 33, .window_id = 3};
+    struct np_surface menu = {.id = 34, .window_id = 4, .popup_parent_window = 3};
+    struct np_surface *surfaces[] = {&notes, &other_notes, &shell, &menu};
+    for (unsigned i = 0; i < 4; i++) {
+        surfaces[i]->resource = wl_resource_create(i < 2 ? editor : terminal, &wl_surface_interface, 6, 2 + i % 2);
+        assert(surfaces[i]->resource);
+        key_surfaces[i] = surfaces[i];
+        wl_list_insert(server.surfaces.next, &surfaces[i]->link);
+    }
+    key_surface_count = 4;
+    struct np_input editor_keyboard = {.resource = wl_resource_create(editor, &wl_keyboard_interface, 9, 4)};
+    struct np_input terminal_keyboard = {.resource = wl_resource_create(terminal, &wl_keyboard_interface, 9, 4)};
+    assert(editor_keyboard.resource && terminal_keyboard.resource);
+    wl_list_insert(&server.keyboards, &editor_keyboard.link);
+    wl_list_insert(&server.keyboards, &terminal_keyboard.link);
+    key_activations = 0; reply.count = 0; text_field_ready = false; agent_texts = 0;
+    const int keys[] = {AGENT_KEY, AGENT_KEY};
+
+    np_set_keyboard_focus(&server, 1);
+    struct keyboard_events e = keyboard_events(&server, user_pair[1], 4);
+    assert(e.enter == 1 && e.entered == 2);
+
+    /* The agent types into another client without disturbing the user's. */
+    assert(agent_request(&server, 7, 3, keys, 2));
+    assert(reply.count == 1 && reply.token == 7 && reply.accepted == 2 && !reply.problem[0]);
+    assert(server.focused_window == 1 && server.agent_window == 3 && !key_activations);
+    e = keyboard_events(&server, agent_pair[1], 4);
+    assert(e.enter == 1 && e.entered == 2 && e.key == 2 && e.modifiers == 2);
+    e = keyboard_events(&server, user_pair[1], 4);
+    assert(!e.enter && !e.leave && !e.key);
+    /* The user keeps typing in their own window meanwhile. */
+    assert(dispatch_key(&server, 1, true, 0));
+    e = keyboard_events(&server, user_pair[1], 4);
+    assert(e.key == 1 && key_activations == 1);
+    assert(!keyboard_events(&server, agent_pair[1], 4).key);
+
+    /* One client has one keyboard focus: the user's window can be shared,
+     * but another window of the user's client is refused. */
+    assert(agent_request(&server, 8, 2, keys, 2));
+    assert(reply.count == 2 && reply.accepted == 0 && strstr(reply.problem, "user is typing"));
+    assert(!keyboard_events(&server, user_pair[1], 4).key && server.agent_window == 3);
+    assert(agent_request(&server, 9, 1, keys, 2));
+    assert(reply.count == 3 && reply.accepted == 2 && server.agent_window == 3);
+    assert(keyboard_events(&server, user_pair[1], 4).key == 2);
+
+    /* A grab opened by agent input takes the agent's focus, and gives it back. */
+    menu.has_grab = true;
+    np_keyboard_focus_grab(&server, &menu);
+    assert(menu.grab_agent && server.agent_window == 4 && server.focused_window == 1);
+    e = keyboard_events(&server, agent_pair[1], 4);
+    assert(e.leave == 1 && e.enter == 1 && e.entered == 3);
+    assert(agent_request(&server, 10, 3, keys, 2));
+    assert(reply.accepted == 2 && keyboard_events(&server, agent_pair[1], 4).key == 2);
+    /* The user's focus changes are not redirected into the agent's menu. */
+    handle_keyboard_focus(&server, 2);
+    assert(server.focused_window == 2 && server.agent_window == 4);
+    handle_keyboard_focus(&server, 1);
+    assert(server.focused_window == 1 && server.agent_window == 4);
+    menu.has_grab = false;
+    np_keyboard_focus_ungrab(&server, &menu);
+    assert(server.agent_window == 3 && !menu.grab_agent);
+    e = keyboard_events(&server, agent_pair[1], 4);
+    assert(e.leave == 1 && e.enter == 1 && e.entered == 2);
+    keyboard_events(&server, user_pair[1], 4);
+
+    /* Text waits for the client to enable a field, then reports the gap. */
+    const int text[] = {AGENT_KEY, AGENT_TEXT, AGENT_KEY};
+    assert(agent_request(&server, 11, 3, text, 3));
+    assert(reply.count == 4 && server.agent_input && server.agent_input->next == 1);
+    assert(agent_request(&server, 12, 3, keys, 2));
+    assert(reply.count == 5 && reply.token == 12 && strstr(reply.problem, "still running"));
+    text_field_ready = true;
+    agent_input_resume(&server);
+    assert(reply.count == 6 && reply.token == 11 && reply.accepted == 3 && agent_texts == 1 && !server.agent_input);
+    text_field_ready = false;
+    assert(agent_request(&server, 13, 3, text, 3));
+    server.agent_input->wait_until_ms = 1;
+    agent_input_resume(&server);
+    assert(reply.count == 7 && reply.token == 13 && reply.accepted == 1 && strstr(reply.problem, "no text-input"));
+    keyboard_events(&server, agent_pair[1], 4);
+
+    /* Malformed requests fail as a whole, before any event is delivered. */
+    const int bad[] = {AGENT_KEY, AGENT_BAD};
+    assert(!agent_request(&server, 14, 3, bad, 2));
+    assert(!agent_request(&server, 0, 3, keys, 2));
+    assert(reply.count == 7 && !keyboard_events(&server, agent_pair[1], 4).key);
+    assert(agent_request(&server, 15, 9, keys, 2));
+    assert(reply.count == 8 && reply.accepted == 0 && strstr(reply.problem, "window closed"));
+
+    /* When the user moves into the agent's window the two share it, and
+     * moving away again leaves the agent's focus where it was. */
+    np_set_keyboard_focus(&server, 3);
+    assert(!keyboard_events(&server, agent_pair[1], 4).enter && server.agent_window == 3);
+    assert(keyboard_events(&server, user_pair[1], 4).leave == 1);
+    np_set_keyboard_focus(&server, 1);
+    e = keyboard_events(&server, agent_pair[1], 4);
+    assert(!e.enter && !e.leave && server.agent_window == 3);
+    /* The user taking another window of the agent's client wins it. */
+    struct np_surface second_shell = {.id = 35, .window_id = 5};
+    second_shell.resource = wl_resource_create(terminal, &wl_surface_interface, 6, 5);
+    key_surfaces[4] = &second_shell; key_surface_count = 5;
+    keyboard_events(&server, user_pair[1], 4);
+    np_set_keyboard_focus(&server, 5);
+    assert(server.focused_window == 5 && !server.agent_window);
+    e = keyboard_events(&server, agent_pair[1], 4);
+    assert(e.leave == 1 && e.enter == 1 && e.entered == 5);
+
+    /* Activation revocation on disconnect has its own fixture. */
+    for (unsigned i = 0; i < 4; i++) wl_list_remove(&surfaces[i]->link);
+    np_input_host_disconnected(&server);
+    assert(!server.focused_window && !server.agent_window && !server.agent_input);
+    assert(keyboard_events(&server, agent_pair[1], 4).leave == 1);
+
+    wl_list_remove(&editor_keyboard.link); wl_list_remove(&terminal_keyboard.link);
+    key_surface_count = 0;
+    wl_client_destroy(editor); wl_client_destroy(terminal); wl_display_destroy(server.display);
+    close(user_pair[1]); close(agent_pair[1]);
+}
+
 int main(void)
 {
 	for (uint32_t version = 4; version <= 9; version++) {
@@ -483,8 +684,9 @@ int main(void)
 	test_cursor_activation_replays_only_retained_contents();
 	test_capture_reuses_scene_and_flat_pending_identity();
 	test_keyboard_window_isolation_and_popup_ancestors();
+	test_agent_focus_alongside_user();
 	assert(wheel_value120(1e300) == INT32_MAX);
 	assert(wheel_value120(-1e300) == INT32_MIN);
-	puts("PASS: pointer v4-v9 scroll, disconnect, cursor activation, capture replay and keyboard window isolation");
+	puts("PASS: pointer v4-v9 scroll, disconnect, cursor activation, capture replay and keyboard window isolation, agent focus");
 	return 0;
 }

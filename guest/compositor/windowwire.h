@@ -104,6 +104,7 @@ enum np_window_host_opcode {
 	NP_HOST_PRESENTATION_DRAIN = 39,
 	NP_HOST_PRESENTATION_RESUME = 40,
 	NP_HOST_ACCESSIBILITY_REQUEST = 41,
+	NP_HOST_AGENT_INPUT = 42,
 };
 
 enum np_window_pixel_format {
