@@ -1,6 +1,7 @@
 import AppKit
 import Darwin
 import NativePipeProtocol
+import OSLog
 import UniformTypeIdentifiers
 
 // Published by the task before signalling, read only after the worker waits.
@@ -96,6 +97,7 @@ public final class LinuxFilePromise: NSObject, NSFilePromiseProviderDelegate {
         cachedProvider = provider
         return provider
     }
+    nonisolated private static let log = Logger(subsystem: "com.nativepipe", category: "FileDrag")
     nonisolated private static let queue: OperationQueue = {
         let queue = OperationQueue()
         queue.name = "com.nativepipe.file-promises"
@@ -159,6 +161,10 @@ public final class LinuxFilePromise: NSObject, NSFilePromiseProviderDelegate {
         // the file-promise worker waits, never the AppKit event loop.
         done.wait()
         let error = result.error
+        if let error {
+            let detail = error as NSError
+            Self.log.error("Promise for \(self.remote.path, privacy: .public) to \(url.path, privacy: .public) failed: \(detail.domain, privacy: .public) \(detail.code) \(String(describing: error), privacy: .public)")
+        }
         completionHandler(error)
         Task { @MainActor in self.completed?(error) }
     }
