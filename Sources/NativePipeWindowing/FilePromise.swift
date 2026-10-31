@@ -107,10 +107,20 @@ public final class LinuxFilePromise: NSObject, NSFilePromiseProviderDelegate {
         self.remote = remote; self.write = write
     }
 
+    /// Copies through the shared volume when one can be published, otherwise
+    /// over the file connection.
     public convenience init(remote: URL, access: any UserFileAccess, publishGuestFiles: GuestFilePublisher? = nil) {
         self.init(remote: remote) { destination in
-            guard let publish = publishGuestFiles else { throw GuestFileSharingError.unavailable }
-            let files = try await publish([remote], access, .drag)
+            let files: [URL]
+            do {
+                guard let publish = publishGuestFiles else { throw GuestFileSharingError.unavailable }
+                files = try await publish([remote], access, .drag)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                try await access.exportFile(remote, to: destination)
+                return
+            }
             try Task.checkCancellation()
             guard files.count == 1, let source = files.first else { throw FileRPC.Failure.protocolError }
             _ = try FileTransferURLs.decode(FileTransferURLs.encode(files))

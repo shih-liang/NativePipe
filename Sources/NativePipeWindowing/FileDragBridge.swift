@@ -4,7 +4,9 @@ import OSLog
 
 /// One AppKit/Wayland file-drag state machine for VMHost and RemoteHost.
 /// Intra-Linux drags keep their original Wayland path until the pointer exits
-/// our windows; only then does AppKit take over the external drag.
+/// our windows; only then does AppKit take over the external drag. Linux files
+/// leave as URLs on the shared volume; without one, as file promises that copy
+/// them over the file connection when the destination asks.
 @MainActor
 final class FileDragBridge: NSObject, NSDraggingSource {
     private static let log = Logger(subsystem: "com.nativepipe", category: "FileDrag")
@@ -22,6 +24,11 @@ final class FileDragBridge: NSObject, NSDraggingSource {
     private var outgoing: UInt32 = 0
     private var outgoingURLs: [URL] = []
     private var outgoingHostURLs: [URL]?
+    /// The shared volume is unavailable for this drag: export copies instead.
+    private var copyingOut = false
+    private var promises: [LinuxFilePromise] = []
+    private var remaining = 0
+    private var failed = false
     private var publication: Task<Void, Never>?
     private weak var pendingExportView: NSView?
     private var pendingExportEvent: NSEvent?
@@ -46,7 +53,7 @@ final class FileDragBridge: NSObject, NSDraggingSource {
         case .sourceData:
             guard message.token == outgoing, let data = message.data else { return }
             outgoingURLs = (try? FileTransferURLs.decode(data)) ?? []
-            publication?.cancel(); outgoingHostURLs = nil
+            publication?.cancel(); outgoingHostURLs = nil; copyingOut = false
             if let publish = bridge?.publishGuestFiles, let access = bridge?.fileAccess, !outgoingURLs.isEmpty {
                 let token = outgoing, connection = generation, files = outgoingURLs
                 publication = Task { @MainActor [weak self] in
@@ -59,25 +66,19 @@ final class FileDragBridge: NSObject, NSDraggingSource {
                         _ = try FileTransferURLs.decode(FileTransferURLs.encode(urls))
                         guard urls.count == files.count else { throw FileRPC.Failure.protocolError }
                         self.outgoingHostURLs = urls
-                        // A delayed mount may finish after mouse-up or after
-                        // the source view disappears. Start only the same live
-                        // gesture, using metadata-resolved URL representations.
-                        if let view = self.pendingExportView, let event = self.pendingExportEvent {
-                            self.pendingExportView = nil; self.pendingExportEvent = nil
-                            guard NSEvent.pressedMouseButtons & 1 != 0, view.window != nil else {
-                                self.clearExport(); return
-                            }
-                            _ = self.beginExportIfNeeded(view: view, event: event)
-                        }
+                        self.resumePendingExport()
                     } catch {
                         guard !(error is CancellationError), let self,
                               self.generation == connection, self.outgoing == token else { return }
-                        self.clearExport()
-                        self.reportError(error)
+                        // No shared volume (no FSKit authorization, extension
+                        // disabled, …): the drop still gets copies.
+                        Self.log.info("Drag \(token) copies files: \(error.localizedDescription, privacy: .public)")
+                        self.copyingOut = true
+                        self.resumePendingExport()
                     }
                 }
             } else if !outgoingURLs.isEmpty {
-                clearExport(); reportError(GuestFileSharingError.unavailable)
+                copyingOut = true
             }
             Self.log.debug("Drag \(message.token) offers \(self.outgoingURLs.count) files")
         case .accepted:
@@ -193,24 +194,50 @@ final class FileDragBridge: NSObject, NSDraggingSource {
         }
     }
 
+    /// A delayed mount may finish after mouse-up or after the source view
+    /// disappears. Start only the same live gesture.
+    private func resumePendingExport() {
+        guard let view = pendingExportView, let event = pendingExportEvent else { return }
+        pendingExportView = nil; pendingExportEvent = nil
+        guard NSEvent.pressedMouseButtons & 1 != 0, view.window != nil else { clearExport(); return }
+        _ = beginExportIfNeeded(view: view, event: event)
+    }
+
     func beginExportIfNeeded(view: NSView, event: NSEvent) -> Bool {
         guard session == nil, outgoing != 0, !outgoingURLs.isEmpty,
-              bridge?.fileAccess != nil,
+              let access = bridge?.fileAccess,
               bridge?.containsGuestWindow(at: NSEvent.mouseLocation) == false else { return false }
-        // The source URI may omit directory metadata. AppKit rejects the
-        // generic UTType.item, so never guess .data or block its event loop:
-        // wait for the existing publication task to return actual mounted URLs.
-        guard let hostURLs = outgoingHostURLs else {
+        let urls: [URL], writers: [any NSPasteboardWriting]
+        if let hostURLs = outgoingHostURLs {
+            urls = hostURLs; writers = hostURLs.map { $0 as NSURL }
+        } else if copyingOut {
+            let token = outgoing
+            promises = outgoingURLs.map { remote in
+                LinuxFilePromise(remote: remote) { try await access.exportFile(remote, to: $0) }
+            }
+            remaining = promises.count; failed = false
+            for promise in promises {
+                promise.completed = { [weak self] error in
+                    guard let self, self.outgoing == token else { return }
+                    if let error, !(error is CancellationError) { self.failed = true; self.reportError(error) }
+                    self.remaining -= 1
+                    self.finishExportIfReady()
+                }
+            }
+            urls = outgoingURLs; writers = promises.map(\.provider)
+        } else {
+            // The source URI may omit directory metadata. AppKit rejects the
+            // generic UTType.item, so never guess .data or block its event
+            // loop: wait for publication to return mounted URLs or fail.
             pendingExportView = view; pendingExportEvent = event
             return false
         }
         pendingExportView = nil; pendingExportEvent = nil
         dropped = false; localDrop = false
         let point = view.convert(event.locationInWindow, from: nil)
-        let writers: [any NSPasteboardWriting] = hostURLs.map { $0 as NSURL }
         let items = writers.enumerated().map { i, writer in
             let item = NSDraggingItem(pasteboardWriter: writer)
-            let image = NSWorkspace.shared.icon(for: hostURLs[i].hasDirectoryPath ? .folder : .data)
+            let image = NSWorkspace.shared.icon(for: urls[i].hasDirectoryPath ? .folder : .data)
             item.setDraggingFrame(NSRect(x: point.x + CGFloat(i * 4), y: point.y,
                 width: 48, height: 48), contents: image)
             return item
@@ -238,15 +265,17 @@ final class FileDragBridge: NSObject, NSDraggingSource {
         }
     }
     private func finishExportIfReady() {
-        guard dropped else { return }
-        Self.log.debug("Drag \(self.outgoing) finished")
-        send(.init(.exportEnded, token: outgoing, data: Data([1])))
+        guard dropped, remaining == 0 else { return }
+        Self.log.debug("Drag \(self.outgoing) finished, failed \(self.failed)")
+        send(.init(.exportEnded, token: outgoing, data: Data([failed ? 0 : 1])))
         clearExport()
     }
     private func clearExport() {
         publication?.cancel(); publication = nil
         pendingExportView = nil; pendingExportEvent = nil
         outgoing = 0; outgoingURLs = []; outgoingHostURLs = nil
+        // AppKit's providers own their promises; writes already asked for finish.
+        copyingOut = false; promises = []; remaining = 0; failed = false
         dropped = false; localDrop = false
     }
     func pointerReleased() { if session == nil && !dropped { clearExport() } }
