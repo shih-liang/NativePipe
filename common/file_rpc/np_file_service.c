@@ -552,6 +552,32 @@ static int op_mkdir(struct connection *connection, struct np_file2_stream *strea
     return error ? error : reply(stream, NULL, 0);
 }
 
+/* Creates a symbolic link without resolving its target: folder copies keep
+ * links as links. Like MKDIR, an existing name is never replaced. */
+static int op_symlink(struct connection *connection, struct np_file2_stream *stream, const unsigned char *body, size_t length) {
+    if (length < 4) return EINVAL;
+    unsigned flags = np_file_u32(body);
+    if (flags & ~NP_FILE_NOFOLLOW) return EINVAL;
+    if (connection->read_only) return EROFS;
+    char path[4096], target[NP_FILE_PATH_MAX + 1]; size_t offset = 4;
+    int error = take_path(body, length, &offset, path, 0);
+    if (error) return error;
+    if (length - offset < 4) return EINVAL;
+    uint32_t size = np_file_u32(body + offset);
+    offset += 4;
+    if (!size || size > NP_FILE_PATH_MAX || size != length - offset || memchr(body + offset, 0, size)) return EINVAL;
+    memcpy(target, body + offset, size); target[size] = 0;
+    char *name = strrchr(path, '/');
+    if (!name || !name[1] || !strcmp(name + 1, ".") || !strcmp(name + 1, "..")) return EINVAL;
+    *name++ = 0;
+    int fd = (flags & NP_FILE_NOFOLLOW) ? np_file_open_nofollow(connection->root, *path ? path : "/", O_RDONLY | O_DIRECTORY, 0)
+                                        : np_file_open(connection->root, *path ? path : "/", O_RDONLY | O_DIRECTORY, 0);
+    if (fd < 0) return ERROR;
+    error = symlinkat(target, fd, name) < 0 ? ERROR : 0;
+    close(fd);
+    return error ? error : reply(stream, NULL, 0);
+}
+
 /* Lazy access pins a no-link path and never follows a link out of a subtree. */
 static int open_snapshot(struct connection *connection, const char *path, struct stat *st) {
     int fd = np_file_open_nofollow(connection->root, path, O_RDONLY | O_NONBLOCK, 0);
@@ -650,6 +676,7 @@ static void perform(struct connection *connection, struct job *job) {
     case NP_FILE_SNAPSHOT: error = op_snapshot(connection, job->stream, job->body, job->length); break;
     case NP_FILE_RANGE: error = op_range(connection, job->stream, job->body, job->length); break;
     case NP_FILE_READLINK: error = op_readlink(connection, job->stream, job->body, job->length); break;
+    case NP_FILE_SYMLINK: error = op_symlink(connection, job->stream, job->body, job->length); break;
     case NP_FILE_CREATE_STAGING: case NP_FILE_PUBLISH_STAGING: case NP_FILE_DISCARD_STAGING:
         error = op_staging(connection, job->stream, job->opcode, job->body, job->length); break;
     default: error = ENOSYS; break;

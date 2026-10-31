@@ -292,7 +292,14 @@ public final class FileRPCUserAccess: UserFileRangeAccess {
             let values = try local.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey])
             return (values.isDirectory == true, values.isRegularFile == true, values.isSymbolicLink == true)
         }
-        guard !info.2 else { throw FileRPC.Failure.invalidPath }
+        if info.2 {
+            // Like a Finder copy, a link inside a folder stays a link.
+            let target = try await FileTransferLocalIO.perform {
+                try FileManager.default.destinationOfSymbolicLink(atPath: local.path)
+            }
+            try await rpc.createSymbolicLink(remote, target: target, noFollow: noFollow)
+            return
+        }
         if info.0 {
             try await rpc.createDirectory(remote, noFollow: noFollow)
             let children = try await FileTransferLocalIO.perform { try FileManager.default.contentsOfDirectory(at: local, includingPropertiesForKeys: nil) }

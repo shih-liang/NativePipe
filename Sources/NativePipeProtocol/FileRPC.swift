@@ -242,6 +242,17 @@ public struct FileRPC: Sendable {
         }
     }
 
+    /// Creates a symbolic link with exactly `target`, which is not resolved.
+    /// An existing name is never replaced.
+    public func createSymbolicLink(_ path: String, target: String, noFollow: Bool = false) async throws {
+        let bytes = Data(target.utf8)
+        guard !bytes.isEmpty, !bytes.contains(0), bytes.count <= Int(NP_FILE_PATH_MAX) else { throw Failure.invalidPath }
+        try await operation { session in
+            _ = try session.call(NP_FILE_SYMLINK, Session.encode(noFollow ? NP_FILE_NOFOLLOW : 0) + Session.path(path) +
+                                 Session.encode(UInt32(bytes.count)) + bytes)
+        }
+    }
+
     public func download(_ path: String, to destination: FileHandle,
                          progress: @escaping Progress = { _, _ in }) async throws {
         try await operation { session in

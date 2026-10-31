@@ -205,15 +205,33 @@ final class FileRPCTests: XCTestCase {
         try Data("old".utf8).write(to: target)
         do { try await files.uploadFile(local, to: RemoteFileURL.make("/target")); XCTFail("Never overwrite an existing file") } catch { }
         XCTAssertEqual(try Data(contentsOf: target), Data("old".utf8))
-        try FileManager.default.createSymbolicLink(at: local.appendingPathComponent("unsupported-link"), withDestinationURL: target)
+        XCTAssertEqual(mkfifo(local.appendingPathComponent("unsupported-pipe").path, 0o600), 0)
         let progress = FileProgressRecorder()
         do {
             try await files.uploadFile(local, to: RemoteFileURL.make("/absent"), progress: { progress.append($0) })
-            XCTFail("Symbolic links cannot be recursively uploaded")
+            XCTFail("Special files cannot be uploaded")
         } catch { }
         XCTAssertFalse(FileManager.default.fileExists(atPath: server.root.appendingPathComponent("absent").path))
         XCTAssertFalse(progress.values.contains(where: \.isComplete))
         XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: server.root.path).contains { $0.hasPrefix(".nativepipe-upload-") })
+        XCTAssertEqual(server.workers.wait(timeout: .now() + 2), .success)
+    }
+
+    @MainActor
+    func testFolderUploadKeepsLinksAsLinksWithoutFollowingThem() async throws {
+        let server = try Server(), files = FileRPCUserAccess(rpc: server.rpc)
+        let local = FileManager.default.temporaryDirectory.appendingPathComponent("link-upload-\(UUID())")
+        try FileManager.default.createDirectory(at: local, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: local) }
+        try Data("inside".utf8).write(to: local.appendingPathComponent("file"))
+        try FileManager.default.createSymbolicLink(atPath: local.appendingPathComponent("relative").path, withDestinationPath: "file")
+        try FileManager.default.createSymbolicLink(atPath: local.appendingPathComponent("escaping").path,
+                                                   withDestinationPath: "/etc/passwd")
+        try await files.uploadFile(local, to: RemoteFileURL.make("/uploaded-tree", isDirectory: true))
+        let uploaded = server.root.appendingPathComponent("uploaded-tree").path
+        XCTAssertEqual(try String(contentsOfFile: uploaded + "/file", encoding: .utf8), "inside")
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: uploaded + "/relative"), "file")
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: uploaded + "/escaping"), "/etc/passwd")
         XCTAssertEqual(server.workers.wait(timeout: .now() + 2), .success)
     }
 

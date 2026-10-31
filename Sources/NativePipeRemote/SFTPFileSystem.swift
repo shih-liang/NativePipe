@@ -335,6 +335,8 @@ private struct SFTPTreeNode {
     let modified: Date?
     let accessed: Date?
     let permissions: UInt32?
+    /// A symbolic link inside a folder is copied as a link to this target.
+    var linkTarget: String? = nil
 }
 
 private final class SFTPTransferWorker {
@@ -397,6 +399,12 @@ private final class SFTPTransferWorker {
             let path = try remote.map { try remotePath($0, components) }
             let url = local.map { localPath($0, components) }
             let attributes = try listed.flatMap { $0.hasKind ? $0 : nil } ?? connection.attributes(path!)
+            // Like a Finder copy, a link inside a folder stays a link.
+            if attributes.kind == .symbolicLink, !components.isEmpty, let path {
+                nodes.append(SFTPTreeNode(components: components, kind: .symbolicLink, size: 0, modified: nil,
+                                          accessed: nil, permissions: nil, linkTarget: try connection.readlink(path)))
+                return
+            }
             guard attributes.kind == .directory || attributes.kind == .file else {
                 throw SFTPFileSystemError.unsupportedFile(url?.path ?? path!)
             }
@@ -468,7 +476,16 @@ private final class SFTPTransferWorker {
                 for name in try localNames(fd) {
                     let child = openat(fd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
                     guard child >= 0 else {
-                        if errno == ELOOP { throw SFTPFileSystemError.unsupportedFile(localPath(local, components + [name]).path) }
+                        if errno == ELOOP {
+                            // Like a Finder copy, a link inside a folder stays a link.
+                            var target = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
+                            let count = readlinkat(fd, name, &target, Int(PATH_MAX))
+                            guard count > 0 else { throw SFTPFileSystemError.unsupportedFile(localPath(local, components + [name]).path) }
+                            nodes.append(SFTPTreeNode(components: components + [name], kind: .symbolicLink, size: 0, modified: nil,
+                                                      accessed: nil, permissions: nil,
+                                                      linkTarget: String(decoding: target[0..<count].map { UInt8(bitPattern: $0) }, as: UTF8.self)))
+                            continue
+                        }
                         throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
                     }
                     defer { Darwin.close(child) }
@@ -521,12 +538,14 @@ private final class SFTPTransferWorker {
                 try connection.checkCancellation()
                 let target = try remotePath(staging, node.components)
                 if node.kind == .directory { try connection.mkdir(target) }
+                else if let link = node.linkTarget { try connection.symlink(target, target: link) }
                 else {
                     relativePath = node.components.joined(separator: "/")
                     try uploadFile(localPath(local, node.components), destination: target, node: node)
                 }
             }
-            for node in nodes.reversed() {
+            // SETSTAT follows links; a link keeps the server's own attributes.
+            for node in nodes.reversed() where node.linkTarget == nil {
                 try connection.setAttributes(remotePath(staging, node.components), permissions: node.permissions,
                     accessed: node.accessed, modified: node.modified)
             }
@@ -627,7 +646,9 @@ private final class SFTPTransferWorker {
         for node in nodes {
             try connection.checkCancellation()
             let target = localRawPath(staging, node.components)
-            if node.kind == .directory {
+            if let link = node.linkTarget {
+                guard Darwin.symlink(link, target) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+            } else if node.kind == .directory {
                 guard Darwin.mkdir(target, 0o700) == 0 else {
                     if errno == EEXIST { throw SFTPFileSystemError.localNameCollision(source) }
                     throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
@@ -637,7 +658,9 @@ private final class SFTPTransferWorker {
                 try downloadFile(remotePath(source, node.components), destination: target, node: node)
             }
         }
-        for node in nodes.reversed() { try setLocalAttributes(localRawPath(staging, node.components), node: node) }
+        for node in nodes.reversed() where node.linkTarget == nil {
+            try setLocalAttributes(localRawPath(staging, node.components), node: node)
+        }
         try connection.checkCancellation()
         let existing = try localExists(destination)
         try validateDestination(existing, root: root, path: destination.path, overwrite: overwrite)

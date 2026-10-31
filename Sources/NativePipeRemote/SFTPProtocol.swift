@@ -345,6 +345,27 @@ final class SFTPConnection {
         }
         return value
     }
+    /// SSH_FXP_READLINK: a symbolic link's own target.
+    func readlink(_ path: String) throws -> String {
+        let names = try nameRequest(19, path: path)
+        guard let names, names.count == 1, let value = names.first?.0, !value.isEmpty, !value.contains("\0") else {
+            throw SFTPFailure.protocolError("Expected one symbolic link target.")
+        }
+        return value
+    }
+    /// SSH_FXP_SYMLINK. OpenSSH's sftp-server takes the two paths in reverse
+    /// order and kept it for compatibility; its PROTOCOL file tells clients to
+    /// send the target first. Servers advertising @openssh.com extensions get
+    /// that order, others the draft's link-then-target order.
+    func symlink(_ link: String, target: String) throws {
+        var payload = Data()
+        if extensions.keys.contains(where: { $0.hasSuffix("@openssh.com") }) {
+            payload.sftpString(target); payload.sftpString(link)
+        } else {
+            payload.sftpString(link); payload.sftpString(target)
+        }
+        try success(request(20, payload))
+    }
     func loginHome() throws -> String {
         if let home { return home }
         let value = try realpath(".")
