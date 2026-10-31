@@ -11,6 +11,26 @@ private final class NativeCopyContext {
 }
 
 public extension FileTransferLocalIO {
+    /// Writes a file promise's destination in place. The destination must not
+    /// exist yet; whatever `write` left there is removed if it fails.
+    static func writePromised(to destination: URL,
+                              _ write: (URL) async throws -> Void) async throws {
+        guard destination.isFileURL, !["", "/", ".", ".."].contains(destination.lastPathComponent) else {
+            throw FileRPC.Failure.invalidPath
+        }
+        try await perform {
+            var existing = stat()
+            if lstat(destination.path, &existing) == 0 { throw FileRPC.Failure.local(EEXIST) }
+            guard errno == ENOENT else { throw FileRPC.Failure.local(errno) }
+        }
+        do { try await write(destination) }
+        catch {
+            // Removing a large failed tree must not block the caller's actor.
+            await Task.detached(priority: .utility) { try? FileManager.default.removeItem(at: destination) }.value
+            throw error
+        }
+    }
+
     /// Copy a mounted source with native byte-range reads, xattrs and atomic
     /// publication. Existing destinations are never replaced.
     static func copy(source: URL, to destination: URL,

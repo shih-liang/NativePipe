@@ -86,6 +86,10 @@ public protocol UserFileAccess: AnyObject {
                      progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws -> [URL]
     func exportFile(_ remote: URL, to local: URL,
                     progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws
+    /// Fulfils a file promise. AppKit grants a sandboxed source access to the
+    /// promised URL only, and its documentation says to write the file to
+    /// exactly that URL: no sibling staging. Partial output is removed on failure.
+    func exportPromisedFile(_ remote: URL, to local: URL) async throws
 }
 
 public extension UserFileAccess {
@@ -102,6 +106,21 @@ public extension UserFileAccess {
                     progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws {
         try await exportFile(remote, to: local)
         progress(.init(bytesTransferred: 0, isComplete: true))
+    }
+    /// Downloads into this app's own temporary directory, then copies the
+    /// finished item to the promised URL.
+    func exportPromisedFile(_ remote: URL, to local: URL) async throws {
+        try await FileTransferLocalIO.writePromised(to: local) { [self] destination in
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("nativepipe-promise-" + UUID().uuidString, isDirectory: true)
+            try await FileTransferLocalIO.perform {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+            }
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let staged = directory.appendingPathComponent(destination.lastPathComponent)
+            try await exportFile(remote, to: staged)
+            try await FileTransferLocalIO.perform { try FileManager.default.copyItem(at: staged, to: destination) }
+        }
     }
     /// One destination per selected item; duplicates fail before any transfer.
     func exportFiles(_ remotes: [URL], to directory: URL,
@@ -337,6 +356,17 @@ public final class FileRPCUserAccess: UserFileRangeAccess {
             throw error
         }
         tracker.finish()
+    }
+
+    /// Streams straight into the promised URL.
+    public func exportPromisedFile(_ remote: URL, to local: URL) async throws {
+        _ = try FileTransferURLs.decode(FileTransferURLs.encode([remote]))
+        try await FileTransferLocalIO.writePromised(to: local) { [self] destination in
+            let info = try await rpc.stat(remote.path)
+            let tracker = FileTransferProgressTracker(totalBytes: info.isRegular ? info.size : nil, progress: { _ in })
+            try await download(remote.path, to: destination, relativePath: "", depth: 0, tracker: tracker)
+            tracker.finish()
+        }
     }
 
     private func download(_ remote: String, to local: URL, relativePath: String, depth: Int,

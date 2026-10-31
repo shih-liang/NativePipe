@@ -1,6 +1,7 @@
 import AppKit
 import Darwin
 import NativePipeProtocol
+import OSLog
 import UniformTypeIdentifiers
 
 // Published by the task before signalling, read only after the worker waits.
@@ -96,6 +97,7 @@ public final class LinuxFilePromise: NSObject, NSFilePromiseProviderDelegate {
         cachedProvider = provider
         return provider
     }
+    nonisolated private static let log = Logger(subsystem: "com.nativepipe", category: "FileDrag")
     nonisolated private static let queue: OperationQueue = {
         let queue = OperationQueue()
         queue.name = "com.nativepipe.file-promises"
@@ -107,14 +109,26 @@ public final class LinuxFilePromise: NSObject, NSFilePromiseProviderDelegate {
         self.remote = remote; self.write = write
     }
 
+    /// Copies through the shared volume when one can be published, otherwise
+    /// over the file connection.
     public convenience init(remote: URL, access: any UserFileAccess, publishGuestFiles: GuestFilePublisher? = nil) {
         self.init(remote: remote) { destination in
-            guard let publish = publishGuestFiles else { throw GuestFileSharingError.unavailable }
-            let files = try await publish([remote], access, .drag)
+            let files: [URL]
+            do {
+                guard let publish = publishGuestFiles else { throw GuestFileSharingError.unavailable }
+                files = try await publish([remote], access, .drag)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                try await access.exportPromisedFile(remote, to: destination)
+                return
+            }
             try Task.checkCancellation()
             guard files.count == 1, let source = files.first else { throw FileRPC.Failure.protocolError }
             _ = try FileTransferURLs.decode(FileTransferURLs.encode(files))
-            try await FileTransferLocalIO.copy(source: source, to: destination)
+            try await FileTransferLocalIO.writePromised(to: destination) { destination in
+                try await FileTransferLocalIO.perform { try FileManager.default.copyItem(at: source, to: destination) }
+            }
         }
     }
 
@@ -149,6 +163,10 @@ public final class LinuxFilePromise: NSObject, NSFilePromiseProviderDelegate {
         // the file-promise worker waits, never the AppKit event loop.
         done.wait()
         let error = result.error
+        if let error {
+            let detail = error as NSError
+            Self.log.error("Promise for \(self.remote.path, privacy: .public) to \(url.path, privacy: .public) failed: \(detail.domain, privacy: .public) \(detail.code) \(String(describing: error), privacy: .public)")
+        }
         completionHandler(error)
         Task { @MainActor in self.completed?(error) }
     }
