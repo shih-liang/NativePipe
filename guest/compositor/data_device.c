@@ -83,16 +83,7 @@ struct np_data_offer {
 	size_t host_data_length;
 };
 
-static void host_drag_receive(struct np_data_offer *offer, int fd, bool paths);
-/* Files dragged in from the host are offered the way GTK offers local files:
- * URIs, and their paths as plain text. Some toolkits' apps (WeChat) read the
- * path from text/plain rather than parsing text/uri-list. */
-static const char *const host_drag_mimes[] = {"text/uri-list", "text/plain;charset=utf-8", "text/plain"};
-static bool host_drag_mime(const char *mime) {
-    for (size_t i = 0; i < sizeof(host_drag_mimes) / sizeof(host_drag_mimes[0]); i++)
-        if (!strcmp(mime, host_drag_mimes[i])) return true;
-    return false;
-}
+static void host_drag_receive(struct np_data_offer *offer, int fd);
 static void host_drag_offer_destroyed(struct np_data_offer *offer);
 static void host_drag_finished(struct np_data_offer *offer, bool success) {
     if (offer->finished) return;
@@ -189,9 +180,8 @@ static void data_offer_receive(struct wl_client *client, struct wl_resource *res
 	struct np_data_offer *offer = wl_resource_get_user_data(resource);
 	if (offer && offer->from_host) {
 		if (offer->host_drag) {
-			if (host_drag_mime(mime_type) && !offer->finished &&
-			    (offer->active || offer->dropped))
-				host_drag_receive(offer, fd, strcmp(mime_type, "text/uri-list") != 0);
+			if (!strcmp(mime_type, "text/uri-list") && !offer->finished &&
+			    (offer->active || offer->dropped)) host_drag_receive(offer, fd);
 			else close(fd);
 			return;
 		}
@@ -244,7 +234,7 @@ static bool nullable_string_equal(const char *a, const char *b) {
 static void data_offer_accept(struct wl_client *client, struct wl_resource *resource,
                               uint32_t serial, const char *mime_type) {
 	struct np_data_offer *offer = wl_resource_get_user_data(resource);
-	if (offer && offer->host_drag && mime_type && !host_drag_mime(mime_type)) mime_type = NULL;
+	if (offer && offer->host_drag && mime_type && strcmp(mime_type, "text/uri-list")) mime_type = NULL;
 	if (!offer || nullable_string_equal(offer->accepted_mime, mime_type)) return;
 	char *accepted = mime_type ? strdup(mime_type) : NULL;
 	if (mime_type && !accepted) {
@@ -540,55 +530,7 @@ struct np_clip_pending {
 	uint32_t token;
 	int fd;
 	struct np_data_offer *offer;
-	/* A host drag read as text/plain: deliver local paths, not URIs. */
-	bool paths;
 };
-
-static int hex_value(unsigned char c) {
-	if (c >= '0' && c <= '9') return c - '0';
-	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-	return -1;
-}
-
-/// Turns a text/uri-list of file URIs into newline-separated local paths.
-/// Lines that are comments, not local file URIs, or decode to a NUL are
-/// skipped. Returns NULL (and *out_length 0) when nothing remains.
-static unsigned char *uri_list_paths(const unsigned char *bytes, size_t length, size_t *out_length) {
-	*out_length = 0;
-	unsigned char *out = malloc(length + 1);
-	if (!out) return NULL;
-	size_t used = 0, start = 0;
-	while (start < length) {
-		size_t end = start;
-		while (end < length && bytes[end] != '\n') end++;
-		size_t stop = end;
-		if (stop > start && bytes[stop - 1] == '\r') stop--;
-		const unsigned char *line = bytes + start;
-		size_t n = stop - start;
-		start = end + 1;
-		if (n < 8 || line[0] == '#' || memcmp(line, "file://", 7)) continue;
-		size_t i = 7;
-		if (n - i >= 9 && !memcmp(line + i, "localhost", 9)) i += 9;
-		if (i >= n || line[i] != '/') continue;
-		size_t mark = used;
-		if (used) out[used++] = '\n';
-		bool valid = true;
-		for (; i < n; i++) {
-			unsigned char c = line[i];
-			if (c == '%' && i + 2 < n && hex_value(line[i + 1]) >= 0 && hex_value(line[i + 2]) >= 0) {
-				c = (unsigned char)(hex_value(line[i + 1]) << 4 | hex_value(line[i + 2]));
-				i += 2;
-			}
-			if (!c) { valid = false; break; }
-			out[used++] = c;
-		}
-		if (!valid) used = mark;
-	}
-	if (!used) { free(out); return NULL; }
-	*out_length = used;
-	return out;
-}
 
 static void clip_request_from_host(struct np_server *server, const char *mime_type, int fd) {
 	struct np_clip_pending *pending = calloc(1, sizeof(*pending));
@@ -617,11 +559,9 @@ void np_data_deliver_host_data(struct np_server *server, uint32_t token,
 	                           bool present) {
 	struct np_clip_pending *pending, *tmp;
 	int fd = -1;
-	bool paths = false;
 	wl_list_for_each_safe(pending, tmp, &server->clip_pending, link) {
 		if (pending->token != token) continue;
 		fd = pending->fd;
-		paths = pending->paths;
 		wl_list_remove(&pending->link);
 		free(pending);
 		break;
@@ -629,9 +569,7 @@ void np_data_deliver_host_data(struct np_server *server, uint32_t token,
 	if (fd < 0) return;
 
 	unsigned char *data = NULL;
-	if (present && length && paths) {
-		data = uri_list_paths(bytes, length, &length);
-	} else if (present && length) {
+	if (present && length) {
 		data = malloc(length);
 		if (data) memcpy(data, bytes, length);
 	}
@@ -662,10 +600,10 @@ void np_data_deliver_host_data(struct np_server *server, uint32_t token,
 	clip_write_ready(fd, WL_EVENT_WRITABLE, write_state);
 }
 
-static void host_drag_receive(struct np_data_offer *offer, int fd, bool paths) {
+static void host_drag_receive(struct np_data_offer *offer, int fd) {
     struct np_clip_pending *p = calloc(1, sizeof(*p));
     if (!p) { close(fd); return; }
-    p->fd = fd; p->token = ++offer->server->next_clip_token; p->offer = offer; p->paths = paths;
+    p->fd = fd; p->token = ++offer->server->next_clip_token; p->offer = offer;
     wl_list_insert(&offer->server->clip_pending, &p->link);
     if (offer->host_data) np_data_deliver_host_data(offer->server, p->token,
         offer->host_data, offer->host_data_length, true);
@@ -794,8 +732,7 @@ bool np_data_handle_file_drag(struct np_server *s, struct np_window_reader *r) {
         offer = wl_resource_get_user_data(resource);
         offer->from_host = true; offer->host_drag = token; offer->active = true;
         wl_data_device_send_data_offer(device->resource, resource);
-        for (size_t i = 0; i < sizeof(host_drag_mimes) / sizeof(host_drag_mimes[0]); i++)
-            wl_data_offer_send_offer(resource, host_drag_mimes[i]);
+        wl_data_offer_send_offer(resource, "text/uri-list");
         if (wl_resource_get_version(resource) >= 3) {
             wl_data_offer_send_source_actions(resource, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
             wl_data_offer_send_action(resource, 0);
