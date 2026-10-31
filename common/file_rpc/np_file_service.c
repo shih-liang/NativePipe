@@ -345,13 +345,41 @@ static int op_stat(struct connection *connection, struct np_file2_stream *stream
 #else
     int fd = np_file_open(connection->root, path, O_RDONLY | O_NONBLOCK, 0);
 #endif
-    if (fd < 0) return ERROR;
     struct stat st;
+    if (fd < 0) {
+        /* Without O_PATH, report a final symbolic link itself, as Linux does. */
+        if (errno != ELOOP) return ERROR;
+        char *name = NULL;
+        int parent = path_parent(connection->root, path, &name);
+        if (parent < 0) return ERROR;
+        error = fstatat(parent, name, &st, AT_SYMLINK_NOFOLLOW) < 0 ? ERROR : 0;
+        close(parent);
+        if (error) return error;
+        unsigned char bytes[NP_FILE_METADATA]; metadata(bytes, &st);
+        return reply(stream, bytes, sizeof(bytes));
+    }
     error = fstat(fd, &st) < 0 ? ERROR : 0;
     close(fd);
     if (error) return error;
     unsigned char bytes[NP_FILE_METADATA]; metadata(bytes, &st);
     return reply(stream, bytes, sizeof(bytes));
+}
+
+/* A symbolic link's own target, never followed: folder copies recreate the
+ * link, as Finder does, rather than its destination. */
+static int op_readlink(struct connection *connection, struct np_file2_stream *stream, const unsigned char *body, size_t length) {
+    char path[4096], *name = NULL; size_t offset = 0;
+    int error = take_path(body, length, &offset, path, 0);
+    if (error) return error;
+    if (offset != length) return EINVAL;
+    int parent = path_parent(connection->root, path, &name);
+    if (parent < 0) return ERROR;
+    char target[NP_FILE_PATH_MAX + 1];
+    ssize_t count = readlinkat(parent, name, target, sizeof(target));
+    error = count < 0 ? ERROR : (size_t)count > NP_FILE_PATH_MAX ? ENAMETOOLONG : 0;
+    close(parent);
+    if (error) return error;
+    return reply(stream, target, (size_t)count);
 }
 
 static int op_open(struct connection *connection, struct np_file2_stream *stream, const unsigned char *body, size_t length) {
@@ -621,6 +649,7 @@ static void perform(struct connection *connection, struct job *job) {
     case NP_FILE_MKDIR: error = op_mkdir(connection, job->stream, job->body, job->length); break;
     case NP_FILE_SNAPSHOT: error = op_snapshot(connection, job->stream, job->body, job->length); break;
     case NP_FILE_RANGE: error = op_range(connection, job->stream, job->body, job->length); break;
+    case NP_FILE_READLINK: error = op_readlink(connection, job->stream, job->body, job->length); break;
     case NP_FILE_CREATE_STAGING: case NP_FILE_PUBLISH_STAGING: case NP_FILE_DISCARD_STAGING:
         error = op_staging(connection, job->stream, job->opcode, job->body, job->length); break;
     default: error = ENOSYS; break;

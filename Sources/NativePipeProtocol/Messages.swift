@@ -239,6 +239,7 @@ public struct PathStat: Sendable {
 
     public var isDirectory: Bool { (mode & 0o170000) == 0o040000 }
     public var isRegular: Bool { (mode & 0o170000) == 0o100000 }
+    public var isSymbolicLink: Bool { (mode & 0o170000) == 0o120000 }
     public var isSymlink: Bool { (mode & 0o170000) == 0o120000 }
     public var permissions: UInt32 { mode & 0o7777 }
 }

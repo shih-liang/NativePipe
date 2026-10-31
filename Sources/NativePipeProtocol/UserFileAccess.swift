@@ -388,6 +388,12 @@ public final class FileRPCUserAccess: UserFileRangeAccess {
             try await FileTransferLocalIO.perform {
                 guard chmod(local.path, mode_t(info.permissions & 0o777)) == 0 else { throw FileRPC.Failure.local(errno) }
             }
+        } else if info.isSymbolicLink {
+            // Like a Finder copy, a link inside a folder stays a link.
+            let target = try await rpc.readlink(remote)
+            try await FileTransferLocalIO.perform {
+                guard symlink(target, local.path) == 0 else { throw FileRPC.Failure.local(errno) }
+            }
         } else {
             guard info.isRegular else { throw FileRPC.Failure.invalidPath }
             let fd = try await FileTransferLocalIO.perform {

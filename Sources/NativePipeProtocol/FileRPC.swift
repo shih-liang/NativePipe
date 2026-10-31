@@ -191,6 +191,17 @@ public struct FileRPC: Sendable {
         }
     }
 
+    /// A symbolic link's own target, which is never followed.
+    public func readlink(_ path: String) async throws -> String {
+        try await operation { session in
+            let reply = try session.call(NP_FILE_READLINK, Session.path(path)).body
+            guard !reply.isEmpty, !reply.contains(0), let target = String(data: reply, encoding: .utf8) else {
+                throw Failure.invalidPath
+            }
+            return target
+        }
+    }
+
     /// A pinned-file revision includes inode, device, size, and nanosecond
     /// modification/change times. No file contents are read by this request.
     public func snapshot(_ path: String) async throws -> UserFileMetadata {
