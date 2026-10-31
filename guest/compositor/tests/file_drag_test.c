@@ -76,7 +76,7 @@ static struct np_data_offer *enter(struct np_server *s, struct wl_client *client
     command(s, 1, token, NULL);
     struct np_data_offer *offer = wl_container_of(s->data_offers.next, offer, link);
     assert(offer->host_drag == token && offer->active);
-    data_offer_accept(client, offer->resource, 0, "text/plain");
+    data_offer_accept(client, offer->resource, 0, "application/octet-stream");
     assert(!offer->accepted_mime);
     data_offer_accept(client, offer->resource, 0, "text/uri-list");
     data_offer_set_actions(client, offer->resource, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY,
@@ -297,6 +297,26 @@ int main(void) {
     command(&s, 4, 3, NULL);
     wl_resource_destroy(first->resource);
     assert(last_action == 104 && last_token == 3 && !last_success);
+
+    /* Apps that read text/plain get decoded local paths, one per line. */
+    first = enter(&s, client, 5);
+    data_offer_accept(client, first->resource, 0, "text/plain;charset=utf-8");
+    assert(first->accepted_mime && !strcmp(first->accepted_mime, "text/plain;charset=utf-8"));
+    command(&s, 4, 5, NULL);
+    const char *uris = "# comment\r\nfile:///run/drops/%E7%94%B3%E8%AF%B7%20a.docx\r\n"
+                       "file://localhost/tmp/b\r\nhttps://example.com/c\r\nfile:///bad%00name\r\n";
+    const char *paths = "/run/drops/\xe7\x94\xb3\xe8\xaf\xb7 a.docx\n/tmp/b";
+    int text = receive_type(first, client, "text/plain");
+    fd = receive(first, client);
+    command(&s, 5, 5, uris);
+    char big[256]; ssize_t got = read(text, big, sizeof(big));
+    assert(got == (ssize_t)strlen(paths) && !memcmp(big, paths, strlen(paths)));
+    assert(read(text, big, sizeof(big)) == 0); close(text);
+    assert(read(fd, big, sizeof(big)) == (ssize_t)strlen(uris) && !memcmp(big, uris, strlen(uris)));
+    close(fd);
+    data_offer_finish(client, first->resource);
+    assert(last_action == 104 && last_token == 5 && last_success);
+    wl_resource_destroy(first->resource);
 
     first = enter(&s, client, 4); fd = receive(first, client);
     np_data_host_disconnected(&s);
