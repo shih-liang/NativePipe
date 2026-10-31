@@ -213,7 +213,7 @@ final class FileDragBridge: NSObject, NSDraggingSource {
         } else if copyingOut {
             let token = outgoing
             promises = outgoingURLs.map { remote in
-                LinuxFilePromise(remote: remote) { try await access.exportFile(remote, to: $0) }
+                LinuxFilePromise(remote: remote) { try await access.exportPromisedFile(remote, to: $0) }
             }
             remaining = promises.count; failed = false
             for promise in promises {

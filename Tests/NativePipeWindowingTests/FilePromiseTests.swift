@@ -97,6 +97,30 @@ final class FilePromiseTests: XCTestCase {
         }
     }
 
+    func testPromiseWritesOnlyTheDestinationAndCleansFailures() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("promised-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("file.bin"), access = PromiseFileAccess()
+        // A sandboxed promise may write the promised URL only: no sibling staging.
+        try await access.exportPromisedFile(URL(fileURLWithPath: "/guest/file.bin"), to: destination)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), ["file.bin"])
+        XCTAssertEqual(try Data(contentsOf: destination), PromiseFileAccess.contents)
+        do {
+            try await access.exportPromisedFile(URL(fileURLWithPath: "/guest/file.bin"), to: destination)
+            XCTFail("An existing destination must not be replaced")
+        } catch { XCTAssertEqual(try Data(contentsOf: destination), PromiseFileAccess.contents) }
+        let failing = directory.appendingPathComponent("partial.bin")
+        do {
+            try await FileTransferLocalIO.writePromised(to: failing) { url in
+                try Data("partial".utf8).write(to: url)
+                throw POSIXError(.EIO)
+            }
+            XCTFail("The failed write must be reported")
+        } catch { XCTAssertEqual((error as? POSIXError)?.code, .EIO) }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: failing.path))
+    }
+
     func testProviderOwnsWriterAfterSourceDisappearsWithoutRetainCycle() throws {
         _ = NSApplication.shared
         var access: PromiseFileAccess? = PromiseFileAccess()

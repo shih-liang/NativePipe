@@ -120,13 +120,15 @@ public final class LinuxFilePromise: NSObject, NSFilePromiseProviderDelegate {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                try await access.exportFile(remote, to: destination)
+                try await access.exportPromisedFile(remote, to: destination)
                 return
             }
             try Task.checkCancellation()
             guard files.count == 1, let source = files.first else { throw FileRPC.Failure.protocolError }
             _ = try FileTransferURLs.decode(FileTransferURLs.encode(files))
-            try await FileTransferLocalIO.copy(source: source, to: destination)
+            try await FileTransferLocalIO.writePromised(to: destination) { destination in
+                try await FileTransferLocalIO.perform { try FileManager.default.copyItem(at: source, to: destination) }
+            }
         }
     }
 
