@@ -1,5 +1,6 @@
 import AppKit
 import NativePipeProtocol
+import NativePipeSharing
 @testable import NativePipeWindowing
 import XCTest
 
@@ -10,14 +11,14 @@ final class ClipboardBridgeTests: XCTestCase {
         defer { pasteboard.releaseGlobally() }
         let files = ClipboardTestFiles()
         let bridge = ClipboardBridge(pasteboard: pasteboard)
-        bridge.fileAccess = files
+        bridge.sharing = SharingSession(transport: files)
         defer { bridge.stop() }
         let paths = ["/guest/Résumé.txt".precomposedStringWithCanonicalMapping,
                      "/guest/Résumé".decomposedStringWithCanonicalMapping]
         let remotes = [try RemoteFileURL.make(paths[0]), try RemoteFileURL.make(paths[1], isDirectory: true)]
         let mounted = [URL(fileURLWithPath: "/Volumes/Shared/document"), URL(fileURLWithPath: "/Volumes/Shared/folder", isDirectory: true)]
         var published: [URL] = []
-        bridge.publishGuestFiles = { urls, access, purpose in
+        bridge.sharing?.hostVolume = ClosureHostVolume { urls, access, purpose in
             XCTAssertEqual(purpose, .clipboard)
             XCTAssertTrue((access as AnyObject) === files)
             published = urls
@@ -43,10 +44,10 @@ final class ClipboardBridgeTests: XCTestCase {
         let pasteboard = NSPasteboard.withUniqueName()
         defer { pasteboard.releaseGlobally() }
         let bridge = ClipboardBridge(pasteboard: pasteboard)
-        bridge.fileAccess = ClipboardTestFiles()
+        bridge.sharing = SharingSession(transport: ClipboardTestFiles())
         defer { bridge.stop() }
         var resume: CheckedContinuation<[URL], Never>?
-        bridge.publishGuestFiles = { _, _, _ in await withCheckedContinuation { resume = $0 } }
+        bridge.sharing?.hostVolume = ClosureHostVolume { _, _, _ in await withCheckedContinuation { resume = $0 } }
         bridge.connectionReady()
         pasteboard.clearContents(); pasteboard.setString("keep", forType: .string)
         var token: UInt32?
@@ -68,14 +69,15 @@ final class ClipboardBridgeTests: XCTestCase {
         let pasteboard = NSPasteboard.withUniqueName()
         defer { pasteboard.releaseGlobally() }
         let bridge = ClipboardBridge(pasteboard: pasteboard)
-        bridge.fileAccess = ClipboardTestFiles()
+        bridge.sharing = SharingSession(transport: ClipboardTestFiles())
         defer { bridge.stop() }
-        var published = false, revocations = 0
-        bridge.publishGuestFiles = { _, _, purpose in
+        var published = false
+        let volume = ClosureHostVolume { _, _, purpose in
             XCTAssertEqual(purpose, .clipboard); published = true
             return [URL(fileURLWithPath: "/Volumes/Shared/file")]
         }
-        bridge.onFileSharingRevoked = { revocations += 1 }
+        bridge.sharing?.hostVolume = volume
+        var revocations: Int { volume.revoked.filter { $0 == .clipboard }.count }
         bridge.connectionReady()
         var token: UInt32?
         bridge.output = { if case .selectionRequest(let value, _) = $0 { token = value } }
@@ -140,8 +142,8 @@ final class ClipboardBridgeTests: XCTestCase {
         defer { pasteboard.releaseGlobally() }
         let sourceFiles = ClipboardTestFiles(), destinationFiles = ClipboardTestFiles()
         let source = ClipboardBridge(pasteboard: pasteboard), destination = ClipboardBridge(pasteboard: pasteboard)
-        source.fileAccess = sourceFiles; destination.fileAccess = destinationFiles
-        source.publishGuestFiles = { _, _, purpose in XCTAssertEqual(purpose, .clipboard); return [file, folder] }
+        source.sharing = SharingSession(transport: sourceFiles); destination.sharing = SharingSession(transport: destinationFiles)
+        source.sharing?.hostVolume = ClosureHostVolume { _, _, purpose in XCTAssertEqual(purpose, .clipboard); return [file, folder] }
         defer { source.stop(); destination.stop() }
         source.connectionReady()
         var request: UInt32?
@@ -177,22 +179,32 @@ final class ClipboardBridgeTests: XCTestCase {
         }
     }
 
-    func testMissingPublisherReportsUnavailableWithoutChangingClipboardOrExporting() throws {
+    func testWithoutSharedVolumeGuestFilesAreCopiedOnlyWhenPasted() async throws {
         let pasteboard = NSPasteboard.withUniqueName()
         defer { pasteboard.releaseGlobally() }
-        pasteboard.setString("keep", forType: .string)
+        pasteboard.setString("old", forType: .string)
         let files = ClipboardTestFiles(), bridge = ClipboardBridge(pasteboard: pasteboard)
-        bridge.fileAccess = files
-        defer { bridge.stop() }
+        files.allowsExports = true
+        bridge.sharing = SharingSession(transport: files)
+        bridge.sharing?.hostVolume = unavailableVolume()
+        defer { bridge.stop(); bridge.sharing?.stop() }
         bridge.connectionReady()
-        var request: UInt32?, failure: Error?
+        var request: UInt32?
         bridge.output = { if case .selectionRequest(let token, _) = $0 { request = token } }
-        bridge.onError = { failure = $0 }
         bridge.guestOffered(mimeTypes: ["text/uri-list"])
-        bridge.guestSuppliedData(token: try XCTUnwrap(request), data: FileTransferURLs.encode([URL(fileURLWithPath: "/guest/file")]))
-        XCTAssertTrue(failure is GuestFileSharingError)
-        XCTAssertEqual(files.exports, 0); XCTAssertEqual(pasteboard.string(forType: .string), "keep")
-        XCTAssertFalse((pasteboard.types ?? []).contains(.fileURL))
+        bridge.guestSuppliedData(token: try XCTUnwrap(request), data: FileTransferURLs.encode([URL(fileURLWithPath: "/guest/report.txt")]))
+        for _ in 0..<100 {
+            if (pasteboard.types ?? []).contains(.fileURL) { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue((pasteboard.types ?? []).contains(.fileURL))
+        XCTAssertEqual(files.detachedExports.value, 0, "Copying must not transfer anything before a paste")
+        let pasted = try XCTUnwrap(pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL])
+        XCTAssertEqual(files.detachedExports.value, 1)
+        XCTAssertEqual(pasted.map(\.lastPathComponent), ["report.txt"])
+        XCTAssertEqual(try String(contentsOf: pasted[0], encoding: .utf8), "exported /guest/report.txt")
+        _ = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true])
+        XCTAssertEqual(files.detachedExports.value, 1, "A second read reuses the copy")
     }
 
     func testCancelledPasteCancelsImporterWithoutDeletingSharedSource() async throws {
@@ -205,7 +217,7 @@ final class ClipboardBridgeTests: XCTestCase {
         defer { pasteboard.releaseGlobally() }
         pasteboard.writeObjects([file as NSURL])
         let files = ClipboardTestFiles(), bridge = ClipboardBridge(pasteboard: pasteboard)
-        files.delay = true; bridge.fileAccess = files
+        files.delay = true; bridge.sharing = SharingSession(transport: files)
         defer { bridge.stop() }
         bridge.connectionReady()
         bridge.guestRequestedHostData(token: 1, mimeType: "text/uri-list")
@@ -228,7 +240,7 @@ final class ClipboardBridgeTests: XCTestCase {
         defer { pasteboard.releaseGlobally() }
         pasteboard.writeObjects([URL(fileURLWithPath: "/nonexistent/linportal-test-" + UUID().uuidString) as NSURL])
         let bridge = ClipboardBridge(pasteboard: pasteboard), files = ClipboardTestFiles()
-        bridge.fileAccess = files
+        bridge.sharing = SharingSession(transport: files)
         defer { bridge.stop() }
         bridge.connectionReady()
         let completed = expectation(description: "failed paste answered")
@@ -245,10 +257,20 @@ final class ClipboardBridgeTests: XCTestCase {
 private final class ClipboardTestFiles: UserFileAccess {
     var imported: [(String, Bool)] = []
     var exports = 0
+    var allowsExports = false
+    let detachedExports = ExportCount()
+    var detachedExport: (@Sendable (URL, URL) async throws -> Void)? {
+        guard allowsExports else { return nil }
+        let count = detachedExports
+        return { remote, local in
+            count.increment()
+            try Data("exported \(remote.path)".utf8).write(to: local, options: .withoutOverwriting)
+        }
+    }
     var delay = false
     var importStarted = false
     var cancelled = false
-    func importFiles(_ urls: [URL], shareDirectories: Bool) async throws -> [URL] {
+    func importFiles(_ urls: [URL], progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws -> [URL] {
         importStarted = true
         if delay {
             do { try await Task.sleep(for: .seconds(10)) }
@@ -261,12 +283,23 @@ private final class ClipboardTestFiles: UserFileAccess {
                 return try String(contentsOf: file, encoding: .utf8)
             }
         }
-        imported += texts.map { ($0, shareDirectories) }
+        imported += texts.map { ($0, true) }
         return urls.map { URL(fileURLWithPath: "/destination/" + $0.lastPathComponent) }
     }
     func exportFile(_ remote: URL, to local: URL) async throws {
         exports += 1
-        XCTFail("File sharing must never export a private copy")
-        throw FileRPC.Failure.protocolError
+        guard allowsExports else {
+            XCTFail("A mounted volume must never need a private copy")
+            throw FileRPC.Failure.protocolError
+        }
+        try Data("exported \(remote.path)".utf8).write(to: local, options: .withoutOverwriting)
     }
+}
+
+/// Counts copies made off the main actor.
+final class ExportCount: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    var value: Int { lock.withLock { count } }
+    func increment() { lock.withLock { count += 1 } }
 }

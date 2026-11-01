@@ -3,6 +3,7 @@ import CoreServices
 import Darwin
 import Foundation
 import NativePipeProtocol
+import NativePipeSharing
 import NativePipeStrings
 
 public enum GuestOpenPrompt: Equatable {
@@ -18,19 +19,18 @@ public enum GuestOpenAction: Equatable {
 }
 
 /// The same approval and transfer workflow serves VM vsock and SSH stdio.
-/// All guest files are published through the virtual filesystem; explicit
-/// Save copies the mounted item to the user-selected destination.
+/// Files come through the machine's SharingSession: the live shared volume
+/// when it can be mounted, otherwise a copy made for this request.
 @MainActor
 public final class GuestOpenCoordinator {
     private let machineName: String
     private let isEnabled: () -> Bool
     private let shares: () -> [GuestOpenPolicy.SharedFolder]
-    private let fileAccess: UserFileAccess
+    private let sharing: SharingSession
     private let confirm: @MainActor (GuestOpenPrompt) async -> GuestOpenAction
     private let open: @MainActor (URL) async -> Bool
     private let quarantine: @MainActor (URL) async throws -> Void
     private let transferProgress: (@Sendable (FileTransferProgress) -> Void)?
-    private let publishGuestFiles: GuestFilePublisher?
     private var active: Task<HostOpenWire.Response, Never>?
     private var activeID: UUID?
     private var stopped = false
@@ -38,17 +38,15 @@ public final class GuestOpenCoordinator {
 
     public init(machineName: String, isEnabled: @escaping () -> Bool = { true },
                 shares: @escaping () -> [GuestOpenPolicy.SharedFolder] = { [] },
-                fileAccess: UserFileAccess,
+                sharing: SharingSession,
                 confirm: @escaping @MainActor (GuestOpenPrompt) async -> GuestOpenAction = GuestOpenDialogs.confirm,
                 open: @escaping @MainActor (URL) async -> Bool = GuestOpenCoordinator.openWithWorkspace,
                 quarantine: @escaping @MainActor (URL) async throws -> Void = GuestOpenCoordinator.markAsDownloaded,
-                transferProgress: (@Sendable (FileTransferProgress) -> Void)? = nil,
-                publishGuestFiles: GuestFilePublisher? = nil) {
+                transferProgress: (@Sendable (FileTransferProgress) -> Void)? = nil) {
         self.machineName = machineName; self.isEnabled = isEnabled; self.shares = shares
-        self.fileAccess = fileAccess; self.confirm = confirm
+        self.sharing = sharing; self.confirm = confirm
         self.open = open; self.quarantine = quarantine
         self.transferProgress = transferProgress
-        self.publishGuestFiles = publishGuestFiles
     }
 
     public func handle(_ request: HostOpenWire.Request) async -> HostOpenWire.Response {
@@ -107,13 +105,34 @@ public final class GuestOpenCoordinator {
         defer { progressWindow?.close(); scopedDestination?.stopAccessingSecurityScopedResource() }
         do {
             try check(share)
-            guard let publishGuestFiles else { throw GuestFileSharingError.unavailable }
             // Consent precedes registration and all range reads. Opening does
             // not crawl or mutate the read-only volume's quarantine attributes.
-            let files = try await publishGuestFiles([RemoteFileURL.make(path)], fileAccess, .open)
+            let remote = try RemoteFileURL.make(path)
+            let mounted: URL?
+            switch try await sharing.hostFiles(for: [remote], purpose: .open) {
+            case .mounted(let urls): mounted = urls.first
+            case .deferred: mounted = nil
+            }
             try check(share)
-            guard files.count == 1, let source = files.first else { throw FileRPC.Failure.protocolError }
-            _ = try FileTransferURLs.decode(FileTransferURLs.encode(files))
+            if case .save(let destination) = action, mounted == nil {
+                let parent = destination.deletingLastPathComponent()
+                if parent.startAccessingSecurityScopedResource() { scopedDestination = parent }
+                // The save panel grants this one URL: write it in place.
+                try await sharing.copyGuestItem(remote, to: destination, promised: true)
+                savedCopy = destination
+                try check(share)
+                try await quarantine(destination)
+                try check(share)
+                return .init(status: .opened, message: NPText("Saved on the Mac."))
+            }
+            let source: URL
+            if let mounted { source = mounted }
+            else {
+                // A private copy is a download: mark it like a saved file.
+                source = try await sharing.temporaryCopy(of: remote, purpose: .open, progress: transferProgress ?? { _ in })
+                try await quarantine(source)
+            }
+            try check(share)
             if case .save(let destination) = action {
                 let parent = destination.deletingLastPathComponent()
                 if parent.startAccessingSecurityScopedResource() { scopedDestination = parent }

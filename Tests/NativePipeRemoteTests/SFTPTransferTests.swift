@@ -34,7 +34,7 @@ final class SFTPTransferTests: XCTestCase {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
         try data.write(to: folder.appendingPathComponent("child.txt"))
         let files = RemoteUserFileAccess(command: command, environment: env)
-        let imported = try await files.importFiles([folder], shareDirectories: false)
+        let imported = try await files.importFiles([folder])
         let importedRoot = try XCTUnwrap(imported.first).deletingLastPathComponent().path
         XCTAssertTrue(importedRoot.hasPrefix("/tmp/nativepipe-drop-"))
         defer {

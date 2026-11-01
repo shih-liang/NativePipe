@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import NativePipeProtocol
+import NativePipeSharing
 import XCTest
 @testable import NativePipeWindowing
 
@@ -12,13 +13,18 @@ private final class ReceivedFiles: UserFileAccess {
     var size = 6
     var contents = Data("hello!".utf8)
     var fails = false
+    var allowsExports = false
     var afterPublication: (() -> Void)?
     var sources: [URL] = []
     var mounted: [URL] = []
-    func importFiles(_ urls: [URL], shareDirectories: Bool) async throws -> [URL] { urls }
+    func importFiles(_ urls: [URL], progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws -> [URL] { urls }
     func exportFile(_ remote: URL, to local: URL) async throws {
-        exports += 1; XCTFail("np-open must never export a private guest copy")
-        throw FileRPC.Failure.protocolError
+        exports += 1
+        guard allowsExports else {
+            XCTFail("A mounted volume must never need a private guest copy")
+            throw FileRPC.Failure.protocolError
+        }
+        try contents.write(to: local, options: .withoutOverwriting)
     }
     func publish(_ urls: [URL], in root: URL) async throws -> [URL] {
         publications += 1; sources += urls
@@ -70,14 +76,16 @@ final class GuestOpenCoordinatorTests: XCTestCase {
             XCTAssertEqual(purpose, .open)
             return try await received.publish(urls, in: root)
         }
+        let sharing = SharingSession(transport: received)
+        if let publisher { sharing.hostVolume = ClosureHostVolume(publisher) }
         return GuestOpenCoordinator(machineName: "Test Linux", isEnabled: enabled, shares: shares,
-            fileAccess: received,
+            sharing: sharing,
             confirm: { [self] prompt in prompts.append(prompt); return await action(prompt) },
             open: { [self] url in opened.append(url); return true },
             quarantine: { [self] url in
                 if markFails { throw FileRPC.Failure.protocolError }
                 marked.append(url); afterQuarantine?()
-            }, transferProgress: { _ in }, publishGuestFiles: publisher)
+            }, transferProgress: { _ in })
     }
 
     func testMountPublicationHappensOnlyAfterReceiveApprovalAndNeedsNoPrivateCopy() async throws {
@@ -99,17 +107,22 @@ final class GuestOpenCoordinatorTests: XCTestCase {
         XCTAssertEqual(opened, [file]); XCTAssertTrue(marked.isEmpty)
     }
 
-    func testMissingPublisherNeverFallsBackToExportForOpenOrSave() async throws {
+    func testWithoutSharedVolumeOpenAndSaveCopyOverTheFileConnection() async throws {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        received.allowsExports = true
         let destination = root.appendingPathComponent("saved.txt")
-        for action in [GuestOpenAction.open, .save(destination)] {
-            let response = await coordinator(action: { _ in action }, fileSharingAvailable: false)
-                .handle(.init(kind: .file, value: "/guest/file.txt"))
-            XCTAssertEqual(response.status, .failed); XCTAssertNotNil(response.message)
-        }
-        XCTAssertEqual(received.publications, 0); XCTAssertEqual(received.exports, 0)
-        XCTAssertTrue(opened.isEmpty); XCTAssertTrue(marked.isEmpty)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        let opening = await coordinator(action: { _ in .open }, fileSharingAvailable: false)
+            .handle(.init(kind: .file, value: "/guest/file.txt"))
+        XCTAssertEqual(opening.status, .opened)
+        XCTAssertEqual(opened.map(\.lastPathComponent), ["file.txt"])
+        XCTAssertEqual(marked, opened, "A private copy is marked as downloaded before it opens")
+        let saving = await coordinator(action: { _ in .save(destination) }, fileSharingAvailable: false)
+            .handle(.init(kind: .file, value: "/guest/file.txt"))
+        XCTAssertEqual(saving.status, .opened)
+        XCTAssertEqual(try Data(contentsOf: destination), received.contents)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), ["saved.txt"],
+                       "Save writes the chosen URL in place, with no sibling staging")
+        XCTAssertEqual(received.publications, 0); XCTAssertEqual(received.exports, 2)
     }
 
     func testPublishedExecutableStillRequiresIndividualExecutionApproval() async throws {

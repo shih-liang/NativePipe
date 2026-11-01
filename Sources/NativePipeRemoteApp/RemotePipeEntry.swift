@@ -2,6 +2,7 @@ import AppKit
 import NativePipeRemote
 import NativePipeStrings
 import NativePipeFileSharing
+import NativePipeSharing
 import NativePipeWindowing
 
 @main
@@ -27,13 +28,9 @@ struct RemotePipeMain {
                 let sharing = SharedFileVolumeBroker(
                     directory: FileManager.default.temporaryDirectory.appendingPathComponent("npfs-" + UUID().uuidString.prefix(8)),
                     name: command.destination)
-                delegate.display.bridge.publishGuestFiles = { try await sharing.publish($0, using: $1, purpose: $2) }
-                delegate.display.bridge.onGuestFileSharingRevoked = { sharing.revoke() }
-                delegate.display.bridge.onClipboardFileSharingRevoked = { sharing.revoke(purpose: .clipboard) }
-                stopSharing = { sharing.stop() }
-            } else {
-                delegate.display.bridge.publishGuestFiles = { _, _, _ in throw GuestFileSharingError.unavailable }
+                delegate.display.bridge.sharing?.hostVolume = sharing
             }
+            stopSharing = { [weak bridge = delegate.display.bridge] in bridge?.sharing?.stop() }
             delegate.aboutPanelOptions = [
                 .applicationName: "NativePipe",
                 .applicationVersion: NativePipeVersion.current,

@@ -1,21 +1,22 @@
 import AppKit
 import NativePipeProtocol
+import NativePipeSharing
 
 /// Joins the Wayland selection to NSPasteboard.
 ///
 /// The two models agree more than they differ: both are "one owner, advertising
 /// a set of types, handing over bytes on demand". What they disagree about is
-/// naming. Small values and file names are resolved at announce time; embedded
-/// clients publish mounted URLs whose contents are fetched only on Mac reads.
-/// Every file selection uses standard mounted URLs, including cross-machine paste.
+/// naming, which ContentFormats translates. Small values and file names are
+/// resolved at announce time; files go through the machine's SharingSession,
+/// which either mounts them or copies each one when it is pasted.
 @MainActor
 final class ClipboardBridge {
     /// Sends a host command to the guest.
     var output: ((Windowing.HostCommand) -> Void)?
-    var fileAccess: (any UserFileAccess)?
-    var publishGuestFiles: GuestFilePublisher?
-    var onFileSharingRevoked: (() -> Void)?
+    var sharing: SharingSession?
     var onError: ((Error) -> Void)?
+    /// Supplies on-demand file copies while it owns the Mac pasteboard.
+    private var fileProvider: GuestFilePasteboardProvider?
     private var selectionGeneration: UInt64 = 0
     private var connectionGeneration: UInt64 = 0
     private var hostTransfers: [UInt32: Task<Void, Never>] = [:]
@@ -32,22 +33,6 @@ final class ClipboardBridge {
     private var poll: Timer?
     private var allowsHostToGuest = true
     private var allowsGuestToHost = true
-
-    /// Preference order, best first. The guest is asked for the first type it
-    /// actually offers rather than for everything, because the announcement is
-    /// resolved eagerly: fetching all of them would copy an image across the
-    /// channel to satisfy a paste that only ever wanted the text.
-    private static let guestToNative: [(mime: String, native: NSPasteboard.PasteboardType)] = [
-        ("text/uri-list", .fileURL),
-        ("text/plain;charset=utf-8", .string),
-        ("UTF8_STRING", .string),
-        ("text/plain", .string),
-        ("STRING", .string),
-        ("TEXT", .string),
-        ("text/html", .html),
-        ("image/png", .png),
-        ("image/tiff", .tiff),
-    ]
 
     private static func note(_ message: @autoclosure () -> String) {
         guard ProcessInfo.processInfo.environment["NATIVEPIPE_WINDOW_TRACE"] != nil else { return }
@@ -80,7 +65,7 @@ final class ClipboardBridge {
     func stop() {
         poll?.invalidate()
         poll = nil
-        pendingGuestReads.removeAll()
+        abandonGuestReads()
         disconnect()
     }
 
@@ -91,7 +76,7 @@ final class ClipboardBridge {
         guestPublication?.cancel(); guestPublication = nil
         for task in hostTransfers.values { task.cancel() }
         hostTransfers.removeAll()
-        pendingGuestReads.removeAll()
+        abandonGuestReads()
     }
 
     func setPolicy(hostToGuest: Bool, guestToHost: Bool) {
@@ -109,12 +94,10 @@ final class ClipboardBridge {
             for task in hostTransfers.values { task.cancel() }
         }
         if !guestToHost {
-            if guestChanged { onFileSharingRevoked?() }
+            if guestChanged { sharing?.revoke(.clipboard) }
             selectionGeneration &+= 1
             guestPublication?.cancel(); guestPublication = nil
-            let pending = Array(pendingGuestReads.values)
-            pendingGuestReads.removeAll()
-            for completion in pending { completion(nil) }
+            abandonGuestReads()
         }
     }
 
@@ -125,61 +108,87 @@ final class ClipboardBridge {
     func guestOffered(mimeTypes: [String]) {
         selectionGeneration &+= 1
         guestPublication?.cancel(); guestPublication = nil
-        pendingGuestReads.removeAll()
-        onFileSharingRevoked?()
+        abandonGuestReads()
+        sharing?.revoke(.clipboard)
         let generation = selectionGeneration
         let changeCount = pasteboard.changeCount
         guard connected, allowsGuestToHost else { return }
-        guard !mimeTypes.isEmpty else { return }
-        let offered = Set(mimeTypes)
-        guard let match = Self.guestToNative.first(where: { offered.contains($0.mime) }) else {
-            return
+        // Only the best representations are fetched: the announcement is
+        // resolved eagerly, and fetching every type would copy an image across
+        // the channel for a paste that only ever wanted the text.
+        let wanted = ContentFormats.preferredGuestTypes(from: mimeTypes)
+        guard !wanted.isEmpty else { return }
+        var answers = [Data?](repeating: nil, count: wanted.count)
+        var remaining = wanted.count
+        for (index, mime) in wanted.enumerated() {
+            requestFromGuest(mime: mime) { [weak self] data in
+                answers[index] = data
+                remaining -= 1
+                guard remaining == 0, let self, self.selectionGeneration == generation,
+                      self.pasteboard.changeCount == changeCount else { return }
+                let fetched = zip(wanted, answers).compactMap { mime, data in
+                    data.flatMap { $0.isEmpty ? nil : (mime: mime, data: $0) }
+                }
+                guard !fetched.isEmpty else { return }
+                self.publishGuestSelection(fetched, generation: generation, changeCount: changeCount)
+            }
         }
-        requestFromGuest(mime: match.mime) { [weak self] data in
-            guard let self, self.selectionGeneration == generation,
-                  self.pasteboard.changeCount == changeCount,
-                  let data, !data.isEmpty else { return }
-            if match.native == .fileURL {
-                guard let access = self.fileAccess, let publish = self.publishGuestFiles else {
-                    self.onError?(GuestFileSharingError.unavailable); return
-                }
-                let urls: [URL]
-                do { urls = try FileTransferURLs.decode(data) }
-                catch { self.onError?(error); return }
-                self.guestPublication = Task { @MainActor [weak self] in
-                    do {
-                        let hostURLs = try await publish(urls, access, .clipboard)
-                        try Task.checkCancellation()
-                        guard let self, self.connected, self.allowsGuestToHost,
-                              self.selectionGeneration == generation,
-                              self.pasteboard.changeCount == changeCount else { return }
-                        _ = try FileTransferURLs.decode(FileTransferURLs.encode(hostURLs))
-                        guard hostURLs.count == urls.count else { throw FileRPC.Failure.protocolError }
-                        self.pasteboard.clearContents()
+    }
+
+    /// Puts what the guest copied on the Mac pasteboard as one item. Files go
+    /// through the sharing backend; everything else is converted right away.
+    private func publishGuestSelection(_ fetched: [(mime: String, data: Data)],
+                                       generation: UInt64, changeCount: Int) {
+        if let files = fetched.first(where: { $0.mime == ContentFormats.fileList }),
+           let urls = try? FileTransferURLs.decode(files.data), urls.allSatisfy(\.isFileURL) {
+            guard let sharing else { onError?(GuestFileSharingError.unavailable); return }
+            guestPublication = Task { @MainActor [weak self] in
+                do {
+                    let shared = try await sharing.hostFiles(for: urls, purpose: .clipboard)
+                    try Task.checkCancellation()
+                    guard let self, self.connected, self.allowsGuestToHost, self.selectionGeneration == generation,
+                          self.pasteboard.changeCount == changeCount else { return }
+                    self.pasteboard.clearContents()
+                    switch shared {
+                    case .mounted(let hostURLs):
                         guard self.pasteboard.writeObjects(hostURLs as [NSURL]) else { throw FileRPC.Failure.protocolError }
-                        self.lastSeenChangeCount = self.pasteboard.changeCount
-                    } catch {
-                        guard !(error is CancellationError), let self,
-                              self.selectionGeneration == generation else { return }
-                        self.onError?(error)
+                    case .deferred(let guestURLs):
+                        // Copied only when an app pastes them (copy at paste time).
+                        let provider = try GuestFilePasteboardProvider(session: sharing)
+                        provider.onError = { [weak self] in self?.onError?($0) }
+                        self.fileProvider = provider
+                        guard self.pasteboard.writeObjects(provider.items(for: guestURLs)) else { throw FileRPC.Failure.protocolError }
                     }
-                }
-                return
-            } else {
-                // declareTypes, not clearContents: setData refuses to write a
-                // type the pasteboard was never told to expect, and it reports
-                // that by returning false rather than by failing loudly. Both
-                // halves of the transfer can be working and the clipboard still
-                // come up empty.
-                self.pasteboard.declareTypes([match.native], owner: nil)
-                if !self.pasteboard.setData(data, forType: match.native) {
-                    Self.note("pasteboard refused \(match.native.rawValue)")
-                    return
+                    // Our own write must not read back as the Mac taking the clipboard.
+                    self.lastSeenChangeCount = self.pasteboard.changeCount
+                } catch {
+                    guard !(error is CancellationError), let self, self.selectionGeneration == generation else { return }
+                    self.onError?(error)
                 }
             }
-            // Our own write must not read back as the Mac taking the clipboard.
-            self.lastSeenChangeCount = self.pasteboard.changeCount
+            return
         }
+        let item = NSPasteboardItem()
+        var written = false
+        for entry in fetched {
+            if entry.data.count > WindowWire.maximumClipboardDataSize {
+                Self.note("refusing \(entry.data.count)-byte guest selection")
+                continue
+            }
+            written = ContentFormats.write(entry.data, mime: entry.mime, to: item) || written
+        }
+        guard written else { Self.note("no Mac representation for \(fetched.map(\.mime))"); return }
+        pasteboard.clearContents()
+        guard pasteboard.writeObjects([item]) else { Self.note("pasteboard refused the guest selection"); return }
+        // Our own write must not read back as the Mac taking the clipboard.
+        lastSeenChangeCount = pasteboard.changeCount
+    }
+
+    /// Every waiting read is answered, so no fetch is left suspended.
+    private func abandonGuestReads() {
+        let pending = Array(pendingGuestReads.values)
+        pendingGuestReads.removeAll()
+        for completion in pending { completion(nil) }
     }
 
     private func requestFromGuest(mime: String, completion: @escaping (Data?) -> Void) {
@@ -205,15 +214,10 @@ final class ClipboardBridge {
         lastSeenChangeCount = current
         selectionGeneration &+= 1
         guestPublication?.cancel(); guestPublication = nil
-        pendingGuestReads.removeAll()
-        onFileSharingRevoked?()
-
-        var mimeTypes: [String] = []
-        let available = Set(pasteboard.types ?? [])
-        for entry in Self.guestToNative where available.contains(entry.native) {
-            if !mimeTypes.contains(entry.mime) { mimeTypes.append(entry.mime) }
-        }
-        output?(.hostSelectionOffered(mimeTypes: mimeTypes))
+        abandonGuestReads()
+        sharing?.revoke(.clipboard)
+        fileProvider = nil
+        output?(.hostSelectionOffered(mimeTypes: ContentFormats.mimeTypes(for: pasteboard)))
     }
 
     /// A guest client is pasting and wants the Mac's clipboard in `mimeType`.
@@ -222,11 +226,10 @@ final class ClipboardBridge {
             output?(.hostSelectionData(token: token, mimeType: mimeType, data: nil))
             return
         }
-        let native = Self.guestToNative.first { $0.mime == mimeType }?.native
-        if native == .fileURL {
+        if mimeType == ContentFormats.fileList, ContentFormats.hasFiles(pasteboard) {
             let urls = pasteboard.readObjects(forClasses: [NSURL.self],
                 options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
-            let access = fileAccess
+            let sharing = sharing
             let connection = connectionGeneration
             // A request token identifies one live paste, including while its
             // importer is suspended. Duplicate tokens cannot replace its owner.
@@ -238,8 +241,8 @@ final class ClipboardBridge {
             hostTransfers[token] = Task { @MainActor [weak self] in
                 var bytes: Data?
                 do {
-                    if let access, !urls.isEmpty {
-                        bytes = FileTransferURLs.encode(try await access.importFiles(urls))
+                    if let sharing, !urls.isEmpty {
+                        bytes = FileTransferURLs.encode(try await sharing.guestURLs(for: urls, purpose: .clipboard))
                     }
                     try Task.checkCancellation()
                 } catch {
@@ -255,10 +258,7 @@ final class ClipboardBridge {
             }
             return
         }
-        var data: Data?
-        if let native {
-            data = pasteboard.data(forType: native)
-        }
+        var data = ContentFormats.data(forMIME: mimeType, from: pasteboard)
         if let bytes = data, bytes.count > WindowWire.maximumClipboardDataSize {
             Self.note("refusing \(bytes.count)-byte host selection")
             data = nil

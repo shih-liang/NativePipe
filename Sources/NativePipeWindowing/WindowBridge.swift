@@ -6,6 +6,7 @@ import ImageIO
 import IOSurface
 @preconcurrency import Metal
 import NativePipeProtocol
+import NativePipeSharing
 import UniformTypeIdentifiers
 import QuartzCore
 
@@ -560,15 +561,10 @@ public final class WindowBridge: NSObject {
     }
 
     let clipboard: ClipboardBridge
-    public var fileAccess: (any UserFileAccess)? {
-        didSet { clipboard.fileAccess = fileAccess }
-    }
-    public var publishGuestFiles: GuestFilePublisher? {
-        didSet { clipboard.publishGuestFiles = publishGuestFiles }
-    }
-    public var onGuestFileSharingRevoked: (() -> Void)?
-    public var onClipboardFileSharingRevoked: (() -> Void)? {
-        didSet { clipboard.onFileSharingRevoked = onClipboardFileSharingRevoked }
+    /// The machine's sharing backend. Drag and drop, the clipboard and
+    /// opening files on the Mac use it for every file they share.
+    public var sharing: SharingSession? {
+        didSet { clipboard.sharing = sharing }
     }
     lazy var fileDrag = FileDragBridge(bridge: self)
 
@@ -1438,7 +1434,7 @@ public final class WindowBridge: NSObject {
         case .channelReady:
             activationAuthority.clear()
             onChannelReady?()
-            onGuestFileSharingRevoked?()
+            sharing?.revoke()
             connectionGeneration &+= 1
             presentationSessionID = nil
             completedPauseRollback = nil
@@ -2392,7 +2388,7 @@ public final class WindowBridge: NSObject {
         presentationBarrier = nil
         fileDrag.disconnect()
         clipboard.disconnect()
-        onGuestFileSharingRevoked?()
+        sharing?.revoke()
         for (surface, frame) in pendingSurfaceFrames {
             completeAuxiliaryFrame(frame, surface: surface)
         }

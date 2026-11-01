@@ -1,37 +1,31 @@
 import AppKit
 import NativePipeProtocol
+import NativePipeSharing
 @testable import NativePipeWindowing
 import XCTest
 
 @MainActor
 final class FilePromiseTests: XCTestCase {
-    func testMountedPromiseWaitsForAcceptanceThenUsesNativeCopyWithoutRemoteExport() throws {
+    func testPromiseCopiesThroughTheSessionOnlyWhenWritten() throws {
         _ = NSApplication.shared
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mounted-promise-" + UUID().uuidString)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("session-promise-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let source = directory.appendingPathComponent("source.txt"), destination = directory.appendingPathComponent("received.txt")
-        try Data("mounted bytes".utf8).write(to: source)
-        let access = PromiseFileAccess()
-        var publications = 0
-        let promise = LinuxFilePromise(remote: URL(fileURLWithPath: "/guest/source.txt"), access: access,
-            publishGuestFiles: { files, _, purpose in
-                XCTAssertEqual(files.map(\.path), ["/guest/source.txt"]); XCTAssertEqual(purpose, .drag)
-                publications += 1
-                return [source]
-            })
+        let destination = directory.appendingPathComponent("received.txt"), access = PromiseFileAccess()
+        let promise = LinuxFilePromise(remote: URL(fileURLWithPath: "/guest/source.txt"), sharing: SharingSession(transport: access))
         nonisolated(unsafe) let provider = promise.provider
-        XCTAssertEqual(publications, 0)
-        let received = expectation(description: "native mounted copy")
+        XCTAssertEqual(access.exports, 0, "Nothing is copied before the destination asks")
+        let received = expectation(description: "promised copy")
         OperationQueue().addOperation {
             promise.filePromiseProvider(provider, writePromiseTo: destination) { error in
                 XCTAssertNil(error)
-                XCTAssertEqual(try? Data(contentsOf: destination), Data("mounted bytes".utf8))
+                XCTAssertEqual(try? Data(contentsOf: destination), PromiseFileAccess.contents)
                 received.fulfill()
             }
         }
         wait(for: [received], timeout: 5)
-        XCTAssertEqual(publications, 1); XCTAssertEqual(access.exports, 0)
+        XCTAssertEqual(access.exports, 1)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), ["received.txt"])
     }
 
     func testNativePublishedCopyRejectsReplacementAndCleansReadOnlyStaging() async throws {
@@ -60,8 +54,8 @@ final class FilePromiseTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: directory) }
         let destination = directory.appendingPathComponent("file")
-        let promise = LinuxFilePromise(remote: URL(fileURLWithPath: "/guest/file"), access: PromiseFileAccess(),
-            publishGuestFiles: { _, _, _ in XCTFail("Cancelled drop must not mount or read"); return [] })
+        let access = PromiseFileAccess()
+        let promise = LinuxFilePromise(remote: URL(fileURLWithPath: "/guest/file"), sharing: SharingSession(transport: access))
         promise.cancel()
         nonisolated(unsafe) let provider = promise.provider
         let cancelled = expectation(description: "cancelled promise")
@@ -73,28 +67,7 @@ final class FilePromiseTests: XCTestCase {
         }
         wait(for: [cancelled], timeout: 5)
         XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
-    }
-
-    func testUnavailableVolumeCopiesOverFileConnection() throws {
-        _ = NSApplication.shared
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("unavailable-promise-" + UUID().uuidString)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        for publisher: GuestFilePublisher? in [nil, { _, _, _ in throw GuestFileSharingError.unavailable }] {
-            let destination = directory.appendingPathComponent(UUID().uuidString), access = PromiseFileAccess()
-            let promise = LinuxFilePromise(remote: URL(fileURLWithPath: "/guest/file"), access: access,
-                                           publishGuestFiles: publisher)
-            nonisolated(unsafe) let provider = promise.provider
-            let copied = expectation(description: "file connection copy")
-            OperationQueue().addOperation {
-                promise.filePromiseProvider(provider, writePromiseTo: destination) { error in
-                    XCTAssertNil(error); copied.fulfill()
-                }
-            }
-            wait(for: [copied], timeout: 5)
-            XCTAssertEqual(access.exports, 1)
-            XCTAssertEqual(try Data(contentsOf: destination), PromiseFileAccess.contents)
-        }
+        XCTAssertEqual(access.exports, 0, "A cancelled drop never reads the guest file")
     }
 
     func testPromiseWritesOnlyTheDestinationAndCleansFailures() async throws {
@@ -125,7 +98,8 @@ final class FilePromiseTests: XCTestCase {
         _ = NSApplication.shared
         var access: PromiseFileAccess? = PromiseFileAccess()
         weak var weakAccess = access
-        var promise: LinuxFilePromise? = LinuxFilePromise(remote: URL(fileURLWithPath: "/guest/folder", isDirectory: true), access: access!)
+        var promise: LinuxFilePromise? = LinuxFilePromise(remote: URL(fileURLWithPath: "/guest/folder", isDirectory: true),
+                                                          sharing: SharingSession(transport: access!))
         weak var weakPromise = promise
         var provider: NSFilePromiseProvider? = promise!.provider
         XCTAssertEqual(provider?.fileType, "public.folder")
@@ -173,8 +147,7 @@ final class FilePromiseTests: XCTestCase {
         let access = PromiseFileAccess()
         let source = directory.appendingPathComponent("mounted.bin")
         try PromiseFileAccess.contents.write(to: source)
-        let promise = LinuxFilePromise(remote: URL(fileURLWithPath: "/guest/example.bin"), access: access,
-            publishGuestFiles: { _, _, _ in [source] })
+        let promise = LinuxFilePromise(remote: URL(fileURLWithPath: "/guest/example.bin"), sharing: SharingSession(transport: access))
         // AppKit calls this delegate on its worker queue too. The test only
         // passes the provider through; it never reads or mutates it there.
         nonisolated(unsafe) let provider = promise.provider
@@ -200,7 +173,7 @@ final class FilePromiseTests: XCTestCase {
             XCTAssertNil(error)
         }
         wait(for: [written, completed], timeout: 5)
-        XCTAssertEqual(access.exports, 0)
+        XCTAssertEqual(access.exports, 1, "The promise copies once, through the session")
         withExtendedLifetime(promise) {}
     }
 }
@@ -228,7 +201,7 @@ private final class TestPromiseReceiver: NSFilePromiseReceiver, @unchecked Senda
 private final class PromiseFileAccess: UserFileAccess {
     var exports = 0
     nonisolated static let contents = Data(repeating: 0x5a, count: 32 * 1024 * 1024)
-    func importFiles(_ urls: [URL], shareDirectories: Bool) async throws -> [URL] { urls }
+    func importFiles(_ urls: [URL], progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws -> [URL] { urls }
     func exportFile(_ remote: URL, to local: URL) async throws {
         exports += 1
         try await Task.sleep(for: .milliseconds(10))

@@ -1,5 +1,6 @@
 import AppKit
 import NativePipeProtocol
+import NativePipeSharing
 import OSLog
 
 /// One AppKit/Wayland file-drag state machine for VMHost and RemoteHost.
@@ -46,7 +47,7 @@ final class FileDragBridge: NSObject, NSDraggingSource {
         switch message.action {
         case .offered:
             Self.log.debug("Guest offered drag \(message.token)")
-            guard session == nil, !dropped, bridge?.fileAccess != nil else { return }
+            guard session == nil, !dropped, bridge?.sharing != nil else { return }
             clearExport()
             outgoing = message.token; outgoingURLs = []
             send(.init(.readSource, token: outgoing))
@@ -54,31 +55,29 @@ final class FileDragBridge: NSObject, NSDraggingSource {
             guard message.token == outgoing, let data = message.data else { return }
             outgoingURLs = (try? FileTransferURLs.decode(data)) ?? []
             publication?.cancel(); outgoingHostURLs = nil; copyingOut = false
-            if let publish = bridge?.publishGuestFiles, let access = bridge?.fileAccess, !outgoingURLs.isEmpty {
+            if let sharing = bridge?.sharing, !outgoingURLs.isEmpty {
                 let token = outgoing, connection = generation, files = outgoingURLs
                 publication = Task { @MainActor [weak self] in
                     do {
                         // Preparing names while Linux owns the gesture avoids
                         // waiting for a whole-file transfer at the Mac boundary.
-                        let urls = try await publish(files, access, .drag)
+                        let shared = try await sharing.hostFiles(for: files, purpose: .drag)
                         try Task.checkCancellation()
                         guard let self, self.generation == connection, self.outgoing == token else { return }
-                        _ = try FileTransferURLs.decode(FileTransferURLs.encode(urls))
-                        guard urls.count == files.count else { throw FileRPC.Failure.protocolError }
-                        self.outgoingHostURLs = urls
+                        switch shared {
+                        case .mounted(let urls): self.outgoingHostURLs = urls
+                        case .deferred:
+                            Self.log.info("Drag \(token) copies files when dropped")
+                            self.copyingOut = true
+                        }
                         self.resumePendingExport()
                     } catch {
                         guard !(error is CancellationError), let self,
                               self.generation == connection, self.outgoing == token else { return }
-                        // No shared volume (no FSKit authorization, extension
-                        // disabled, …): the drop still gets copies.
-                        Self.log.info("Drag \(token) copies files: \(error.localizedDescription, privacy: .public)")
-                        self.copyingOut = true
-                        self.resumePendingExport()
+                        self.clearExport()
+                        self.reportError(error)
                     }
                 }
-            } else if !outgoingURLs.isEmpty {
-                copyingOut = true
             }
             Self.log.debug("Drag \(message.token) offers \(self.outgoingURLs.count) files")
         case .accepted:
@@ -98,7 +97,7 @@ final class FileDragBridge: NSObject, NSDraggingSource {
     }
 
     func destination(_ info: NSDraggingInfo, window: UInt32, point: CGPoint, entering: Bool) -> NSDragOperation {
-        guard bridge?.fileAccess != nil, info.draggingSourceOperationMask.contains(.copy) else { return [] }
+        guard bridge?.sharing != nil, info.draggingSourceOperationMask.contains(.copy) else { return [] }
         let own = (info.draggingSource as AnyObject?) === self
         guard own || info.draggingPasteboard.canReadObject(forClasses: [NSURL.self, NSFilePromiseReceiver.self],
             options: [.urlReadingFileURLsOnly: true]) else { return [] }
@@ -128,7 +127,7 @@ final class FileDragBridge: NSObject, NSDraggingSource {
     }
 
     func perform(_ info: NSDraggingInfo) -> Bool {
-        guard accepted, let access = bridge?.fileAccess else { return false }
+        guard accepted, let sharing = bridge?.sharing else { return false }
         let token = incoming
         let own = (info.draggingSource as AnyObject?) === self
         let urls = info.draggingPasteboard.readObjects(forClasses: [NSURL.self],
@@ -155,7 +154,7 @@ final class FileDragBridge: NSObject, NSDraggingSource {
         transfers[token] = Task { [weak self] in
             defer { withExtendedLifetime(receipt) {} }
             do {
-                let imported = try await receipt.importFiles(using: access)
+                let imported = try await receipt.importFiles(using: sharing)
                 guard let self, self.generation == connection else { return }
                 self.transfers[token] = nil
                 self.send(.init(.payload, token: token, data: FileTransferURLs.encode(imported)))
@@ -175,12 +174,12 @@ final class FileDragBridge: NSObject, NSDraggingSource {
             send(.init(.payload, token: token, data: FileTransferURLs.encode(importedURLs)))
             return
         }
-        guard transfers[token] == nil, !incomingURLs.isEmpty, let access = bridge?.fileAccess else { return }
+        guard transfers[token] == nil, !incomingURLs.isEmpty, let sharing = bridge?.sharing else { return }
         let urls = incomingURLs
         let connection = generation
         transfers[token] = Task { [weak self] in
             do {
-                let imported = try await access.importFiles(urls)
+                let imported = try await sharing.guestURLs(for: urls, purpose: .drag)
                 guard let self, self.generation == connection else { return }
                 self.transfers[token] = nil
                 if self.incoming == token { self.importedURLs = imported }
@@ -205,7 +204,7 @@ final class FileDragBridge: NSObject, NSDraggingSource {
 
     func beginExportIfNeeded(view: NSView, event: NSEvent) -> Bool {
         guard session == nil, outgoing != 0, !outgoingURLs.isEmpty,
-              let access = bridge?.fileAccess,
+              let sharing = bridge?.sharing,
               bridge?.containsGuestWindow(at: NSEvent.mouseLocation) == false else { return false }
         let urls: [URL], writers: [any NSPasteboardWriting]
         if let hostURLs = outgoingHostURLs {
@@ -213,7 +212,7 @@ final class FileDragBridge: NSObject, NSDraggingSource {
         } else if copyingOut {
             let token = outgoing
             promises = outgoingURLs.map { remote in
-                LinuxFilePromise(remote: remote) { try await access.exportPromisedFile(remote, to: $0) }
+                LinuxFilePromise(remote: remote, sharing: sharing)
             }
             remaining = promises.count; failed = false
             for promise in promises {
