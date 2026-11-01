@@ -79,7 +79,10 @@ token chosen by the client before sending the request. It exclusively creates a
 private 0700 sibling directory named `.nativepipe-upload-UUID` and a 0600
 `.nativepipe-owner` marker that binds the token to the directory's device and
 inode. Its METADATA response echoes the token. Knowing the token before CREATE
-allows cleanup even if cancellation loses that acknowledgement.
+allows cleanup even if cancellation loses that acknowledgement. The host closes
+that connection before it sends DISCARD on another one, which may run before a
+CREATE still in progress; the service therefore removes a directory it created
+when the acknowledgement cannot be written.
 
 The existing recursive upload writes a file or directory tree into `.payload`
 inside this directory, using WRITE/MKDIR with NOFOLLOW. PUBLISH_STAGING appends

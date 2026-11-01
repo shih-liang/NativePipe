@@ -213,6 +213,33 @@ static void test_staging(struct server *s) {
     free_reply(reply); disconnect(client);
     assert(fstatat(s->root, "blocked", &st, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT);
     assert(unlinkat(s->root, "staging-parent", 0) == 0);
+
+    /* The host closes the connection when CREATE's answer is lost, then sends
+     * DISCARD on a new one. The service may still be creating the tree, so
+     * DISCARD can find nothing; whichever runs last must leave no tree. */
+    for (unsigned round = 0; round < 100; round++) {
+        int sockets[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        struct server lost = *s; lost.socket = sockets[0];
+        pthread_t thread; assert(pthread_create(&thread, NULL, serve, &lost) == 0);
+        unsigned char frame[2 * NP_FILE2_HEADER + 8 + 4 + 8300] = {0}, *request = frame + NP_FILE2_HEADER + 8;
+        memcpy(frame, "NP2F", 4); frame[4] = NP_FILE2_HELLO; np_file_put32(frame + 12, 8);
+        frame[NP_FILE2_HEADER] = NP_FILE2_VERSION; frame[NP_FILE2_HEADER + 1] = NP_FILE2_ROLE_HOST;
+        unsigned char *body = request + NP_FILE2_HEADER;
+        body[0] = NP_FILE_CREATE_STAGING;
+        assert(getentropy(token, NP_FILE_STAGING_TOKEN) == 0);
+        memcpy(body + 4, token, NP_FILE_STAGING_TOKEN);
+        size_t size = 4 + NP_FILE_STAGING_TOKEN;
+        size += put_path(body + size, stage);
+        memcpy(request, "NP2F", 4); request[4] = NP_FILE2_REQUEST; request[5] = NP_FILE2_END_STREAM;
+        np_file_put32(request + 8, 2); np_file_put32(request + 12, (uint32_t)size);
+        size += (size_t)(request - frame) + NP_FILE2_HEADER;
+        assert(write(sockets[1], frame, size) == (ssize_t)size);
+        if (round % 2) usleep(round * 5);
+        close(sockets[1]);
+        (void)staging(s, NP_FILE_DISCARD_STAGING, stage, token, NULL);
+        assert(pthread_join(thread, NULL) == 0);
+        assert(fstatat(s->root, stage + 1, &st, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT);
+    }
 }
 
 int main(void) {

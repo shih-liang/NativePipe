@@ -177,6 +177,16 @@ static int discard_staging(int parent, const char *name, int fd) {
     if (unlinkat(fd, STAGING_MARKER, 0) < 0) return -1;
     return unlinkat(parent, name, AT_REMOVEDIR);
 }
+static int discard_owned(int root, char path[4096], const unsigned char *token) {
+    char *name;
+    int parent = path_parent(root, path, &name);
+    if (parent < 0) return -1;
+    int fd = owned_staging(parent, name, token);
+    int result = fd < 0 ? -1 : discard_staging(parent, name, fd);
+    int error = errno;
+    if (fd >= 0) close(fd);
+    close(parent); errno = error; return result;
+}
 static int create_staging(int root, char path[4096], const unsigned char *token) {
     char *name;
     int parent = path_parent(root, path, &name);
@@ -646,20 +656,18 @@ static int op_staging(struct connection *connection, struct np_file2_stream *str
     if (error) return error;
     if (offset != length) return EINVAL;
     if (opcode == NP_FILE_CREATE_STAGING) {
+        char created[4096];
+        memcpy(created, path, sizeof(created));
         if (create_staging(connection->root, path, token) < 0) return ERROR;
-    } else if (opcode == NP_FILE_PUBLISH_STAGING) {
-        if (publish_staging(connection->root, path, token, destination) < 0) return ERROR;
-    } else {
-        char *name;
-        int parent = path_parent(connection->root, path, &name);
-        if (parent < 0) return ERROR;
-        int fd = owned_staging(parent, name, token);
-        int cleanup = fd < 0 ? -1 : discard_staging(parent, name, fd);
-        error = cleanup < 0 ? ERROR : 0;
-        if (fd >= 0) close(fd);
-        close(parent);
-        if (error) return error;
+        /* A host that cannot read this answer has already given up and closed
+         * the connection, so its DISCARD may have run before the directory
+         * existed. Nobody else knows of it now; remove it here. */
+        if (np_file2_respond(stream, 0, NULL, 0, 1) < 0) (void)discard_owned(connection->root, created, token);
+        return 0;
     }
+    if (opcode == NP_FILE_PUBLISH_STAGING) {
+        if (publish_staging(connection->root, path, token, destination) < 0) return ERROR;
+    } else if (discard_owned(connection->root, path, token) < 0) return ERROR;
     return reply(stream, NULL, 0);
 }
 
