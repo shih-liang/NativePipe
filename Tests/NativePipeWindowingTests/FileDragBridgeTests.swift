@@ -131,4 +131,36 @@ final class FileDragBridgeTests: XCTestCase {
             XCTAssertEqual(files.exports, 0); XCTAssertEqual(failures, 0)
         }
     }
+
+    func testLinuxTextDragBecomesOneMacItemWithEveryRepresentation() async throws {
+        _ = NSApplication.shared
+        let bridge = WindowBridge(frameSource: nil)
+        bridge.sharing = SharingSession(transport: DragRangeFiles())
+        var sent: [FileDragMessage] = []
+        bridge.output = { if case .fileDrag(let message) = $0 { sent.append(message) } }
+        let drag = FileDragBridge(bridge: bridge, reportError: { XCTFail("Unexpected failure: \($0)") })
+        defer { drag.disconnect(); bridge.clipboard.stop() }
+        drag.receive(.init(.offered, token: 9, data: FileDragMessage.typeList(["text/plain", "text/html", "image/x-unknown"])))
+        let reads = sent.filter { $0.action == .readSource }.map { FileDragMessage.type(in: $0.data) }
+        XCTAssertEqual(reads, ["text/html", "text/plain"], "Rich text is read with its plain-text companion")
+        drag.receive(.init(.sourceData, token: 9, data: FileDragMessage.tagged("text/html", Data("<b>Hi</b>".utf8))))
+        drag.receive(.init(.sourceData, token: 9, data: FileDragMessage.tagged("text/plain", Data("Hi".utf8))))
+        let view = DragRecordingView()
+        XCTAssertTrue(drag.beginExportIfNeeded(view: view, event: try event()))
+        let item = try XCTUnwrap(view.draggedItems.first?.item as? NSPasteboardItem)
+        XCTAssertEqual(item.string(forType: .html), "<b>Hi</b>")
+        XCTAssertEqual(item.string(forType: .string), "Hi")
+        XCTAssertEqual(sent.last.map { FileDragMessage.type(in: $0.data) }, "text/html")
+        XCTAssertEqual(sent.last?.action, .exportBegan)
+    }
+
+    func testDragTypeTagsStayCompatibleWithOlderPeers() {
+        XCTAssertEqual(FileDragMessage.types(in: nil), ["text/uri-list"])
+        XCTAssertEqual(FileDragMessage.type(in: nil), "text/uri-list")
+        let plain = Data("file:///tmp/a\r\n".utf8)
+        XCTAssertEqual(FileDragMessage.untag(plain).type, "text/uri-list")
+        XCTAssertEqual(FileDragMessage.untag(plain).bytes, plain)
+        let tagged = FileDragMessage.untag(FileDragMessage.tagged("text/plain", Data("x".utf8)))
+        XCTAssertEqual(tagged.type, "text/plain"); XCTAssertEqual(tagged.bytes, Data("x".utf8))
+    }
 }
