@@ -1,6 +1,7 @@
 import AppKit
 import Darwin
 import NativePipeProtocol
+import NativePipeSharing
 import OSLog
 import UniformTypeIdentifiers
 
@@ -22,14 +23,14 @@ struct IncomingDragFiles {
         receipt = receivers.isEmpty ? nil : try IncomingFilePromises(receivers)
     }
 
-    func importFiles(using access: any UserFileAccess) async throws -> [URL] {
+    func importFiles(using sharing: SharingSession) async throws -> [URL] {
         defer { withExtendedLifetime(receipt) {} }
         var imported: [URL] = []
-        if !urls.isEmpty { imported = try await access.importFiles(urls) }
+        if !urls.isEmpty { imported = try await sharing.guestURLs(for: urls, purpose: .drag) }
         if let receipt {
             let files = try await receipt.files()
-            // A temporary promised directory must not become a persistent share.
-            imported += try await access.importFiles(files, shareDirectories: false)
+            // Promised files land in temporary staging: copy, never share live.
+            imported += try await sharing.guestURLs(for: files, purpose: .drag, liveShare: false)
         }
         try Task.checkCancellation()
         return imported
@@ -109,26 +110,12 @@ public final class LinuxFilePromise: NSObject, NSFilePromiseProviderDelegate {
         self.remote = remote; self.write = write
     }
 
-    /// Copies through the shared volume when one can be published, otherwise
-    /// over the file connection.
-    public convenience init(remote: URL, access: any UserFileAccess, publishGuestFiles: GuestFilePublisher? = nil) {
+    /// Fulfils the promise with the sharing backend's copy of the guest item.
+    /// AppKit may ask after the source view is gone; the provider keeps the
+    /// session it needs alive until then.
+    public convenience init(remote: URL, sharing: SharingSession) {
         self.init(remote: remote) { destination in
-            let files: [URL]
-            do {
-                guard let publish = publishGuestFiles else { throw GuestFileSharingError.unavailable }
-                files = try await publish([remote], access, .drag)
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                try await access.exportPromisedFile(remote, to: destination)
-                return
-            }
-            try Task.checkCancellation()
-            guard files.count == 1, let source = files.first else { throw FileRPC.Failure.protocolError }
-            _ = try FileTransferURLs.decode(FileTransferURLs.encode(files))
-            try await FileTransferLocalIO.writePromised(to: destination) { destination in
-                try await FileTransferLocalIO.perform { try FileManager.default.copyItem(at: source, to: destination) }
-            }
+            try await sharing.copyGuestItem(remote, to: destination, promised: true)
         }
     }
 

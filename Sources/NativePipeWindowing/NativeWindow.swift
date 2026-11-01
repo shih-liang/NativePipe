@@ -1773,7 +1773,8 @@ private final class SurfaceView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         let promisedTypes = NSFilePromiseReceiver.readableDraggedTypes.map { NSPasteboard.PasteboardType($0) }
-        registerForDraggedTypes([.fileURL] + promisedTypes)
+        // Files, plus the content types ContentFormats converts for Linux.
+        registerForDraggedTypes([.fileURL] + promisedTypes + [.string, .html, .rtf, .URL, .png, .tiff])
         sceneLayer.anchorPoint = .zero
         sceneLayer.isGeometryFlipped = true
         surfaceLayer.contentsGravity = .resize

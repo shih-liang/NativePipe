@@ -860,11 +860,13 @@ static void popup_grab(struct wl_client *client, struct wl_resource *resource,
 		return;
 	}
 	if (surface->has_grab) return;
-	if (server->last_input_client != client ||
-	    server->last_input_serial != serial) {
+	bool after_drop = server->drop_client == client;
+	if (!after_drop && (server->last_input_client != client ||
+	                    server->last_input_serial != serial)) {
 		xdg_popup_send_popup_done(resource);
 		return;
 	}
+	server->drop_client = NULL;
 
 	// The grab is what makes a menu dismiss when the user clicks elsewhere. The
 	// host decides when that has happened and sends dismissPopup back.

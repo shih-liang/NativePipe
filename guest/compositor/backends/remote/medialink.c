@@ -235,7 +235,7 @@ bool np_media_send_binary(struct np_media *m, const void *payload, size_t length
     const unsigned char *p = payload;
     /* A catalog end marker must follow every batch, even though it is short.
      * Other replies have independent request tokens and may bypass the catalog. */
-    if (length >= 12 && !memcmp(p, "NPAP", 4) && (p[5] == 1 || p[5] == 4))
+    if (length >= 12 && !memcmp(p, "NPAP", 4) && (p[5] == 1 || p[5] == 9 || p[5] == 4))
         return send_binary(m, 2, payload, length);
     return send_binary(m, length > 1024 ? 2 : 0, payload, length);
 }

@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import NativePipeProtocol
+import NativePipeSharing
 import NativePipeWindowing
 import NativePipeStrings
 
@@ -37,10 +38,12 @@ public final class RemoteDisplayController {
         frames = RemoteFrameSource()
         bridge = WindowBridge(frameSource: frames)
         bridge.reportsPresentationTime = true
-        let files = RemoteUserFileAccess(command: command, environment: environment)
-        // Opened in place through the remote compositor's mount when it has one.
-        files.shareFile = { [drops = session.drops] in drops.share($0) }
-        bridge.fileAccess = files
+        // Opened in place through the remote compositor's mount when it has
+        // one; otherwise copied over SFTP. The app adds the shared volume.
+        let drops = session.drops
+        bridge.sharing = SharingSession(
+            transport: RemoteUserFileAccess(command: command, environment: environment),
+            guestShare: { url in try await FileTransferLocalIO.perform { drops.share(url) } })
         bridge.applicationIconProvider = { [weak self] id in
             self?.applications.first(where: { $0.matches(applicationID: id) })
                 .flatMap { $0.iconData.flatMap(NSImage.init(data:)) }
@@ -175,15 +178,14 @@ public final class RemoteDisplayController {
 
     private func receiveHostOpen(token: UInt32, request: HostOpenWire.Request) {
         guard hostOpenRequests[token] == nil else { return }
-        guard hostOpenRequests.count < 16, let access = bridge.fileAccess else {
+        guard hostOpenRequests.count < 16, let sharing = bridge.sharing else {
             session.send(.hostOpenResponse(token: token, response: .init(status: .refused,
                 message: NPText("Another request is waiting. Try again in a moment."))))
             return
         }
         if hostOpen == nil {
             hostOpen = GuestOpenCoordinator(machineName: bridge.machineName,
-                isEnabled: { [weak self] in self?.hostOpenEnabled() ?? false }, fileAccess: access,
-                publishGuestFiles: bridge.publishGuestFiles)
+                isEnabled: { [weak self] in self?.hostOpenEnabled() ?? false }, sharing: sharing)
         }
         guard let coordinator = hostOpen else { return }
         let generation = hostOpenGeneration

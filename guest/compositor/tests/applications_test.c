@@ -43,6 +43,9 @@ static int activation_service(const char *output)
     return 0;
 }
 #endif
+#ifndef NP_ICONS_ONLY
+static GHashTable *mime_types;
+#endif
 static void put(const char *relative, const char *text)
 {
     char *path = g_build_filename(root, relative, NULL), *parent = g_path_get_dirname(path);
@@ -71,7 +74,7 @@ static GHashTable *catalog(struct np_apps *a, unsigned token)
         if (r.data[5] == 3) { free(r.data); continue; }
         assert(number(r.data + 8) == token);
         if (r.data[5] == 4) { assert(r.length == 16 && number(r.data + 12) == 0); free(r.data); break; }
-        assert(r.data[5] == 1 && number(r.data + 12) <= 32);
+        assert(r.data[5] == 9 && number(r.data + 12) <= 32);
         memcpy(r.data, "NPW2", 4);
         struct np_window_reader rd;
         assert(np_window_reader_init(&rd, r.data, r.length, NP_WINDOW_GUEST_TO_HOST));
@@ -82,6 +85,8 @@ static GHashTable *catalog(struct np_apps *a, unsigned token)
             assert(id && name && !g_hash_table_contains(ids, id));
             g_hash_table_insert(ids, id, name);
             for (int k = 0; k < 4; ++k) { char *field = np_window_read_string(&rd); assert(field); free(field); }
+            char *types = np_window_read_string(&rd); assert(types);
+            if (*types) g_hash_table_insert(mime_types, g_strdup(id), types); else free(types);
         }
         assert(np_window_reader_finished(&rd));
         free(r.data);
@@ -231,6 +236,7 @@ int main(int argc, char **argv)
     printf("PASS: inherited SVG, XPM, bounded PNG conversion and FIFO rejection (%s)\n", root);
     return 0;
 #else
+    mime_types = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
     struct np_apps *a = np_apps_start(); assert(a);
     GHashTable *ids = catalog(a, 1);
     assert(g_hash_table_size(ids) == 602);
@@ -298,6 +304,30 @@ int main(int argc, char **argv)
     assert(unlink(oversized) == 0); g_free(oversized);
     await_change(a);
     ids = catalog(a, 8); assert(g_hash_table_size(ids) == 605); g_hash_table_unref(ids);
+    /* Open With: the entry's MimeType is listed and %F receives local paths. */
+    char *opened = g_build_filename(root, "opened.txt", NULL);
+    char *open_entry = g_strdup_printf("[Desktop Entry]\nType=Application\nName=Open Test\nMimeType=text/plain;image/png;\n"
+                                       "Exec=%s --record %s %%F\n", binary, opened);
+    put("data/applications/open.desktop", open_entry); g_free(open_entry);
+    await_change(a);
+    g_hash_table_remove_all(mime_types);
+    ids = catalog(a, 50); g_hash_table_unref(ids);
+    assert(!g_strcmp0(g_hash_table_lookup(mime_types, "open.desktop"), "text/plain;image/png"));
+    assert(!np_apps_request(a, 1, 51, NP_APP_OPEN, "open.desktop") && errno == EINVAL);
+    assert(!np_apps_request(a, 1, 51, NP_APP_OPEN, "open.desktop\nhttps://example.com/") && errno == EINVAL);
+    assert(!np_apps_request(a, 1, 51, NP_APP_OPEN, "a/open.desktop\nfile:///tmp/x") && errno == EINVAL);
+    assert(np_apps_request(a, 1, 52, NP_APP_OPEN, "open.desktop\nfile:///tmp/two%20words.txt\nfile:///tmp/%E4%BD%A0.png"));
+    gboolean open_launched = FALSE;
+    for (;;) {
+        struct np_app_reply r = next(a);
+        if (r.data[5] == 2) { assert(number(r.data + 8) == 52 && number(r.data + 12) > 0 && number(r.data + 16) == 0); open_launched = TRUE; }
+        gboolean exited = r.data[5] == 6;
+        free(r.data); if (exited) break;
+    }
+    assert(open_launched);
+    assert(g_file_get_contents(opened, &contents, NULL, NULL));
+    assert(strstr(contents, "arg=[/tmp/two words.txt]\narg=[/tmp/\u4f60.png]\n"));
+    g_free(contents); g_free(opened);
     /* Closing while the bounded reply handoff is full must join promptly. */
     assert(np_apps_request(a, 1, 9, NP_APP_LIST, ""));
     struct pollfd pending = { np_apps_fd(a), POLLIN, 0 };

@@ -101,6 +101,10 @@ struct np_server {
 	uint32_t pointer_buttons;
 	struct wl_client *last_input_client;
 	uint32_t last_input_serial;
+	/* The client that last received wl_data_device.drop, until the next real
+	 * input. A drop carries no serial, so its target's drop menu (libfm-qt's
+	 * Copy/Move/Link) can only cite an older one; the drop is its user event. */
+	struct wl_client *drop_client;
 	struct wl_resource *cursor_surface;
 	int32_t cursor_hotspot_x, cursor_hotspot_y;
 	/* 1 for logical (Wayland) cursor images; the output scale when the image is

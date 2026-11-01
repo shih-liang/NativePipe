@@ -79,11 +79,28 @@ struct np_data_offer {
 	uint32_t preferred_action;
 	uint32_t chosen_action;
 	uint32_t host_drag;
-	unsigned char *host_data;
-	size_t host_data_length;
+	/* The types a Mac drag offers, and the bytes the Mac supplied so far. */
+	struct host_value {
+		char *mime;
+		unsigned char *data;
+		size_t length;
+		bool supplied, present;
+	} host_values[NP_MAX_MIME_TYPES];
+	int host_value_count;
 };
 
-static void host_drag_receive(struct np_data_offer *offer, int fd);
+static struct host_value *host_value(struct np_data_offer *offer, const char *mime) {
+	for (int i = 0; mime && i < offer->host_value_count; i++)
+		if (!strcmp(offer->host_values[i].mime, mime)) return &offer->host_values[i];
+	return NULL;
+}
+static bool host_supplied(const struct np_data_offer *offer) {
+	for (int i = 0; i < offer->host_value_count; i++)
+		if (offer->host_values[i].present) return true;
+	return false;
+}
+
+static void host_drag_receive(struct np_data_offer *offer, int fd, const char *mime);
 static void host_drag_offer_destroyed(struct np_data_offer *offer);
 static void host_drag_finished(struct np_data_offer *offer, bool success) {
     if (offer->finished) return;
@@ -180,8 +197,8 @@ static void data_offer_receive(struct wl_client *client, struct wl_resource *res
 	struct np_data_offer *offer = wl_resource_get_user_data(resource);
 	if (offer && offer->from_host) {
 		if (offer->host_drag) {
-			if (!strcmp(mime_type, "text/uri-list") && !offer->finished &&
-			    (offer->active || offer->dropped)) host_drag_receive(offer, fd);
+			if (host_value(offer, mime_type) && !offer->finished &&
+			    (offer->active || offer->dropped)) host_drag_receive(offer, fd, mime_type);
 			else close(fd);
 			return;
 		}
@@ -200,7 +217,7 @@ static void data_offer_resource_destroy(struct wl_resource *resource) {
 	struct np_data_offer *offer = wl_resource_get_user_data(resource);
 	if (!offer) return;
 	if (offer->host_drag && offer->dropped && !offer->finished)
-		host_drag_finished(offer, wl_resource_get_version(resource) < 3 && offer->host_data != NULL);
+		host_drag_finished(offer, wl_resource_get_version(resource) < 3 && host_supplied(offer));
 	host_drag_offer_destroyed(offer);
 	if (offer->dnd && offer->source && !offer->finished &&
 	    (offer->active || offer->dropped) &&
@@ -222,7 +239,10 @@ static void data_offer_resource_destroy(struct wl_resource *resource) {
 	}
 	wl_list_remove(&offer->link);
 	free(offer->accepted_mime);
-	free(offer->host_data);
+	for (int i = 0; i < offer->host_value_count; i++) {
+		free(offer->host_values[i].mime);
+		free(offer->host_values[i].data);
+	}
 	free(offer);
 }
 
@@ -234,7 +254,7 @@ static bool nullable_string_equal(const char *a, const char *b) {
 static void data_offer_accept(struct wl_client *client, struct wl_resource *resource,
                               uint32_t serial, const char *mime_type) {
 	struct np_data_offer *offer = wl_resource_get_user_data(resource);
-	if (offer && offer->host_drag && mime_type && strcmp(mime_type, "text/uri-list")) mime_type = NULL;
+	if (offer && offer->host_drag && mime_type && !host_value(offer, mime_type)) mime_type = NULL;
 	if (!offer || nullable_string_equal(offer->accepted_mime, mime_type)) return;
 	char *accepted = mime_type ? strdup(mime_type) : NULL;
 	if (mime_type && !accepted) {
@@ -381,8 +401,16 @@ struct np_clip_write {
 
 static void clip_read_finish(struct np_clip_read *read_state, bool ok) {
 	if (read_state->file_drag) {
+		/* "mime\0bytes", so the Mac can read several types of one drag. */
+		size_t prefix = strlen(read_state->mime) + 1;
+		unsigned char *tagged = ok ? malloc(prefix + read_state->len) : NULL;
+		if (tagged) {
+			memcpy(tagged, read_state->mime, prefix);
+			if (read_state->len) memcpy(tagged + prefix, read_state->data, read_state->len);
+		}
 		file_drag_event(read_state->server, 102, read_state->token, 0,
-		    read_state->data, read_state->len, ok);
+		    tagged, tagged ? prefix + read_state->len : 0, tagged != NULL);
+		free(tagged);
 	} else {
 	struct np_window_message message;
 	np_window_message_init(&message, NP_WINDOW_GUEST_TO_HOST,
@@ -530,6 +558,8 @@ struct np_clip_pending {
 	uint32_t token;
 	int fd;
 	struct np_data_offer *offer;
+	/* A Mac drag read: the type this pipe waits for. */
+	char *mime;
 };
 
 static void clip_request_from_host(struct np_server *server, const char *mime_type, int fd) {
@@ -563,6 +593,7 @@ void np_data_deliver_host_data(struct np_server *server, uint32_t token,
 		if (pending->token != token) continue;
 		fd = pending->fd;
 		wl_list_remove(&pending->link);
+		free(pending->mime);
 		free(pending);
 		break;
 	}
@@ -600,21 +631,23 @@ void np_data_deliver_host_data(struct np_server *server, uint32_t token,
 	clip_write_ready(fd, WL_EVENT_WRITABLE, write_state);
 }
 
-static void host_drag_receive(struct np_data_offer *offer, int fd) {
-    struct np_clip_pending *p = calloc(1, sizeof(*p));
-    if (!p) { close(fd); return; }
-    p->fd = fd; p->token = ++offer->server->next_clip_token; p->offer = offer;
+static void host_drag_receive(struct np_data_offer *offer, int fd, const char *mime) {
+    struct host_value *value = host_value(offer, mime);
+    struct np_clip_pending *p = value ? calloc(1, sizeof(*p)) : NULL;
+    char *copy = p ? strdup(mime) : NULL;
+    if (!copy) { free(p); close(fd); return; }
+    p->fd = fd; p->token = ++offer->server->next_clip_token; p->offer = offer; p->mime = copy;
     wl_list_insert(&offer->server->clip_pending, &p->link);
-    if (offer->host_data) np_data_deliver_host_data(offer->server, p->token,
-        offer->host_data, offer->host_data_length, true);
-    else file_drag_event(offer->server, 105, offer->host_drag, 0, NULL, 0, false);
+    if (value->supplied) np_data_deliver_host_data(offer->server, p->token,
+        value->data, value->length, value->present);
+    else file_drag_event(offer->server, 105, offer->host_drag, 0, mime, strlen(mime), true);
 }
 
 static void host_drag_offer_destroyed(struct np_data_offer *offer) {
     struct np_clip_pending *p, *next;
     wl_list_for_each_safe(p, next, &offer->server->clip_pending, link) {
         if (p->offer != offer) continue;
-        close(p->fd); wl_list_remove(&p->link); free(p);
+        close(p->fd); wl_list_remove(&p->link); free(p->mime); free(p);
     }
 }
 
@@ -639,11 +672,15 @@ bool np_data_handle_file_drag(struct np_server *s, struct np_window_reader *r) {
         length > 1024 * 1024 || action < 1 || action > 9) return false;
     if (action >= 6) {
         if (token != s->file_drag_serial || !s->drag_source) return true;
-        if (action == 6) { serve_source(s, token, "text/uri-list", s->drag_source, true); return true; }
+        /* An older host reads and announces files only. */
+        char mime[256] = "text/uri-list";
+        bool typed = present && length && length < sizeof(mime) && !memchr(data, 0, length);
+        if (typed) { memcpy(mime, data, length); mime[length] = 0; }
+        if (action == 6) { serve_source(s, token, mime, s->drag_source, true); return true; }
         if (action == 7) {
             np_data_drag_leave(s, s->drag_focus_window);
             s->drag_focus_window = 0; s->drag_exported = true;
-            wl_data_source_send_target(s->drag_source, "text/uri-list");
+            wl_data_source_send_target(s->drag_source, mime);
             if (wl_resource_get_version(s->drag_source) >= 3)
                 wl_data_source_send_action(s->drag_source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
             send_drag_icon(s, NULL);
@@ -664,21 +701,36 @@ bool np_data_handle_file_drag(struct np_server *s, struct np_window_reader *r) {
         return true;
     }
     if (action == 5) {
+        /* "mime\0bytes"; a payload without a type is a file list (a URI list
+         * never contains NUL). */
+        char mime[256] = "text/uri-list";
+        const unsigned char *bytes = data;
+        size_t count = present ? length : 0;
+        const unsigned char *nul = present && length ? memchr(data, 0, length < sizeof(mime) ? length : sizeof(mime)) : NULL;
+        if (nul) {
+            memcpy(mime, data, (size_t)(nul - data)); mime[nul - data] = 0;
+            bytes = nul + 1; count = length - (size_t)(nul - data) - 1;
+        }
         struct np_data_offer *offer;
         wl_list_for_each(offer, &s->data_offers, link) {
             if (offer->host_drag != token || offer->finished) continue;
-            free(offer->host_data); offer->host_data = NULL;
-            offer->host_data_length = length;
-            if (present && length) {
-                offer->host_data = malloc(length);
-                if (offer->host_data) memcpy(offer->host_data, data, length);
+            struct host_value *value = host_value(offer, mime);
+            if (!value) continue;
+            free(value->data); value->data = NULL; value->length = 0;
+            value->supplied = true; value->present = present && count;
+            if (value->present) {
+                value->data = malloc(count);
+                if (value->data) { memcpy(value->data, bytes, count); value->length = count; }
+                else value->present = false;
             }
             struct np_clip_pending *p, *next;
             wl_list_for_each_safe(p, next, &s->clip_pending, link) {
-                if (p->offer == offer) np_data_deliver_host_data(s, p->token,
-                    offer->host_data, length, offer->host_data != NULL);
+                if (p->offer == offer && !strcmp(p->mime, mime)) np_data_deliver_host_data(s, p->token,
+                    value->data, value->length, value->present);
             }
-            if (!offer->host_data) host_drag_finished(offer, false);
+            /* The Mac could not supply what the destination asked for. */
+            if (!value->present && offer->dropped && offer->accepted_mime && !strcmp(offer->accepted_mime, mime))
+                host_drag_finished(offer, false);
         }
         return true;
     }
@@ -693,6 +745,7 @@ bool np_data_handle_file_drag(struct np_server *s, struct np_window_reader *r) {
             offer->active = false;
             if (offer->accepted_mime && offer->chosen_action == WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY) {
                 offer->dropped = true;
+                s->drop_client = wl_resource_get_client(offer->device);
                 wl_data_device_send_drop(offer->device);
             } else {
                 wl_data_device_send_leave(offer->device);
@@ -731,8 +784,22 @@ bool np_data_handle_file_drag(struct np_server *s, struct np_window_reader *r) {
         if (!resource) continue;
         offer = wl_resource_get_user_data(resource);
         offer->from_host = true; offer->host_drag = token; offer->active = true;
+        /* The Mac lists its types, one per line; an older host offers files. */
+        const char *list = present && length ? (const char *)data : "text/uri-list";
+        size_t list_length = present && length ? length : strlen(list);
+        for (size_t start = 0; start < list_length && offer->host_value_count < NP_MAX_MIME_TYPES;) {
+            const char *line = list + start;
+            const char *end = memchr(line, '\n', list_length - start);
+            size_t n = end ? (size_t)(end - line) : list_length - start;
+            start += n + 1;
+            if (!n || n >= 256 || memchr(line, 0, n)) continue;
+            char *mime = strndup(line, n);
+            if (!mime || host_value(offer, mime)) { free(mime); continue; }
+            offer->host_values[offer->host_value_count++].mime = mime;
+        }
         wl_data_device_send_data_offer(device->resource, resource);
-        wl_data_offer_send_offer(resource, "text/uri-list");
+        for (int i = 0; i < offer->host_value_count; i++)
+            wl_data_offer_send_offer(resource, offer->host_values[i].mime);
         if (wl_resource_get_version(resource) >= 3) {
             wl_data_offer_send_source_actions(resource, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
             wl_data_offer_send_action(resource, 0);
@@ -776,6 +843,7 @@ void np_data_host_disconnected(struct np_server *server) {
 	wl_list_for_each_safe(pending, pending_tmp, &server->clip_pending, link) {
 		close(pending->fd);
 		wl_list_remove(&pending->link);
+		free(pending->mime);
 		free(pending);
 	}
 
@@ -965,6 +1033,7 @@ void np_data_drag_finish(struct np_server *server) {
 			continue;
 		}
 		match->dropped = true;
+		server->drop_client = wl_resource_get_client(device->resource);
 		wl_data_device_send_drop(device->resource);
 		dropped = true;
 	}
@@ -1038,13 +1107,17 @@ static void data_device_start_drag(struct wl_client *client, struct wl_resource 
 	}
 	np_data_drag_enter(server, surface, fixed_from(server->pointer_x), fixed_from(server->pointer_y));
 	struct np_data_source *offered = wl_resource_get_user_data(source);
-	if (offered && (offered->actions & WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY)) {
+	if (offered && (offered->actions & WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY) && offered->mime_count) {
+		/* The Mac chooses what to read from the source's types, one per line. */
+		char list[NP_MAX_MIME_TYPES * 257];
+		size_t used = 0;
 		for (int i = 0; i < offered->mime_count; ++i) {
-			if (!strcmp(offered->mime_types[i], "text/uri-list")) {
-				file_drag_event(server, 101, server->file_drag_serial, root ? root->window_id : 0, NULL, 0, false);
-				break;
-			}
+			size_t n = strlen(offered->mime_types[i]);
+			if (!n || n > 256 || used + n + 1 > sizeof(list)) continue;
+			if (used) list[used++] = '\n';
+			memcpy(list + used, offered->mime_types[i], n); used += n;
 		}
+		file_drag_event(server, 101, server->file_drag_serial, root ? root->window_id : 0, list, used, true);
 	}
 }
 

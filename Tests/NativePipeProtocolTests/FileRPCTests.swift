@@ -398,8 +398,7 @@ final class FileRPCTests: XCTestCase {
         try bytes.write(to: source.appendingPathComponent("hello # world.txt"))
         try Data().write(to: source.appendingPathComponent("empty.txt"))
         let uploadProgress = FileProgressRecorder()
-        let paths = try await files.importFiles([source], shareDirectories: true,
-                                               progress: { uploadProgress.append($0) })
+        let paths = try await files.importFiles([source], progress: { uploadProgress.append($0) })
         XCTAssertTrue(paths[0].path.hasPrefix("/tmp/nativepipe-drop-"))
         XCTAssertTrue(uploadProgress.values.contains { $0.relativePath == "folder/empty.txt" })
         let received = server.root.appendingPathComponent("result")

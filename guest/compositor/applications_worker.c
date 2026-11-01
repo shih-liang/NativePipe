@@ -105,7 +105,9 @@ static void list(struct np_apps *a, struct request *r)
     const char *error = NULL;
     while (item) {
         struct np_window_message m;
-        init_reply(&m, 1, r->token);
+        /* Type 9 is type 1 plus MimeType, so hosts can still tell a catalog
+         * from an older guest, which has no such field. */
+        init_reply(&m, 9, r->token);
         size_t count_offset = m.len;
         np_window_put_u32(&m, 0);
         uint32_t count = 0;
@@ -113,9 +115,12 @@ static void list(struct np_apps *a, struct request *r)
             GAppInfo *app = item->data;
             if (!visible(app)) continue;
             char *icon = g_desktop_app_info_get_string(G_DESKTOP_APP_INFO(app), "Icon");
+            /* The types it opens, ";"-separated as in the entry's MimeType key. */
+            const char *const *supported = g_app_info_get_supported_types(app);
+            char *types = supported ? g_strjoinv(";", (char **)supported) : g_strdup("");
             const char *fields[] = {g_app_info_get_id(app), g_app_info_get_display_name(app),
                 g_app_info_get_description(app), g_app_info_get_executable(app),
-                g_desktop_app_info_get_startup_wm_class(G_DESKTOP_APP_INFO(app)), icon};
+                g_desktop_app_info_get_startup_wm_class(G_DESKTOP_APP_INFO(app)), icon, types};
             size_t bytes = 4 * G_N_ELEMENTS(fields);
             for (unsigned i = 0; i < G_N_ELEMENTS(fields); ++i) {
                 if (!fields[i]) fields[i] = "";
@@ -124,9 +129,9 @@ static void list(struct np_apps *a, struct request *r)
             }
             if (bytes > 65536 - 16 || strlen(fields[0]) > 4096)
                 error = "Application metadata exceeds the per-entry size limit.";
-            if (error || (count && m.len + bytes > 65536)) { g_free(icon); break; }
+            if (error || (count && m.len + bytes > 65536)) { g_free(icon); g_free(types); break; }
             for (unsigned i = 0; i < G_N_ELEMENTS(fields); ++i) np_window_put_string(&m, fields[i]);
-            g_free(icon);
+            g_free(icon); g_free(types);
             ++count;
         }
         if (!m.ok) error = "Could not encode the application catalog.";
@@ -220,6 +225,14 @@ static void dispatch(struct np_apps *a, struct request *r)
         emit(a, r->generation, &m);
         return;
     }
+    /* NP_APP_OPEN: the first line names the application, the rest are URIs. */
+    GList *uris = NULL;
+    if (r->action == NP_APP_OPEN) {
+        char **lines = g_strsplit(r->id, "\n", -1);
+        for (int i = 1; lines[i]; i++) if (*lines[i]) uris = g_list_append(uris, g_strdup(lines[i]));
+        g_free(r->id); r->id = g_strdup(lines[0]);
+        g_strfreev(lines);
+    }
     GDesktopAppInfo *entry = strchr(r->id, '/') ? NULL : g_desktop_app_info_new(r->id);
     struct np_window_message m;
     if (r->action == NP_APP_ICON) {
@@ -248,11 +261,11 @@ static void dispatch(struct np_apps *a, struct request *r)
                 /* The synchronous manager API only queues a D-Bus call; its
                  * return value does not report a failed service activation. */
                 struct activation result = {0};
-                g_app_info_launch_uris_async(G_APP_INFO(entry), NULL, NULL, a->cancel, activated, &result);
+                g_app_info_launch_uris_async(G_APP_INFO(entry), uris, NULL, a->cancel, activated, &result);
                 while (!result.done) g_main_context_iteration(a->context, TRUE);
                 ok = result.ok; error = result.error;
             } else {
-                ok = g_desktop_app_info_launch_uris_as_manager(entry, NULL, NULL,
+                ok = g_desktop_app_info_launch_uris_as_manager(entry, uris, NULL,
                     G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD,
                     child_setup, NULL, launched, &l, &error);
             }
@@ -264,6 +277,7 @@ static void dispatch(struct np_apps *a, struct request *r)
         g_clear_error(&error);
     }
     g_clear_object(&entry);
+    g_list_free_full(uris, g_free);
     emit(a, r->generation, &m);
 }
 static gboolean requests_ready(gint fd, GIOCondition condition, gpointer data)
@@ -383,13 +397,29 @@ void np_apps_set_generation(struct np_apps *a, uint64_t generation)
     g_cond_signal(&a->available);
     g_mutex_unlock(&a->lock);
 }
+/* An application ID line, then one or more local file URIs. */
+bool np_apps_open_valid(const char *request)
+{
+    const char *end = strchr(request, '\n');
+    if (!end || end == request || memchr(request, '/', (size_t)(end - request))) return false;
+    unsigned count = 0;
+    for (const char *line = end + 1; *line;) {
+        const char *next = strchr(line, '\n');
+        size_t n = next ? (size_t)(next - line) : strlen(line);
+        if (n < 8 || strncmp(line, "file:///", 8) || ++count > 1024) return false;
+        line += n + (next ? 1 : 0);
+    }
+    return count > 0;
+}
 bool np_apps_request(struct np_apps *a, uint64_t generation, uint32_t token,
                      uint32_t action, const char *id)
 {
-    if (!a || !token || action > NP_APP_APPEARANCE || !id || strlen(id) > 4096 ||
+    if (!a || !token || action > NP_APP_OPEN || !id ||
+        strlen(id) > (action == NP_APP_OPEN ? 65536u : 4096u) ||
         (action == NP_APP_APPEARANCE && strcmp(id, "dark") && strcmp(id, "light")) ||
         (action == NP_APP_LIST && *id) ||
-        (action != NP_APP_LIST && (!*id || strchr(id, '/')))) { errno = EINVAL; return false; }
+        (action != NP_APP_LIST && action != NP_APP_OPEN && (!*id || strchr(id, '/'))) ||
+        (action == NP_APP_OPEN && !np_apps_open_valid(id))) { errno = EINVAL; return false; }
     if (g_async_queue_length(a->requests) >= 32) { errno = EAGAIN; return false; }
     struct request *r = g_new0(struct request, 1);
     *r = (struct request){ generation, token, action, g_strdup(id) };

@@ -3,6 +3,7 @@ import FSKit
 import Darwin
 import Security
 import NativePipeProtocol
+import NativePipeSharing
 import NativePipeStrings
 
 /// A machine-session-owned catalog, not a copy of the machine's filesystem.
@@ -57,13 +58,13 @@ public final class SharedFileVolumeBroker {
                   SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
                   let entitlements = (information as? [String: Any])?[kSecCodeInfoEntitlementsDict as String] as? [String: Any],
                   entitlements["com.apple.developer.fskit.mount"] as? Bool == true else {
-                throw NSError(domain: "NativePipe.FileSharing", code: Int(EACCES), userInfo: [NSLocalizedDescriptionKey:
-                    NPText("This build lacks FSKit mount authorization. Virtual file sharing requires an application signed with an authorized provisioning profile.")])
+                throw HostFileVolumeUnavailable(
+                    NPText("This build lacks FSKit mount authorization. Virtual file sharing requires an application signed with an authorized provisioning profile."))
             }
             let modules = try await FSClient.shared.installedExtensions
             guard modules.contains(where: { $0.bundleIdentifier == filesystemBundleIdentifier && $0.isEnabled }) else {
-                throw NSError(domain: "NativePipe.FileSharing", code: Int(ENODEV), userInfo: [NSLocalizedDescriptionKey:
-                    NPText("Enable %@ in System Settings → General → Login Items & Extensions → File System Extensions before sharing files.", moduleDisplayName)])
+                throw HostFileVolumeUnavailable(
+                    NPText("Enable %@ in System Settings → General → Login Items & Extensions → File System Extensions before sharing files.", moduleDisplayName))
             }
             let bookmark = try directory.bookmarkData(options: [.withSecurityScope, .securityScopeAllowOnlyReadAccess])
             var stale = false
@@ -94,7 +95,10 @@ public final class SharedFileVolumeBroker {
 
     public func publish(_ files: [URL], using access: any UserFileAccess,
                         purpose: GuestFileSharePurpose = .files) async throws -> [URL] {
-        guard !stopped, let rangeAccess = access as? any UserFileRangeAccess else { throw POSIXError(.ENOTSUP) }
+        guard !stopped else { throw POSIXError(.ENOTSUP) }
+        guard let rangeAccess = access as? any UserFileRangeAccess else {
+            throw HostFileVolumeUnavailable(NPText("The virtual file sharing backend is not available."))
+        }
         _ = try FileTransferURLs.decode(FileTransferURLs.encode(files))
         let token = generation
         let purposeToken = purposeGenerations[purpose]
@@ -428,3 +432,7 @@ public final class SharedFileVolumeBroker {
         return EIO
     }
 }
+
+/// The FSKit shared volume is the live Linux → Mac backend of SharingSession.
+@available(macOS 27.0, *)
+extension SharedFileVolumeBroker: HostFileVolume {}

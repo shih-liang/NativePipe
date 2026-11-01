@@ -68,7 +68,7 @@ public final class ApplicationClient {
             guard let request = pending[token], request.action == .list || !message.isEmpty else { return }
             finish(token, message.isEmpty ? .success(.batch(token, request.apps)) : .failure(Failure(message)))
         case .launched(let token, _, let message):
-            guard pending[token]?.action == .launch || pending[token]?.action == .appearance else { return }
+            guard [.launch, .open, .appearance].contains(pending[token]?.action) else { return }
             finish(token, message.isEmpty ? .success(reply) : .failure(Failure(message)))
         case .icon(let token, _):
             guard pending[token]?.action == .icon else { return }
@@ -195,6 +195,20 @@ public final class ApplicationClient {
             .agentInput(token: $0, window: window, events: events)
         }), accepted <= events.count else { throw Failure(NPText("Invalid agent input reply.")) }
         return AgentInputReceipt(accepted: Int(accepted), problem: problem.isEmpty ? nil : problem)
+    }
+
+    /// Launches an application with guest files, as a Linux file manager's
+    /// Open With does: the entry's %f/%F/%u/%U decide how they are passed.
+    public func open(_ files: [URL], with id: String) async throws -> Int32 {
+        guard !id.isEmpty, !id.contains("/"), !id.contains("\n"), !files.isEmpty, files.count <= 1024,
+              files.allSatisfy({ $0.isFileURL && !$0.absoluteString.contains("\n") }) else {
+            throw Failure(NPText("Invalid application ID."))
+        }
+        let request = ([id] + files.map(\.absoluteString)).joined(separator: "\n")
+        guard case .launched(_, let pid, _) = try await self.request(.open, request) else {
+            throw Failure(NPText("Invalid application ID."))
+        }
+        return pid
     }
 
     /// Zero means D-Bus activation succeeded without creating a child process.

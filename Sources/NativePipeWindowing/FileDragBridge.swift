@@ -1,12 +1,15 @@
 import AppKit
 import NativePipeProtocol
+import NativePipeSharing
 import OSLog
 
-/// One AppKit/Wayland file-drag state machine for VMHost and RemoteHost.
+/// One AppKit/Wayland drag state machine for VMHost and RemoteHost.
 /// Intra-Linux drags keep their original Wayland path until the pointer exits
-/// our windows; only then does AppKit take over the external drag. Linux files
-/// leave as URLs on the shared volume; without one, as file promises that copy
-/// them over the file connection when the destination asks.
+/// our windows; only then does AppKit take over the external drag.
+/// Files travel through the machine's SharingSession: Linux files leave as URLs
+/// on the shared volume or, without one, as file promises copied when dropped.
+/// Text, links, HTML and images are converted by ContentFormats in both
+/// directions; a file drag offers files only.
 @MainActor
 final class FileDragBridge: NSObject, NSDraggingSource {
     private static let log = Logger(subsystem: "com.nativepipe", category: "FileDrag")
@@ -17,6 +20,10 @@ final class FileDragBridge: NSObject, NSDraggingSource {
     private var target: UInt32 = 0
     private var incomingSequence = -1
     private var incomingURLs: [URL] = []
+    /// What the current Mac drag offers Linux, and where its data lives.
+    private var incomingFiles = false
+    private var incomingTypes: [String] = []
+    private var incomingPasteboard: NSPasteboard?
     private var importedURLs: [URL]?
     private var transfers: [UInt32: Task<Void, Never>] = [:]
     private var droppedImports: Set<UInt32> = []
@@ -24,6 +31,11 @@ final class FileDragBridge: NSObject, NSDraggingSource {
     private var outgoing: UInt32 = 0
     private var outgoingURLs: [URL] = []
     private var outgoingHostURLs: [URL]?
+    /// A Linux drag of content rather than files: the types read, their bytes,
+    /// and the pasteboard item made from them.
+    private var outgoingWanted: [String] = []
+    private var outgoingContent: [String: Data] = [:]
+    private var outgoingItem: NSPasteboardItem?
     /// The shared volume is unavailable for this drag: export copies instead.
     private var copyingOut = false
     private var promises: [LinuxFilePromise] = []
@@ -46,39 +58,54 @@ final class FileDragBridge: NSObject, NSDraggingSource {
         switch message.action {
         case .offered:
             Self.log.debug("Guest offered drag \(message.token)")
-            guard session == nil, !dropped, bridge?.fileAccess != nil else { return }
+            guard session == nil, !dropped, bridge?.sharing != nil else { return }
             clearExport()
             outgoing = message.token; outgoingURLs = []
-            send(.init(.readSource, token: outgoing))
+            let types = FileDragMessage.types(in: message.data)
+            outgoingWanted = types.contains(FileDragMessage.fileList)
+                ? [FileDragMessage.fileList] : ContentFormats.preferredGuestTypes(from: types)
+            for type in outgoingWanted { send(.init(.readSource, token: outgoing, data: Data(type.utf8))) }
         case .sourceData:
             guard message.token == outgoing, let data = message.data else { return }
-            outgoingURLs = (try? FileTransferURLs.decode(data)) ?? []
+            let (type, bytes) = FileDragMessage.untag(data)
+            guard type == FileDragMessage.fileList, let files = try? FileTransferURLs.decode(bytes), !files.isEmpty else {
+                // Content, including web links in a URI list.
+                outgoingContent[type] = bytes
+                guard outgoingWanted.allSatisfy({ outgoingContent[$0] != nil }) else { return }
+                let item = NSPasteboardItem()
+                var written = false
+                for wanted in outgoingWanted {
+                    if let content = outgoingContent[wanted] { written = ContentFormats.write(content, mime: wanted, to: item) || written }
+                }
+                outgoingItem = written ? item : nil
+                resumePendingExport()
+                return
+            }
+            outgoingURLs = files
             publication?.cancel(); outgoingHostURLs = nil; copyingOut = false
-            if let publish = bridge?.publishGuestFiles, let access = bridge?.fileAccess, !outgoingURLs.isEmpty {
+            if let sharing = bridge?.sharing, !outgoingURLs.isEmpty {
                 let token = outgoing, connection = generation, files = outgoingURLs
                 publication = Task { @MainActor [weak self] in
                     do {
                         // Preparing names while Linux owns the gesture avoids
                         // waiting for a whole-file transfer at the Mac boundary.
-                        let urls = try await publish(files, access, .drag)
+                        let shared = try await sharing.hostFiles(for: files, purpose: .drag)
                         try Task.checkCancellation()
                         guard let self, self.generation == connection, self.outgoing == token else { return }
-                        _ = try FileTransferURLs.decode(FileTransferURLs.encode(urls))
-                        guard urls.count == files.count else { throw FileRPC.Failure.protocolError }
-                        self.outgoingHostURLs = urls
+                        switch shared {
+                        case .mounted(let urls): self.outgoingHostURLs = urls
+                        case .deferred:
+                            Self.log.info("Drag \(token) copies files when dropped")
+                            self.copyingOut = true
+                        }
                         self.resumePendingExport()
                     } catch {
                         guard !(error is CancellationError), let self,
                               self.generation == connection, self.outgoing == token else { return }
-                        // No shared volume (no FSKit authorization, extension
-                        // disabled, …): the drop still gets copies.
-                        Self.log.info("Drag \(token) copies files: \(error.localizedDescription, privacy: .public)")
-                        self.copyingOut = true
-                        self.resumePendingExport()
+                        self.clearExport()
+                        self.reportError(error)
                     }
                 }
-            } else if !outgoingURLs.isEmpty {
-                copyingOut = true
             }
             Self.log.debug("Drag \(message.token) offers \(self.outgoingURLs.count) files")
         case .accepted:
@@ -92,16 +119,21 @@ final class FileDragBridge: NSObject, NSDraggingSource {
                 clearExport()
             }
         case .requestData:
-            if message.token == incoming { supplyIncomingFiles() }
+            if message.token == incoming { supplyIncoming(type: FileDragMessage.type(in: message.data)) }
         default: break
         }
     }
 
     func destination(_ info: NSDraggingInfo, window: UInt32, point: CGPoint, entering: Bool) -> NSDragOperation {
-        guard bridge?.fileAccess != nil, info.draggingSourceOperationMask.contains(.copy) else { return [] }
-        let own = (info.draggingSource as AnyObject?) === self
-        guard own || info.draggingPasteboard.canReadObject(forClasses: [NSURL.self, NSFilePromiseReceiver.self],
-            options: [.urlReadingFileURLsOnly: true]) else { return [] }
+        guard bridge?.sharing != nil, info.draggingSourceOperationMask.contains(.copy) else { return [] }
+        let pasteboard = info.draggingPasteboard
+        let own = (info.draggingSource as AnyObject?) === self && !outgoingURLs.isEmpty
+        // A file drag offers files only: text forms of their names would make
+        // some Linux apps insert the path instead of the file.
+        let files = own || pasteboard.canReadObject(forClasses: [NSURL.self, NSFilePromiseReceiver.self],
+            options: [.urlReadingFileURLsOnly: true])
+        let types = files ? [FileDragMessage.fileList] : ContentFormats.mimeTypes(for: pasteboard)
+        guard !types.isEmpty else { return [] }
         if incomingSequence != info.draggingSequenceNumber {
             if !droppedImports.contains(incoming) {
                 transfers[incoming]?.cancel(); transfers[incoming] = nil
@@ -109,13 +141,15 @@ final class FileDragBridge: NSObject, NSDraggingSource {
             repeat { nextToken &+= 1 } while nextToken == 0
             incoming = nextToken; incomingSequence = info.draggingSequenceNumber
             importedURLs = nil
-            incomingURLs = own ? outgoingURLs : (info.draggingPasteboard.readObjects(forClasses: [NSURL.self],
+            incomingFiles = files; incomingTypes = types; incomingPasteboard = pasteboard
+            incomingURLs = own ? outgoingURLs : !files ? [] : (pasteboard.readObjects(forClasses: [NSURL.self],
                 options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? [])
             if own { importedURLs = outgoingURLs }
         }
         if entering || target != window {
             target = window; accepted = false
-            send(.init(.enter, token: incoming, window: window, x: point.x, y: point.y))
+            send(.init(.enter, token: incoming, window: window, x: point.x, y: point.y,
+                       data: FileDragMessage.typeList(incomingTypes)))
             return .copy // Negotiation completes asynchronously at the next update.
         }
         send(.init(.motion, token: incoming, window: window, x: point.x, y: point.y))
@@ -128,8 +162,10 @@ final class FileDragBridge: NSObject, NSDraggingSource {
     }
 
     func perform(_ info: NSDraggingInfo) -> Bool {
-        guard accepted, let access = bridge?.fileAccess else { return false }
+        guard accepted, let sharing = bridge?.sharing else { return false }
         let token = incoming
+        // Content is read by Linux on demand, type by type (requestData).
+        if !incomingFiles { send(.init(.drop, token: token)); return true }
         let own = (info.draggingSource as AnyObject?) === self
         let urls = info.draggingPasteboard.readObjects(forClasses: [NSURL.self],
             options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
@@ -155,7 +191,7 @@ final class FileDragBridge: NSObject, NSDraggingSource {
         transfers[token] = Task { [weak self] in
             defer { withExtendedLifetime(receipt) {} }
             do {
-                let imported = try await receipt.importFiles(using: access)
+                let imported = try await receipt.importFiles(using: sharing)
                 guard let self, self.generation == connection else { return }
                 self.transfers[token] = nil
                 self.send(.init(.payload, token: token, data: FileTransferURLs.encode(imported)))
@@ -169,18 +205,30 @@ final class FileDragBridge: NSObject, NSDraggingSource {
         return true
     }
 
+    /// Linux asked for one type of the Mac drag.
+    private func supplyIncoming(type: String) {
+        guard !incomingFiles else {
+            if type == FileDragMessage.fileList { supplyIncomingFiles() }
+            else { send(.init(.payload, token: incoming, data: FileDragMessage.tagged(type, Data()))) }
+            return
+        }
+        var bytes = incomingPasteboard.flatMap { ContentFormats.data(forMIME: type, from: $0) } ?? Data()
+        if bytes.count > WindowWire.maximumClipboardDataSize { bytes = Data() }
+        send(.init(.payload, token: incoming, data: FileDragMessage.tagged(type, bytes)))
+    }
+
     private func supplyIncomingFiles() {
         let token = incoming
         if let importedURLs {
             send(.init(.payload, token: token, data: FileTransferURLs.encode(importedURLs)))
             return
         }
-        guard transfers[token] == nil, !incomingURLs.isEmpty, let access = bridge?.fileAccess else { return }
+        guard transfers[token] == nil, !incomingURLs.isEmpty, let sharing = bridge?.sharing else { return }
         let urls = incomingURLs
         let connection = generation
         transfers[token] = Task { [weak self] in
             do {
-                let imported = try await access.importFiles(urls)
+                let imported = try await sharing.guestURLs(for: urls, purpose: .drag)
                 guard let self, self.generation == connection else { return }
                 self.transfers[token] = nil
                 if self.incoming == token { self.importedURLs = imported }
@@ -204,16 +252,21 @@ final class FileDragBridge: NSObject, NSDraggingSource {
     }
 
     func beginExportIfNeeded(view: NSView, event: NSEvent) -> Bool {
-        guard session == nil, outgoing != 0, !outgoingURLs.isEmpty,
-              let access = bridge?.fileAccess,
+        guard session == nil, outgoing != 0, !outgoingURLs.isEmpty || outgoingItem != nil,
+              let sharing = bridge?.sharing,
               bridge?.containsGuestWindow(at: NSEvent.mouseLocation) == false else { return false }
-        let urls: [URL], writers: [any NSPasteboardWriting]
-        if let hostURLs = outgoingHostURLs {
-            urls = hostURLs; writers = hostURLs.map { $0 as NSURL }
+        let icons: [NSImage], writers: [any NSPasteboardWriting]
+        func fileIcons(_ urls: [URL]) -> [NSImage] {
+            urls.map { NSWorkspace.shared.icon(for: $0.hasDirectoryPath ? .folder : .data) }
+        }
+        if outgoingURLs.isEmpty, let item = outgoingItem {
+            icons = [NSWorkspace.shared.icon(for: .text)]; writers = [item]
+        } else if let hostURLs = outgoingHostURLs {
+            icons = fileIcons(hostURLs); writers = hostURLs.map { $0 as NSURL }
         } else if copyingOut {
             let token = outgoing
             promises = outgoingURLs.map { remote in
-                LinuxFilePromise(remote: remote) { try await access.exportPromisedFile(remote, to: $0) }
+                LinuxFilePromise(remote: remote, sharing: sharing)
             }
             remaining = promises.count; failed = false
             for promise in promises {
@@ -224,7 +277,7 @@ final class FileDragBridge: NSObject, NSDraggingSource {
                     self.finishExportIfReady()
                 }
             }
-            urls = outgoingURLs; writers = promises.map(\.provider)
+            icons = fileIcons(outgoingURLs); writers = promises.map(\.provider)
         } else {
             // The source URI may omit directory metadata. AppKit rejects the
             // generic UTType.item, so never guess .data or block its event
@@ -237,12 +290,14 @@ final class FileDragBridge: NSObject, NSDraggingSource {
         let point = view.convert(event.locationInWindow, from: nil)
         let items = writers.enumerated().map { i, writer in
             let item = NSDraggingItem(pasteboardWriter: writer)
-            let image = NSWorkspace.shared.icon(for: urls[i].hasDirectoryPath ? .folder : .data)
+            let image = icons[i]
             item.setDraggingFrame(NSRect(x: point.x + CGFloat(i * 4), y: point.y,
                 width: 48, height: 48), contents: image)
             return item
         }
-        send(.init(.exportBegan, token: outgoing))
+        // Tells the Linux source which type the Mac is taking.
+        let taken = outgoingURLs.isEmpty ? outgoingWanted.first ?? FileDragMessage.fileList : FileDragMessage.fileList
+        send(.init(.exportBegan, token: outgoing, data: Data(taken.utf8)))
         Self.log.debug("AppKit begins drag \(self.outgoing)")
         bridge?.hideDragIcon()
         session = view.beginDraggingSession(with: items, event: event, source: self)
@@ -274,6 +329,7 @@ final class FileDragBridge: NSObject, NSDraggingSource {
         publication?.cancel(); publication = nil
         pendingExportView = nil; pendingExportEvent = nil
         outgoing = 0; outgoingURLs = []; outgoingHostURLs = nil
+        outgoingWanted = []; outgoingContent = [:]; outgoingItem = nil
         // AppKit's providers own their promises; writes already asked for finish.
         copyingOut = false; promises = []; remaining = 0; failed = false
         dropped = false; localDrop = false
@@ -286,6 +342,7 @@ final class FileDragBridge: NSObject, NSDraggingSource {
         transfers.removeAll(); droppedImports.removeAll()
         incoming = 0; incomingSequence = -1; target = 0; accepted = false
         importedURLs = nil; incomingURLs = []
+        incomingFiles = false; incomingTypes = []; incomingPasteboard = nil
         clearExport()
     }
 }

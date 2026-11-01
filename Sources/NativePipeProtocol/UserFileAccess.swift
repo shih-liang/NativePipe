@@ -80,28 +80,28 @@ public enum FileTransferLocalIO {
 /// (Remote); the pasteboard and AppKit drag lifecycle are shared by both.
 @MainActor
 public protocol UserFileAccess: AnyObject {
-    func importFiles(_ urls: [URL], shareDirectories: Bool) async throws -> [URL]
-    func exportFile(_ remote: URL, to local: URL) async throws
-    func importFiles(_ urls: [URL], shareDirectories: Bool,
+    /// Copies Mac files into a new guest folder and returns their guest URLs.
+    /// Live sharing (the drop mount) is chosen above this, by SharingSession.
+    func importFiles(_ urls: [URL],
                      progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws -> [URL]
+    func exportFile(_ remote: URL, to local: URL) async throws
     func exportFile(_ remote: URL, to local: URL,
                     progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws
     /// Fulfils a file promise. AppKit grants a sandboxed source access to the
     /// promised URL only, and its documentation says to write the file to
     /// exactly that URL: no sibling staging. Partial output is removed on failure.
     func exportPromisedFile(_ remote: URL, to local: URL) async throws
+    /// The same copy as `exportFile`, runnable off the main actor, for callers
+    /// that must wait for it synchronously (AppKit's on-demand clipboard data).
+    /// nil when this connection can only copy on the main actor.
+    var detachedExport: (@Sendable (URL, URL) async throws -> Void)? { get }
 }
 
 public extension UserFileAccess {
     func importFiles(_ urls: [URL]) async throws -> [URL] {
-        try await importFiles(urls, shareDirectories: true)
+        try await importFiles(urls, progress: { _ in })
     }
-    func importFiles(_ urls: [URL], shareDirectories: Bool,
-                     progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws -> [URL] {
-        let result = try await importFiles(urls, shareDirectories: shareDirectories)
-        progress(.init(bytesTransferred: 0, isComplete: true))
-        return result
-    }
+    var detachedExport: (@Sendable (URL, URL) async throws -> Void)? { nil }
     func exportFile(_ remote: URL, to local: URL,
                     progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws {
         try await exportFile(remote, to: local)
@@ -169,14 +169,13 @@ public enum FileTransferURLs {
     }
 }
 
-/// No root RPC is used by desktop clients. A VM can optionally clone/share
-/// host files first; every failed clone falls back to this streaming path.
+/// The VM's file connection: no root RPC is used by desktop clients. Copies
+/// stream over FileRPC; live sharing is decided above, by SharingSession.
 @MainActor
 public final class FileRPCUserAccess: UserFileRangeAccess {
     private let rpc: FileRPC
     private var rangeCancellations: [UUID: @Sendable () -> Void] = [:]
     private var rangeGeneration: UInt64 = 0
-    public var shareFile: ((URL) async throws -> URL?)?
     public init(rpc: FileRPC) { self.rpc = rpc }
 
     public func metadata(for remote: URL) async throws -> UserFileMetadata {
@@ -223,10 +222,7 @@ public final class FileRPCUserAccess: UserFileRangeAccess {
         return value
     }
 
-    public func importFiles(_ urls: [URL], shareDirectories: Bool = true) async throws -> [URL] {
-        try await importFiles(urls, shareDirectories: shareDirectories, progress: { _ in })
-    }
-    public func importFiles(_ urls: [URL], shareDirectories: Bool,
+    public func importFiles(_ urls: [URL],
                             progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws -> [URL] {
         _ = try FileTransferURLs.decode(FileTransferURLs.encode(urls))
         let tracker = FileTransferProgressTracker(progress: progress)
@@ -239,8 +235,6 @@ public final class FileRPCUserAccess: UserFileRangeAccess {
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             let isDirectory = try await FileTransferLocalIO.perform { try url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true }
             try Task.checkCancellation()
-            if shareDirectories || !isDirectory,
-               let shared = try await shareFile?(url) { result.append(shared); continue }
             if directory == nil {
                 let path = "/tmp/nativepipe-drop-" + UUID().uuidString
                 try await rpc.createDirectory(path)
@@ -334,6 +328,17 @@ public final class FileRPCUserAccess: UserFileRangeAccess {
     }
     public func exportFile(_ remote: URL, to local: URL,
                            progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws {
+        try await Self.export(rpc, remote, to: local, progress: progress)
+    }
+
+    public var detachedExport: (@Sendable (URL, URL) async throws -> Void)? {
+        let rpc = rpc
+        return { remote, local in try await Self.export(rpc, remote, to: local, progress: { _ in }) }
+    }
+
+    /// FileRPC is a Sendable value, so a copy never needs the main actor.
+    nonisolated static func export(_ rpc: FileRPC, _ remote: URL, to local: URL,
+                                   progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws {
         _ = try FileTransferURLs.decode(FileTransferURLs.encode([remote]))
         guard local.isFileURL, !["", "/", ".", ".."].contains(local.lastPathComponent) else { throw FileRPC.Failure.invalidPath }
         let parent = local.deletingLastPathComponent()
@@ -348,7 +353,7 @@ public final class FileRPCUserAccess: UserFileRangeAccess {
         let tracker = FileTransferProgressTracker(totalBytes: info.isRegular ? info.size : nil, progress: progress)
         let staging = local.deletingLastPathComponent().appendingPathComponent(".nativepipe-transfer-" + UUID().uuidString)
         do {
-            try await download(remote.path, to: staging, relativePath: "", depth: 0, tracker: tracker)
+            try await download(rpc, remote.path, to: staging, relativePath: "", depth: 0, tracker: tracker)
             try Task.checkCancellation()
             try await FileTransferLocalIO.perform {
                 guard renamex_np(staging.path, local.path, UInt32(RENAME_EXCL)) == 0 else { throw FileRPC.Failure.local(errno) }
@@ -368,16 +373,17 @@ public final class FileRPCUserAccess: UserFileRangeAccess {
     /// Streams straight into the promised URL.
     public func exportPromisedFile(_ remote: URL, to local: URL) async throws {
         _ = try FileTransferURLs.decode(FileTransferURLs.encode([remote]))
-        try await FileTransferLocalIO.writePromised(to: local) { [self] destination in
+        let rpc = rpc
+        try await FileTransferLocalIO.writePromised(to: local) { destination in
             let info = try await rpc.stat(remote.path)
             let tracker = FileTransferProgressTracker(totalBytes: info.isRegular ? info.size : nil, progress: { _ in })
-            try await download(remote.path, to: destination, relativePath: "", depth: 0, tracker: tracker)
+            try await Self.download(rpc, remote.path, to: destination, relativePath: "", depth: 0, tracker: tracker)
             tracker.finish()
         }
     }
 
-    private func download(_ remote: String, to local: URL, relativePath: String, depth: Int,
-                          tracker: FileTransferProgressTracker) async throws {
+    nonisolated private static func download(_ rpc: FileRPC, _ remote: String, to local: URL, relativePath: String, depth: Int,
+                                             tracker: FileTransferProgressTracker) async throws {
         try Task.checkCancellation()
         guard depth < 64 else { throw FileRPC.Failure.invalidPath }
         let info = try await rpc.stat(remote)
@@ -387,7 +393,7 @@ public final class FileRPCUserAccess: UserFileRangeAccess {
                 guard mkdir(local.path, 0o700) == 0 else { throw FileRPC.Failure.local(errno) }
             }
             for entry in try await rpc.read(remote).entries {
-                try await download(remote + "/" + entry.name,
+                try await download(rpc, remote + "/" + entry.name,
                     to: local.appendingPathComponent(entry.name),
                     relativePath: relativePath.isEmpty ? entry.name : relativePath + "/" + entry.name,
                     depth: depth + 1, tracker: tracker)

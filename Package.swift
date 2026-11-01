@@ -9,6 +9,7 @@ let products: [Product] = [
     .library(name: "NativePipeNotifications", targets: ["NativePipeNotifications"]),
     .library(name: "NativePipeWindowing", targets: ["NativePipeWindowing"]),
     .library(name: "NativePipeRemote", targets: ["NativePipeRemote"]),
+    .library(name: "NativePipeSharing", targets: ["NativePipeSharing"]),
     .library(name: "NativePipeFileSharing", targets: ["NativePipeFileSharing"]),
     .library(name: "NativePipeFileSystem", targets: ["NativePipeFileSystem"]),
     .executable(name: "NativePipeFileSystemExtension", targets: ["NativePipeFileSystemExtension"]),
@@ -18,13 +19,19 @@ let products: [Product] = [
 // only filesystem publication and the extension require macOS 27.
 let fsKitLink: [LinkerSetting] = [.unsafeFlags(["-Xlinker", "-weak_framework", "-Xlinker", "FSKit"])]
 let targets: [Target] = [
-        .target(name: "NativePipeFileSharing", dependencies: ["NativePipeStrings", "NativePipeProtocol"],
+        // The one sharing backend (content formats, live shares, copies) behind
+        // drag and drop, clipboard and opening files on the other side.
+        .target(name: "NativePipeSharing", dependencies: ["NativePipeStrings", "NativePipeProtocol"],
+                swiftSettings: [.swiftLanguageMode(.v5)]),
+        .testTarget(name: "NativePipeSharingTests", dependencies: ["NativePipeSharing", "NativePipeProtocol"],
+                swiftSettings: [.swiftLanguageMode(.v5)]),
+        .target(name: "NativePipeFileSharing", dependencies: ["NativePipeStrings", "NativePipeProtocol", "NativePipeSharing"],
                 swiftSettings: [.swiftLanguageMode(.v5)], linkerSettings: fsKitLink),
         .target(name: "NativePipeFileSystem", dependencies: ["NativePipeFileSharing"],
                 swiftSettings: [.swiftLanguageMode(.v5)], linkerSettings: fsKitLink),
         .executableTarget(name: "NativePipeFileSystemExtension", dependencies: ["NativePipeFileSystem"],
                 swiftSettings: [.swiftLanguageMode(.v5)], linkerSettings: fsKitLink),
-        .testTarget(name: "NativePipeFileSharingTests", dependencies: ["NativePipeFileSharing", "NativePipeProtocol"],
+        .testTarget(name: "NativePipeFileSharingTests", dependencies: ["NativePipeFileSharing", "NativePipeProtocol", "NativePipeSharing"],
                 swiftSettings: [.swiftLanguageMode(.v5)], linkerSettings: fsKitLink),
         .testTarget(name: "NativePipeFileSystemTests", dependencies: ["NativePipeFileSystem", "NativePipeFileSharing", "NativePipeProtocol"],
                 swiftSettings: [.swiftLanguageMode(.v5)], linkerSettings: fsKitLink),
@@ -60,13 +67,13 @@ let targets: [Target] = [
         // Wayland guest events ↔ NSWindow / clipboard / key codes.
         .target(
             name: "NativePipeWindowing",
-            dependencies: ["NativePipeStrings", "NativePipeProtocol", "NativePipeNotifications"],
+            dependencies: ["NativePipeStrings", "NativePipeProtocol", "NativePipeNotifications", "NativePipeSharing"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         // Remote Linux: SSH stdio NPIP + NPEN, VideoToolbox decode, WindowBridge.
         .target(
             name: "NativePipeRemote",
-            dependencies: ["NativePipeStrings", "NativePipeProtocol", "NativePipeWindowing", "CNativePipeAV1"],
+            dependencies: ["NativePipeStrings", "NativePipeProtocol", "NativePipeWindowing", "NativePipeSharing", "CNativePipeAV1"],
             swiftSettings: [.swiftLanguageMode(.v5)],
             linkerSettings: [
                 .linkedFramework("VideoToolbox"),
@@ -79,7 +86,7 @@ let targets: [Target] = [
         .executableTarget(
             name: "NativePipeRemoteApp",
             dependencies: ["NativePipeStrings", "NativePipeFileSharing", "NativePipeWindowing",
-                "NativePipeRemote",
+                "NativePipeRemote", "NativePipeSharing",
                 "NativePipeProtocol",
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
@@ -91,7 +98,7 @@ let targets: [Target] = [
         ),
         .testTarget(
             name: "NativePipeWindowingTests",
-            dependencies: ["NativePipeWindowing", "NativePipeProtocol"],
+            dependencies: ["NativePipeWindowing", "NativePipeProtocol", "NativePipeSharing"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .testTarget(

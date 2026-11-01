@@ -8,6 +8,8 @@
 static struct np_surface surface;
 static unsigned restored, last_action, last_token;
 static bool last_success;
+static unsigned char last_data[1024];
+static size_t last_size;
 static struct np_surface *fixture_icon;
 static unsigned icon_changes, icon_replays, icon_queues;
 static uint32_t icon_replay_id;
@@ -58,9 +60,22 @@ bool np_window_event_send_message(struct np_server *s, struct np_window_message 
     const unsigned char *bytes; size_t size; bool present;
     assert(np_window_read_bytes(&r, &bytes, &size, true, &present));
     last_success = present && size == 1 && bytes[0];
+    last_size = present && size <= sizeof(last_data) ? size : 0;
+    if (last_size) memcpy(last_data, bytes, last_size);
     return true;
 }
 
+static void command_bytes(struct np_server *s, unsigned action, unsigned token, const void *payload, size_t length) {
+    struct np_window_message m;
+    np_window_message_init(&m, NP_WINDOW_HOST_TO_GUEST, NP_HOST_FILE_DRAG);
+    np_window_put_u32(&m, action); np_window_put_u32(&m, token); np_window_put_u32(&m, 1);
+    np_window_put_f64(&m, 10); np_window_put_f64(&m, 20);
+    np_window_put_optional_bytes(&m, (const unsigned char *)payload, length, payload != NULL);
+    struct np_window_reader r;
+    assert(np_window_reader_init(&r, m.data, m.len, NP_WINDOW_HOST_TO_GUEST));
+    assert(np_data_handle_file_drag(s, &r));
+    np_window_message_clear(&m);
+}
 static void command(struct np_server *s, unsigned action, unsigned token, const char *payload) {
     struct np_window_message m;
     np_window_message_init(&m, NP_WINDOW_HOST_TO_GUEST, NP_HOST_FILE_DRAG);
@@ -277,6 +292,8 @@ int main(void) {
     assert(last_action == 105 && last_token == 1);
     command(&s, 4, 1, NULL);
     assert(first->dropped && restored == 1 && !s.host_file_drag);
+    /* The drop is the target's user event for its drop menu's popup grab. */
+    assert(s.drop_client == client);
     struct np_data_offer *second = enter(&s, client, 2);
     /* A second drag must not invalidate the previous dropped offer's read. */
     const char *uri = "file:///tmp/first.txt\r\n";
@@ -297,6 +314,43 @@ int main(void) {
     command(&s, 4, 3, NULL);
     wl_resource_destroy(first->resource);
     assert(last_action == 104 && last_token == 3 && !last_success);
+
+    /* A Mac drag of text and files offers both types; each read asks the Mac
+     * for its own type and gets only that type's bytes. */
+    {
+        const char *types = "text/plain;charset=utf-8\ntext/uri-list";
+        command_bytes(&s, 1, 6, types, strlen(types));
+        struct np_data_offer *offer = wl_container_of(s.data_offers.next, offer, link);
+        assert(offer->host_drag == 6 && offer->host_value_count == 2);
+        data_offer_accept(client, offer->resource, 0, "image/png");
+        assert(!offer->accepted_mime);
+        data_offer_accept(client, offer->resource, 0, "text/plain;charset=utf-8");
+        assert(offer->accepted_mime && !strcmp(offer->accepted_mime, "text/plain;charset=utf-8"));
+        data_offer_set_actions(client, offer->resource, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY,
+                               WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
+        int text = receive_type(offer, client, "text/plain;charset=utf-8");
+        assert(last_action == 105 && last_token == 6 && last_size == 24 &&
+               !memcmp(last_data, "text/plain;charset=utf-8", 24));
+        int files = receive_type(offer, client, "text/uri-list");
+        command(&s, 4, 6, NULL);
+        assert(offer->dropped);
+        static const char tagged[] = "text/plain;charset=utf-8\0Hello, Linux";
+        command_bytes(&s, 5, 6, tagged, sizeof(tagged) - 1);
+        char got[64]; ssize_t n = read(text, got, sizeof(got));
+        assert(n == 12 && !memcmp(got, "Hello, Linux", 12));
+        assert(read(text, got, sizeof(got)) == 0); close(text);
+        /* An untyped payload is the file list, delivered to its own reader. */
+        command(&s, 5, 6, "file:///tmp/a\r\n");
+        n = read(files, got, sizeof(got));
+        assert(n == 15 && !memcmp(got, "file:///tmp/a\r\n", 15)); close(files);
+        /* A later read of a supplied type is answered from the cache. */
+        last_action = 0;
+        int again = receive_type(offer, client, "text/plain;charset=utf-8");
+        assert(last_action != 105 && read(again, got, sizeof(got)) == 12); close(again);
+        data_offer_finish(client, offer->resource);
+        assert(last_action == 104 && last_token == 6 && last_success);
+        wl_resource_destroy(offer->resource);
+    }
 
     first = enter(&s, client, 4); fd = receive(first, client);
     np_data_host_disconnected(&s);

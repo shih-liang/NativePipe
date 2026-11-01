@@ -787,7 +787,7 @@ final class SFTPFileSystemTests: XCTestCase {
         try FileManager.default.createDirectory(at: source, withIntermediateDirectories: false)
         let bytes = Data(repeating: 0x51, count: 32 * 1024 * 1024 + 13)
         try bytes.write(to: source.appendingPathComponent("payload"))
-        let imported = try await files.importFiles([source], shareDirectories: false)
+        let imported = try await files.importFiles([source])
         defer { try? FileManager.default.removeItem(at: imported[0].deletingLastPathComponent()) }
         let destination = local.appendingPathComponent("received")
         let recorder = SFTPProgressRecorder()

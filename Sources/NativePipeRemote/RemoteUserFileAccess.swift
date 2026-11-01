@@ -6,8 +6,6 @@ public final class RemoteUserFileAccess: UserFileRangeAccess {
     let command: SSHCommand
     let environment: [String: String]
     private let makeSession: @MainActor () -> SFTPFileSystem
-    /// Offers a dropped item in place on the remote computer; nil copies it.
-    public var shareFile: (@Sendable (URL) -> URL?)?
     private var rangeSession: SFTPFileSystem?
     private var rangeTail: Task<Void, Never>?
     private var rangeGeneration: UInt64 = 0
@@ -73,10 +71,8 @@ public final class RemoteUserFileAccess: UserFileRangeAccess {
             worker.cancel(); delivery.finish(.failure(CancellationError()))
         }
     }
-    public func importFiles(_ urls: [URL], shareDirectories: Bool) async throws -> [URL] {
-        try await importFiles(urls, shareDirectories: shareDirectories, progress: { _ in })
-    }
-    public func importFiles(_ urls: [URL], shareDirectories: Bool,
+    /// Copies Mac files over SFTP; live sharing is decided by SharingSession.
+    public func importFiles(_ urls: [URL],
                      progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws -> [URL] {
         _ = try FileTransferURLs.decode(FileTransferURLs.encode(urls))
         let tracker = FileTransferProgressTracker(progress: progress)
@@ -88,12 +84,6 @@ public final class RemoteUserFileAccess: UserFileRangeAccess {
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             let isDirectory = try await FileTransferLocalIO.perform { try url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true }
             try Task.checkCancellation()
-            // Temporary promised folders must not become a lasting share.
-            if shareDirectories || !isDirectory, let shareFile,
-               let shared = try await FileTransferLocalIO.perform({ shareFile(url) }) {
-                result.append(shared)
-                continue
-            }
             let parent = "/tmp/nativepipe-drop-" + UUID().uuidString
             let remote = parent + "/" + url.lastPathComponent
             let session = makeSession()

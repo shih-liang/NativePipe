@@ -1,5 +1,6 @@
 import AppKit
 import NativePipeProtocol
+import NativePipeSharing
 import XCTest
 @testable import NativePipeWindowing
 
@@ -15,7 +16,7 @@ private final class DragRecordingView: NSView {
 @MainActor
 private final class DragRangeFiles: UserFileAccess {
     var exports = 0
-    func importFiles(_ urls: [URL], shareDirectories: Bool) async throws -> [URL] { urls }
+    func importFiles(_ urls: [URL], progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws -> [URL] { urls }
     func exportFile(_ remote: URL, to local: URL) async throws {
         exports += 1
     }
@@ -43,11 +44,11 @@ final class FileDragBridgeTests: XCTestCase {
     func testDirectoryURIWithoutSlashWaitsForMetadataThenDragsResolvedURL() async throws {
         _ = NSApplication.shared
         let bridge = WindowBridge(frameSource: nil), files = DragRangeFiles()
-        bridge.fileAccess = files
+        bridge.sharing = SharingSession(transport: files)
         let drag = FileDragBridge(bridge: bridge, reportError: { _ in XCTFail("Expected successful publication") })
         defer { drag.disconnect(); bridge.clipboard.stop() }
         var release: CheckedContinuation<[URL], Never>?
-        bridge.publishGuestFiles = { urls, _, purpose in
+        bridge.sharing?.hostVolume = ClosureHostVolume { urls, _, purpose in
             XCTAssertEqual(urls.map(\.path), ["/guest/folder.txt"])
             XCTAssertFalse(urls[0].hasDirectoryPath); XCTAssertEqual(purpose, .drag)
             return await withCheckedContinuation { release = $0 }
@@ -64,7 +65,7 @@ final class FileDragBridgeTests: XCTestCase {
         // is ready and inspect its writers without posting any OS input.
         try await Task.sleep(for: .milliseconds(20))
         XCTAssertTrue(view.draggedItems.isEmpty)
-        bridge.publishGuestFiles = { _, _, _ in [mountedFolder] }
+        bridge.sharing?.hostVolume = ClosureHostVolume { _, _, _ in [mountedFolder] }
         try offer(drag, token: 2)
         try await Task.sleep(for: .milliseconds(20))
         XCTAssertTrue(drag.beginExportIfNeeded(view: view, event: try event()))
@@ -76,11 +77,11 @@ final class FileDragBridgeTests: XCTestCase {
 
     func testMouseUpWhileMountWaitsDiscardsLatePublication() async throws {
         let bridge = WindowBridge(frameSource: nil), files = DragRangeFiles()
-        bridge.fileAccess = files
+        bridge.sharing = SharingSession(transport: files)
         var failures = 0, release: CheckedContinuation<[URL], Never>?
         let drag = FileDragBridge(bridge: bridge, reportError: { _ in failures += 1 })
         defer { drag.disconnect(); bridge.clipboard.stop() }
-        bridge.publishGuestFiles = { _, _, _ in await withCheckedContinuation { release = $0 } }
+        bridge.sharing?.hostVolume = ClosureHostVolume { _, _, _ in await withCheckedContinuation { release = $0 } }
         try offer(drag); try await until { release != nil }
         let view = DragRecordingView()
         XCTAssertFalse(drag.beginExportIfNeeded(view: view, event: try event()))
@@ -93,11 +94,11 @@ final class FileDragBridgeTests: XCTestCase {
 
     func testDisconnectWhileMountWaitsCannotStartLaterDrag() async throws {
         let bridge = WindowBridge(frameSource: nil), files = DragRangeFiles()
-        bridge.fileAccess = files
+        bridge.sharing = SharingSession(transport: files)
         var failures = 0, release: CheckedContinuation<[URL], Never>?
         let drag = FileDragBridge(bridge: bridge, reportError: { _ in failures += 1 })
         defer { drag.disconnect(); bridge.clipboard.stop() }
-        bridge.publishGuestFiles = { _, _, _ in await withCheckedContinuation { release = $0 } }
+        bridge.sharing?.hostVolume = ClosureHostVolume { _, _, _ in await withCheckedContinuation { release = $0 } }
         try offer(drag); try await until { release != nil }
         let view = DragRecordingView()
         XCTAssertFalse(drag.beginExportIfNeeded(view: view, event: try event()))
@@ -110,13 +111,14 @@ final class FileDragBridgeTests: XCTestCase {
 
     func testUnavailableVolumeDragsPromisesThatCopyOverFileConnection() async throws {
         _ = NSApplication.shared
-        for publisher: GuestFilePublisher? in [{ _, _, _ in throw GuestFileSharingError.unavailable }, nil] {
+        for unavailable in [true, false] {
             let bridge = WindowBridge(frameSource: nil), files = DragRangeFiles()
-            bridge.fileAccess = files
+            bridge.sharing = SharingSession(transport: files)
             var failures = 0
             let drag = FileDragBridge(bridge: bridge, reportError: { _ in failures += 1 })
             defer { drag.disconnect(); bridge.clipboard.stop() }
-            bridge.publishGuestFiles = publisher
+            // An unmountable volume, or none at all: both copy on drop.
+            if unavailable { bridge.sharing?.hostVolume = unavailableVolume() }
             try offer(drag)
             // Let publication fail first: a pending gesture resumed without a
             // pressed button would be discarded instead.
@@ -128,5 +130,37 @@ final class FileDragBridgeTests: XCTestCase {
             // Nothing is copied until the destination asks for the promise.
             XCTAssertEqual(files.exports, 0); XCTAssertEqual(failures, 0)
         }
+    }
+
+    func testLinuxTextDragBecomesOneMacItemWithEveryRepresentation() async throws {
+        _ = NSApplication.shared
+        let bridge = WindowBridge(frameSource: nil)
+        bridge.sharing = SharingSession(transport: DragRangeFiles())
+        var sent: [FileDragMessage] = []
+        bridge.output = { if case .fileDrag(let message) = $0 { sent.append(message) } }
+        let drag = FileDragBridge(bridge: bridge, reportError: { XCTFail("Unexpected failure: \($0)") })
+        defer { drag.disconnect(); bridge.clipboard.stop() }
+        drag.receive(.init(.offered, token: 9, data: FileDragMessage.typeList(["text/plain", "text/html", "image/x-unknown"])))
+        let reads = sent.filter { $0.action == .readSource }.map { FileDragMessage.type(in: $0.data) }
+        XCTAssertEqual(reads, ["text/html", "text/plain"], "Rich text is read with its plain-text companion")
+        drag.receive(.init(.sourceData, token: 9, data: FileDragMessage.tagged("text/html", Data("<b>Hi</b>".utf8))))
+        drag.receive(.init(.sourceData, token: 9, data: FileDragMessage.tagged("text/plain", Data("Hi".utf8))))
+        let view = DragRecordingView()
+        XCTAssertTrue(drag.beginExportIfNeeded(view: view, event: try event()))
+        let item = try XCTUnwrap(view.draggedItems.first?.item as? NSPasteboardItem)
+        XCTAssertEqual(item.string(forType: .html), "<b>Hi</b>")
+        XCTAssertEqual(item.string(forType: .string), "Hi")
+        XCTAssertEqual(sent.last.map { FileDragMessage.type(in: $0.data) }, "text/html")
+        XCTAssertEqual(sent.last?.action, .exportBegan)
+    }
+
+    func testDragTypeTagsStayCompatibleWithOlderPeers() {
+        XCTAssertEqual(FileDragMessage.types(in: nil), ["text/uri-list"])
+        XCTAssertEqual(FileDragMessage.type(in: nil), "text/uri-list")
+        let plain = Data("file:///tmp/a\r\n".utf8)
+        XCTAssertEqual(FileDragMessage.untag(plain).type, "text/uri-list")
+        XCTAssertEqual(FileDragMessage.untag(plain).bytes, plain)
+        let tagged = FileDragMessage.untag(FileDragMessage.tagged("text/plain", Data("x".utf8)))
+        XCTAssertEqual(tagged.type, "text/plain"); XCTAssertEqual(tagged.bytes, Data("x".utf8))
     }
 }

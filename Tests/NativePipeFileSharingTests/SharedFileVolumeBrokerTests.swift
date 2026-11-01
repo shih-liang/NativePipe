@@ -2,6 +2,7 @@ import Foundation
 import Darwin
 import AppKit
 import NativePipeProtocol
+import NativePipeSharing
 import XCTest
 @testable import NativePipeFileSharing
 
@@ -35,9 +36,8 @@ final class SharedFileVolumeBrokerTests: XCTestCase {
         access.add(file)
         do { _ = try await broker.publish([file], using: access); XCTFail("The XCTest process has no FSKit mount authorization") }
         catch {
-            let error = error as NSError
-            XCTAssertEqual(error.domain, "NativePipe.FileSharing")
-            XCTAssertEqual(error.code, Int(EACCES))
+            // SharingSession copies instead when the volume is unavailable.
+            XCTAssertTrue(error is HostFileVolumeUnavailable)
             XCTAssertTrue(error.localizedDescription.contains("FSKit"))
         }
         XCTAssertFalse(broker.hasPublishedFiles)
@@ -330,6 +330,6 @@ private final class SharedRangeFixture: UserFileRangeAccess {
         reads.append((offset, length)); return Data("hello".utf8.prefix(length))
     }
     func closeRangeAccess() { closed += 1 }
-    func importFiles(_ urls: [URL], shareDirectories: Bool) async throws -> [URL] { throw POSIXError(.ENOTSUP) }
+    func importFiles(_ urls: [URL], progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws -> [URL] { throw POSIXError(.ENOTSUP) }
     func exportFile(_ remote: URL, to local: URL) async throws { exports += 1; throw POSIXError(.ENOTSUP) }
 }
