@@ -745,6 +745,7 @@ bool np_data_handle_file_drag(struct np_server *s, struct np_window_reader *r) {
             offer->active = false;
             if (offer->accepted_mime && offer->chosen_action == WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY) {
                 offer->dropped = true;
+                s->drop_client = wl_resource_get_client(offer->device);
                 wl_data_device_send_drop(offer->device);
             } else {
                 wl_data_device_send_leave(offer->device);
@@ -1032,6 +1033,7 @@ void np_data_drag_finish(struct np_server *server) {
 			continue;
 		}
 		match->dropped = true;
+		server->drop_client = wl_resource_get_client(device->resource);
 		wl_data_device_send_drop(device->resource);
 		dropped = true;
 	}

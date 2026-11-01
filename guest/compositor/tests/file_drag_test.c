@@ -292,6 +292,8 @@ int main(void) {
     assert(last_action == 105 && last_token == 1);
     command(&s, 4, 1, NULL);
     assert(first->dropped && restored == 1 && !s.host_file_drag);
+    /* The drop is the target's user event for its drop menu's popup grab. */
+    assert(s.drop_client == client);
     struct np_data_offer *second = enter(&s, client, 2);
     /* A second drag must not invalidate the previous dropped offer's read. */
     const char *uri = "file:///tmp/first.txt\r\n";

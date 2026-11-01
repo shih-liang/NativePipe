@@ -552,6 +552,7 @@ void np_input_host_disconnected(struct np_server *server)
     server->pointer_grab_serial = 0;
     server->last_input_client = NULL;
     server->last_input_serial = 0;
+    server->drop_client = NULL;
     struct np_input *pointer;
     wl_list_for_each(pointer, &server->pointers, link) pointer->active_scroll_axes = 0;
     struct np_surface *surface;
@@ -877,6 +878,7 @@ static void deliver_key(struct np_server *server, struct np_surface *surface, ui
 	if (pressed) {
 		server->last_input_serial = serial;
 		server->last_input_client = wl_resource_get_client(surface->resource);
+		server->drop_client = NULL;
 	}
 	uint32_t time = input_now_ms();
 	int delivered = 0, total = 0;
@@ -1126,6 +1128,7 @@ static const char *agent_pointer_button(struct np_server *server, uint32_t which
 	if (pressed) {
 		server->last_input_serial = serial;
 		server->last_input_client = wl_resource_get_client(surface->resource);
+		server->drop_client = NULL;
 	}
 	struct np_input *entry;
 	wl_list_for_each(entry, &server->pointers, link) {
@@ -1313,6 +1316,7 @@ static void handle_pointer_button(struct np_server *server, uint32_t window_id,
 		server->pointer_grab_client = wl_resource_get_client(surface->resource);
 		server->last_input_serial = serial;
 		server->last_input_client = wl_resource_get_client(surface->resource);
+		server->drop_client = NULL;
 	}
 	uint32_t time = input_now_ms();
 	int delivered = 0, total = 0;
