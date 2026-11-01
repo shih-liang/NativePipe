@@ -84,6 +84,26 @@ final class SharingSessionTests: XCTestCase {
         catch { XCTAssertEqual((error as? POSIXError)?.code, .EIO) }
     }
 
+    func testChosenGuestItemsAreCopiedUnderTheirNamesWithoutAVolume() async throws {
+        let transport = TransportFixture()
+        let session = SharingSession(transport: transport, hostVolume: VolumeFixture(.failure(HostFileVolumeUnavailable("no FSKit"))))
+        let remotes = ["/home/me/a/notes.txt", "/home/me/b/notes.txt", "/home/me/c.txt"].map { URL(fileURLWithPath: $0) }
+        let urls = try await session.hostURLs(for: remotes, purpose: .files)
+        XCTAssertEqual(urls.map(\.lastPathComponent), ["notes.txt", "notes.txt", "c.txt"])
+        XCTAssertEqual(urls[0].deletingLastPathComponent(), urls[2].deletingLastPathComponent(), "One folder to show")
+        XCTAssertNotEqual(urls[0], urls[1], "Equal names never overwrite each other")
+        XCTAssertEqual(try urls.map { try String(contentsOf: $0, encoding: .utf8) }, remotes.map(\.path))
+        XCTAssertTrue(session.holdsCopies(for: .files))
+        session.revoke(.files)
+        XCTAssertFalse(session.holdsCopies())
+        let mounted = URL(fileURLWithPath: "/Volumes/Linux/c.txt")
+        let live = SharingSession(transport: transport, hostVolume: VolumeFixture(.success([mounted])))
+        let shared = try await live.hostURLs(for: [remotes[2]], purpose: .files)
+        XCTAssertEqual(shared, [mounted])
+        XCTAssertFalse(live.holdsCopies())
+        session.stop(); live.stop()
+    }
+
     func testTemporaryCopiesLiveUntilTheirPurposeIsRevoked() async throws {
         let transport = TransportFixture(), volume = VolumeFixture(.success([]))
         let session = SharingSession(transport: transport, hostVolume: volume)

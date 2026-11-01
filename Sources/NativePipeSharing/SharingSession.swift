@@ -94,6 +94,43 @@ public final class SharingSession {
         return .deferred(guestFiles)
     }
 
+    /// Mac URLs for guest items a person chose, for example to show them in
+    /// Finder: the live volume when it is available, otherwise copies kept in
+    /// one private folder under their guest names until the purpose is revoked.
+    public func hostURLs(for guestFiles: [URL], purpose: GuestFileSharePurpose,
+                         progress: @escaping @Sendable (FileTransferProgress) -> Void = { _ in }) async throws -> [URL] {
+        let remotes: [URL]
+        switch try await hostFiles(for: guestFiles, purpose: purpose) {
+        case .mounted(let urls): return urls
+        case .deferred(let deferred): remotes = deferred
+        }
+        let folder = try reserveCopyFolder(purpose: purpose)
+        var names = Set<String>(), result: [URL] = []
+        for remote in remotes {
+            try Task.checkCancellation()
+            let name = remote.lastPathComponent
+            guard !["", "/", ".", ".."].contains(name) else { throw FileRPC.Failure.invalidPath }
+            // Items from different guest folders may share a name.
+            var parent = folder
+            if !names.insert(name).inserted {
+                let unique = folder.appendingPathComponent(UUID().uuidString, isDirectory: true)
+                try await FileTransferLocalIO.perform {
+                    try FileManager.default.createDirectory(at: unique, withIntermediateDirectories: false)
+                }
+                parent = unique
+            }
+            let local = parent.appendingPathComponent(name, isDirectory: remote.hasDirectoryPath)
+            try await copyGuestItem(remote, to: local, progress: progress)
+            result.append(local)
+        }
+        return result
+    }
+
+    /// True while copies made for a purpose (or any purpose) still exist.
+    public func holdsCopies(for purpose: GuestFileSharePurpose? = nil) -> Bool {
+        copies.contains { (purpose == nil || $0.key == purpose) && !$0.value.isEmpty }
+    }
+
     /// Copies one guest item to an exact Mac URL, which must not exist yet.
     /// `promised` fulfils a file promise: only the promised URL is written,
     /// as AppKit requires of a sandboxed source; otherwise the item is staged
