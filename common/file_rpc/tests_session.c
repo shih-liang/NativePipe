@@ -314,6 +314,28 @@ static void test_release_cancels_and_close_wakes(void) {
     np_file2_stream_release(pending);
 }
 
+/* Closing while both sides still write must leave no writer on a descriptor the
+ * next socketpair can reuse; a stray write would break that pair's framing. */
+static void test_close_during_writes_leaves_reused_descriptors_alone(void) {
+    for (unsigned round = 0; round < 200; round++) {
+        struct side host, guest; pair(&host, &guest, 0, 1);
+        echo(host.session, 1000, round);
+        struct np_file2_stream *stream = np_file2_request(host.session, ECHO, NULL, 0, 0);
+        struct np_file2_message *message = malloc(sizeof(*message));
+        assert(stream && message && np_file2_receive(stream, message) == 1);
+        struct transfer transfer = {stream, NP_FILE2_STREAM_DATA_MAX, round, 0, 0};
+        pthread_t sender; assert(pthread_create(&sender, NULL, send_pattern, &transfer) == 0);
+        /* The guest's echo writer is still sending back when its session closes. */
+        if (round % 2) usleep(round * 10);
+        np_file2_session_close(host.session);
+        assert(pthread_join(sender, NULL) == 0);
+        np_file2_stream_release(stream);
+        wait_until(&guest, &guest.closed);
+        np_file2_session_close(guest.session);
+        free(message);
+    }
+}
+
 static void raw_frame(int socket, uint8_t type, uint8_t flags, uint32_t id, const void *body, uint32_t length) {
     unsigned char header[NP_FILE2_HEADER] = {'N','P','2','F', type, flags, 0, 0};
     np_file_put32(header + 8, id); np_file_put32(header + 12, length);
@@ -405,6 +427,7 @@ int main(void) {
     test_unserved_request_is_cancelled();
     test_stalled_stream_and_cancel();
     test_release_cancels_and_close_wakes();
+    test_close_during_writes_leaves_reused_descriptors_alone();
     expect_protocol_error(bad_magic);
     expect_protocol_error(same_role);
     expect_protocol_error(wrong_parity);

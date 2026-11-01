@@ -374,8 +374,12 @@ void np_file2_session_close(struct np_file2_session *session) {
     fail(session, ECONNRESET);
     pthread_join(session->reader, NULL);
     pthread_join(session->controller, NULL);
-    close(session->socket);
     pthread_mutex_lock(&session->lock);
+    /* A stream's writer may have passed the gate before the failure and not yet
+     * reached send(). Closing under it would let it write into whatever socket
+     * reuses the descriptor; the shutdown above makes it return promptly. */
+    while (session->writing) pthread_cond_wait(&session->changed, &session->lock);
+    close(session->socket);
     session->owner_closed = 1;
     /* Unreferenced streams can go now; referenced ones on release. */
     struct np_file2_stream *stream = session->streams;
