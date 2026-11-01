@@ -68,7 +68,7 @@ final class ApplicationClientTests: XCTestCase {
                 }
                 client.receive(.end(token, ""))
             case .icon: icons += 1; client.receive(.icon(token, Data(id.utf8)))
-            case .launch, .appearance: client.receive(.launched(token, 0, ""))
+            case .launch, .appearance, .open: client.receive(.launched(token, 0, ""))
             }
         }
         client.setConnected(true)

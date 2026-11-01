@@ -7,7 +7,9 @@
 /* Owned by the compositor, running with its uid and session environment.
  * No Wayland objects or backend calls cross into this worker. */
 struct np_apps;
-enum np_app_action { NP_APP_LIST, NP_APP_LAUNCH, NP_APP_ICON, NP_APP_APPEARANCE };
+/* NP_APP_OPEN: "app-id\nfile:///…\n…" launches the app with those files,
+ * the way a file manager's Open With does. */
+enum np_app_action { NP_APP_LIST, NP_APP_LAUNCH, NP_APP_ICON, NP_APP_APPEARANCE, NP_APP_OPEN };
 struct np_app_reply {
     uint64_t generation;
     unsigned char *data;
@@ -16,6 +18,7 @@ struct np_app_reply {
 struct np_apps *np_apps_start(void);
 int np_apps_fd(struct np_apps *apps);
 void np_apps_set_generation(struct np_apps *apps, uint64_t generation);
+bool np_apps_open_valid(const char *request);
 /* A rejected request sets EINVAL for invalid input or EAGAIN for a full queue. */
 bool np_apps_request(struct np_apps *apps, uint64_t generation, uint32_t token,
                      uint32_t action, const char *id);

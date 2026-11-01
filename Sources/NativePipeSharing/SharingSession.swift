@@ -60,6 +60,16 @@ public final class SharingSession {
         return result.compactMap { $0 }
     }
 
+    /// Opens Mac files in a Linux application, as Finder's Open With does on
+    /// the Mac: the files reach the guest live where possible, otherwise as
+    /// copies, and the application entry decides how it receives them.
+    public func open(_ hostFiles: [URL], with application: String,
+                     using applications: ApplicationClient) async throws -> Int32 {
+        let urls = try await guestURLs(for: hostFiles, purpose: .open)
+        guard urls.count == hostFiles.count else { throw FileRPC.Failure.protocolError }
+        return try await applications.open(urls, with: application)
+    }
+
     // MARK: Linux → Mac
 
     public enum HostFiles: Equatable {

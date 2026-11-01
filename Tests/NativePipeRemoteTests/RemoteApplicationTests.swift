@@ -559,19 +559,27 @@ final class RemoteApplicationTests: XCTestCase {
         return Int((Double(bytes[0]) * 10 / 255).rounded()) - 1
     }
     func testCatalogBinaryReplyAndLimits() throws {
-        var payload = ApplicationReply.magic + Data([1, 1, 0, 0])
+        var payload = ApplicationReply.magic + Data([1, 9, 0, 0])
         func number(_ value: UInt32) { var v = value.littleEndian; withUnsafeBytes(of: &v) { payload.append(contentsOf: $0) } }
         func field(_ bytes: Data) { number(UInt32(bytes.count)); payload.append(bytes) }
         number(42); number(1)
-        for value in ["editor.desktop", "Éditeur", "Text editor", "editor", "Editor", "editor-icon"] { field(Data(value.utf8)) }
+        for value in ["editor.desktop", "Éditeur", "Text editor", "editor", "Editor", "editor-icon",
+                      "text/plain;text/markdown"] { field(Data(value.utf8)) }
         guard case .batch(let token, let apps) = try ApplicationReply.decode(payload) else {
             return XCTFail("Expected catalog")
         }
         XCTAssertEqual(token, 42)
         XCTAssertEqual(apps.first?.name, "Éditeur")
         XCTAssertEqual(apps.first?.iconName, "editor-icon")
+        XCTAssertEqual(apps.first?.mimeTypes, ["text/plain", "text/markdown"])
         XCTAssertThrowsError(try ApplicationReply.decode(payload.dropLast()))
         XCTAssertThrowsError(try ApplicationReply.decode(payload + Data([0])))
+        // An older guest's catalog has no MimeType field.
+        var older = payload.prefix(payload.count - 4 - "text/plain;text/markdown".utf8.count)
+        older[older.startIndex + 5] = 1
+        guard case .batch(_, let olderApps) = try ApplicationReply.decode(Data(older)) else { return XCTFail("Expected catalog") }
+        XCTAssertEqual(olderApps.first?.iconName, "editor-icon")
+        XCTAssertNil(olderApps.first?.mimeTypes)
         var command = SSHCommand(destination: "host", application: [])
         XCTAssertThrowsError(try command.validate())
         command.persistentSession = true

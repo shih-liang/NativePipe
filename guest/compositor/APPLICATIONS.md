@@ -31,14 +31,18 @@ existing NPIP framing and host control/event lanes are retained; there is no
 new listener, JSON object or per-application process in the host.
 
 Host NPW2 opcode 27 carries `token:u32, action:u32, desktopID:string`.
-Actions are list (0, empty ID), launch (1), thumbnail (2), and appearance
-(3, `dark` or `light` in the string field). Appearance applies the same GNOME
+Actions are list (0, empty ID), launch (1), thumbnail (2), appearance
+(3, `dark` or `light` in the string field), and open (4: the desktop ID on the
+first line, then one or more `file:///` URIs, one per line, at most 1024 and
+64 KiB). Open is Open With: GIO passes the files as the entry's
+`%f`/`%F`/`%u`/`%U` field codes say, and the reply is opcode 2. Appearance applies the same GNOME
 color-scheme and GTK-theme settings used by VMHost's desktop integration.
 NPAP uses an 8-byte header (`NPAP`, direction=1, opcode, two zero bytes), then:
 
 | Opcode | Body |
 | --- | --- |
-| 1 | token, count (0–32), metadata records |
+| 1 | token, count (0–32), metadata records (older guests) |
+| 9 | token, count (0–32), metadata records with MimeType |
 | 2 | token, pid:i32, error:string; empty error means launch succeeded |
 | 3 | token=0; application database changed |
 | 4 | token, error:string; completes a catalog, or fails any request if error is nonempty |
@@ -46,7 +50,9 @@ NPAP uses an 8-byte header (`NPAP`, direction=1, opcode, two zero bytes), then:
 | 6 | token=0, pid:i32, exitStatus:i32 |
 
 Metadata fields: ID, display name, comment, executable (identity matching only),
-StartupWMClass and icon name, all length-prefixed UTF-8 strings. Integers are
+StartupWMClass and icon name, and for opcode 9 the entry's MimeType list
+(`;`-separated, from `g_app_info_get_supported_types`), all length-prefixed
+UTF-8 strings. Integers are
 little-endian. No 512-application truncation remains. Transport trust limits
 produce explicit errors instead of partial catalogs.
 Metadata batches are also limited to 64 KiB. Oversized or invalid entries fail

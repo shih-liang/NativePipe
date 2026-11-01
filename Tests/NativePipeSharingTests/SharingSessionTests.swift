@@ -45,6 +45,28 @@ final class SharingSessionTests: XCTestCase {
         XCTAssertEqual(transport.imported.last, [urls[1]], "Temporary items are always copied")
     }
 
+    func testOpenWithLinuxAppSharesTheFilesThenLaunchesTheEntryWithTheirURIs() async throws {
+        var requests: [(ApplicationAction, String)] = []
+        var client: ApplicationClient!
+        client = ApplicationClient { command in
+            guard case .applicationRequest(let token, let action, let request) = command else { return }
+            requests.append((action, request))
+            client.receive(.launched(token, 4242, ""))
+        }
+        client.setConnected(true)
+        let session = SharingSession(transport: TransportFixture(), guestShare: { url in
+            url.lastPathComponent == "live.txt" ? URL(fileURLWithPath: "/run/nativepipe/drops/1/T/live.txt") : nil
+        })
+        let files = ["live.txt", "two words.txt"].map { URL(fileURLWithPath: "/Users/me/" + $0) }
+        let pid = try await session.open(files, with: "org.gnome.TextEditor.desktop", using: client)
+        XCTAssertEqual(pid, 4242)
+        XCTAssertEqual(requests.map(\.0), [.open])
+        XCTAssertEqual(requests.first?.1, "org.gnome.TextEditor.desktop\nfile:///run/nativepipe/drops/1/T/live.txt\n"
+                       + "file:///tmp/nativepipe-drop-test/two%20words.txt")
+        do { _ = try await session.open(files, with: "bad/id", using: client); XCTFail("Invalid IDs are refused") }
+        catch {}
+    }
+
     func testGuestFilesAreMountedWhenPossibleAndDeferredWhenUnavailable() async throws {
         let remote = URL(fileURLWithPath: "/home/me/file.txt")
         let mounted = URL(fileURLWithPath: "/Volumes/Linux/file.txt")

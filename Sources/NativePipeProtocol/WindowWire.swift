@@ -573,7 +573,8 @@ public enum WindowWire {
             append(message.x.bitPattern, to: &payload); append(message.y.bitPattern, to: &payload)
             try append(message.data, to: &payload)
         case .applicationRequest(let token, let action, let application):
-            guard token != 0, application.utf8.count <= 4096 else { throw EncodeError.invalidValue }
+            // An open request carries file URIs after the application ID.
+            guard token != 0, application.utf8.count <= (action == .open ? 65536 : 4096) else { throw EncodeError.invalidValue }
             append(token, to: &payload)
             append(action.rawValue, to: &payload)
             try append(application, to: &payload)

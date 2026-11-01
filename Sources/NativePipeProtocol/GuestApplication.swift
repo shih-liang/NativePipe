@@ -6,11 +6,16 @@ public struct GuestApplication: Identifiable, Codable, Sendable, Equatable {
     public let id, name, executable: String
     public let comment, startupWMClass, iconName: String?
     public var iconData: Data?
+    /// The MIME types it opens (its desktop entry's MimeType). Optional so
+    /// catalogs saved before this field still decode.
+    public let mimeTypes: [String]?
 
     public init(id: String, name: String, comment: String? = nil, executable: String = "",
-                startupWMClass: String? = nil, iconName: String? = nil, iconData: Data? = nil) {
+                startupWMClass: String? = nil, iconName: String? = nil, iconData: Data? = nil,
+                mimeTypes: [String]? = nil) {
         self.id = id; self.name = name; self.comment = comment; self.executable = executable
         self.startupWMClass = startupWMClass; self.iconName = iconName; self.iconData = iconData
+        self.mimeTypes = mimeTypes
     }
     public func matches(applicationID: String) -> Bool {
         WindowApplicationIdentity.matches(applicationID, candidates: [
@@ -22,7 +27,8 @@ public struct GuestApplication: Identifiable, Codable, Sendable, Equatable {
     }
 }
 
-public enum ApplicationAction: UInt32, Sendable { case list, launch, icon, appearance }
+/// `open` launches an application with files: "app-id\nfile:///…" (one URI per line).
+public enum ApplicationAction: UInt32, Sendable { case list, launch, icon, appearance, open }
 
 /// NPAP replies inside the existing NPIP event stream. Catalogs are streamed
 /// in batches of up to 32 metadata records, followed by an explicit completion.
@@ -48,17 +54,19 @@ public enum ApplicationReply: Sendable {
         guard [UInt8(3), 6].contains(data[5]) || token != 0 else { throw WindowWire.DecodeError.malformed }
         let reply: Self
         switch data[5] {
-        case 1:
+        case 1, 9: // 9 adds each entry's MimeType.
             let count = try r.number()
             guard token != 0, count <= 32 else { throw WindowWire.DecodeError.malformed }
             var apps: [GuestApplication] = []
             for _ in 0..<count {
                 let id = try r.string(), name = try r.string(), comment = try r.string()
                 let executable = try r.string(), wm = try r.string(), icon = try r.string()
+                let types = data[5] == 9 ? try r.string() : ""
                 guard !id.isEmpty, !id.contains("/") else { throw WindowWire.DecodeError.malformed }
                 apps.append(GuestApplication(id: id, name: name,
                     comment: comment.isEmpty ? nil : comment, executable: executable,
-                    startupWMClass: wm.isEmpty ? nil : wm, iconName: icon.isEmpty ? nil : icon))
+                    startupWMClass: wm.isEmpty ? nil : wm, iconName: icon.isEmpty ? nil : icon,
+                    mimeTypes: data[5] == 9 ? types.split(separator: ";").map(String.init) : nil))
             }
             reply = .batch(token, apps)
         case 2: reply = try .launched(token, Int32(bitPattern: r.number()), r.string())
