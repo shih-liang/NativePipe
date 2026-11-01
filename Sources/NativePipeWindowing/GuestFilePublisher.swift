@@ -7,7 +7,8 @@ import NativePipeStrings
 /// registering names never needs to copy their contents.
 public typealias GuestFilePublisher = @MainActor ([URL], any UserFileAccess, GuestFileSharePurpose) async throws -> [URL]
 
-/// Missing filesystem support is reported; sharing never downloads a private copy.
+/// The publisher itself never downloads a private copy. Callers that need
+/// the files anyway (drags) copy them over the file connection instead.
 public enum GuestFileSharingError: LocalizedError {
     case unavailable
     public var errorDescription: String? {

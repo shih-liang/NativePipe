@@ -17,7 +17,7 @@ private final class DragRangeFiles: UserFileAccess {
     var exports = 0
     func importFiles(_ urls: [URL], shareDirectories: Bool) async throws -> [URL] { urls }
     func exportFile(_ remote: URL, to local: URL) async throws {
-        exports += 1; XCTFail("Dragging may not download a fallback copy")
+        exports += 1
     }
 }
 
@@ -108,18 +108,25 @@ final class FileDragBridgeTests: XCTestCase {
         XCTAssertTrue(view.draggedItems.isEmpty); XCTAssertEqual(files.exports, 0); XCTAssertEqual(failures, 0)
     }
 
-    func testFailedPublicationReportsOnceAndNeverCreatesPromiseFallback() async throws {
-        let bridge = WindowBridge(frameSource: nil), files = DragRangeFiles()
-        bridge.fileAccess = files
-        var failures = 0
-        let drag = FileDragBridge(bridge: bridge, reportError: { _ in failures += 1 })
-        defer { drag.disconnect(); bridge.clipboard.stop() }
-        bridge.publishGuestFiles = { _, _, _ in throw GuestFileSharingError.unavailable }
-        try offer(drag); try await until { failures == 1 }
-        let view = DragRecordingView()
-        XCTAssertFalse(drag.beginExportIfNeeded(view: view, event: try event()))
-        drag.receive(.init(.sourceData, token: 1, data: FileTransferURLs.encode([URL(fileURLWithPath: "/guest/folder.txt")])))
-        try await Task.sleep(for: .milliseconds(20))
-        XCTAssertEqual(failures, 1); XCTAssertTrue(view.draggedItems.isEmpty); XCTAssertEqual(files.exports, 0)
+    func testUnavailableVolumeDragsPromisesThatCopyOverFileConnection() async throws {
+        _ = NSApplication.shared
+        for publisher: GuestFilePublisher? in [{ _, _, _ in throw GuestFileSharingError.unavailable }, nil] {
+            let bridge = WindowBridge(frameSource: nil), files = DragRangeFiles()
+            bridge.fileAccess = files
+            var failures = 0
+            let drag = FileDragBridge(bridge: bridge, reportError: { _ in failures += 1 })
+            defer { drag.disconnect(); bridge.clipboard.stop() }
+            bridge.publishGuestFiles = publisher
+            try offer(drag)
+            // Let publication fail first: a pending gesture resumed without a
+            // pressed button would be discarded instead.
+            try await Task.sleep(for: .milliseconds(20))
+            let view = DragRecordingView()
+            XCTAssertTrue(drag.beginExportIfNeeded(view: view, event: try event()))
+            let promise = try XCTUnwrap(view.draggedItems.first?.item as? NSFilePromiseProvider)
+            XCTAssertEqual(promise.delegate?.filePromiseProvider(promise, fileNameForType: promise.fileType), "folder.txt")
+            // Nothing is copied until the destination asks for the promise.
+            XCTAssertEqual(files.exports, 0); XCTAssertEqual(failures, 0)
+        }
     }
 }

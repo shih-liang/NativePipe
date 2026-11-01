@@ -110,7 +110,38 @@ int test_chmod(const char *path, mode_t mode) {
     return 0;
 }
 
+static void write_file(const char *path, const char *text) {
+    FILE *file = fopen(path, "w"); assert(file);
+    fputs(text, file); fclose(file);
+}
+
+static void test_session_locale(void) {
+    char user[] = "/tmp/np-locale-user-XXXXXX", system[] = "/tmp/np-locale-system-XXXXXX";
+    int fd = mkstemp(user); assert(fd >= 0); close(fd);
+    fd = mkstemp(system); assert(fd >= 0); close(fd);
+    char out[NP_LOCALE_VARS][NP_LOCALE_ENTRY];
+    const char *const files[] = {user, system, NULL};
+    write_file(system, "# system\nLANG=en_US.UTF-8\nLC_TIME=\"de_DE.UTF-8\"\nLC_ALL=C\nPATH=/x\n");
+    write_file(user, "");
+    /* An empty user file falls back to the system file. */
+    size_t n = session_locale(files, out);
+    assert(n == 2 && !strcmp(out[0], "LANG=en_US.UTF-8") && !strcmp(out[1], "LC_TIME=de_DE.UTF-8"));
+    /* A user file replaces the system one, as /etc/profile.d/locale.sh does. */
+    write_file(user, "export LANG='zh_CN.UTF-8'\nLANG=zh_TW.UTF-8\nLC_CTYPE=bad value\nLC_MESSAGES=$(id)\n");
+    n = session_locale(files, out);
+    assert(n == 1 && !strcmp(out[0], "LANG=zh_TW.UTF-8"));
+    /* Without a configured LANG the session still runs in UTF-8. */
+    write_file(user, "LC_TIME=en_GB.UTF-8\n");
+    n = session_locale(files, out);
+    assert(n == 2 && !strcmp(out[0], "LC_TIME=en_GB.UTF-8") && !strcmp(out[1], "LANG=C.UTF-8"));
+    const char *const none[] = {"/nonexistent/locale.conf", NULL};
+    n = session_locale(none, out);
+    assert(n == 1 && !strcmp(out[0], "LANG=C.UTF-8"));
+    unlink(user); unlink(system);
+}
+
 int main(void) {
+    test_session_locale();
     test_default_volume();
     struct passwd pw = {.pw_name = "installtest", .pw_uid = 1000, .pw_gid = 1000};
     char runtime[128];

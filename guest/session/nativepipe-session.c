@@ -16,6 +16,7 @@
 #include <grp.h>
 #include <pwd.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -247,6 +248,60 @@ static int setup_runtime(const struct passwd *pw, char *runtime, size_t cap) {
     return 0;
 }
 
+/* A login gets its locale from the distribution's profile: Arch's
+ * /etc/profile.d/locale.sh sources the user's locale.conf, else the system's;
+ * Debian keeps it in /etc/default/locale. The session replaces login, so it
+ * reads the same files. Only locale.conf(5) variables are taken (never LC_ALL),
+ * and without any configuration the session uses C.UTF-8 as Alpine does. */
+#define NP_LOCALE_VARS 15
+#define NP_LOCALE_ENTRY 128
+static const char *const locale_vars[] = {
+    "LANG", "LANGUAGE", "LC_CTYPE", "LC_NUMERIC", "LC_TIME", "LC_COLLATE",
+    "LC_MONETARY", "LC_MESSAGES", "LC_PAPER", "LC_NAME", "LC_ADDRESS",
+    "LC_TELEPHONE", "LC_MEASUREMENT", "LC_IDENTIFICATION", NULL};
+
+static size_t session_locale(const char *const files[], char out[][NP_LOCALE_ENTRY]) {
+    size_t count = 0;
+    for (size_t f = 0; files[f] && count == 0; f++) {
+        FILE *file = fopen(files[f], "r");
+        if (!file) continue;
+        char line[512];
+        while (count < NP_LOCALE_VARS && fgets(line, sizeof(line), file)) {
+            char *key = line;
+            while (*key == ' ' || *key == '\t') key++;
+            if (!strncmp(key, "export ", 7)) key += 7;
+            char *eq = strchr(key, '=');
+            if (*key == '#' || !eq) continue;
+            *eq = '\0';
+            char *value = eq + 1;
+            value[strcspn(value, "\r\n")] = '\0';
+            size_t length = strlen(value);
+            if (length >= 2 && (value[0] == '"' || value[0] == '\'') && value[length - 1] == value[0]) {
+                value[length - 1] = '\0';
+                value++;
+            }
+            bool known = false;
+            for (size_t v = 0; locale_vars[v]; v++) known = known || !strcmp(key, locale_vars[v]);
+            if (!known || !*value || strpbrk(value, " \t;`$\\\"'") ||
+                snprintf(out[count], NP_LOCALE_ENTRY, "%s=%s", key, value) >= NP_LOCALE_ENTRY)
+                continue;
+            bool replaced = false;
+            for (size_t i = 0; i < count && !replaced; i++) {
+                if (!strncmp(out[i], key, strlen(key)) && out[i][strlen(key)] == '=') {
+                    memcpy(out[i], out[count], NP_LOCALE_ENTRY);
+                    replaced = true;
+                }
+            }
+            if (!replaced) count++;
+        }
+        fclose(file);
+    }
+    bool has_lang = false;
+    for (size_t i = 0; i < count; i++) has_lang = has_lang || !strncmp(out[i], "LANG=", 5);
+    if (!has_lang && count < NP_LOCALE_VARS) snprintf(out[count++], NP_LOCALE_ENTRY, "LANG=C.UTF-8");
+    return count;
+}
+
 static int drop_and_exec(const struct passwd *pw, const char *runtime) {
     if (initgroups(pw->pw_name, pw->pw_gid) < 0)
         return -1;
@@ -272,7 +327,12 @@ static int drop_and_exec(const struct passwd *pw, const char *runtime) {
     snprintf(shellenv, sizeof(shellenv), "SHELL=%s",
              pw->pw_shell && pw->pw_shell[0] ? pw->pw_shell : "/bin/sh");
     snprintf(runtimeenv, sizeof(runtimeenv), "XDG_RUNTIME_DIR=%s", runtime);
-    char *envp[19];
+    char user_locale[320];
+    snprintf(user_locale, sizeof(user_locale), "%s/.config/locale.conf", home);
+    const char *const locale_files[] = {user_locale, "/etc/locale.conf", "/etc/default/locale", NULL};
+    char locale_env[NP_LOCALE_VARS][NP_LOCALE_ENTRY];
+    size_t locale_count = session_locale(locale_files, locale_env);
+    char *envp[19 + NP_LOCALE_VARS];
     size_t envc = 0;
     long page_size = sysconf(_SC_PAGESIZE);
     int has_venus = np_venus_icd_available();
@@ -286,6 +346,7 @@ static int drop_and_exec(const struct passwd *pw, const char *runtime) {
     envp[envc++] = classenv;
     envp[envc++] = desktopenv;
     envp[envc++] = currentdesktopenv;
+    for (size_t i = 0; i < locale_count; i++) envp[envc++] = locale_env[i];
     if (page_size > 0 && page_size < 16384 &&
         access(NP_INSTALLED_ALIGN_BLOB, R_OK) == 0)
         envp[envc++] = preloadenv;

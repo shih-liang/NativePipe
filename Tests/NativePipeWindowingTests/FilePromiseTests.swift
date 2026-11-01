@@ -75,23 +75,50 @@ final class FilePromiseTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
     }
 
-    func testMissingPublisherNeverFallsBackToRemoteExport() throws {
+    func testUnavailableVolumeCopiesOverFileConnection() throws {
         _ = NSApplication.shared
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("unavailable-promise-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let destination = directory.appendingPathComponent("file"), access = PromiseFileAccess()
-        let promise = LinuxFilePromise(remote: URL(fileURLWithPath: "/guest/file"), access: access)
-        nonisolated(unsafe) let provider = promise.provider
-        let failed = expectation(description: "unavailable backend")
-        OperationQueue().addOperation {
-            promise.filePromiseProvider(provider, writePromiseTo: destination) { error in
-                XCTAssertTrue(error is GuestFileSharingError); failed.fulfill()
+        for publisher: GuestFilePublisher? in [nil, { _, _, _ in throw GuestFileSharingError.unavailable }] {
+            let destination = directory.appendingPathComponent(UUID().uuidString), access = PromiseFileAccess()
+            let promise = LinuxFilePromise(remote: URL(fileURLWithPath: "/guest/file"), access: access,
+                                           publishGuestFiles: publisher)
+            nonisolated(unsafe) let provider = promise.provider
+            let copied = expectation(description: "file connection copy")
+            OperationQueue().addOperation {
+                promise.filePromiseProvider(provider, writePromiseTo: destination) { error in
+                    XCTAssertNil(error); copied.fulfill()
+                }
             }
+            wait(for: [copied], timeout: 5)
+            XCTAssertEqual(access.exports, 1)
+            XCTAssertEqual(try Data(contentsOf: destination), PromiseFileAccess.contents)
         }
-        wait(for: [failed], timeout: 5)
-        XCTAssertEqual(access.exports, 0)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+    }
+
+    func testPromiseWritesOnlyTheDestinationAndCleansFailures() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("promised-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("file.bin"), access = PromiseFileAccess()
+        // A sandboxed promise may write the promised URL only: no sibling staging.
+        try await access.exportPromisedFile(URL(fileURLWithPath: "/guest/file.bin"), to: destination)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), ["file.bin"])
+        XCTAssertEqual(try Data(contentsOf: destination), PromiseFileAccess.contents)
+        do {
+            try await access.exportPromisedFile(URL(fileURLWithPath: "/guest/file.bin"), to: destination)
+            XCTFail("An existing destination must not be replaced")
+        } catch { XCTAssertEqual(try Data(contentsOf: destination), PromiseFileAccess.contents) }
+        let failing = directory.appendingPathComponent("partial.bin")
+        do {
+            try await FileTransferLocalIO.writePromised(to: failing) { url in
+                try Data("partial".utf8).write(to: url)
+                throw POSIXError(.EIO)
+            }
+            XCTFail("The failed write must be reported")
+        } catch { XCTAssertEqual((error as? POSIXError)?.code, .EIO) }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: failing.path))
     }
 
     func testProviderOwnsWriterAfterSourceDisappearsWithoutRetainCycle() throws {

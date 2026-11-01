@@ -305,6 +305,27 @@ int main(void) {
     assert(open_path(client, NP_FILE_OPEN_DIRECTORY | NP_FILE_NOFOLLOW, 0, "/folder-link", reply, &handle) != 0);
     assert(pwrite(sparse, "changed", 7, (off_t)large_offset) == 7);
     assert(range(client, "/sparse", large_offset, 7, version, reply) == NP_FILE_STALE && !reply->data_length);
+    /* A link's own target is readable without following it. */
+    assert(path_call(client, NP_FILE_READLINK, "/sparse-link", reply) == 0 &&
+           reply->length == 6 && !memcmp(reply->body, "sparse", 6));
+    assert(path_call(client, NP_FILE_READLINK, "/folder-link", reply) == 0 &&
+           reply->length == 1 && reply->body[0] == '.');
+    assert(path_call(client, NP_FILE_READLINK, "/sparse", reply) == EINVAL);
+    assert(path_call(client, NP_FILE_READLINK, "/folder-link/sparse-link", reply) != 0);
+    /* Links are created verbatim and never replace an existing name. */
+    {
+        unsigned char request[64];
+        np_file_put32(request, NP_FILE_NOFOLLOW);
+        size_t used = 4 + put_path(request + 4, "/new-link");
+        size_t with_target = used + put_path(request + used, "../escape");
+        assert(call(client, NP_FILE_SYMLINK, request, with_target, NULL, 0, reply) == 0);
+        char target[32]; ssize_t n = readlinkat(root, "new-link", target, sizeof(target));
+        assert(n == 9 && !memcmp(target, "../escape", 9));
+        assert(call(client, NP_FILE_SYMLINK, request, with_target, NULL, 0, reply) == EEXIST);
+        np_file_put32(request + used, 0);
+        assert(call(client, NP_FILE_SYMLINK, request, used + 4, NULL, 0, reply) == EINVAL);
+        assert(unlinkat(root, "new-link", 0) == 0);
+    }
     disconnect(client);
     assert(unlinkat(root, "sparse-link", 0) == 0); assert(unlinkat(root, "folder-link", 0) == 0);
     close(sparse); assert(unlinkat(root, "sparse", 0) == 0);

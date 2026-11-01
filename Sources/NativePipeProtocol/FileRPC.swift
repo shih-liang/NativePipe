@@ -191,6 +191,17 @@ public struct FileRPC: Sendable {
         }
     }
 
+    /// A symbolic link's own target, which is never followed.
+    public func readlink(_ path: String) async throws -> String {
+        try await operation { session in
+            let reply = try session.call(NP_FILE_READLINK, Session.path(path)).body
+            guard !reply.isEmpty, !reply.contains(0), let target = String(data: reply, encoding: .utf8) else {
+                throw Failure.invalidPath
+            }
+            return target
+        }
+    }
+
     /// A pinned-file revision includes inode, device, size, and nanosecond
     /// modification/change times. No file contents are read by this request.
     public func snapshot(_ path: String) async throws -> UserFileMetadata {
@@ -228,6 +239,17 @@ public struct FileRPC: Sendable {
     public func createDirectory(_ path: String, noFollow: Bool = false) async throws {
         try await operation { session in
             _ = try session.call(NP_FILE_MKDIR, Session.encode(noFollow ? NP_FILE_NOFOLLOW : 0) + Session.path(path))
+        }
+    }
+
+    /// Creates a symbolic link with exactly `target`, which is not resolved.
+    /// An existing name is never replaced.
+    public func createSymbolicLink(_ path: String, target: String, noFollow: Bool = false) async throws {
+        let bytes = Data(target.utf8)
+        guard !bytes.isEmpty, !bytes.contains(0), bytes.count <= Int(NP_FILE_PATH_MAX) else { throw Failure.invalidPath }
+        try await operation { session in
+            _ = try session.call(NP_FILE_SYMLINK, Session.encode(noFollow ? NP_FILE_NOFOLLOW : 0) + Session.path(path) +
+                                 Session.encode(UInt32(bytes.count)) + bytes)
         }
     }
 

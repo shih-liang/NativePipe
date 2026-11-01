@@ -34,7 +34,9 @@ enum np_file_opcode {
     NP_FILE_RANGE,            /* offset:u64, length:u32, revision, path -> DATA */
     NP_FILE_CREATE_STAGING,   /* token, path -> empty */
     NP_FILE_PUBLISH_STAGING,  /* token, destination path, path -> empty */
-    NP_FILE_DISCARD_STAGING   /* token, path -> empty */
+    NP_FILE_DISCARD_STAGING,  /* token, path -> empty */
+    NP_FILE_READLINK,         /* path -> the symbolic link's target bytes */
+    NP_FILE_SYMLINK           /* flags:u32, path, target_length:u32, target -> empty */
 };
 /* OPEN and MKDIR flags. */
 #define NP_FILE_OPEN_WRITE 1u       /* create a regular file and truncate it */

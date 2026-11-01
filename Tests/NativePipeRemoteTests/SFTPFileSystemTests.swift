@@ -414,20 +414,32 @@ final class SFTPFileSystemTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: root.appendingPathComponent("tree/two"), encoding: .utf8), "second")
         XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: root.path).contains { $0.hasPrefix(".nativepipe-") })
     }
-    @MainActor func testRealServerRejectsSymlinkTreesBeforePublishing() async throws {
+    @MainActor func testRealServerCopiesLinksInsideFoldersWithoutFollowingThem() async throws {
         let root = try temporaryDirectory(), local = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root); try? FileManager.default.removeItem(at: local) }
         let source = local.appendingPathComponent("source")
         try FileManager.default.createDirectory(at: source, withIntermediateDirectories: false)
+        try Data("inside".utf8).write(to: source.appendingPathComponent("file"))
+        try FileManager.default.createSymbolicLink(atPath: source.appendingPathComponent("relative").path, withDestinationPath: "file")
         try FileManager.default.createSymbolicLink(atPath: source.appendingPathComponent("loop").path, withDestinationPath: source.path)
         let system = try realServer(root)
-        do { try await system.transfer(direction: .upload, local: source, remote: "target", progress: { _ in }); XCTFail("symlinks must not be traversed") }
-        catch SFTPFileSystemError.unsupportedFile { }
-        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("target").path))
+        // Upload: OpenSSH's reversed SYMLINK order must still produce the same links.
+        try await system.transfer(direction: .upload, local: source, remote: "target", progress: { _ in })
+        let uploaded = root.appendingPathComponent("target").path
+        XCTAssertEqual(try String(contentsOfFile: uploaded + "/file", encoding: .utf8), "inside")
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: uploaded + "/relative"), "file")
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: uploaded + "/loop"), source.path)
+        // Download: links come back as links; the loop is never traversed.
+        let received = local.appendingPathComponent("received")
+        try await system.transfer(direction: .download, local: received, remote: "target", progress: { _ in })
+        XCTAssertEqual(try String(contentsOf: received.appendingPathComponent("file"), encoding: .utf8), "inside")
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: received.appendingPathComponent("relative").path), "file")
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: received.appendingPathComponent("loop").path), source.path)
+        // A link that is itself the transferred item is still not followed.
         try FileManager.default.createSymbolicLink(atPath: root.appendingPathComponent("link").path, withDestinationPath: source.path)
-        do { try await system.transfer(direction: .download, local: local.appendingPathComponent("received"), remote: "link", progress: { _ in }); XCTFail("symlinks must not be followed") }
+        do { try await system.transfer(direction: .download, local: local.appendingPathComponent("followed"), remote: "link", progress: { _ in }); XCTFail("symlinks must not be followed") }
         catch SFTPFileSystemError.unsupportedFile { }
-        XCTAssertFalse(FileManager.default.fileExists(atPath: local.appendingPathComponent("received").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: local.appendingPathComponent("followed").path))
     }
     @MainActor func testCancelledUploadPreservesExistingDestinationAndNeverReportsCompletion() async throws {
         let root = try temporaryDirectory(), local = try temporaryDirectory()
