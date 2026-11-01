@@ -141,6 +141,10 @@ int np_frontend_run(int argc, char **argv, void *backend_state)
     setenv("XDG_CURRENT_DESKTOP", "NativePipe", 1);
     setenv("GDK_BACKEND", "wayland", 0);
     setenv("QT_QPA_PLATFORM", "wayland", 0);
+    /* Qt maps unknown desktop names (ours) to its generic theme, whose icon
+     * theme is hicolor: no file or folder icons. Its built-in GNOME theme uses
+     * Adwaita, as GTK does here. Keep a theme the user chose (qt6ct, …). */
+    setenv("QT_QPA_PLATFORMTHEME", "gnome", 0);
     setenv("MOZ_ENABLE_WAYLAND", "1", 0);
     unsetenv("WAYLAND_SOCKET");
     if (server.xwayland_display[0]) {

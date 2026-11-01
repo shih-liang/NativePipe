@@ -28,6 +28,11 @@ if [ -n "${_nativepipe_display}" ] && \
     XDG_SESSION_TYPE=wayland
     XDG_CURRENT_DESKTOP=NativePipe
     export XDG_SESSION_TYPE XDG_CURRENT_DESKTOP
+    # Qt has no theme for this desktop name and would use hicolor icons only.
+    if [ -z "${QT_QPA_PLATFORMTHEME:-}" ]; then
+        QT_QPA_PLATFORMTHEME=gnome
+        export QT_QPA_PLATFORMTHEME
+    fi
     case "${_nativepipe_xdisplay}" in
         :[0-9]*|:[0-9]*.[0-9]*)
             case "${_nativepipe_xauthority}" in
