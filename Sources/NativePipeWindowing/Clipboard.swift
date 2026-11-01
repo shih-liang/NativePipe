@@ -141,7 +141,7 @@ final class ClipboardBridge {
                                        generation: UInt64, changeCount: Int) {
         if let files = fetched.first(where: { $0.mime == ContentFormats.fileList }),
            let urls = try? FileTransferURLs.decode(files.data), urls.allSatisfy(\.isFileURL) {
-            guard let sharing else { onError?(GuestFileSharingError.unavailable); return }
+            guard let sharing else { onError?(SharingUnavailable()); return }
             guestPublication = Task { @MainActor [weak self] in
                 do {
                     let shared = try await sharing.hostFiles(for: urls, purpose: .clipboard)

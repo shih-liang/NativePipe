@@ -2,6 +2,12 @@ import Foundation
 import NativePipeProtocol
 import NativePipeStrings
 
+/// There is no file connection to share through.
+public struct SharingUnavailable: LocalizedError {
+    public init() {}
+    public var errorDescription: String? { NPText("The virtual file sharing backend is not available.") }
+}
+
 /// The one sharing backend behind every frontend (drag and drop, clipboard,
 /// opening on the other side, file browsers) for one machine connection.
 ///

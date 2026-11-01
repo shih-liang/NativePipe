@@ -71,8 +71,8 @@ final class GuestOpenCoordinatorTests: XCTestCase {
         shares: @escaping () -> [GuestOpenPolicy.SharedFolder] = { [] },
         action: @escaping (GuestOpenPrompt) async -> GuestOpenAction = { _ in .open },
         markFails: Bool = false, afterQuarantine: (() -> Void)? = nil,
-        fileSharingAvailable: Bool = true, publishGuestFiles: GuestFilePublisher? = nil) -> GuestOpenCoordinator {
-        let publisher: GuestFilePublisher? = !fileSharingAvailable ? nil : publishGuestFiles ?? { [self] urls, _, purpose in
+        fileSharingAvailable: Bool = true, publishGuestFiles: ClosureHostVolume.Publish? = nil) -> GuestOpenCoordinator {
+        let publisher: ClosureHostVolume.Publish? = !fileSharingAvailable ? nil : publishGuestFiles ?? { [self] urls, _, purpose in
             XCTAssertEqual(purpose, .open)
             return try await received.publish(urls, in: root)
         }
@@ -94,7 +94,7 @@ final class GuestOpenCoordinatorTests: XCTestCase {
         let file = directory.appendingPathComponent("document.txt")
         try Data("document".utf8).write(to: file)
         var publications = 0
-        let publish: GuestFilePublisher = { urls, _, purpose in
+        let publish: ClosureHostVolume.Publish = { urls, _, purpose in
             XCTAssertEqual(purpose, .open); XCTAssertEqual(urls.map(\.path), ["/home/test/document.txt"])
             publications += 1; return [file]
         }
