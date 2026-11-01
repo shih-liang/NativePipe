@@ -1,6 +1,7 @@
 import XCTest
 import Darwin
 import CNativePipeFileRPC
+import NativePipeStrings
 
 private final class FileProgressRecorder: @unchecked Sendable {
     private let lock = NSLock()
@@ -417,9 +418,9 @@ final class FileRPCTests: XCTestCase {
         for invalid in ["file:///", "file://foreign/tmp/file", "https://example.com/file", "file:///tmp/file%00"] {
             XCTAssertThrowsError(try FileTransferURLs.decode(Data(invalid.utf8)))
         }
-        XCTAssertTrue(FileRPC.Failure.remote(38).localizedDescription.contains("not implemented"))
-        XCTAssertTrue(FileRPC.Failure.remote(40).localizedDescription.contains("symbolic"))
-        XCTAssertTrue(FileRPC.Failure.remote(104).localizedDescription.contains("reset"))
+        XCTAssertTrue(FileRPC.Failure.remote(38).localizedDescription.contains(NPText("Operation not implemented")))
+        XCTAssertTrue(FileRPC.Failure.remote(40).localizedDescription.contains(NPText("Too many symbolic links")))
+        XCTAssertTrue(FileRPC.Failure.remote(104).localizedDescription.contains(NPText("Connection reset")))
     }
 
     @MainActor

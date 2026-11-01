@@ -93,7 +93,7 @@ let targets: [Target] = [
         ),
         .testTarget(
             name: "NativePipeProtocolTests",
-            dependencies: ["NativePipeProtocol", "CNativePipeFileRPC"],
+            dependencies: ["NativePipeProtocol", "CNativePipeFileRPC", "NativePipeStrings"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .testTarget(
