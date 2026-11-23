@@ -179,32 +179,66 @@ final class ClipboardBridgeTests: XCTestCase {
         }
     }
 
-    func testWithoutSharedVolumeGuestFilesAreCopiedOnlyWhenPasted() async throws {
-        let pasteboard = NSPasteboard.withUniqueName()
-        defer { pasteboard.releaseGlobally() }
+    /// The guest copies a file while the shared volume is unavailable.
+    private func publishDeferredGuestFile(_ files: ClipboardTestFiles, on pasteboard: NSPasteboard,
+                                          path: String = "/guest/report.txt") async throws -> ClipboardBridge {
         pasteboard.setString("old", forType: .string)
-        let files = ClipboardTestFiles(), bridge = ClipboardBridge(pasteboard: pasteboard)
+        let bridge = ClipboardBridge(pasteboard: pasteboard)
         files.allowsExports = true
         bridge.sharing = SharingSession(transport: files)
         bridge.sharing?.hostVolume = unavailableVolume()
-        defer { bridge.stop(); bridge.sharing?.stop() }
         bridge.connectionReady()
         var request: UInt32?
         bridge.output = { if case .selectionRequest(let token, _) = $0 { request = token } }
         bridge.guestOffered(mimeTypes: ["text/uri-list"])
-        bridge.guestSuppliedData(token: try XCTUnwrap(request), data: FileTransferURLs.encode([URL(fileURLWithPath: "/guest/report.txt")]))
+        bridge.guestSuppliedData(token: try XCTUnwrap(request), data: FileTransferURLs.encode([URL(fileURLWithPath: path)]))
         for _ in 0..<100 {
             if (pasteboard.types ?? []).contains(.fileURL) { break }
             try await Task.sleep(for: .milliseconds(5))
         }
         XCTAssertTrue((pasteboard.types ?? []).contains(.fileURL))
-        XCTAssertEqual(files.detachedExports.value, 0, "Copying must not transfer anything before a paste")
-        let pasted = try XCTUnwrap(pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL])
-        XCTAssertEqual(files.detachedExports.value, 1)
-        XCTAssertEqual(pasted.map(\.lastPathComponent), ["report.txt"])
-        XCTAssertEqual(try String(contentsOf: pasted[0], encoding: .utf8), "exported /guest/report.txt")
-        _ = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true])
-        XCTAssertEqual(files.detachedExports.value, 1, "A second read reuses the copy")
+        return bridge
+    }
+
+    /// ENABLE_FSKIT=0 builds: guest files never reach the Mac by copying.
+    /// A Mac paste is answered at once with no files and reports the reason,
+    /// so nothing waits on the main thread the console and VM windows share.
+    func testWithoutSharedVolumeMacPasteGetsNoFilesAndReportsWhy() async throws {
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        let files = ClipboardTestFiles()
+        let bridge = try await publishDeferredGuestFile(files, on: pasteboard)
+        defer { bridge.stop(); bridge.sharing?.stop() }
+        var reported: [Error] = []
+        bridge.onError = { reported.append($0) }
+        XCTAssertNil(pasteboard.string(forType: .string), "The older Mac copy is no longer pasted")
+        let started = Date()
+        let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+        XCTAssertLessThan(Date().timeIntervalSince(started), 0.5, "The paste is answered without waiting")
+        XCTAssertTrue(urls.isEmpty)
+        for _ in 0..<100 where reported.isEmpty { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(reported.count, 1)
+        XCTAssertTrue(reported.first is HostFileVolumeUnavailable)
+        XCTAssertEqual(files.exports, 0, "Nothing is copied")
+    }
+
+    func testWithoutSharingBackendMacPasteReportsWhy() async throws {
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        let bridge = ClipboardBridge(pasteboard: pasteboard)
+        defer { bridge.stop() }
+        bridge.connectionReady()
+        var request: UInt32?
+        var reported: Error?
+        bridge.onError = { reported = $0 }
+        bridge.output = { if case .selectionRequest(let token, _) = $0 { request = token } }
+        bridge.guestOffered(mimeTypes: ["text/uri-list"])
+        bridge.guestSuppliedData(token: try XCTUnwrap(request), data: FileTransferURLs.encode([URL(fileURLWithPath: "/guest/a.txt")]))
+        XCTAssertNil(reported, "Copying inside Linux shows no error")
+        let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+        XCTAssertTrue(urls.isEmpty)
+        for _ in 0..<100 where reported == nil { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertTrue(reported is SharingUnavailable)
     }
 
     func testCancelledPasteCancelsImporterWithoutDeletingSharedSource() async throws {
@@ -258,15 +292,6 @@ private final class ClipboardTestFiles: UserFileAccess {
     var imported: [(String, Bool)] = []
     var exports = 0
     var allowsExports = false
-    let detachedExports = ExportCount()
-    var detachedExport: (@Sendable (URL, URL) async throws -> Void)? {
-        guard allowsExports else { return nil }
-        let count = detachedExports
-        return { remote, local in
-            count.increment()
-            try Data("exported \(remote.path)".utf8).write(to: local, options: .withoutOverwriting)
-        }
-    }
     var delay = false
     var importStarted = false
     var cancelled = false
@@ -294,12 +319,4 @@ private final class ClipboardTestFiles: UserFileAccess {
         }
         try Data("exported \(remote.path)".utf8).write(to: local, options: .withoutOverwriting)
     }
-}
-
-/// Counts copies made off the main actor.
-final class ExportCount: @unchecked Sendable {
-    private let lock = NSLock()
-    private var count = 0
-    var value: Int { lock.withLock { count } }
-    func increment() { lock.withLock { count += 1 } }
 }

@@ -91,17 +91,12 @@ public protocol UserFileAccess: AnyObject {
     /// promised URL only, and its documentation says to write the file to
     /// exactly that URL: no sibling staging. Partial output is removed on failure.
     func exportPromisedFile(_ remote: URL, to local: URL) async throws
-    /// The same copy as `exportFile`, runnable off the main actor, for callers
-    /// that must wait for it synchronously (AppKit's on-demand clipboard data).
-    /// nil when this connection can only copy on the main actor.
-    var detachedExport: (@Sendable (URL, URL) async throws -> Void)? { get }
 }
 
 public extension UserFileAccess {
     func importFiles(_ urls: [URL]) async throws -> [URL] {
         try await importFiles(urls, progress: { _ in })
     }
-    var detachedExport: (@Sendable (URL, URL) async throws -> Void)? { nil }
     func exportFile(_ remote: URL, to local: URL,
                     progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws {
         try await exportFile(remote, to: local)
@@ -329,11 +324,6 @@ public final class FileRPCUserAccess: UserFileRangeAccess {
     public func exportFile(_ remote: URL, to local: URL,
                            progress: @escaping @Sendable (FileTransferProgress) -> Void) async throws {
         try await Self.export(rpc, remote, to: local, progress: progress)
-    }
-
-    public var detachedExport: (@Sendable (URL, URL) async throws -> Void)? {
-        let rpc = rpc
-        return { remote, local in try await Self.export(rpc, remote, to: local, progress: { _ in }) }
     }
 
     /// FileRPC is a Sendable value, so a copy never needs the main actor.
