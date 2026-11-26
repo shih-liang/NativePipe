@@ -179,6 +179,61 @@ final class ClipboardBridgeTests: XCTestCase {
         }
     }
 
+    /// The Mac clipboard is read when the app comes to the front or a window
+    /// becomes key, and on a timer only while the app is in front.
+    func testMacClipboardIsCheckedOnActivationAndPolledOnlyInFront() {
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        let center = NotificationCenter()
+        var active = false
+        let bridge = ClipboardBridge(pasteboard: pasteboard, notificationCenter: center, isApplicationActive: { active })
+        defer { bridge.stop() }
+        var offers: [[String]] = []
+        bridge.output = { if case .hostSelectionOffered(let types) = $0 { offers.append(types) } }
+        bridge.start()
+        bridge.connectionReady()
+        XCTAssertFalse(bridge.isPolling, "No timer in the background")
+        let initial = offers.count
+
+        pasteboard.clearContents(); pasteboard.setString("from another app", forType: .string)
+        active = true
+        center.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+        XCTAssertEqual(offers.count, initial + 1, "Activation offers the new copy")
+        XCTAssertFalse(offers.last?.isEmpty ?? true, "It carries the new copy's types")
+        XCTAssertTrue(bridge.isPolling)
+
+        center.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+        XCTAssertEqual(offers.count, initial + 1, "An unchanged clipboard is not offered again")
+
+        pasteboard.clearContents(); pasteboard.setString("universal clipboard", forType: .string)
+        center.post(name: NSWindow.didBecomeKeyNotification, object: nil)
+        XCTAssertEqual(offers.count, initial + 2, "A window becoming key checks too")
+
+        active = false
+        center.post(name: NSApplication.didResignActiveNotification, object: nil)
+        XCTAssertFalse(bridge.isPolling)
+    }
+
+    func testDisabledMacToLinuxClipboardNeverPolls() {
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        let center = NotificationCenter()
+        let bridge = ClipboardBridge(pasteboard: pasteboard, notificationCenter: center, isApplicationActive: { true })
+        defer { bridge.stop() }
+        bridge.start()
+        XCTAssertTrue(bridge.isPolling)
+        bridge.setPolicy(hostToGuest: false, guestToHost: true)
+        XCTAssertFalse(bridge.isPolling)
+        center.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+        XCTAssertFalse(bridge.isPolling)
+        bridge.setPolicy(hostToGuest: true, guestToHost: true)
+        XCTAssertTrue(bridge.isPolling)
+        bridge.stop()
+        XCTAssertFalse(bridge.isPolling)
+        center.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+        XCTAssertFalse(bridge.isPolling, "Stopped bridges ignore activation")
+    }
+
     /// The guest copies a file while the shared volume is unavailable.
     private func publishDeferredGuestFile(_ files: ClipboardTestFiles, on pasteboard: NSPasteboard,
                                           path: String = "/guest/report.txt") async throws -> ClipboardBridge {

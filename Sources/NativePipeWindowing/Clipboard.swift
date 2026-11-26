@@ -33,6 +33,11 @@ final class ClipboardBridge {
     /// tell the Mac's own copies apart from the echo of a guest's.
     private var lastSeenChangeCount: Int
     private var poll: Timer?
+    /// `start()` was called and `stop()` has not been since.
+    private var wantsPolling = false
+    private let notificationCenter: NotificationCenter
+    private let isApplicationActive: () -> Bool
+    private var observers: [NSObjectProtocol] = []
     private var allowsHostToGuest = true
     private var allowsGuestToHost = true
 
@@ -41,10 +46,21 @@ final class ClipboardBridge {
         FileHandle.standardError.write(Data("[clip] \(message())\n".utf8))
     }
 
-    init(pasteboard: NSPasteboard = .general) {
+    /// The Mac clipboard is checked while the app is in front only. In the
+    /// background, the user copying in another app is caught by the check on
+    /// activation, which runs before any Linux app regains focus.
+    static let activePollInterval: TimeInterval = 1.5
+
+    init(pasteboard: NSPasteboard = .general, notificationCenter: NotificationCenter = .default,
+         isApplicationActive: @escaping () -> Bool = { NSApp?.isActive ?? false }) {
         self.pasteboard = pasteboard
+        self.notificationCenter = notificationCenter
+        self.isApplicationActive = isApplicationActive
         lastSeenChangeCount = pasteboard.changeCount
     }
+
+    /// True while the foreground check timer runs.
+    var isPolling: Bool { poll != nil }
 
     func connectionReady() {
         disconnect()
@@ -52,23 +68,61 @@ final class ClipboardBridge {
         pollPasteboard(force: true)
     }
 
+    /// NSPasteboard has no change notification, so the change count is the
+    /// only signal there is. Wayland needs the Mac's types before a Linux app
+    /// pastes (its offer is sent with keyboard focus), so the count is read
+    /// when the app becomes active or a window becomes key, and every
+    /// `activePollInterval` while the app stays in front: Universal Clipboard,
+    /// clipboard managers and `pbcopy` can change it then. Contents still
+    /// travel only when Linux pastes.
     func start() {
-        guard poll == nil else { return }
-        // NSPasteboard has no change notification, so the change count is the
-        // only signal there is. Reading it is a cheap round trip to pboard and
-        // nothing else happens unless the number moved.
-        let timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.pollPasteboard() }
+        guard !wantsPolling else { return }
+        wantsPolling = true
+        let check: @Sendable (Notification) -> Void = { [weak self] _ in
+            MainActor.assumeIsolated { self?.applicationOrWindowActivated() }
         }
-        RunLoop.main.add(timer, forMode: .common)
-        poll = timer
+        let resigned: @Sendable (Notification) -> Void = { [weak self] _ in
+            MainActor.assumeIsolated { self?.updatePolling() }
+        }
+        observers = [
+            notificationCenter.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil,
+                                           queue: .main, using: check),
+            notificationCenter.addObserver(forName: NSWindow.didBecomeKeyNotification, object: nil,
+                                           queue: .main, using: check),
+            notificationCenter.addObserver(forName: NSApplication.didResignActiveNotification, object: nil,
+                                           queue: .main, using: resigned),
+        ]
+        updatePolling()
     }
 
     func stop() {
-        poll?.invalidate()
-        poll = nil
+        wantsPolling = false
+        for observer in observers { notificationCenter.removeObserver(observer) }
+        observers.removeAll()
+        updatePolling()
         abandonGuestReads()
         disconnect()
+    }
+
+    private func applicationOrWindowActivated() {
+        pollPasteboard()
+        updatePolling()
+    }
+
+    /// Runs the timer only while it can matter: started, allowed, in front.
+    private func updatePolling() {
+        let run = wantsPolling && allowsHostToGuest && isApplicationActive()
+        if run, poll == nil {
+            let timer = Timer(timeInterval: Self.activePollInterval, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.pollPasteboard() }
+            }
+            timer.tolerance = Self.activePollInterval / 3
+            RunLoop.main.add(timer, forMode: .common)
+            poll = timer
+        } else if !run {
+            poll?.invalidate()
+            poll = nil
+        }
     }
 
     func disconnect() {
@@ -88,10 +142,10 @@ final class ClipboardBridge {
         allowsGuestToHost = guestToHost
         if hostToGuest {
             start()
+            updatePolling()
             if hostChanged { pollPasteboard(force: true) }
         } else {
-            poll?.invalidate()
-            poll = nil
+            updatePolling()
             if hostChanged, connected { output?(.hostSelectionOffered(mimeTypes: [])) }
             for task in hostTransfers.values { task.cancel() }
         }
