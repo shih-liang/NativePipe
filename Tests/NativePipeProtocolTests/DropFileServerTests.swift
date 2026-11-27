@@ -503,6 +503,118 @@ final class DropFileServerTests: XCTestCase {
         XCTAssertEqual(still.size, 4)
     }
 
+    // MARK: Pause and resume
+
+    func testPauseLetsGoOfMacLocksAndResumeTakesThemBack() async throws {
+        let server = DropFileServer()
+        let guest = try await connect(server)
+        defer { guest.close(); server.detach() }
+        // macOS flock(2) and fcntl(2) locks conflict, so each gets its own file.
+        let file = try write("db", String(repeating: "x", count: 100))
+        let lockfile = try write("lockfile", "")
+        _ = try XCTUnwrap(server.share(file))
+        _ = try XCTUnwrap(server.share(lockfile))
+        let tokens = server.inventory().reduce(into: [String: String]()) { $0[$1.name] = $1.token }
+        let handle = try await open(guest, try XCTUnwrap(tokens["db"]), "db", flags: Linux.rdWr)
+        let other = try await open(guest, try XCTUnwrap(tokens["lockfile"]), "lockfile")
+        try await expect(guest, Opcode.setlk, lockBody(handle, owner: 1, 0, 49, LockType.write), 0)
+        try await expect(guest, Opcode.setlk, lockBody(handle, owner: 1, 10, 19, LockType.unlock), 0)
+        try await expect(guest, Opcode.setlk, lockBody(other, owner: 2, 0, UInt64(Int64.max), LockType.read,
+                                                       flags: DropFileServer.LockFlag.flock), 0)
+
+        await server.pause()
+        // Nothing of the guest's holds a Mac program back while the VM is frozen.
+        let (mac, macResult) = macLock(file, F_WRLCK)
+        XCTAssertEqual(macResult, 0)
+        Darwin.close(mac)
+        let probe = Darwin.open(lockfile.path, O_RDONLY)
+        XCTAssertEqual(np_drop_flock(probe, LOCK_EX | LOCK_NB), 0)
+        Darwin.close(probe)
+        // A request arriving now waits for the VM to run again.
+        let waiting = Task { try await self.read(guest, handle, offset: 0, length: 2) }
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        await server.resume()
+        let bytes = try await waiting.value
+        XCTAssertEqual(String(decoding: bytes, as: UTF8.self), "xx")
+        // The same ranges are locked again, and the gap the owner unlocked stays free.
+        XCTAssertEqual(macLock(file, F_WRLCK, 5, 1).1, EAGAIN)
+        XCTAssertEqual(macLock(file, F_WRLCK, 45, 1).1, EAGAIN)
+        let (gap, gapResult) = macLock(file, F_WRLCK, 12, 3)
+        XCTAssertEqual(gapResult, 0)
+        Darwin.close(gap)
+        let after = Darwin.open(lockfile.path, O_RDONLY)
+        defer { Darwin.close(after) }
+        XCTAssertEqual(np_drop_flock(after, LOCK_EX | LOCK_NB), -1, "the flock is held again")
+        _ = try await read(guest, other, offset: 0, length: 0)
+    }
+
+    func testResumeMakesHandlesStaleWhenTheFileOrALockWasLost() async throws {
+        let server = DropFileServer()
+        let guest = try await connect(server)
+        defer { guest.close(); server.detach() }
+        let replaced = try write("doc", "old")
+        let locked = try write("db", "data")
+        _ = try XCTUnwrap(server.share(replaced))
+        _ = try XCTUnwrap(server.share(locked))
+        let tokens = server.inventory().reduce(into: [String: String]()) { $0[$1.name] = $1.token }
+        let doc = try await open(guest, try XCTUnwrap(tokens["doc"]), "doc")
+        let db = try await open(guest, try XCTUnwrap(tokens["db"]), "db", flags: Linux.rdWr)
+        let plain = try await open(guest, try XCTUnwrap(tokens["db"]), "db")
+        try await expect(guest, Opcode.setlk, lockBody(db, owner: 7, 0, 3, LockType.write), 0)
+
+        await server.pause()
+        // A Mac app saves the document atomically, and another locks the database.
+        let saved = directory.appendingPathComponent("doc.new")
+        try "new".write(to: saved, atomically: false, encoding: .utf8)
+        _ = try FileManager.default.replaceItemAt(replaced, withItemAt: saved)
+        let (mac, macResult) = macLock(locked, F_WRLCK, 2, 1)
+        XCTAssertEqual(macResult, 0)
+        defer { Darwin.close(mac) }
+        await server.resume()
+
+        try await expect(guest, Opcode.read, readBody(doc, 0, 3), Status.estale)
+        try await expect(guest, Opcode.read, readBody(db, 0, 4), Status.estale)
+        let carriesOn = try await read(guest, plain, offset: 0, length: 4)
+        XCTAssertEqual(String(decoding: carriesOn, as: UTF8.self), "data", "a handle that held no lost lock carries on")
+        // New opens see the current file; stale handles can still be released.
+        let fresh = try await open(guest, try XCTUnwrap(tokens["doc"]), "doc")
+        let current = try await read(guest, fresh, offset: 0, length: 3)
+        XCTAssertEqual(String(decoding: current, as: UTF8.self), "new")
+        try await expect(guest, Opcode.flush, encode64(db) + encode64(7), 0)
+        try await expect(guest, Opcode.release, encode64(doc), 0)
+        try await expect(guest, Opcode.release, encode64(db), 0)
+        XCTAssertEqual(server.inventory().first { $0.name == "doc" }?.openFiles, 1)
+    }
+
+    func testLockRangesFollowFcntlSemantics() async throws {
+        // Overlapping sets, a split by unlock and a downgrade, then a pause:
+        // exactly the final ranges come back.
+        let server = DropFileServer()
+        let guest = try await connect(server)
+        defer { guest.close(); server.detach() }
+        let file = try write("ranges", String(repeating: "x", count: 100))
+        _ = try XCTUnwrap(server.share(file))
+        let token = try XCTUnwrap(server.tokens.first)
+        let handle = try await open(guest, token, "ranges", flags: Linux.rdWr)
+        try await expect(guest, Opcode.setlk, lockBody(handle, owner: 1, 0, 29, LockType.write), 0)
+        try await expect(guest, Opcode.setlk, lockBody(handle, owner: 1, 20, 59, LockType.read), 0)
+        try await expect(guest, Opcode.setlk, lockBody(handle, owner: 1, 5, 9, LockType.unlock), 0)
+        await server.pause()
+        await server.resume()
+        func macCan(_ type: Int32, _ start: off_t) -> Bool {
+            let (descriptor, result) = macLock(file, type, start, 1)
+            Darwin.close(descriptor)
+            return result == 0
+        }
+        XCTAssertFalse(macCan(F_RDLCK, 0), "0-4 write")
+        XCTAssertTrue(macCan(F_WRLCK, 7), "5-9 unlocked")
+        XCTAssertFalse(macCan(F_RDLCK, 15), "10-19 write")
+        XCTAssertTrue(macCan(F_RDLCK, 25), "20-59 read")
+        XCTAssertFalse(macCan(F_WRLCK, 25), "20-59 read")
+        XCTAssertTrue(macCan(F_WRLCK, 60), "60- unlocked")
+    }
+
     // MARK: End to end through the C FUSE handler
 
     func testCFuseHandlerReadsThroughSwiftServer() async throws {
