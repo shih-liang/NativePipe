@@ -148,15 +148,22 @@ public struct FileRPC: Sendable {
         }
     }
 
-    public struct UploadStaging: Sendable {
+    public struct UploadStaging: Sendable, Codable, Hashable {
         public let path: String
-        let token: Data
+        /// The ownership capability; only it can publish or remove the directory.
+        public let token: Data
+        /// A staging directory a caller recorded before it was interrupted.
+        public init(path: String, token: Data) throws {
+            guard token.count == Int(NP_FILE_STAGING_TOKEN) else { throw Failure.protocolError }
+            self.path = path; self.token = token
+        }
+        fileprivate init(unchecked path: String, token: Data) { self.path = path; self.token = token }
     }
     public func createUploadStaging(_ path: String) async throws -> UploadStaging {
         try UserFileRange.validate(RemoteFileURL.make(path))
         var token = Data(repeating: 0, count: Int(NP_FILE_STAGING_TOKEN))
         token.withUnsafeMutableBytes { arc4random_buf($0.baseAddress, $0.count) }
-        let staging = UploadStaging(path: path, token: token)
+        let staging = UploadStaging(unchecked: path, token: token)
         do {
             return try await operation { session in
                 _ = try session.call(NP_FILE_CREATE_STAGING, staging.token + Session.path(path))
@@ -170,12 +177,67 @@ public struct FileRPC: Sendable {
             throw error
         }
     }
-    public func publishStaging(_ staging: UploadStaging, to destination: String) async throws {
+    /// `replace` publishes a file over an existing file in one rename. A guest
+    /// service without it fails with `remote(EINVAL)`.
+    public func publishStaging(_ staging: UploadStaging, to destination: String, replace: Bool = false) async throws {
         try UserFileRange.validate(RemoteFileURL.make(destination))
         try await operation { session in
             _ = try session.call(NP_FILE_PUBLISH_STAGING,
-                                 staging.token + Session.path(destination) + Session.path(staging.path))
+                                 staging.token + Session.path(destination) + Session.path(staging.path)
+                                    + (replace ? Session.encode(NP_FILE_PUBLISH_REPLACE) : Data()))
         }
+    }
+
+    /// Whether the guest can publish over an existing file. A guest that
+    /// can parses the flag and refuses the unowned probe; an older one
+    /// rejects the request's length.
+    public func canReplaceAtomically(in parent: String) async -> Bool {
+        let probe = (parent == "/" ? "" : parent) + "/.nativepipe-upload-" + UUID().uuidString
+        guard let staging = try? UploadStaging(path: probe, token: Data(count: Int(NP_FILE_STAGING_TOKEN))) else { return false }
+        do {
+            try await publishStaging(staging, to: probe + "-target", replace: true)
+            return true
+        } catch Failure.remote(let code) { return code != EINVAL }
+        catch { return false }
+    }
+
+    /// Uploads one file so that its destination only ever holds a complete
+    /// file: the bytes go into a private staging directory beside it, and one
+    /// rename publishes them. An interrupted upload leaves at most that
+    /// directory, which `discardStaging` removes; `staged` reports it while it
+    /// exists, so a caller can record it and remove it later.
+    ///
+    /// `replace` replaces an existing file in the same rename. A guest that
+    /// cannot do that is written in place, as before, and `staged` is not called.
+    public func uploadAtomically(_ source: FileHandle, to path: String, replace: Bool = false,
+                                 staged: @escaping @Sendable (UploadStaging, _ active: Bool) -> Void = { _, _ in },
+                                 progress: @escaping Progress = { _, _ in }) async throws {
+        let destination = try RemoteFileURL.make(path)
+        try UserFileRange.validate(destination)
+        let name = destination.lastPathComponent
+        guard !["", "/", ".", ".."].contains(name) else { throw Failure.invalidPath }
+        let parent = destination.deletingLastPathComponent().path
+        if replace, !(await canReplaceAtomically(in: parent)) {
+            try await upload(source, to: path, replace: true, progress: progress)
+            return
+        }
+        let staging = try await createUploadStaging((parent == "/" ? "" : parent) + "/.nativepipe-upload-" + UUID().uuidString)
+        staged(staging, true)
+        do {
+            try await upload(source, to: staging.path + "/.payload", replace: false, noFollow: true, progress: progress)
+            try Task.checkCancellation()
+            // The commit finishes even when the caller gives up meanwhile, so
+            // the reported result is the published one.
+            let rpc = self
+            try await Task.detached(priority: .utility) { try await rpc.publishStaging(staging, to: path, replace: replace) }.value
+        } catch {
+            let rpc = self
+            // A fresh operation, so cancellation cannot cancel the cleanup.
+            let removed = await Task.detached(priority: .utility) { (try? await rpc.discardStaging(staging)) != nil }.value
+            if removed { staged(staging, false) }
+            throw error
+        }
+        staged(staging, false)
     }
     public func discardStaging(_ staging: UploadStaging) async throws {
         try await operation { session in

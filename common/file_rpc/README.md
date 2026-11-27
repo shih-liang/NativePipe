@@ -91,6 +91,12 @@ be in the same pinned parent directory. A native exclusive rename publishes
 `.payload` atomically (`renameat2(RENAME_NOREPLACE)` on Linux,
 `renameatx_np(RENAME_EXCL)` on macOS); unavailable native support fails closed.
 An existing file, folder or symbolic link is never overwritten or merged.
+PUBLISH_STAGING may end with flags:u32. REPLACE=1 publishes a regular file over
+an existing regular file with one `renameat`, so readers see the old contents
+or the new ones and never a partial file; a folder payload, or a folder, link
+or other object at the destination, is refused (EINVAL, EISDIR or EEXIST). A
+service without flags rejects the longer body with EINVAL, which a client uses
+to detect support before it uploads.
 Cancellation is checked before commit; the short commit finishes independently
 so the reported result reflects publication. DISCARD_STAGING appends the token
 and removes only the verified owned tree, without following any nested link.

@@ -106,8 +106,16 @@ static uint32_t range(struct client client, const char *path, uint64_t offset, u
     return call(client, NP_FILE_RANGE, body, 12 + NP_FILE_REVISION + put_path(body + 12 + NP_FILE_REVISION, path),
                 NULL, 0, reply);
 }
+static uint32_t staging_flags(struct server *s, uint16_t opcode, const char *path,
+                              unsigned char token[NP_FILE_STAGING_TOKEN], const char *destination,
+                              int with_flags, uint32_t flags);
 static uint32_t staging(struct server *s, uint16_t opcode, const char *path,
                         unsigned char token[NP_FILE_STAGING_TOKEN], const char *destination) {
+    return staging_flags(s, opcode, path, token, destination, 0, 0);
+}
+static uint32_t staging_flags(struct server *s, uint16_t opcode, const char *path,
+                              unsigned char token[NP_FILE_STAGING_TOKEN], const char *destination,
+                              int with_flags, uint32_t flags) {
     struct client client = connect_server(s);
     struct reply *reply = new_reply();
     if (opcode == NP_FILE_CREATE_STAGING) assert(getentropy(token, NP_FILE_STAGING_TOKEN) == 0);
@@ -115,6 +123,7 @@ static uint32_t staging(struct server *s, uint16_t opcode, const char *path,
     memcpy(body, token, NP_FILE_STAGING_TOKEN);
     if (destination) size += put_path(body + size, destination);
     size += put_path(body + size, path);
+    if (with_flags) { np_file_put32(body + size, flags); size += 4; }
     uint32_t status = call(client, opcode, body, size, NULL, 0, reply);
     assert(status || (!reply->length && !reply->data_length));
     free_reply(reply); disconnect(client);
@@ -131,6 +140,50 @@ static unsigned count_names(const struct reply *reply, unsigned expected_length)
         i += 3 + n; names++;
     }
     return names;
+}
+
+/* Replacing publishes a complete file over an existing one in one rename;
+ * nothing else is replaced, and an interrupted upload never reaches it. */
+static void test_staging_replace(struct server *s) {
+    const char *stage = "/.nativepipe-upload-22222222-1234-1234-1234-123456789abc";
+    unsigned char token[NP_FILE_STAGING_TOKEN];
+    int old = openat(s->root, "replaced", O_CREAT | O_EXCL | O_WRONLY, 0600); assert(old >= 0);
+    assert(write(old, "old", 3) == 3); close(old);
+    assert(staging(s, NP_FILE_CREATE_STAGING, stage, token, NULL) == 0);
+    int stage_fd = openat(s->root, stage + 1, O_RDONLY | O_DIRECTORY | O_NOFOLLOW); assert(stage_fd >= 0);
+    int payload = openat(stage_fd, ".payload", O_CREAT | O_EXCL | O_WRONLY, 0600); assert(payload >= 0);
+    assert(write(payload, "replacement", 11) == 11); close(payload);
+    assert(staging_flags(s, NP_FILE_PUBLISH_STAGING, stage, token, "/replaced", 1, 2) == EINVAL);
+    assert(staging(s, NP_FILE_PUBLISH_STAGING, stage, token, "/replaced") == EEXIST);
+    assert(mkdirat(s->root, "occupied", 0700) == 0);
+    assert(staging_flags(s, NP_FILE_PUBLISH_STAGING, stage, token, "/occupied", 1, NP_FILE_PUBLISH_REPLACE) == EISDIR);
+    assert(symlinkat("/replaced", s->root, "linked") == 0);
+    assert(staging_flags(s, NP_FILE_PUBLISH_STAGING, stage, token, "/linked", 1, NP_FILE_PUBLISH_REPLACE) == EEXIST);
+    /* The old file is untouched until the commit. */
+    old = openat(s->root, "replaced", O_RDONLY); assert(old >= 0);
+    char bytes[16] = {0}; assert(read(old, bytes, sizeof(bytes)) == 3 && !memcmp(bytes, "old", 3)); close(old);
+    assert(staging_flags(s, NP_FILE_PUBLISH_STAGING, stage, token, "/replaced", 1, NP_FILE_PUBLISH_REPLACE) == 0);
+    old = openat(s->root, "replaced", O_RDONLY); assert(old >= 0);
+    memset(bytes, 0, sizeof(bytes));
+    assert(read(old, bytes, sizeof(bytes)) == 11 && !memcmp(bytes, "replacement", 11)); close(old);
+    struct stat st;
+    assert(fstatat(s->root, stage + 1, &st, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT);
+    close(stage_fd);
+    /* A new name is published as well. */
+    assert(staging(s, NP_FILE_CREATE_STAGING, stage, token, NULL) == 0);
+    stage_fd = openat(s->root, stage + 1, O_RDONLY | O_DIRECTORY | O_NOFOLLOW); assert(stage_fd >= 0);
+    payload = openat(stage_fd, ".payload", O_CREAT | O_EXCL | O_WRONLY, 0600); assert(payload >= 0); close(payload);
+    assert(staging_flags(s, NP_FILE_PUBLISH_STAGING, stage, token, "/fresh", 1, NP_FILE_PUBLISH_REPLACE) == 0);
+    close(stage_fd);
+    /* A folder payload is never published over anything with replace. */
+    assert(staging(s, NP_FILE_CREATE_STAGING, stage, token, NULL) == 0);
+    stage_fd = openat(s->root, stage + 1, O_RDONLY | O_DIRECTORY | O_NOFOLLOW); assert(stage_fd >= 0);
+    assert(mkdirat(stage_fd, ".payload", 0700) == 0);
+    assert(staging_flags(s, NP_FILE_PUBLISH_STAGING, stage, token, "/fresh2", 1, NP_FILE_PUBLISH_REPLACE) == EINVAL);
+    assert(staging(s, NP_FILE_DISCARD_STAGING, stage, token, NULL) == 0);
+    close(stage_fd);
+    assert(unlinkat(s->root, "replaced", 0) == 0 && unlinkat(s->root, "fresh", 0) == 0);
+    assert(unlinkat(s->root, "linked", 0) == 0 && unlinkat(s->root, "occupied", AT_REMOVEDIR) == 0);
 }
 
 static void test_staging(struct server *s) {
@@ -429,6 +482,7 @@ int main(void) {
     disconnect(client);
     assert(unlinkat(root, "browse-link", 0) == 0);
     test_staging(&s);
+    test_staging_replace(&s);
 
     /* Directory pages never split a name, and a page too small for the next
      * name is refused rather than skipping it. */

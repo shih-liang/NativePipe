@@ -221,7 +221,8 @@ done:;
     if (fd >= 0) close(fd);
     close(parent); errno = error; return result;
 }
-static int publish_staging(int root, char path[4096], const unsigned char *token, char destination[4096]) {
+static int publish_staging(int root, char path[4096], const unsigned char *token, char destination[4096],
+                           int replace) {
     char *name, *target;
     int parent = path_parent(root, path, &name);
     if (parent < 0) return -1;
@@ -235,6 +236,20 @@ static int publish_staging(int root, char path[4096], const unsigned char *token
     if (!same_inode(&a, &b)) { errno = EINVAL; goto done; }
     if (fstatat(fd, STAGING_PAYLOAD, &payload, AT_SYMLINK_NOFOLLOW) < 0) goto done;
     if (!S_ISREG(payload.st_mode) && !S_ISDIR(payload.st_mode)) { errno = EINVAL; goto done; }
+    if (replace) {
+        /* Only a file replaces a file. A folder, link or anything else in
+         * the way stays, as an exclusive publish would leave it. */
+        struct stat existing;
+        if (!S_ISREG(payload.st_mode)) { errno = EINVAL; goto done; }
+        if (fstatat(destination_parent, target, &existing, AT_SYMLINK_NOFOLLOW) == 0 && !S_ISREG(existing.st_mode)) {
+            errno = S_ISDIR(existing.st_mode) ? EISDIR : EEXIST;
+            goto done;
+        }
+        /* rename(2) replaces the old file in one step: readers see the old
+         * contents or the new ones, never a partial file. */
+        result = renameat(fd, STAGING_PAYLOAD, destination_parent, target);
+        goto committed;
+    }
 #ifdef __APPLE__
     result = renameatx_np(fd, STAGING_PAYLOAD, destination_parent, target, RENAME_EXCL);
 #elif defined(__linux__)
@@ -242,6 +257,7 @@ static int publish_staging(int root, char path[4096], const unsigned char *token
 #else
     errno = ENOTSUP;
 #endif
+committed:
     /* Rename is the commit point. A cleanup failure must not report a failed
      * upload after the completed file has become visible to its recipient. */
     if (!result) {
@@ -654,7 +670,9 @@ static int op_staging(struct connection *connection, struct np_file2_stream *str
     int error = opcode == NP_FILE_PUBLISH_STAGING ? take_path(body, length, &offset, destination, 0) : 0;
     if (!error) error = take_path(body, length, &offset, path, 0);
     if (error) return error;
-    if (offset != length) return EINVAL;
+    unsigned flags = 0;
+    if (opcode == NP_FILE_PUBLISH_STAGING && length - offset == 4) { flags = np_file_u32(body + offset); offset += 4; }
+    if (offset != length || flags & ~NP_FILE_PUBLISH_REPLACE) return EINVAL;
     if (opcode == NP_FILE_CREATE_STAGING) {
         char created[4096];
         memcpy(created, path, sizeof(created));
@@ -666,7 +684,7 @@ static int op_staging(struct connection *connection, struct np_file2_stream *str
         return 0;
     }
     if (opcode == NP_FILE_PUBLISH_STAGING) {
-        if (publish_staging(connection->root, path, token, destination) < 0) return ERROR;
+        if (publish_staging(connection->root, path, token, destination, (flags & NP_FILE_PUBLISH_REPLACE) != 0) < 0) return ERROR;
     } else if (discard_owned(connection->root, path, token) < 0) return ERROR;
     return reply(stream, NULL, 0);
 }
