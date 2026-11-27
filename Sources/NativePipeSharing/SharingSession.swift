@@ -100,6 +100,22 @@ public final class SharingSession {
         return .deferred(guestFiles)
     }
 
+    /// Mac URLs on the live shared volume, for frontends that must never wait
+    /// for a copy (the clipboard: AppKit asks for pasted data synchronously on
+    /// the main thread). Throws `HostFileVolumeUnavailable`, with the reason,
+    /// when this build or Mac cannot mount the volume.
+    public func mountedHostFiles(for guestFiles: [URL], purpose: GuestFileSharePurpose) async throws -> [URL] {
+        _ = try FileTransferURLs.decode(FileTransferURLs.encode(guestFiles))
+        guard !stopped else { throw CancellationError() }
+        guard let hostVolume else {
+            throw HostFileVolumeUnavailable(NPText("The virtual file sharing backend is not available."))
+        }
+        let urls = try await hostVolume.publish(guestFiles, using: transport, purpose: purpose)
+        guard urls.count == guestFiles.count else { throw FileRPC.Failure.protocolError }
+        _ = try FileTransferURLs.decode(FileTransferURLs.encode(urls))
+        return urls
+    }
+
     /// Mac URLs for guest items a person chose, for example to show them in
     /// Finder: the live volume when it is available, otherwise copies kept in
     /// one private folder under their guest names until the purpose is revoked.

@@ -84,6 +84,20 @@ final class SharingSessionTests: XCTestCase {
         catch { XCTAssertEqual((error as? POSIXError)?.code, .EIO) }
     }
 
+    func testMountedOnlyHostFilesReportWhyTheVolumeIsUnavailable() async throws {
+        let remote = URL(fileURLWithPath: "/home/me/file.txt")
+        let mounted = URL(fileURLWithPath: "/Volumes/Linux/file.txt")
+        let volume = VolumeFixture(.success([mounted]))
+        let session = SharingSession(transport: TransportFixture(), hostVolume: volume)
+        let shared = try await session.mountedHostFiles(for: [remote], purpose: .clipboard)
+        XCTAssertEqual(shared, [mounted])
+        volume.result = .failure(HostFileVolumeUnavailable("no FSKit"))
+        do { _ = try await session.mountedHostFiles(for: [remote], purpose: .clipboard); XCTFail("Never copies instead") }
+        catch { XCTAssertEqual((error as? HostFileVolumeUnavailable)?.reason, "no FSKit") }
+        do { _ = try await SharingSession(transport: TransportFixture()).mountedHostFiles(for: [remote], purpose: .clipboard); XCTFail("No volume") }
+        catch { XCTAssertTrue(error is HostFileVolumeUnavailable) }
+    }
+
     func testChosenGuestItemsAreCopiedUnderTheirNamesWithoutAVolume() async throws {
         let transport = TransportFixture()
         let session = SharingSession(transport: transport, hostVolume: VolumeFixture(.failure(HostFileVolumeUnavailable("no FSKit"))))

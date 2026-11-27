@@ -576,7 +576,17 @@ public final class WindowBridge: NSObject {
         dragIconPresenter?.setVisible(false)
         if let surface = dragIconSurface { retireAuxiliaryFrames(surface: surface) }
     }
-    func reportFileTransferError(_ error: Error) { NSApp.presentError(error) }
+    /// A sheet on the window in front, never an app-modal alert: an alert
+    /// would stop the console and every other window until dismissed.
+    func reportFileTransferError(_ error: Error) {
+        let window = NSApp.keyWindow ?? NSApp.mainWindow
+            ?? NSApp.orderedWindows.first { $0.isVisible && !($0 is NSPanel) }
+        guard let window, window.attachedSheet == nil else {
+            NSLog("%@", error.localizedDescription)
+            return
+        }
+        NSAlert(error: error).beginSheetModal(for: window)
+    }
 
     public init(frameSource: FrameSource?) {
         self.frameSource = frameSource

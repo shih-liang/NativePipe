@@ -7,16 +7,18 @@ import NativePipeSharing
 /// The two models agree more than they differ: both are "one owner, advertising
 /// a set of types, handing over bytes on demand". What they disagree about is
 /// naming, which ContentFormats translates. Small values and file names are
-/// resolved at announce time; files go through the machine's SharingSession,
-/// which either mounts them or copies each one when it is pasted.
+/// resolved at announce time. Guest files reach the Mac only through the live
+/// shared volume, so a paste never waits for a transfer: Finder reads the
+/// files itself, with its own progress. Without the volume, a Mac paste gets
+/// no files and reports why.
 @MainActor
 final class ClipboardBridge {
     /// Sends a host command to the guest.
     var output: ((Windowing.HostCommand) -> Void)?
     var sharing: SharingSession?
     var onError: ((Error) -> Void)?
-    /// Supplies on-demand file copies while it owns the Mac pasteboard.
-    private var fileProvider: GuestFilePasteboardProvider?
+    /// Answers Mac pastes of guest files that cannot be shared.
+    private var unavailableFiles: UnavailableGuestFiles?
     private var selectionGeneration: UInt64 = 0
     private var connectionGeneration: UInt64 = 0
     private var hostTransfers: [UInt32: Task<Void, Never>] = [:]
@@ -31,6 +33,11 @@ final class ClipboardBridge {
     /// tell the Mac's own copies apart from the echo of a guest's.
     private var lastSeenChangeCount: Int
     private var poll: Timer?
+    /// `start()` was called and `stop()` has not been since.
+    private var wantsPolling = false
+    private let notificationCenter: NotificationCenter
+    private let isApplicationActive: () -> Bool
+    private var observers: [NSObjectProtocol] = []
     private var allowsHostToGuest = true
     private var allowsGuestToHost = true
 
@@ -39,10 +46,21 @@ final class ClipboardBridge {
         FileHandle.standardError.write(Data("[clip] \(message())\n".utf8))
     }
 
-    init(pasteboard: NSPasteboard = .general) {
+    /// The Mac clipboard is checked while the app is in front only. In the
+    /// background, the user copying in another app is caught by the check on
+    /// activation, which runs before any Linux app regains focus.
+    static let activePollInterval: TimeInterval = 1.5
+
+    init(pasteboard: NSPasteboard = .general, notificationCenter: NotificationCenter = .default,
+         isApplicationActive: @escaping () -> Bool = { NSApp?.isActive ?? false }) {
         self.pasteboard = pasteboard
+        self.notificationCenter = notificationCenter
+        self.isApplicationActive = isApplicationActive
         lastSeenChangeCount = pasteboard.changeCount
     }
+
+    /// True while the foreground check timer runs.
+    var isPolling: Bool { poll != nil }
 
     func connectionReady() {
         disconnect()
@@ -50,23 +68,61 @@ final class ClipboardBridge {
         pollPasteboard(force: true)
     }
 
+    /// NSPasteboard has no change notification, so the change count is the
+    /// only signal there is. Wayland needs the Mac's types before a Linux app
+    /// pastes (its offer is sent with keyboard focus), so the count is read
+    /// when the app becomes active or a window becomes key, and every
+    /// `activePollInterval` while the app stays in front: Universal Clipboard,
+    /// clipboard managers and `pbcopy` can change it then. Contents still
+    /// travel only when Linux pastes.
     func start() {
-        guard poll == nil else { return }
-        // NSPasteboard has no change notification, so the change count is the
-        // only signal there is. Reading it is a cheap round trip to pboard and
-        // nothing else happens unless the number moved.
-        let timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.pollPasteboard() }
+        guard !wantsPolling else { return }
+        wantsPolling = true
+        let check: @Sendable (Notification) -> Void = { [weak self] _ in
+            MainActor.assumeIsolated { self?.applicationOrWindowActivated() }
         }
-        RunLoop.main.add(timer, forMode: .common)
-        poll = timer
+        let resigned: @Sendable (Notification) -> Void = { [weak self] _ in
+            MainActor.assumeIsolated { self?.updatePolling() }
+        }
+        observers = [
+            notificationCenter.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil,
+                                           queue: .main, using: check),
+            notificationCenter.addObserver(forName: NSWindow.didBecomeKeyNotification, object: nil,
+                                           queue: .main, using: check),
+            notificationCenter.addObserver(forName: NSApplication.didResignActiveNotification, object: nil,
+                                           queue: .main, using: resigned),
+        ]
+        updatePolling()
     }
 
     func stop() {
-        poll?.invalidate()
-        poll = nil
+        wantsPolling = false
+        for observer in observers { notificationCenter.removeObserver(observer) }
+        observers.removeAll()
+        updatePolling()
         abandonGuestReads()
         disconnect()
+    }
+
+    private func applicationOrWindowActivated() {
+        pollPasteboard()
+        updatePolling()
+    }
+
+    /// Runs the timer only while it can matter: started, allowed, in front.
+    private func updatePolling() {
+        let run = wantsPolling && allowsHostToGuest && isApplicationActive()
+        if run, poll == nil {
+            let timer = Timer(timeInterval: Self.activePollInterval, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.pollPasteboard() }
+            }
+            timer.tolerance = Self.activePollInterval / 3
+            RunLoop.main.add(timer, forMode: .common)
+            poll = timer
+        } else if !run {
+            poll?.invalidate()
+            poll = nil
+        }
     }
 
     func disconnect() {
@@ -86,10 +142,10 @@ final class ClipboardBridge {
         allowsGuestToHost = guestToHost
         if hostToGuest {
             start()
+            updatePolling()
             if hostChanged { pollPasteboard(force: true) }
         } else {
-            poll?.invalidate()
-            poll = nil
+            updatePolling()
             if hostChanged, connected { output?(.hostSelectionOffered(mimeTypes: [])) }
             for task in hostTransfers.values { task.cancel() }
         }
@@ -110,6 +166,7 @@ final class ClipboardBridge {
         guestPublication?.cancel(); guestPublication = nil
         abandonGuestReads()
         sharing?.revoke(.clipboard)
+        unavailableFiles = nil
         let generation = selectionGeneration
         let changeCount = pasteboard.changeCount
         guard connected, allowsGuestToHost else { return }
@@ -136,31 +193,24 @@ final class ClipboardBridge {
     }
 
     /// Puts what the guest copied on the Mac pasteboard as one item. Files go
-    /// through the sharing backend; everything else is converted right away.
+    /// through the shared volume; everything else is converted right away.
     private func publishGuestSelection(_ fetched: [(mime: String, data: Data)],
                                        generation: UInt64, changeCount: Int) {
         if let files = fetched.first(where: { $0.mime == ContentFormats.fileList }),
            let urls = try? FileTransferURLs.decode(files.data), urls.allSatisfy(\.isFileURL) {
-            guard let sharing else { onError?(SharingUnavailable()); return }
+            guard let sharing else { publishUnavailableFiles(urls.count, reason: SharingUnavailable(), changeCount: changeCount); return }
             guestPublication = Task { @MainActor [weak self] in
                 do {
-                    let shared = try await sharing.hostFiles(for: urls, purpose: .clipboard)
+                    let hostURLs = try await sharing.mountedHostFiles(for: urls, purpose: .clipboard)
                     try Task.checkCancellation()
-                    guard let self, self.connected, self.allowsGuestToHost, self.selectionGeneration == generation,
-                          self.pasteboard.changeCount == changeCount else { return }
+                    guard let self, self.isCurrent(generation, changeCount) else { return }
                     self.pasteboard.clearContents()
-                    switch shared {
-                    case .mounted(let hostURLs):
-                        guard self.pasteboard.writeObjects(hostURLs as [NSURL]) else { throw FileRPC.Failure.protocolError }
-                    case .deferred(let guestURLs):
-                        // Copied only when an app pastes them (copy at paste time).
-                        let provider = try GuestFilePasteboardProvider(session: sharing)
-                        provider.onError = { [weak self] in self?.onError?($0) }
-                        self.fileProvider = provider
-                        guard self.pasteboard.writeObjects(provider.items(for: guestURLs)) else { throw FileRPC.Failure.protocolError }
-                    }
+                    guard self.pasteboard.writeObjects(hostURLs as [NSURL]) else { throw FileRPC.Failure.protocolError }
                     // Our own write must not read back as the Mac taking the clipboard.
                     self.lastSeenChangeCount = self.pasteboard.changeCount
+                } catch let unavailable as HostFileVolumeUnavailable {
+                    guard let self, self.isCurrent(generation, changeCount) else { return }
+                    self.publishUnavailableFiles(urls.count, reason: unavailable, changeCount: changeCount)
                 } catch {
                     guard !(error is CancellationError), let self, self.selectionGeneration == generation else { return }
                     self.onError?(error)
@@ -181,6 +231,28 @@ final class ClipboardBridge {
         pasteboard.clearContents()
         guard pasteboard.writeObjects([item]) else { Self.note("pasteboard refused the guest selection"); return }
         // Our own write must not read back as the Mac taking the clipboard.
+        lastSeenChangeCount = pasteboard.changeCount
+    }
+
+    private func isCurrent(_ generation: UInt64, _ changeCount: Int) -> Bool {
+        connected && allowsGuestToHost && selectionGeneration == generation && pasteboard.changeCount == changeCount
+    }
+
+    /// The guest copied files the Mac cannot reach. They still take the Mac
+    /// clipboard, so an older copy is not pasted by mistake, but a Mac paste
+    /// gets no files and reports the reason. Copying and pasting inside Linux
+    /// is unaffected and shows no error.
+    private func publishUnavailableFiles(_ count: Int, reason: Error, changeCount: Int) {
+        guard pasteboard.changeCount == changeCount else { return }
+        let provider = UnavailableGuestFiles(reason: reason) { [weak self] in self?.onError?($0) }
+        pasteboard.clearContents()
+        let items = (0..<max(count, 1)).map { _ in
+            let item = NSPasteboardItem()
+            item.setDataProvider(provider, forTypes: [.fileURL])
+            return item
+        }
+        guard pasteboard.writeObjects(items) else { onError?(reason); return }
+        unavailableFiles = provider
         lastSeenChangeCount = pasteboard.changeCount
     }
 
@@ -216,7 +288,7 @@ final class ClipboardBridge {
         guestPublication?.cancel(); guestPublication = nil
         abandonGuestReads()
         sharing?.revoke(.clipboard)
-        fileProvider = nil
+        unavailableFiles = nil
         output?(.hostSelectionOffered(mimeTypes: ContentFormats.mimeTypes(for: pasteboard)))
     }
 
@@ -270,4 +342,28 @@ final class ClipboardBridge {
             token: token, mimeType: mimeType,
             data: data))
     }
+}
+
+/// Answers a Mac paste of guest files at once, with no data, and reports why.
+/// One paste asks once per file; they are reported as one failure.
+private final class UnavailableGuestFiles: NSObject, NSPasteboardItemDataProvider {
+    private let reason: Error
+    private let report: @MainActor (Error) -> Void
+    private var lastReport: TimeInterval = -.infinity
+
+    init(reason: Error, report: @escaping @MainActor (Error) -> Void) {
+        self.reason = reason; self.report = report
+    }
+
+    func pasteboard(_ pasteboard: NSPasteboard?, item: NSPasteboardItem,
+                    provideDataForType type: NSPasteboard.PasteboardType) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastReport > 1 else { return }
+        lastReport = now
+        // Never present from inside AppKit's data request: it is answered first.
+        let reason = reason, report = report
+        DispatchQueue.main.async { MainActor.assumeIsolated { report(reason) } }
+    }
+
+    func pasteboardFinishedWithDataProvider(_ pasteboard: NSPasteboard) {}
 }
