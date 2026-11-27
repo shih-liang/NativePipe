@@ -38,6 +38,9 @@ enum np_file_opcode {
     NP_FILE_READLINK,         /* path -> the symbolic link's target bytes */
     NP_FILE_SYMLINK           /* flags:u32, path, target_length:u32, target -> empty */
 };
+/* PUBLISH_STAGING may end with flags:u32. A service without them rejects the
+ * longer body (EINVAL), so a caller that needs one learns it is unsupported. */
+#define NP_FILE_PUBLISH_REPLACE 1u  /* replace an existing regular file atomically */
 /* OPEN and MKDIR flags. */
 #define NP_FILE_OPEN_WRITE 1u       /* create a regular file and truncate it */
 #define NP_FILE_REPLACE 2u          /* with WRITE: an existing file may be replaced */

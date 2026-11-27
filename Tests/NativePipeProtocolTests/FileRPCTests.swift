@@ -257,6 +257,77 @@ final class FileRPCTests: XCTestCase {
         XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: server.root.path).isEmpty)
     }
 
+    /// One file uploads into staging and is published in one rename, so the
+    /// destination never holds a partial file, and replacing is atomic too.
+    func testAtomicFileUploadPublishesOnlyCompleteFiles() async throws {
+        let server = try Server(), rpc = server.rpc
+        let local = FileManager.default.temporaryDirectory.appendingPathComponent("atomic-upload-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: local) }
+        let target = server.root.appendingPathComponent("target")
+        let events = StagingEvents()
+        func send(_ text: String, replace: Bool) async throws {
+            try Data(text.utf8).write(to: local)
+            let handle = try FileHandle(forReadingFrom: local)
+            defer { try? handle.close() }
+            try await rpc.uploadAtomically(handle, to: "/target", replace: replace, staged: { events.add($0, $1) })
+        }
+        try await send("first", replace: false)
+        XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "first")
+        do { try await send("second", replace: false); XCTFail("an exclusive upload must not overwrite") }
+        catch FileRPC.Failure.remote(let code) { XCTAssertEqual(code, EEXIST) }
+        XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "first")
+        let canReplace = await rpc.canReplaceAtomically(in: "/")
+        XCTAssertTrue(canReplace)
+        try await send("replacement", replace: true)
+        XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "replacement")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: server.root.path), ["target"],
+                       "no staging directory remains")
+        XCTAssertEqual(events.active, [], "every reported staging directory was reported gone")
+        XCTAssertEqual(events.count, 6)
+    }
+
+    func testCancelledAtomicUploadLeavesNeitherDestinationNorStaging() async throws {
+        let server = try Server(), rpc = server.rpc
+        let local = FileManager.default.temporaryDirectory.appendingPathComponent("atomic-cancel-\(UUID())")
+        try Data(repeating: 0x5a, count: 16 * 1024 * 1024).write(to: local)
+        defer { try? FileManager.default.removeItem(at: local) }
+        let handle = try FileHandle(forReadingFrom: local)
+        defer { try? handle.close() }
+        let cancellation = UploadTaskCancellation(), events = StagingEvents()
+        let task = Task {
+            try await rpc.uploadAtomically(handle, to: "/cancelled", staged: { events.add($0, $1) }) { done, _ in
+                if done > 0 { cancellation.cancel() }
+            }
+        }
+        cancellation.set(task)
+        do { try await task.value; XCTFail("a cancelled upload must fail") } catch {}
+        XCTAssertEqual(server.workers.wait(timeout: .now() + 2), .success)
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: server.root.path).isEmpty)
+        XCTAssertEqual(events.active, [])
+    }
+
+    /// An abandoned staging directory is removed later with its recorded capability.
+    func testRecordedStagingCanBeDiscardedLater() async throws {
+        let server = try Server(), rpc = server.rpc
+        let staging = try await rpc.createUploadStaging("/.nativepipe-upload-" + UUID().uuidString)
+        let recorded = try JSONDecoder().decode(FileRPC.UploadStaging.self, from: JSONEncoder().encode(staging))
+        try await rpc.discardStaging(try FileRPC.UploadStaging(path: recorded.path, token: recorded.token))
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: server.root.path).isEmpty)
+        XCTAssertThrowsError(try FileRPC.UploadStaging(path: recorded.path, token: Data(count: 3)))
+    }
+
+    private final class StagingEvents: @unchecked Sendable {
+        private let lock = NSLock()
+        private var live: Set<String> = [], total = 0
+        func add(_ staging: FileRPC.UploadStaging, _ active: Bool) {
+            lock.lock(); defer { lock.unlock() }
+            total += 1
+            if active { live.insert(staging.path) } else { live.remove(staging.path) }
+        }
+        var active: Set<String> { lock.lock(); defer { lock.unlock() }; return live }
+        var count: Int { lock.lock(); defer { lock.unlock() }; return total }
+    }
+
     @MainActor
     func testExactUploadRejectsReadOnlyAndSymlinkedRemoteParents() async throws {
         let local = FileManager.default.temporaryDirectory.appendingPathComponent("readonly-upload-\(UUID())")
