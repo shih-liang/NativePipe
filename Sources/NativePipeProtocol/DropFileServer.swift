@@ -136,27 +136,55 @@ public final class DropFileServer: @unchecked Sendable {
     /// Closed only once released and no request still uses it: a descriptor
     /// number must never be reused while a request could still reach it.
     private final class OpenFile {
-        let descriptor: Int32
+        /// -1 while the VM is paused, and once the handle went stale.
+        var descriptor: Int32
         let path: String
         let accessMode: Int32
+        /// How to open `path` again after a pause: the original flags without
+        /// creating or truncating anything.
+        let reopenFlags: Int32
+        /// The file this handle opened; after a pause only that file will do.
+        let device: Int32, inode: UInt64
         let drop: Drop
         var users = 0
         var released = false
-        init(_ descriptor: Int32, path: String, accessMode: Int32, drop: Drop) {
-            self.descriptor = descriptor; self.path = path; self.accessMode = accessMode; self.drop = drop
+        /// The handle could not get its file or its locks back after a pause:
+        /// every request but RELEASE fails with ESTALE.
+        var stale = false
+        /// The flock(2) lock held on this open file (LOCK_SH, LOCK_EX or 0).
+        var flockMode: Int32 = 0
+        /// Lock owners whose POSIX locks were taken through this handle.
+        var owners: Swift.Set<UInt64> = []
+        init(_ descriptor: Int32, path: String, flags: Int32, device: Int32, inode: UInt64, drop: Drop) {
+            self.descriptor = descriptor; self.path = path; self.accessMode = flags & O_ACCMODE
+            self.reopenFlags = flags & ~(O_CREAT | O_EXCL | O_TRUNC)
+            self.device = device; self.inode = inode; self.drop = drop
         }
     }
     /// A guest lock owner's POSIX locks on one file, as OFD locks on one descriptor.
     private struct LockKey: Hashable { let device: Int32; let inode: UInt64; let owner: UInt64 }
+    private struct LockRange: Equatable { var start: UInt64, end: UInt64, type: UInt32 }
+    /// One owner's descriptor and the ranges it holds, kept so the locks can be
+    /// taken again after a pause. `serial` keeps the ranges in step with the kernel.
+    private final class OwnerLocks {
+        var descriptor: Int32
+        let path: String
+        let flags: Int32
+        var ranges: [LockRange] = []
+        let serial = NSLock()
+        init(_ descriptor: Int32, path: String, flags: Int32) { self.descriptor = descriptor; self.path = path; self.flags = flags }
+    }
 
     private let lock = NSLock()
     private let stagingRoot: URL
     private var drops: [String: Drop] = [:]
     private var handles: [UInt64: OpenFile] = [:]
-    private var lockFiles: [LockKey: Int32] = [:]
+    private var lockFiles: [LockKey: OwnerLocks] = [:]
     private var nextHandle: UInt64 = 1
     private var session: FileSession?
     private var mount: String?
+    /// Between `pause` and `resume`: requests on handles wait.
+    private var paused = false
 
     /// Files a guest creates next to a drop are kept under `stagingDirectory`
     /// (one directory per drop, removed with it).
@@ -214,6 +242,91 @@ public final class DropFileServer: @unchecked Sendable {
         }
         previous?.close()
         closeHandles()
+    }
+
+    // MARK: Pausing
+
+    /// The VM is about to stay frozen: let go of every Mac file and lock it
+    /// holds, as if the guest had closed them, so Mac programs are never kept
+    /// waiting on a guest that cannot run. Each handle remembers its file, its
+    /// flock and its owners' POSIX locks for `resume`. Requests already running
+    /// finish first; requests arriving meanwhile wait for `resume`.
+    public func pause() async {
+        lock.withLock { paused = true }
+        while lock.withLock({ paused && handles.values.contains { $0.users > 0 } }) {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let (files, owners): ([Int32], [Int32]) = lock.withLock {
+            guard paused else { return ([], []) }
+            let files = handles.values.compactMap { file -> Int32? in
+                defer { file.descriptor = -1 }
+                return file.descriptor >= 0 ? file.descriptor : nil
+            }
+            let owners = lockFiles.values.compactMap { owner -> Int32? in
+                defer { owner.descriptor = -1 }
+                return owner.descriptor >= 0 ? owner.descriptor : nil
+            }
+            return (files, owners)
+        }
+        _ = try? await FileTransferLocalIO.perform {
+            owners.forEach(Self.unlockAndClose)
+            files.forEach { Darwin.close($0) }
+        }
+    }
+
+    /// The VM runs again: every handle opens its path again and takes its
+    /// locks back without waiting. A handle whose path is now another file,
+    /// or whose lock a Mac program took meanwhile, goes stale: its requests
+    /// fail with ESTALE until the guest releases it, so a Linux app never
+    /// carries on as if it still had a file or lock it lost.
+    public func resume() async {
+        let (files, owners): ([OpenFile], [(LockKey, OwnerLocks)]) = lock.withLock {
+            (handles.values.filter { $0.descriptor < 0 && !$0.stale }, lockFiles.map { ($0.key, $0.value) })
+        }
+        _ = try? await FileTransferLocalIO.perform { [self] in
+            var lost: [LockKey] = []
+            for (key, owner) in owners where owner.descriptor < 0 {
+                let descriptor = Self.reopen(owner.path, owner.flags, device: key.device, inode: key.inode)
+                if descriptor >= 0, owner.ranges.allSatisfy({ range in
+                    var request = Self.flock(range.start, range.end, range.type)
+                    return fcntl(descriptor, F_OFD_SETLK, &request) == 0
+                }) {
+                    lock.withLock { owner.descriptor = descriptor }
+                } else {
+                    if descriptor >= 0 { Self.unlockAndClose(descriptor) }
+                    lost.append(key)
+                }
+            }
+            for file in files {
+                var descriptor = Self.reopen(file.path, file.reopenFlags, device: file.device, inode: file.inode)
+                if descriptor >= 0, file.flockMode != 0, np_drop_flock(descriptor, file.flockMode | LOCK_NB) != 0 {
+                    Darwin.close(descriptor); descriptor = -1
+                }
+                let keep: Bool = lock.withLock {
+                    let ownerLost = lost.contains { $0.device == file.device && $0.inode == file.inode && file.owners.contains($0.owner) }
+                    guard descriptor >= 0, !ownerLost, !file.released else {
+                        file.stale = descriptor < 0 || ownerLost
+                        return false
+                    }
+                    file.descriptor = descriptor
+                    return true
+                }
+                if !keep, descriptor >= 0 { Darwin.close(descriptor) }
+            }
+            lock.withLock { for key in lost { lockFiles[key] = nil } }
+        }
+        lock.withLock { paused = false }
+    }
+
+    /// `path` opened again, only if it is still the file with this identity.
+    private static func reopen(_ path: String, _ flags: Int32, device: Int32, inode: UInt64) -> Int32 {
+        let descriptor = Darwin.open(path, flags | O_CLOEXEC | O_NONBLOCK)
+        guard descriptor >= 0 else { return -1 }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
+              info.st_dev == device, info.st_ino == inode else { Darwin.close(descriptor); return -1 }
+        _ = fcntl(descriptor, F_SETFL, fcntl(descriptor, F_GETFL) & ~O_NONBLOCK)
+        return descriptor
     }
 
     /// Makes a regular file or a folder available to the guest. Returns its
@@ -355,7 +468,7 @@ public final class DropFileServer: @unchecked Sendable {
             case Opcode.unlink: reply = await unlink(body)
             case Opcode.rename: reply = await rename(body)
             case Opcode.fsync: reply = await fsync(body)
-            case Opcode.flush: reply = flush(body)
+            case Opcode.flush: reply = await flush(body)
             case Opcode.getlk: reply = await getlk(body)
             case Opcode.setlk: reply = await setlk(body, stream)
             case Opcode.rmdir: reply = await removeDirectory(body)
@@ -526,11 +639,13 @@ public final class DropFileServer: @unchecked Sendable {
         }
         guard case .body(var reply) = opened else { return opened }
         let descriptor = Int32(truncatingIfNeeded: u64(reply, 0))
+        var info = stat()
+        guard fstat(descriptor, &info) == 0 else { Darwin.close(descriptor); return .status(Status.eio) }
         let handle: UInt64? = lock.withLock {
             // A handle belongs to the session that opened it.
             guard session != nil else { return nil }
             let handle = nextHandle; nextHandle += 1
-            handles[handle] = OpenFile(descriptor, path: path, accessMode: flags & O_ACCMODE, drop: drop)
+            handles[handle] = OpenFile(descriptor, path: path, flags: flags, device: info.st_dev, inode: info.st_ino, drop: drop)
             drop.openFiles += 1; drop.lastUsed = Date()
             return handle
         }
@@ -705,17 +820,16 @@ public final class DropFileServer: @unchecked Sendable {
         }
     }
 
-    private func flush(_ body: Data) -> Reply {
+    private func flush(_ body: Data) async -> Reply {
         guard body.count == 16 else { return .status(Status.einval) }
         let owner = u64(body, 8)
-        guard let file = acquire(u64(body, 0)) else { return .status(Status.ebadf) }
+        guard let file = await acquire(u64(body, 0)) else { return .status(Status.ebadf) }
         defer { relinquish(file) }
-        var info = stat()
-        if fstat(file.descriptor, &info) == 0 {
-            let key = LockKey(device: info.st_dev, inode: info.st_ino, owner: owner)
-            // The owner's POSIX locks end, as with close(2). Unlock explicitly:
-            // the descriptor may share its open file with the handle.
-            if let descriptor = lock.withLock({ lockFiles.removeValue(forKey: key) }) { Self.unlockAndClose(descriptor) }
+        let key = LockKey(device: file.device, inode: file.inode, owner: owner)
+        // The owner's POSIX locks end, as with close(2), stale handle or not.
+        // Unlock explicitly: the descriptor may share its open file with the handle.
+        if let owner = lock.withLock({ lockFiles.removeValue(forKey: key) }), owner.descriptor >= 0 {
+            Self.unlockAndClose(owner.descriptor)
         }
         return .status(0)
     }
@@ -793,11 +907,26 @@ public final class DropFileServer: @unchecked Sendable {
             type = FileSession.decode32(body, at: 32); flags = FileSession.decode32(body, at: 36)
             guard type <= LinuxLock.unlock, start <= end, start <= DropFileServer.lockToEnd else { return nil }
         }
-        var flock: flock {
-            Darwin.flock(l_start: off_t(start), l_len: end >= DropFileServer.lockToEnd ? 0 : off_t(end - start + 1),
-                         l_pid: 0, l_type: Int16(type == LinuxLock.read ? F_RDLCK : type == LinuxLock.write ? F_WRLCK : F_UNLCK),
-                         l_whence: Int16(SEEK_SET))
+        var flock: flock { DropFileServer.flock(start, end, type) }
+    }
+
+    private static func flock(_ start: UInt64, _ end: UInt64, _ type: UInt32) -> Darwin.flock {
+        Darwin.flock(l_start: off_t(start), l_len: end >= lockToEnd ? 0 : off_t(end - start + 1),
+                     l_pid: 0, l_type: Int16(type == LinuxLock.read ? F_RDLCK : type == LinuxLock.write ? F_WRLCK : F_UNLCK),
+                     l_whence: Int16(SEEK_SET))
+    }
+
+    /// `ranges` after setting `start...end` to `type`, as fcntl(2) does to an
+    /// owner's locks: the range replaces whatever it overlaps.
+    private static func applying(_ ranges: [LockRange], _ start: UInt64, _ end: UInt64, _ type: UInt32) -> [LockRange] {
+        var result: [LockRange] = []
+        for range in ranges {
+            guard range.end >= start, range.start <= end else { result.append(range); continue }
+            if range.start < start { result.append(LockRange(start: range.start, end: start - 1, type: range.type)) }
+            if range.end > end { result.append(LockRange(start: end + 1, end: range.end, type: range.type)) }
         }
+        if type != LinuxLock.unlock { result.append(LockRange(start: start, end: end, type: type)) }
+        return result
     }
 
     private func getlk(_ body: Data) async -> Reply {
@@ -805,7 +934,7 @@ public final class DropFileServer: @unchecked Sendable {
         // flock(2) has no query; FUSE never asks one, but answer "unlocked".
         if request.flags & LockFlag.flock != 0 { return .body(Self.lockReply(nil, request)) }
         return await using(request.handle) { file in
-            let descriptor = try self.lockDescriptor(file, owner: request.owner, create: false) ?? file.descriptor
+            let descriptor = try self.lockDescriptor(file, owner: request.owner, create: false)?.descriptor ?? file.descriptor
             var query = request.flock
             if query.l_type == Int16(F_UNLCK) { query.l_type = Int16(F_WRLCK) }
             try Self.check(fcntl(descriptor, F_OFD_GETLK, &query))
@@ -822,14 +951,19 @@ public final class DropFileServer: @unchecked Sendable {
                     let operation = request.type == LinuxLock.unlock ? LOCK_UN
                         : (request.type == LinuxLock.read ? LOCK_SH : LOCK_EX) | LOCK_NB
                     try Self.check(np_drop_flock(file.descriptor, operation))
+                    self.lock.withLock { file.flockMode = operation & ~LOCK_NB & ~LOCK_UN }
                     return .status(0)
                 }
-                guard let descriptor = try self.lockDescriptor(file, owner: request.owner,
-                                                               create: request.type != LinuxLock.unlock) else {
+                guard let owner = try self.lockDescriptor(file, owner: request.owner,
+                                                          create: request.type != LinuxLock.unlock) else {
                     return .status(0) // nothing locked by this owner
                 }
-                var lock = request.flock
-                try Self.check(fcntl(descriptor, F_OFD_SETLK, &lock))
+                try owner.serial.withLock {
+                    var lock = request.flock
+                    try Self.check(fcntl(owner.descriptor, F_OFD_SETLK, &lock))
+                    owner.ranges = Self.applying(owner.ranges, request.start, request.end, request.type)
+                }
+                self.lock.withLock { _ = file.owners.insert(request.owner) }
                 return .status(0)
             }
             guard wait, case .status(let status) = reply, status == Status.eagain else { return reply }
@@ -842,27 +976,23 @@ public final class DropFileServer: @unchecked Sendable {
 
     /// The owner's own descriptor for `file`'s inode: OFD locks then follow
     /// POSIX ownership (one owner, any number of opens) instead of per-open.
-    private func lockDescriptor(_ file: OpenFile, owner: UInt64, create: Bool) throws -> Int32? {
-        var info = stat()
-        try Self.check(fstat(file.descriptor, &info))
-        let key = LockKey(device: info.st_dev, inode: info.st_ino, owner: owner)
+    private func lockDescriptor(_ file: OpenFile, owner: UInt64, create: Bool) throws -> OwnerLocks? {
+        let key = LockKey(device: file.device, inode: file.inode, owner: owner)
         if let existing = lock.withLock({ lockFiles[key] }) { return existing }
         guard create else { return nil }
         // Reopen by path when that is still the same file; otherwise the open
         // file itself (renamed or replaced since) carries the owner's locks.
-        var descriptor = Darwin.open(file.path, file.accessMode | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW)
-        var reopened = stat()
-        if descriptor >= 0, fstat(descriptor, &reopened) != 0 || reopened.st_dev != info.st_dev || reopened.st_ino != info.st_ino {
-            Darwin.close(descriptor); descriptor = -1
-        }
+        let flags = file.accessMode | O_NOFOLLOW
+        var descriptor = Self.reopen(file.path, flags, device: file.device, inode: file.inode)
         if descriptor < 0 { descriptor = fcntl(file.descriptor, F_DUPFD_CLOEXEC, 0) }
         try Self.check(descriptor)
-        let stored: Int32 = lock.withLock {
+        let created = OwnerLocks(descriptor, path: file.path, flags: flags)
+        let stored: OwnerLocks = lock.withLock {
             if let raced = lockFiles[key] { return raced }
-            lockFiles[key] = descriptor
-            return descriptor
+            lockFiles[key] = created
+            return created
         }
-        if stored != descriptor { Darwin.close(descriptor) }
+        if stored !== created { Darwin.close(descriptor) }
         return stored
     }
 
@@ -878,25 +1008,36 @@ public final class DropFileServer: @unchecked Sendable {
 
     // MARK: Handles
 
-    private func acquire(_ handle: UInt64) -> OpenFile? {
-        lock.withLock {
-            let file = handles[handle]
-            file?.users += 1
-            return file
+    /// The handle's open file, once the VM is not paused.
+    private func acquire(_ handle: UInt64) async -> OpenFile? {
+        while true {
+            let (file, wait): (OpenFile?, Bool) = lock.withLock {
+                guard let file = handles[handle] else { return (nil, false) }
+                if paused { return (nil, true) }
+                file.users += 1
+                return (file, false)
+            }
+            if !wait { return file }
+            try? await Task.sleep(nanoseconds: 10_000_000)
         }
     }
     private func relinquish(_ file: OpenFile) {
-        let close: Bool = lock.withLock {
+        let descriptor: Int32 = lock.withLock {
             file.users -= 1
-            return file.released && file.users == 0
+            return file.released && file.users == 0 ? takeDescriptor(file) : -1
         }
-        if close { Darwin.close(file.descriptor) }
+        if descriptor >= 0 { Darwin.close(descriptor) }
+    }
+    /// The descriptor to close, now owned by the caller. Under `lock`.
+    private func takeDescriptor(_ file: OpenFile) -> Int32 {
+        defer { file.descriptor = -1 }
+        return file.descriptor
     }
     private func using(_ handle: UInt64, _ work: @escaping @Sendable (OpenFile) throws -> Reply) async -> Reply {
-        guard let file = acquire(handle) else { return .status(Status.ebadf) }
-        let reply = await Self.io { try work(file) }
-        relinquish(file)
-        return reply
+        guard let file = await acquire(handle) else { return .status(Status.ebadf) }
+        defer { relinquish(file) }
+        if lock.withLock({ file.stale }) { return .status(Status.estale) }
+        return await Self.io { try work(file) }
     }
 
     private func release(_ body: Data) -> Reply {
@@ -911,20 +1052,25 @@ public final class DropFileServer: @unchecked Sendable {
     }
 
     private func releaseFile(_ file: OpenFile) {
-        let close: Bool = lock.withLock {
+        let descriptor: Int32 = lock.withLock {
             file.released = true
-            return file.users == 0
+            return file.users == 0 ? takeDescriptor(file) : -1
         }
-        if close { Darwin.close(file.descriptor) }
+        if descriptor >= 0 { Darwin.close(descriptor) }
     }
 
-    /// The session ended: every open file and every lock it held goes.
+    /// The session ended: every open file and every lock it held goes, and
+    /// nothing is left to take back after a pause.
     private func closeHandles() {
         let (files, locks): ([OpenFile], [Int32]) = lock.withLock {
-            defer { handles.removeAll(); lockFiles.removeAll() }
+            defer { handles.removeAll(); lockFiles.removeAll(); paused = false }
             let now = Date()
             for file in handles.values { file.drop.openFiles -= 1; file.drop.lastUsed = now }
-            return (Array(handles.values), Array(lockFiles.values))
+            let locks = lockFiles.values.compactMap { owner -> Int32? in
+                defer { owner.descriptor = -1 }
+                return owner.descriptor >= 0 ? owner.descriptor : nil
+            }
+            return (Array(handles.values), locks)
         }
         locks.forEach(Self.unlockAndClose)
         files.forEach(releaseFile)
@@ -1063,7 +1209,7 @@ public final class DropFileServer: @unchecked Sendable {
     public enum Status {
         public static let eperm: UInt32 = 1, enoent: UInt32 = 2, eintr: UInt32 = 4, eio: UInt32 = 5
         public static let ebadf: UInt32 = 9, eagain: UInt32 = 11, eacces: UInt32 = 13, eexist: UInt32 = 17
-        public static let ebusy: UInt32 = 16, eisdir: UInt32 = 21, einval: UInt32 = 22
+        public static let ebusy: UInt32 = 16, eisdir: UInt32 = 21, einval: UInt32 = 22, estale: UInt32 = 116
         public static func from(_ code: Int32) -> UInt32 {
             switch code {
             case EPERM: return eperm
